@@ -1,0 +1,179 @@
+{
+  "event_id": "log_variation_image_gen",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "api",
+    "event_type": "log",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902b7",
+    "name": "checkout.failed",
+    "severity_number": 17,
+    "severity_text": "ERROR",
+    "is_error": 1,
+    "agentPhase": "run",
+    "agentType": "canvas",
+    "caller": "src/services/tracer.ts:314",
+    "canvasId": "9dc05d76-e919-4c53-9274-c8060774ee8a",
+    "conversationMode": "teaching",
+    "endedAt": "2026-05-06T23:32:59.524Z",
+    "llm": {
+      "finishReason": "stop",
+      "messages": [
+        {
+          "content": "You are CanvasAgent. You draw on Excalidraw through MCP tools. You may use Bash only for runtime app source files and validation.\n\nEach turn starts with PNG preview and compact JSON observation. Treat both as ground truth for ids, coordinates, dimensions, and text. Preview shows live user viewport when user has canvas open; otherwise full document bounds.\n\n# Tool contract\n\n- Use available MCP tools for every canvas mutation and inspection.\n- Use Bash only to create, inspect, edit, typecheck, build, or validate runtime app files under /archil/canvas-apps/<appId>. Runtime apps must use bun only. Do not use python, python3, node, ruby, busybox, npm, or npx. Do not use Bash for canvas mutations.\n- Prefer batch_create_elements for related shapes; assign stable ids so arrows can use startElementId/endElementId and later updates are surgical.\n- Use query_elements, get_element, describe_scene, or get_resource when exact ids, coordinates, or more elements are needed.\n- Use get_canvas_screenshot or export_scene after useful drawing when visual verification helps.\n- Use generate_canvas_image when user asks for illustrative generated imagery. Keep generated images framed and purposeful.\n- For interactive apps, create /archil/canvas-apps/<appId>/canvas-app.json with a bun startCommand, such as \"bun server.ts\" or \"bun server.js\". The server must read PORT from the environment and bind 0.0.0.0. Use as many Bash calls as needed to build, inspect, validate, and smoke test complex apps. Once validation succeeds, the next tool call must be create_runtime_app_frame unless a concrete new failure or missing requirement appears. Do not repeat equivalent source rewrites after successful validation. Never finish a runtime app task until a frame exists on the canvas.\n- Never use local canvas write tools for canvas changes.\n\n# Creation routing\n\n- Use Excalidraw native elements for teacher-board artifacts: editable shapes, arrows, labels, tables, timelines, Venn diagrams, flowcharts, proofs, sentence markup, labeled simple diagrams, graph sketches, organizers, and anything requiring exact text or precise geometry.\n- Use generate_canvas_image for visual assets: historical scenes, scientific realism, book-cover or mood images, microscope-like visuals, posters, illustrated organisms, lab safety scenes, artifacts, and sensory context where visual richness matters more than editability.\n- Use code plus create_runtime_app_frame for executable learning objects: sliders, simulations, calculators, animations, drag/drop manipulatives, graphers, quizzes, datasets, maps, timelines with filters, virtual labs, games, and any artifact where learner interaction or computation changes the result.\n- GPT Image 2 is strong for high-quality generation/editing, photorealism, style transfer, visual context, and multi-panel or infographic-like assets. It is still weaker than Excalidraw/code for exact layout, precise text placement, recurring consistency, and pixel-exact composition.\n- Default biological, anatomical, cellular, organism, specimen, and microscope visuals to generated_image. If exact labels are required, generate the visual first, then add native Excalidraw text/arrow labels on top. Only draw cells, anatomy, organisms, or specimens entirely with native shapes when the task explicitly asks for editable/vector/simple schematic/native Excalidraw shapes.\n- Default rule: if teacher wants board clarity, use Excalidraw; if teacher wants image as sensory context, use generated image; if learner should manipulate a system, use code.\n\n# Scenario catalog\n\n1. excalidraw: Evidence table for source analysis. Draw four editable columns labeled quote, context, inference, reliability. Add three blank rows, short placeholder text in each cell, and a small rating scale at row end. Use when teacher wants students to fill or revise reasoning live.\n2. excalidraw: Cause-effect chain. Draw eight event boxes in chronological order, connect them with arrows, add two curved feedback arrows, and mark one box as turning point. Use when exact event labels, sequence, and arrow direction matter.\n3. excalidraw: Algebra worked example. Draw left column for equation steps, right column for justification, horizontal separators, and boxed final answer. Use when teacher needs precise symbols and editable math text.\n4. excalidraw: Coordinate graph sketch. Draw x/y axes, grid ticks, plotted line or curve, vertex/intercept labels, transformation arrows, and short annotation callouts. Use when graph is explanatory rather than numerically simulated.\n5. excalidraw: Grammar sentence diagram. Draw baseline with subject, verb, object, modifier branches, phrase branches, and punctuation markups. Use when teacher wants to edit sentence parts and labels.\n6. excalidraw: CER organizer. Draw claim box at top, three evidence boxes below, reasoning bridge arrows, rebuttal box to side, and conclusion box. Use for argumentative writing scaffolds.\n7. excalidraw: Lab setup schematic. Draw simplified beaker, thermometer, hot plate, sensor, timer, and labels for independent variable, dependent variable, controls, and safety notes. Use when clarity beats realism.\n8. generated_image: Cell or anatomy textbook visual. Generate clean animal cell, plant cell, organ, tissue, organism, or body-system illustration with biological visual detail. If exact organelle or part labels are required, overlay native Excalidraw labels and arrows after generating the image.\n9. excalidraw: Comparative Venn diagram. Draw two or three overlapping circles with labeled regions, example bullets, and common/different claims. Use for literature, history, science, or vocabulary comparisons.\n10. excalidraw: Timeline strip. Draw horizontal time axis, dated event cards, era brackets, color-coded categories, continuity/change markers, and short notes. Use when dates and event order are core content.\n11. excalidraw: Plot mountain. Draw exposition, rising action, climax, falling action, resolution, key scene cards, and conflict annotations. Use for editable story structure.\n12. excalidraw: Vocabulary Frayer model. Draw four quadrants for definition, characteristics, examples, nonexamples, with center term box. Use for board-ready concept vocabulary.\n13. excalidraw: Hierarchy tree. Draw root concept, branches, nested sub-branches, and short labels. Use for taxonomy, government structure, classification, or outline planning.\n14. excalidraw: Process or cycle diagram. Draw repeating steps around circle or linear flow with arrows and checkpoints. Use for water cycle, scientific method, revision process, or historical process.\n15. excalidraw: Free-body diagram. Draw object box or dot, force arrows, labels, angle markers, coordinate axes, and net force note. Use when exact arrow direction and labels matter.\n16. excalidraw: Proof or theorem diagram. Draw geometric figure, givens, marked congruent segments/angles, two-column proof table, and final statement. Use for formal math reasoning.\n17. generated_image: Historical setting scene. Generate realistic classroom-ready image of specific time/place, clothing, architecture, tools, and environment, with no labels. Use as sensory context before teacher annotates with Excalidraw.\n18. generated_image: Ecosystem observation scene. Generate pond, forest, desert, tidepool, or biome scene with organisms and environmental details. Use when students should notice visual relationships before formal labels.\n19. generated_image: Scientific specimen or microscope-style visual. Generate onion cells, pond water, leaf cross-section, mineral sample, fossil, or tissue-like image. Use when texture and realism are more useful than editable vector shapes.\n20. generated_image: Literary mood image. Generate symbolic scene for novel, poem, or theme, such as stormy castle, empty road, crowded city, or isolated room. Use for discussion, not exact plot mapping.\n21. generated_image: Artifact collage. Generate realistic-looking collection of primary-source-style objects, such as newspaper, ration card, propaganda poster, diary page, map fragment, or photograph. Use as image stimulus before analysis.\n22. generated_image: Lab safety or procedure poster. Generate polished visual scene showing goggles, gloves, clean bench, labeled equipment, or unsafe contrast image. Use for visual attention, then add exact rules separately if needed.\n23. generated_image: Illustrated organism or anatomy context. Generate animal, plant, body system, habitat, or organ scene with rich texture and no dense labels. Use when teacher wants realistic visual grounding.\n24. code: Projectile motion simulator. Build app with sliders for launch angle, initial velocity, gravity, and height; animate trajectory; show range, max height, time of flight, and velocity vectors.\n25. code: Function transformation explorer. Build graphing app with sliders for a, h, k, function family selector, live equation, key points, table, and reset button.\n26. code: Fraction and ratio manipulative. Build draggable fraction bars, area models, number line, equivalence checker, comparison mode, and simplification feedback.\n27. code: Predator-prey or population model. Build simulation with growth/death-rate sliders, animated population counts, line chart over time, pause/reset, and scenario presets.\n28. code: Circuit builder. Build drag/drop battery, wires, bulbs, switches, and resistors; detect closed circuits; compute current/voltage; highlight active path.\n29. code: Interactive map. Build map or schematic geography app with clickable regions, migration arrows, layer toggles, year slider, legend, and source popovers.\n30. code: Sentence revision workspace. Build drag/drop clauses, punctuation controls, live sentence preview, grammar validation, and explanation panel.\n31. code: Primary-source sorting task. Build card sorting app where students drag excerpts into bias, purpose, audience, reliability, or chronology buckets and reveal model reasoning.\n32. code: Virtual titration lab. Build burette/flask interaction, drop controls, pH curve, indicator color changes, endpoint detection, and data table.\n33. code: Geometry construction tool. Build draggable points, segments, circles, angle/length measurements, constraints, congruence markings, and live theorem checks.\n34. code: Data exploration dashboard. Build charting app with editable data table, bar/line/scatter toggles, filters, trendline, summary stats, and interpretation prompts.\n35. code: Timeline explorer. Build zoomable timeline with filters, event categories, clickable cards, source snippets, and comparison mode across regions or characters.\n36. code: Quiz or practice engine. Build interactive questions with immediate validation, hints, worked solution reveal, score state, and randomized variants.\n\n# Drawing rules\n\n- Work step-by-step so the user can see progression. Each MCP mutation should be one visible teaching move: one label pair, one connection, one correction, one small cluster, or one local cleanup.\n- Stop after each step, read the tool result, and continue with the next step only if more canvas work is still needed.\n- Prefer simple native Excalidraw elements unless the request fits generated-image or code routing.\n- Keep text short: labels, symbols, equations, one-line notes.\n- Preserve existing and user-authored elements. Update or delete only when user asks or target element clearly conflicts with task.\n- Use concrete CSS colors only when color carries meaning. Never use CSS variables, Tailwind tokens, or theme names.\n\nFinish with one short sentence describing what changed.",
+          "role": "system"
+        },
+        {
+          "content": "<agent-task agentType=\"canvas\">\nmedium: generated_image\n\nGenerate a realistic textbook visual of a plant cell.\n</agent-task>",
+          "role": "user"
+        },
+        {
+          "content": [
+            {
+              "type": "tool-call",
+              "toolName": "Mcp_canvas_generate_canvas_image",
+              "toolCallId": "call_jkl012",
+              "input": {
+                "prompt": "A highly detailed, realistic textbook illustration of a plant cell, showing organelles like chloroplasts, nucleus, and cell wall clearly.",
+                "x": 100,
+                "y": 100,
+                "width": 512,
+                "height": 512
+              }
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "content": "<canvas-tool-result toolName=\"Mcp_canvas_generate_canvas_image\" toolCallId=\"call_jkl012\">\n{\n  \"type\": \"json\",\n  \"value\": {\n    \"success\": true,\n    \"imageId\": \"img_1\"\n  }\n}\n</canvas-tool-result>",
+          "role": "user"
+        }
+      ],
+      "model": "openai/gpt-5.5",
+      "providerOptions": {
+        "openai": {
+          "reasoningEffort": "none",
+          "reasoningSummary": "auto",
+          "serviceTier": "priority"
+        }
+      },
+      "response": {
+        "headers": {
+          "access-control-expose-headers": "X-Request-ID",
+          "alt-svc": "h3=\":443\"; ma=86400",
+          "cf-cache-status": "DYNAMIC",
+          "cf-ray": "9f7bc979f8b12511-SJC",
+          "content-type": "text/event-stream; charset=utf-8",
+          "date": "Wed, 06 May 2026 23:32:57 GMT",
+          "openai-organization": "user-gltv4gcmmvzbjf4owww7qwbx",
+          "openai-processing-ms": "1638",
+          "openai-project": "proj_lWYvBx90rk9YGHwTjhCpLdBg",
+          "openai-version": "2020-10-01",
+          "server": "cloudflare",
+          "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+          "transfer-encoding": "chunked",
+          "x-content-type-options": "nosniff",
+          "x-ratelimit-limit-requests": "5000",
+          "x-ratelimit-limit-tokens": "2000000",
+          "x-ratelimit-remaining-requests": "4999",
+          "x-ratelimit-remaining-tokens": "1984565",
+          "x-ratelimit-reset-requests": "12ms",
+          "x-ratelimit-reset-tokens": "463ms",
+          "x-request-id": "req_b99513210e7045459cbd9daefe65768b"
+        },
+        "id": "resp_08d6c09e71c533600069fbcfa89a708196973ae17d6b1c0f64",
+        "messages": [
+          {
+            "content": [
+              {
+                "input": {
+                  "appId": "induction-sim",
+                  "documentId": "9dc05d76-e919-4c53-9274-c8060774ee8a",
+                  "height": "620",
+                  "id": "induction-sim-frame",
+                  "title": "Interactive Electromagnetic Induction Simulation",
+                  "width": "900",
+                  "x": "20",
+                  "y": "20"
+                },
+                "providerOptions": {
+                  "openai": {
+                    "itemId": "fc_08d6c09e71c533600069fbcfaa6f608196bf08eb145efe15a6"
+                  }
+                },
+                "toolCallId": "call_yBEcfMQygUVBxno55LvdiXoT",
+                "toolName": "Mcp_canvas_create_runtime_app_frame",
+                "type": "tool-call"
+              }
+            ],
+            "role": "assistant"
+          }
+        ],
+        "modelId": "gpt-5.5-2026-04-23"
+      },
+      "toolNames": [
+        "Mcp_canvas_create_element",
+        "Mcp_canvas_batch_create_elements",
+        "Mcp_canvas_update_element",
+        "Mcp_canvas_delete_element",
+        "Mcp_canvas_query_elements",
+        "Mcp_canvas_get_element",
+        "Mcp_canvas_get_resource",
+        "Mcp_canvas_group_elements",
+        "Mcp_canvas_ungroup_elements",
+        "Mcp_canvas_align_elements",
+        "Mcp_canvas_distribute_elements",
+        "Mcp_canvas_lock_elements",
+        "Mcp_canvas_unlock_elements",
+        "Mcp_canvas_clear_canvas",
+        "Mcp_canvas_export_scene",
+        "Mcp_canvas_import_scene",
+        "Mcp_canvas_duplicate_elements",
+        "Mcp_canvas_snapshot_scene",
+        "Mcp_canvas_restore_snapshot",
+        "Mcp_canvas_describe_scene",
+        "Mcp_canvas_get_canvas_screenshot",
+        "Mcp_canvas_export_to_image",
+        "Mcp_canvas_create_from_mermaid",
+        "Mcp_canvas_export_to_excalidraw_url",
+        "Mcp_canvas_set_viewport",
+        "Mcp_canvas_read_diagram_guide",
+        "Mcp_canvas_create_runtime_app_frame",
+        "Mcp_canvas_generate_canvas_image",
+        "Bash"
+      ],
+      "totalUsage": {
+        "cachedInputTokens": 13312,
+        "inputTokenDetails": {
+          "cacheReadTokens": 13312,
+          "noCacheTokens": 1909
+        },
+        "inputTokens": 15221,
+        "outputTokenDetails": {
+          "reasoningTokens": 0,
+          "textTokens": 86
+        },
+        "outputTokens": 86,
+        "reasoningTokens": 0,
+        "totalTokens": 15307
+      }
+    },
+    "parentSpanId": "1532ed67-c167-4ce6-8991-744a06a42b73",
+    "runId": "2e0524c1-62b7-4b4a-b73a-4cab56e55305",
+    "source": "canvas_agent",
+    "spanId": "6c3dbc07-d817-4cae-b8e7-060bbd90ab02",
+    "startedAt": "2026-05-06T23:32:55.984Z",
+    "steeringGeneration": "1",
+    "threadId": "da2c14a9-0297-47ff-bb0f-0ed70b57fcbb",
+    "title": "Untitled",
+    "traceId": "85797e2a-405e-42b0-b0e4-2542dc871965",
+    "turn": "26",
+    "type": "span",
+    "userId": "6cda8b2d-4779-4b09-b254-2ef6a187068b",
+    "userMessageId": "c37b10d4-cbb6-4eac-929e-96a707b8734f",
+    "voiceMode": "session"
+  }
+}

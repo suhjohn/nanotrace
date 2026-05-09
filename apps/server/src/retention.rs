@@ -1,0 +1,136 @@
+use std::{path::Path, sync::Arc, time::SystemTime};
+
+use tokio::fs;
+use tracing::{error, info, warn};
+
+use crate::{config::Config, event_log::find_with_suffix};
+
+#[derive(Debug, thiserror::Error)]
+pub enum RetentionError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub async fn run(cfg: Arc<Config>) {
+    let Some(retain_for) = cfg.done_retention else {
+        info!("local done-file cleanup disabled");
+        return;
+    };
+
+    let interval_duration = cfg
+        .done_cleanup_interval
+        .min(retain_for)
+        .max(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(interval_duration);
+
+    loop {
+        interval.tick().await;
+        if let Err(err) = cleanup_done_files(&cfg).await {
+            error!(error = %err, "done-file cleanup pass failed");
+        }
+    }
+}
+
+async fn cleanup_done_files(cfg: &Config) -> Result<(), RetentionError> {
+    let done_files = find_with_suffix(&cfg.data_dir, ".done").await?;
+    for path in done_files {
+        match should_delete(&path, cfg).await {
+            Ok(true) => {
+                let bytes = file_len(&path).await.unwrap_or(0);
+                fs::remove_file(&path).await?;
+                info!(path = %path.display(), bytes, "deleted uploaded event part from local disk");
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "failed to evaluate done-file retention")
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn should_delete(path: &Path, cfg: &Config) -> Result<bool, std::io::Error> {
+    let Some(retain_for) = cfg.done_retention else {
+        return Ok(false);
+    };
+    let metadata = fs::metadata(path).await?;
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    match modified.elapsed() {
+        Ok(age) => Ok(age >= retain_for),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn file_len(path: &Path) -> Result<u64, std::io::Error> {
+    Ok(fs::metadata(path).await?.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::Duration};
+
+    use super::should_delete;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn retention_disabled_never_deletes() {
+        let temp = std::env::temp_dir().join(format!(
+            "nanotrace-retention-disabled-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let file = temp.join("part.ndjson.done");
+        fs::write(&file, b"ok").expect("write done file");
+
+        let cfg = test_config(temp.clone(), None);
+        assert!(!should_delete(&file, &cfg).await.expect("check retention"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn old_done_file_is_eligible_for_delete() {
+        let temp =
+            std::env::temp_dir().join(format!("nanotrace-retention-old-{}", std::process::id()));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let file = temp.join("part.ndjson.done");
+        fs::write(&file, b"ok").expect("write done file");
+
+        let cfg = test_config(temp.clone(), Some(Duration::from_secs(0)));
+        assert!(should_delete(&file, &cfg).await.expect("check retention"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn test_config(data_dir: std::path::PathBuf, done_retention: Option<Duration>) -> Config {
+        Config {
+            secret_key: "secret".to_owned(),
+            port: 18473,
+            data_dir,
+            s3_bucket: Some("bucket".to_owned()),
+            s3_prefix: "events".to_owned(),
+            clickhouse_url: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            clickhouse_database: "observatory".to_owned(),
+            clickhouse_table: "events".to_owned(),
+            clickhouse_max_result_rows: 100_000,
+            clickhouse_max_execution_secs: 30,
+            clickhouse_max_bytes_to_read: 1_000_000_000,
+            max_request_bytes: 1024,
+            max_event_bytes: 1024,
+            rotate_bytes: 1024,
+            rotate_after: Duration::from_secs(1),
+            upload_poll_interval: Duration::from_millis(500),
+            done_retention,
+            done_cleanup_interval: Duration::from_secs(60),
+            writer_lanes: 1,
+            writer_queue_capacity: 16,
+            writer_flush_interval: Duration::from_millis(100),
+            writer_flush_bytes: 1024,
+            compact_batch_receipts: false,
+            processor_poll_interval: Duration::from_secs(30),
+            processor_builder_cmd: "true".to_string(),
+        }
+    }
+}

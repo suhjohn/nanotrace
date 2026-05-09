@@ -1,0 +1,23 @@
+{
+  "event_id": "fixture-span-end",
+  "timestamp": "2026-05-08T01:23:45.231Z",
+  "observed_timestamp": "2026-05-08T01:23:45.233Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "api",
+    "event_type": "span_end",
+    "signal": "span_end",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902b7",
+    "parent_span_id": "",
+    "name": "POST /checkout",
+    "span_kind": "server",
+    "span_status_code": "error",
+    "start_time": "2026-05-08T01:23:45.000Z",
+    "end_time": "2026-05-08T01:23:45.231Z",
+    "duration_ms": 231,
+    "is_error": 1,
+    "http.status_code": 500
+  }
+}

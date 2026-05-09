@@ -1,0 +1,18 @@
+{
+  "event_id": "fixture-metric-runtime",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "worker",
+    "event_type": "metric",
+    "signal": "metric",
+    "environment": "prod",
+    "metric_name": "runtime.queue.depth",
+    "metric_type": "gauge",
+    "metric_value": 128,
+    "metric_unit": "1",
+    "queue.name": "parquet-flush",
+    "partition": "p=0007"
+  }
+}

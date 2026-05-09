@@ -1,0 +1,166 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ObserveComputeAndNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribePolicies",
+        "autoscaling:DescribeScalingActivities",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeLaunchTemplates",
+        "ec2:DescribeLaunchTemplateVersions",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVpcs",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeListenerAttributes",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ListCloudWatchLogGroups",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ObserveNanotraceCloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/ec2/nanotrace-*",
+        "arn:aws:logs:*:*:log-group:/aws/ec2/nanotrace-*:*",
+        "arn:aws:logs:*:*:log-group:/nanotrace/*",
+        "arn:aws:logs:*:*:log-group:/nanotrace/*:*",
+        "arn:aws:logs:*:*:log-group:nanotrace-*",
+        "arn:aws:logs:*:*:log-group:nanotrace-*:*"
+      ]
+    },
+    {
+      "Sid": "UseSsmShellScriptDocumentForDiagnostics",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:*::document/AWS-RunShellScript",
+        "arn:aws:ssm:*:*:document/AWS-RunShellScript"
+      ]
+    },
+    {
+      "Sid": "RunSsmDiagnosticsOnNanotraceInstances",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "ssm:resourceTag/Name": "nanotrace-*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadSsmDiagnosticResults",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ObserveEventBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:GetBucketNotification",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketTagging",
+        "s3:GetBucketVersioning",
+        "s3:ListTagsForResource",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::nanotrace-*",
+        "arn:aws:s3:::nanotrace-*/*"
+      ]
+    },
+    {
+      "Sid": "ListQueuesForObservation",
+      "Effect": "Allow",
+      "Action": "sqs:ListQueues",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ObserveQueues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags",
+        "sqs:ReceiveMessage"
+      ],
+      "Resource": "arn:aws:sqs:*:*:nanotrace-*"
+    },
+    {
+      "Sid": "ObserveEcr",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeImages",
+        "ecr:DescribeRepositories",
+        "ecr:GetAuthorizationToken",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:ListImages",
+        "ecr:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:ecr:*:*:repository/nanotrace-*"
+    },
+    {
+      "Sid": "GetEcrLoginToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ObserveIamRuntimeIdentities",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetInstanceProfile",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:GetUser",
+        "iam:GetUserPolicy",
+        "iam:ListAccessKeys",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRolePolicies",
+        "iam:ListUserPolicies",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/nanotrace-*-instance-role-*",
+        "arn:aws:iam::*:instance-profile/nanotrace-*-instance-profile-*"
+      ]
+    }
+  ]
+}

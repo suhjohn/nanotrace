@@ -1,0 +1,38 @@
+{
+  "name": "nanotrace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/ui",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm --workspaces run build",
+    "deploy:preview": "pulumi -C deploy/pulumi/nanotrace preview",
+    "deploy:up": "pulumi -C deploy/pulumi/nanotrace up",
+    "deploy:destroy": "pulumi -C deploy/pulumi/nanotrace destroy",
+    "deploy:roll": "node scripts/deploy-roll-pulumi.mjs",
+    "e2e:pulumi": "node scripts/e2e-pulumi.mjs",
+    "loadtest:pulumi": "cargo run --release -p nanotrace-loadtest --",
+    "scale": "node scripts/scale-pulumi-asg.mjs",
+    "scale:down": "node scripts/scale-pulumi-asg.mjs 0",
+    "scale:up": "node scripts/scale-pulumi-asg.mjs 1",
+    "scale:one": "node scripts/scale-pulumi-asg.mjs 1",
+    "scale:two": "node scripts/scale-pulumi-asg.mjs 2",
+    "typecheck": "npm --workspaces run typecheck"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@pulumi/confluentcloud": "^2.68.0"
+  },
+  "devDependencies": {
+    "@pulumi/aws": "^7.29.0",
+    "@pulumi/command": "^1.2.1",
+    "@pulumi/pulumi": "^3.236.0",
+    "@types/node": "^25.6.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

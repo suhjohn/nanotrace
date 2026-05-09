@@ -1,0 +1,18 @@
+{
+  "event_id": "fixture-metric-gauge",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "api",
+    "event_type": "metric",
+    "signal": "metric",
+    "environment": "prod",
+    "metric_name": "process.memory.usage",
+    "metric_type": "gauge",
+    "metric_value": 734003200,
+    "metric_unit": "By",
+    "process.pid": 18473,
+    "memory.type": "rss"
+  }
+}

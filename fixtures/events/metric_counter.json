@@ -1,0 +1,21 @@
+{
+  "event_id": "fixture-metric-counter",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "api",
+    "event_type": "metric",
+    "signal": "metric",
+    "environment": "prod",
+    "metric_name": "http.server.requests",
+    "metric_type": "counter",
+    "metric_value": 1,
+    "metric_unit": "1",
+    "http.method": "POST",
+    "http.route": "/checkout",
+    "http.status_code": 200,
+    "metric.temporality": "delta",
+    "metric.is_monotonic": true
+  }
+}

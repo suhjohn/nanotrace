@@ -1,0 +1,17 @@
+/target/
+/node_modules/
+/dist/
+packages/*/dist/
+/.env
+/.nanotrace/
+**/.wrangler/
+*.log
+__pycache__/
+*.pyc
+experiments/**/target/
+.env*
+!.env.example
+deploy/pulumi/aws/.index.generated.mjs
+
+# Pulumi stack config is environment-specific and may contain encrypted secrets.
+deploy/pulumi/**/Pulumi.*.yaml

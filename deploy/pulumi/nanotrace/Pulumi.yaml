@@ -1,0 +1,5 @@
+name: nanotrace
+description: Nanotrace ALB to EC2/EBS event-log cluster with S3/SQS loader source.
+runtime:
+  name: nodejs
+main: index.ts
