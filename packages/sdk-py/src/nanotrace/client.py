@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import secrets
 import traceback
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import Lock
 from types import TracebackType
 from typing import Any
 from uuid import uuid4
@@ -57,10 +60,24 @@ def _error_fields(error: BaseException) -> JsonObject:
     }
 
 
+class NanotraceFlushError(Exception):
+    def __init__(self, errors: list[BaseException]) -> None:
+        self.errors = errors
+        super().__init__(f"Nanotrace flush failed with {len(errors)} error(s).")
+
+
 @dataclass
 class Nanotrace:
     transport: Transport
     base_context: dict[str, Any] = field(default_factory=dict)
+    _executor: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(max_workers=1, thread_name_prefix="nanotrace"),
+        init=False,
+        repr=False,
+    )
+    _pending: set[Future[None]] = field(default_factory=set, init=False, repr=False)
+    _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def emit(
         self,
@@ -80,7 +97,20 @@ class Nanotrace:
         }
         if observed_timestamp is not None:
             event["observed_timestamp"] = _iso(observed_timestamp)
-        self.transport.send(event)
+        self._enqueue(event)
+
+    def flush(self) -> None:
+        while True:
+            with self._lock:
+                pending = tuple(self._pending)
+            if not pending:
+                break
+            wait(pending)
+
+        if self._errors:
+            errors = list(self._errors)
+            self._errors.clear()
+            raise NanotraceFlushError(errors)
 
     def event(self, name: str, **data: Any) -> None:
         self._write("analytics", {"name": name, **normalize_common(data)})
@@ -347,6 +377,21 @@ class Nanotrace:
     def _write(self, event_type: str, data: JsonObject) -> None:
         self.emit({"event_type": event_type, **data})
 
+    def _enqueue(self, event: JsonObject) -> None:
+        future: Future[None] = self._executor.submit(self.transport.send, event)
+        with self._lock:
+            self._pending.add(future)
+
+        def done(completed: Future[None]) -> None:
+            with self._lock:
+                self._pending.discard(completed)
+            try:
+                completed.result()
+            except BaseException as error:
+                self._errors.append(error)
+
+        future.add_done_callback(done)
+
 
 @dataclass
 class Span:
@@ -421,8 +466,10 @@ class Span:
 class AsyncNanotrace:
     transport: AsyncTransport
     base_context: dict[str, Any] = field(default_factory=dict)
+    _pending: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
+    _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
 
-    async def emit(
+    def emit(
         self,
         data: CommonFields,
         *,
@@ -440,14 +487,23 @@ class AsyncNanotrace:
         }
         if observed_timestamp is not None:
             event["observed_timestamp"] = _iso(observed_timestamp)
-        await self.transport.send(event)
+        self._enqueue(event)
 
-    async def event(self, name: str, **data: Any) -> None:
-        await self._write("analytics", {"name": name, **normalize_common(data)})
+    async def flush(self) -> None:
+        while self._pending:
+            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
 
-    async def log(self, level: str, message: str, **data: Any) -> None:
+        if self._errors:
+            errors = list(self._errors)
+            self._errors.clear()
+            raise NanotraceFlushError(errors)
+
+    def event(self, name: str, **data: Any) -> None:
+        self._write("analytics", {"name": name, **normalize_common(data)})
+
+    def log(self, level: str, message: str, **data: Any) -> None:
         normalized_level = "warn" if level == "warning" else level
-        await self._write(
+        self._write(
             "log",
             {
                 **normalize_common(data),
@@ -458,23 +514,23 @@ class AsyncNanotrace:
             },
         )
 
-    async def debug(self, message: str, **data: Any) -> None:
-        await self.log("debug", message, **data)
+    def debug(self, message: str, **data: Any) -> None:
+        self.log("debug", message, **data)
 
-    async def info(self, message: str, **data: Any) -> None:
-        await self.log("info", message, **data)
+    def info(self, message: str, **data: Any) -> None:
+        self.log("info", message, **data)
 
-    async def warn(self, message: str, **data: Any) -> None:
-        await self.log("warn", message, **data)
+    def warn(self, message: str, **data: Any) -> None:
+        self.log("warn", message, **data)
 
-    async def error(self, error_or_message: BaseException | str, **data: Any) -> None:
+    def error(self, error_or_message: BaseException | str, **data: Any) -> None:
         if isinstance(error_or_message, BaseException):
-            await self.capture_exception(error_or_message, **data)
+            self.capture_exception(error_or_message, **data)
         else:
-            await self.log("error", str(error_or_message), **data)
+            self.log("error", str(error_or_message), **data)
 
-    async def capture_exception(self, error: BaseException, **data: Any) -> None:
-        await self._write(
+    def capture_exception(self, error: BaseException, **data: Any) -> None:
+        self._write(
             "log",
             {
                 **normalize_common(data),
@@ -507,7 +563,7 @@ class AsyncNanotrace:
             attrs={**normalize_common(data), "span_kind": str(kind)},
         )
 
-    async def record_span(
+    def record_span(
         self,
         name: str,
         start_time: datetime | str,
@@ -518,7 +574,7 @@ class AsyncNanotrace:
         kind: str = "internal",
         **data: Any,
     ) -> None:
-        await self._write(
+        self._write(
             "span",
             {
                 **normalize_common(data),
@@ -533,12 +589,12 @@ class AsyncNanotrace:
             },
         )
 
-    async def http_server_request(self, *, method: str, duration_ms: float, **data: Any) -> None:
+    def http_server_request(self, *, method: str, duration_ms: float, **data: Any) -> None:
         route = data.get("route")
         path = data.get("path")
         url = data.get("url")
         status_code = data.get("status_code", data.get("statusCode"))
-        await self._write(
+        self._write(
             "span",
             {
                 **normalize_common(without_keys(data, {"method", "route", "path", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
@@ -555,9 +611,9 @@ class AsyncNanotrace:
             },
         )
 
-    async def http_client_request(self, *, method: str, url: str, duration_ms: float, **data: Any) -> None:
+    def http_client_request(self, *, method: str, url: str, duration_ms: float, **data: Any) -> None:
         status_code = data.get("status_code", data.get("statusCode"))
-        await self._write(
+        self._write(
             "span",
             {
                 **normalize_common(without_keys(data, {"method", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
@@ -572,7 +628,7 @@ class AsyncNanotrace:
             },
         )
 
-    async def db_query(
+    def db_query(
         self,
         *,
         system: str,
@@ -581,7 +637,7 @@ class AsyncNanotrace:
         statement: str | None = None,
         **data: Any,
     ) -> None:
-        await self._write(
+        self._write(
             "span",
             {
                 **normalize_common(without_keys(data, {"system", "operation", "statement", "duration_ms", "durationMs"})),
@@ -594,8 +650,8 @@ class AsyncNanotrace:
             },
         )
 
-    async def rpc_call(self, *, system: str, service: str, method: str, duration_ms: float, **data: Any) -> None:
-        await self._write(
+    def rpc_call(self, *, system: str, service: str, method: str, duration_ms: float, **data: Any) -> None:
+        self._write(
             "span",
             {
                 **normalize_common(without_keys(data, {"system", "service", "method", "duration_ms", "durationMs"})),
@@ -608,38 +664,38 @@ class AsyncNanotrace:
             },
         )
 
-    async def message_publish(self, *, system: str, destination: str, duration_ms: float | None = None, **data: Any) -> None:
-        await self._message_operation("publish", system=system, destination=destination, duration_ms=duration_ms, **data)
+    def message_publish(self, *, system: str, destination: str, duration_ms: float | None = None, **data: Any) -> None:
+        self._message_operation("publish", system=system, destination=destination, duration_ms=duration_ms, **data)
 
-    async def message_consume(self, *, system: str, destination: str, duration_ms: float | None = None, **data: Any) -> None:
-        await self._message_operation("consume", system=system, destination=destination, duration_ms=duration_ms, **data)
+    def message_consume(self, *, system: str, destination: str, duration_ms: float | None = None, **data: Any) -> None:
+        self._message_operation("consume", system=system, destination=destination, duration_ms=duration_ms, **data)
 
-    async def counter(self, name: str, value: float = 1, **data: Any) -> None:
-        await self._metric(name, "counter", value, {"metric.temporality": "delta", "metric.is_monotonic": True}, data)
+    def counter(self, name: str, value: float = 1, **data: Any) -> None:
+        self._metric(name, "counter", value, {"metric.temporality": "delta", "metric.is_monotonic": True}, data)
 
-    async def gauge(self, name: str, value: float, **data: Any) -> None:
-        await self._metric(name, "gauge", value, {}, data)
+    def gauge(self, name: str, value: float, **data: Any) -> None:
+        self._metric(name, "gauge", value, {}, data)
 
-    async def histogram(self, name: str, value: float, **data: Any) -> None:
-        await self._metric(name, "histogram", value, {}, data)
+    def histogram(self, name: str, value: float, **data: Any) -> None:
+        self._metric(name, "histogram", value, {}, data)
 
-    async def timing(self, name: str, duration_ms: float, **data: Any) -> None:
-        await self.histogram(name, duration_ms, metric_unit="ms", **data)
+    def timing(self, name: str, duration_ms: float, **data: Any) -> None:
+        self.histogram(name, duration_ms, metric_unit="ms", **data)
 
-    async def track(self, name: str, **properties: Any) -> None:
-        await self._write("track", {**normalize_common(properties), "name": name})
+    def track(self, name: str, **properties: Any) -> None:
+        self._write("track", {**normalize_common(properties), "name": name})
 
-    async def identify(self, user_id: str, **traits: Any) -> None:
-        await self._write("identify", {**normalize_common(traits), "user_id": user_id})
+    def identify(self, user_id: str, **traits: Any) -> None:
+        self._write("identify", {**normalize_common(traits), "user_id": user_id})
 
-    async def group(self, account_id: str, **traits: Any) -> None:
-        await self._write("group", {**normalize_common(traits), "account_id": account_id})
+    def group(self, account_id: str, **traits: Any) -> None:
+        self._write("group", {**normalize_common(traits), "account_id": account_id})
 
-    async def alias(self, previous_id: str, user_id: str, **data: Any) -> None:
-        await self._write("alias", {**normalize_common(data), "previous_id": previous_id, "user_id": user_id})
+    def alias(self, previous_id: str, user_id: str, **data: Any) -> None:
+        self._write("alias", {**normalize_common(data), "previous_id": previous_id, "user_id": user_id})
 
-    async def page(self, **data: Any) -> None:
-        await self._write(
+    def page(self, **data: Any) -> None:
+        self._write(
             "page",
             {
                 **normalize_common(without_keys(data, {"name", "url", "path", "title", "referrer"})),
@@ -651,19 +707,19 @@ class AsyncNanotrace:
             },
         )
 
-    async def screen(self, name: str, **data: Any) -> None:
-        await self._write("screen", {**normalize_common(data), "screen_name": name, "name": name})
+    def screen(self, name: str, **data: Any) -> None:
+        self._write("screen", {**normalize_common(data), "screen_name": name, "name": name})
 
-    async def revenue(self, revenue: float, **data: Any) -> None:
-        await self.track("Revenue", revenue=revenue, **data)
+    def revenue(self, revenue: float, **data: Any) -> None:
+        self.track("Revenue", revenue=revenue, **data)
 
-    async def experiment_viewed(self, experiment_id: str, variant: str, **data: Any) -> None:
-        await self.track("Experiment Viewed", experiment_id=experiment_id, variant=variant, **data)
+    def experiment_viewed(self, experiment_id: str, variant: str, **data: Any) -> None:
+        self.track("Experiment Viewed", experiment_id=experiment_id, variant=variant, **data)
 
-    async def feature_flag_evaluated(self, feature_flag: str, **data: Any) -> None:
-        await self.track("Feature Flag Evaluated", feature_flag=feature_flag, **data)
+    def feature_flag_evaluated(self, feature_flag: str, **data: Any) -> None:
+        self.track("Feature Flag Evaluated", feature_flag=feature_flag, **data)
 
-    async def _message_operation(
+    def _message_operation(
         self,
         operation: str,
         *,
@@ -672,7 +728,7 @@ class AsyncNanotrace:
         duration_ms: float | None,
         **data: Any,
     ) -> None:
-        await self._write(
+        self._write(
             "span",
             {
                 **normalize_common(without_keys(data, {"system", "destination", "duration_ms", "durationMs"})),
@@ -685,7 +741,7 @@ class AsyncNanotrace:
             },
         )
 
-    async def _metric(
+    def _metric(
         self,
         name: str,
         type_: str,
@@ -693,7 +749,7 @@ class AsyncNanotrace:
         defaults: JsonObject,
         data: dict[str, Any],
     ) -> None:
-        await self._write(
+        self._write(
             "metric",
             {
                 **defaults,
@@ -704,8 +760,21 @@ class AsyncNanotrace:
             },
         )
 
-    async def _write(self, event_type: str, data: JsonObject) -> None:
-        await self.emit({"event_type": event_type, **data})
+    def _write(self, event_type: str, data: JsonObject) -> None:
+        self.emit({"event_type": event_type, **data})
+
+    def _enqueue(self, event: JsonObject) -> None:
+        task = asyncio.create_task(self.transport.send(event))
+        self._pending.add(task)
+
+        def done(completed: asyncio.Task[None]) -> None:
+            self._pending.discard(completed)
+            try:
+                completed.result()
+            except BaseException as error:
+                self._errors.append(error)
+
+        task.add_done_callback(done)
 
 
 @dataclass
@@ -733,9 +802,9 @@ class AsyncSpan:
     ) -> bool:
         try:
             if exc is None:
-                await self.end(span_status_code="ok")
+                self.end(span_status_code="ok")
             else:
-                await self.end(span_status_code="error", is_error=1, **_error_fields(exc))
+                self.end(span_status_code="error", is_error=1, **_error_fields(exc))
             return False
         finally:
             if self._context_manager is not None:
@@ -744,8 +813,8 @@ class AsyncSpan:
     def set(self, key: str, value: Any) -> None:
         self.attrs[key] = normalize_json(value)
 
-    async def event(self, name: str, **data: Any) -> None:
-        await self.client._write(
+    def event(self, name: str, **data: Any) -> None:
+        self.client._write(
             "log",
             {
                 **normalize_common(data),
@@ -755,12 +824,12 @@ class AsyncSpan:
             },
         )
 
-    async def end(self, **data: Any) -> None:
+    def end(self, **data: Any) -> None:
         if self.ended:
             return
         self.ended = True
         end_time = datetime.now(timezone.utc)
-        await self.client.emit(
+        self.client.emit(
             {
                 **self.attrs,
                 **normalize_common(data),

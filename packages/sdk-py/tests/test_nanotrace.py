@@ -5,6 +5,7 @@ import unittest
 from nanotrace import (
     AsyncNanotrace,
     Nanotrace,
+    NanotraceFlushError,
     create_async_nanotrace,
     create_nanotrace,
     trace_context,
@@ -27,12 +28,23 @@ class AsyncRecordingTransport:
         self.events.append(event)
 
 
+class FailingTransport:
+    def send(self, event: dict) -> None:
+        raise RuntimeError("boom")
+
+
+class AsyncFailingTransport:
+    async def send(self, event: dict) -> None:
+        raise RuntimeError("boom")
+
+
 class NanotraceTests(unittest.TestCase):
     def test_sync_log_shapes_event(self) -> None:
         transport = RecordingTransport()
         nt = create_nanotrace(transport, service="api", environment="test")
 
         nt.info("hello", user_id="u_1")
+        nt.flush()
 
         self.assertEqual(len(transport.events), 1)
         event = transport.events[0]
@@ -51,6 +63,7 @@ class NanotraceTests(unittest.TestCase):
         with nt.span("root") as span:
             nt.info("inside")
             span.set("custom", "value")
+        nt.flush()
 
         self.assertEqual(len(transport.events), 2)
         child, end = transport.events
@@ -67,9 +80,18 @@ class NanotraceTests(unittest.TestCase):
 
         with trace_context(trace_id="trace-1", span_id="span-1"):
             nt.event("clicked")
+        nt.flush()
 
         self.assertEqual(transport.events[0]["data"]["trace_id"], "trace-1")
         self.assertEqual(transport.events[0]["data"]["span_id"], "span-1")
+
+    def test_flush_surfaces_delivery_errors(self) -> None:
+        nt = create_nanotrace(FailingTransport())
+
+        nt.info("hello")
+
+        with self.assertRaises(NanotraceFlushError):
+            nt.flush()
 
 
 class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
@@ -77,7 +99,8 @@ class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
         transport = AsyncRecordingTransport()
         nt = create_async_nanotrace(transport, service="api", environment="test")
 
-        await nt.info("hello", user_id="u_1")
+        nt.info("hello", user_id="u_1")
+        await nt.flush()
 
         self.assertEqual(len(transport.events), 1)
         event = transport.events[0]
@@ -91,8 +114,9 @@ class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
         nt = AsyncNanotrace(transport=transport, base_context={"service": "api"})
 
         async with nt.span("root") as span:
-            await nt.info("inside")
+            nt.info("inside")
             span.set("custom", "value")
+        await nt.flush()
 
         self.assertEqual(len(transport.events), 2)
         child, end = transport.events
@@ -101,6 +125,14 @@ class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end["data"]["event_type"], "span")
         self.assertEqual(end["data"]["custom"], "value")
         self.assertEqual(end["data"]["span_status_code"], "ok")
+
+    async def test_async_flush_surfaces_delivery_errors(self) -> None:
+        nt = create_async_nanotrace(AsyncFailingTransport())
+
+        nt.info("hello")
+
+        with self.assertRaises(NanotraceFlushError):
+            await nt.flush()
 
 
 if __name__ == "__main__":

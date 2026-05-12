@@ -234,3 +234,16 @@ PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
     (tenant_id, event_type, timestamp, trace_id, span_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.event_facets (
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        key String CODEC (ZSTD (1)),
+        value String CODEC (ZSTD (1)),
+        value_type LowCardinality (String),
+        count UInt64 CODEC (Delta, ZSTD (1))
+    ) ENGINE = SummingMergeTree
+PARTITION BY
+    toYYYYMMDD (bucket_time)
+ORDER BY
+    (key, bucket_time, value, value_type);

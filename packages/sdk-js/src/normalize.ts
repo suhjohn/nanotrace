@@ -13,6 +13,7 @@ const fieldMap: Record<string, string> = {
   spanKind: 'span_kind',
   spanStatusCode: 'span_status_code',
   spanStatusMessage: 'span_status_message',
+  isError: 'is_error',
   userId: 'user_id',
   anonymousId: 'anonymous_id',
   sessionId: 'session_id',

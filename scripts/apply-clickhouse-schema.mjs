@@ -9,24 +9,42 @@ const user = requiredEnv("CLICKHOUSE_USER");
 const password = requiredEnv("CLICKHOUSE_PASSWORD");
 const database = identifier(process.env.CLICKHOUSE_DATABASE || "observatory", "CLICKHOUSE_DATABASE");
 const table = identifier(process.env.CLICKHOUSE_TABLE || "events", "CLICKHOUSE_TABLE");
+const facetsTable = identifier(process.env.CLICKHOUSE_FACETS_TABLE || "event_facets", "CLICKHOUSE_FACETS_TABLE");
 const schemaPath = path.resolve(root, process.env.CLICKHOUSE_SCHEMA_PATH || "deploy/clickhouse/schema.sql");
 
-const schema = readFileSync(schemaPath, "utf8").replace(
-    /\bobservatory\.events\b/g,
-    `${quoteIdentifier(database)}.${quoteIdentifier(table)}`,
-);
+const eventTableToken = "__NANOTRACE_EVENTS_TABLE__";
+const facetsTableToken = "__NANOTRACE_EVENT_FACETS_TABLE__";
+const schema = readFileSync(schemaPath, "utf8")
+    .replace(/\bobservatory\.event_facets\b/g, facetsTableToken)
+    .replace(/\bobservatory\.events\b/g, eventTableToken)
+    .replaceAll(eventTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(table)}`)
+    .replaceAll(facetsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(facetsTable)}`);
 
 await query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(database)}`);
+await recreateLegacyFacetTable(database, facetsTable);
 for (const statement of splitStatements(schema)) {
     await query(statement);
 }
 for (const statement of compatibilityAlters(database, table)) {
     await query(statement);
 }
+for (const statement of facetCompatibilityAlters(database, facetsTable)) {
+    await query(statement);
+}
 
 console.log(`clickhouse_schema=${database}.${table}`);
+console.log(`clickhouse_facets_schema=${database}.${facetsTable}`);
 
 async function query(sql) {
+    await queryResponse(sql);
+}
+
+async function queryText(sql) {
+    const response = await queryResponse(sql);
+    return await response.text();
+}
+
+async function queryResponse(sql) {
     const url = new URL(clickhouseUrl);
     const response = await fetch(url, {
         method: "POST",
@@ -41,6 +59,7 @@ async function query(sql) {
         const text = await response.text();
         throw new Error(`ClickHouse query failed (${response.status}): ${text}`);
     }
+    return response;
 }
 
 function requiredEnv(key) {
@@ -60,6 +79,42 @@ function identifier(value, key) {
 
 function quoteIdentifier(value) {
     return `\`${value.replaceAll("`", "``")}\``;
+}
+
+function sqlString(value) {
+    return `'${String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
+}
+
+async function recreateLegacyFacetTable(database, table) {
+    const engine = (
+        await queryText(
+            `SELECT engine FROM system.tables WHERE database = ${sqlString(database)} AND name = ${sqlString(table)} FORMAT TabSeparated`,
+        )
+    ).trim();
+    if (!engine) {
+        return;
+    }
+
+    const hasBucketTime = Number(
+        (
+            await queryText(
+                `SELECT count() FROM system.columns WHERE database = ${sqlString(database)} AND table = ${sqlString(table)} AND name = 'bucket_time' FORMAT TabSeparated`,
+            )
+        ).trim(),
+    );
+    const hasCount = Number(
+        (
+            await queryText(
+                `SELECT count() FROM system.columns WHERE database = ${sqlString(database)} AND table = ${sqlString(table)} AND name = 'count' FORMAT TabSeparated`,
+            )
+        ).trim(),
+    );
+
+    if (engine.endsWith("SummingMergeTree") && hasBucketTime && hasCount) {
+        return;
+    }
+
+    await query(`DROP TABLE ${quoteIdentifier(database)}.${quoteIdentifier(table)}`);
 }
 
 function splitStatements(sql) {
@@ -223,5 +278,20 @@ function compatibilityAlters(database, table) {
         `ALTER TABLE ${target} MODIFY COLUMN signal LowCardinality(String) MATERIALIZED multiIf(ifNull(data.event_type, '') IN ('span', 'span_start', 'span_end'), 'trace', ifNull(data.event_type, '') = 'metric', 'metric', ifNull(data.event_type, '') = 'log', 'log', ifNull(data.event_type, '') IN ('analytics', 'track', 'page', 'screen', 'identify', 'group', 'alias'), 'analytics', 'other')`,
         `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1`,
         `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 1`,
+    ];
+}
+
+function facetCompatibilityAlters(database, table) {
+    const target = `${quoteIdentifier(database)}.${quoteIdentifier(table)}`;
+    return [
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS bucket_time DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS key String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS count UInt64 DEFAULT 0 CODEC(Delta, ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN bucket_time DateTime64(3, 'UTC') CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN key String CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN value String CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN count UInt64 CODEC(Delta, ZSTD(1))`,
     ];
 }

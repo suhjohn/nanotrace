@@ -1,4 +1,12 @@
-from .client import AsyncNanotrace, AsyncSpan, Nanotrace, Span, create_async_nanotrace, create_nanotrace
+from .client import (
+    AsyncNanotrace,
+    AsyncSpan,
+    Nanotrace,
+    NanotraceFlushError,
+    Span,
+    create_async_nanotrace,
+    create_nanotrace,
+)
 from .context import current_context, trace_context
 from .transport import (
     AsyncHttpTransport,
@@ -29,6 +37,7 @@ __all__ = [
     "Json",
     "JsonObject",
     "Nanotrace",
+    "NanotraceFlushError",
     "NanotraceTransportError",
     "SidecarHttpTransport",
     "Span",

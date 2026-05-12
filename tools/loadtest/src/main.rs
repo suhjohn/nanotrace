@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 use std::{
@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         max_p95_ms: number_env("NANOTRACE_LOADTEST_MAX_P95_MS", 2_000.0)?,
         max_in_flight: integer_env("NANOTRACE_LOADTEST_MAX_IN_FLIGHT", 2_000)?,
         log_ratio: number_env("NANOTRACE_LOADTEST_LOG_RATIO", 0.10)?,
+        profile: load_profile_env()?,
         clickhouse_wait_ms: number_env("NANOTRACE_LOADTEST_CLICKHOUSE_WAIT_MS", 300_000.0)?,
         clickhouse_poll_ms: number_env("NANOTRACE_LOADTEST_CLICKHOUSE_POLL_MS", 5_000.0)?,
         event_seq: AtomicU64::new(0),
@@ -91,6 +92,7 @@ async fn main() -> Result<()> {
             .join(",")
     );
     println!("stepSeconds={}", context.config.step_seconds);
+    println!("profile={}", context.config.profile.as_str());
     println!(
         "successCriteria=errorRate<={},p95Ms<={}",
         context.config.max_error_rate, context.config.max_p95_ms
@@ -143,10 +145,26 @@ struct Config {
     max_p95_ms: f64,
     max_in_flight: u64,
     log_ratio: f64,
+    profile: LoadProfile,
     clickhouse_wait_ms: f64,
     clickhouse_poll_ms: f64,
     event_seq: AtomicU64,
     accepted_events: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadProfile {
+    Fixture,
+    Realistic,
+}
+
+impl LoadProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixture => "fixture",
+            Self::Realistic => "realistic",
+        }
+    }
 }
 
 struct ClickHouseConfig {
@@ -165,6 +183,7 @@ struct LoadContext {
 
 struct Fixtures {
     log: Fixture,
+    log_variations: Vec<Fixture>,
     rest: Vec<Fixture>,
 }
 
@@ -451,7 +470,12 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
 
 fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
     let seq = context.config.event_seq.fetch_add(1, Ordering::Relaxed);
-    let fixture = choose_fixture(&context.fixtures, seq, context.config.log_ratio);
+    let fixture = choose_fixture(
+        &context.fixtures,
+        seq,
+        context.config.log_ratio,
+        context.config.profile,
+    );
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut event = fixture
@@ -464,6 +488,9 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| anyhow!("fixture {} must contain object data", fixture.name))?;
+    if context.config.profile == LoadProfile::Realistic {
+        randomize_realistic_data(&mut data, &fixture.name, &context.config.run_id, seq, &now);
+    }
 
     event.insert(
         "event_id".to_owned(),
@@ -498,13 +525,538 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
     Ok(Value::Object(event))
 }
 
-fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64) -> &Fixture {
+fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadProfile) -> &Fixture {
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
-        &fixtures.log
+        if profile == LoadProfile::Realistic && !fixtures.log_variations.is_empty() {
+            let index = seq as usize % (fixtures.log_variations.len() + 1);
+            if index == 0 {
+                &fixtures.log
+            } else {
+                &fixtures.log_variations[index - 1]
+            }
+        } else {
+            &fixtures.log
+        }
     } else {
         let index = seq as usize % fixtures.rest.len();
         &fixtures.rest[index]
     }
+}
+
+fn randomize_realistic_data(
+    data: &mut Map<String, Value>,
+    fixture_name: &str,
+    run_id: &str,
+    seq: u64,
+    now: &str,
+) {
+    let mut rng = TinyRng::new(seed_for(run_id, fixture_name, seq));
+    let scenario = Scenario::new(&mut rng, fixture_name, now);
+    apply_realistic_object(data, "", &scenario, &mut rng);
+}
+
+struct Scenario {
+    service: &'static str,
+    environment: &'static str,
+    method: &'static str,
+    route: &'static str,
+    status_code: u16,
+    duration_ms: u64,
+    is_error: bool,
+    user_id: String,
+    session_id: String,
+    account_id: String,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    run_id: String,
+    thread_id: String,
+    canvas_id: String,
+    message_id: String,
+    model: &'static str,
+    finish_reason: &'static str,
+    turn: u64,
+    start_time: String,
+    end_time: String,
+    metric_name: &'static str,
+    metric_type: &'static str,
+    metric_unit: &'static str,
+    metric_value: f64,
+    queue_depth: u64,
+    memory_bytes: u64,
+    pid: u64,
+}
+
+impl Scenario {
+    fn new(rng: &mut TinyRng, fixture_name: &str, now: &str) -> Self {
+        let route = rng.choose_str(&[
+            "/checkout",
+            "/api/canvases/{canvas_id}",
+            "/api/canvas-events",
+            "/cart",
+            "/orders/{order_id}",
+            "/api/traces",
+            "/api/canvas/{document_id}",
+            "/v1/chat/completions",
+            "/health",
+        ]);
+        let method = match route {
+            "/health" => "GET",
+            "/v1/chat/completions" | "/checkout" | "/api/traces" | "/api/canvas-events" => "POST",
+            _ => rng.choose_str(&["GET", "POST", "PATCH"]),
+        };
+        let error_rate = match route {
+            "/checkout" => 3,
+            "/api/canvases/{canvas_id}" | "/api/canvas/{document_id}" => 1,
+            "/api/canvas-events" => 1,
+            "/v1/chat/completions" => 2,
+            "/health" => 1,
+            _ => 2,
+        };
+        let is_error = rng.chance(error_rate, 100);
+        let status_code = if is_error {
+            *rng.choose(&[400_u16, 400, 429, 429, 500, 500, 500, 503])
+        } else if rng.chance(8, 100) {
+            if method == "POST" {
+                *rng.choose(&[200_u16, 201, 202, 204])
+            } else {
+                *rng.choose(&[200_u16, 200, 200, 304])
+            }
+        } else {
+            200
+        };
+        let duration_ms = if is_error {
+            rng.range(250, 4_500)
+        } else {
+            match route {
+                "/health" => rng.range(3, 30),
+                "/v1/chat/completions" => rng.range(700, 9_000),
+                "/api/canvas/{document_id}" | "/api/canvases/{canvas_id}" => rng.range(80, 1_800),
+                _ => rng.range(20, 650),
+            }
+        };
+        let queue_depth = rng.range(0, 2_000);
+        let memory_bytes = rng.range(120_000_000, 3_200_000_000);
+        let (metric_name, metric_type, metric_unit, metric_value) = metric_scenario(
+            fixture_name,
+            route,
+            duration_ms,
+            queue_depth,
+            memory_bytes,
+            rng,
+        );
+        let (start_time, end_time) = span_times(now, duration_ms, rng);
+
+        Self {
+            service: service_for_route(route, rng),
+            environment: rng.choose_str(&["prod", "prod", "prod", "staging", "canary"]),
+            method,
+            route,
+            status_code,
+            duration_ms,
+            is_error,
+            user_id: format!("user_{}", rng.range(10_000, 99_999)),
+            session_id: format!("sess_{}", rng.hex(16)),
+            account_id: format!("acct_{}", rng.range(100, 999)),
+            trace_id: rng.hex(32),
+            span_id: rng.hex(16),
+            parent_span_id: if rng.chance(70, 100) {
+                rng.hex(16)
+            } else {
+                String::new()
+            },
+            run_id: uuid_like(rng),
+            thread_id: uuid_like(rng),
+            canvas_id: uuid_like(rng),
+            message_id: uuid_like(rng),
+            model: rng.choose_str(&[
+                "gpt-4.1",
+                "gpt-4.1-mini",
+                "gpt-5",
+                "gpt-5-mini",
+                "claude-3-7-sonnet",
+            ]),
+            finish_reason: rng.choose_str(&["stop", "tool-calls", "length", "content-filter"]),
+            turn: rng.range(1, 80),
+            start_time,
+            end_time,
+            metric_name,
+            metric_type,
+            metric_unit,
+            metric_value,
+            queue_depth,
+            memory_bytes,
+            pid: rng.range(1_000, 65_000),
+        }
+    }
+
+    fn span_name(&self) -> String {
+        format!("{} {}", self.method, self.route)
+    }
+
+    fn log_message(&self) -> String {
+        if self.is_error {
+            format!(
+                "{} {} failed with status {} after {}ms",
+                self.method, self.route, self.status_code, self.duration_ms
+            )
+        } else {
+            format!(
+                "{} {} completed with status {} in {}ms",
+                self.method, self.route, self.status_code, self.duration_ms
+            )
+        }
+    }
+}
+
+fn apply_realistic_object(
+    object: &mut Map<String, Value>,
+    parent_key: &str,
+    scenario: &Scenario,
+    rng: &mut TinyRng,
+) {
+    for (key, value) in object.iter_mut() {
+        let lower_key = key.to_ascii_lowercase();
+        match value {
+            Value::Object(child) => apply_realistic_object(child, &lower_key, scenario, rng),
+            Value::Array(items) => apply_realistic_array(&lower_key, items, scenario, rng),
+            _ => {
+                if let Some(new_value) =
+                    realistic_scalar_value(&lower_key, parent_key, value, scenario, rng)
+                {
+                    *value = new_value;
+                }
+            }
+        }
+    }
+}
+
+fn apply_realistic_array(key: &str, items: &mut [Value], scenario: &Scenario, rng: &mut TinyRng) {
+    if key == "bucket_counts" {
+        let mut remaining = scenario.duration_ms.max(8);
+        for item in items {
+            let count = rng.range(0, remaining.min(80));
+            remaining = remaining.saturating_sub(count);
+            *item = Value::from(count);
+        }
+        return;
+    }
+
+    if key == "explicit_bounds" {
+        let mut next = 25;
+        for item in items {
+            next += rng.range(25, 175);
+            *item = Value::from(next);
+        }
+        return;
+    }
+
+    for item in items {
+        match item {
+            Value::Object(child) => apply_realistic_object(child, key, scenario, rng),
+            Value::Array(child) => apply_realistic_array(key, child, scenario, rng),
+            _ => {
+                if let Some(new_value) = realistic_scalar_value(key, key, item, scenario, rng) {
+                    *item = new_value;
+                }
+            }
+        }
+    }
+}
+
+fn realistic_scalar_value(
+    key: &str,
+    parent_key: &str,
+    current: &Value,
+    scenario: &Scenario,
+    rng: &mut TinyRng,
+) -> Option<Value> {
+    let value = match key {
+        "service" | "service.name" => Value::String(scenario.service.to_owned()),
+        "environment" | "deployment.environment" => Value::String(scenario.environment.to_owned()),
+        "signal" => Value::String(signal_from_existing(current)),
+        "trace_id" | "traceid" | "trace_id_hex" => Value::String(scenario.trace_id.clone()),
+        "span_id" | "spanid" => Value::String(scenario.span_id.clone()),
+        "parent_span_id" | "parentspanid" => Value::String(scenario.parent_span_id.clone()),
+        "http.method" | "method" if parent_key != "llm" => {
+            Value::String(scenario.method.to_owned())
+        }
+        "http.route" | "route" | "url.path" | "path" => Value::String(scenario.route.to_owned()),
+        "http.status_code" | "status_code" | "status" if current.is_number() => {
+            Value::from(scenario.status_code)
+        }
+        "duration_ms" | "durationms" | "elapsed_ms" | "latency_ms" => {
+            number_like(current, scenario.duration_ms as f64)
+        }
+        "start_time" | "startedat" | "started_at" => Value::String(scenario.start_time.clone()),
+        "end_time" | "endedat" | "ended_at" => Value::String(scenario.end_time.clone()),
+        "is_error" | "error" if current.is_boolean() => Value::Bool(scenario.is_error),
+        "is_error" | "error" => number_like(current, if scenario.is_error { 1.0 } else { 0.0 }),
+        "span_status_code" => {
+            Value::String(if scenario.is_error { "error" } else { "ok" }.to_owned())
+        }
+        "severity_text" | "level" => Value::String(if scenario.is_error {
+            rng.choose(&["ERROR", "WARN"]).to_string()
+        } else {
+            rng.choose(&["INFO", "DEBUG"]).to_string()
+        }),
+        "severity_number" => Value::from(if scenario.is_error { 17 } else { 9 }),
+        "name" if parent_key != "llm" => Value::String(scenario.span_name()),
+        "message" => Value::String(scenario.log_message()),
+        "metric_value" => number_like(current, scenario.metric_value),
+        "value" if parent_key.contains("metric") => number_like(current, scenario.metric_value),
+        "queue.depth" | "queue_depth" => Value::from(scenario.queue_depth),
+        "memory.bytes" | "memory_bytes" | "process.memory.bytes" => {
+            Value::from(scenario.memory_bytes)
+        }
+        "count" => Value::from(rng.range(1, 300)),
+        "sum" => number_like(current, scenario.metric_value * rng.float_range(8.0, 80.0)),
+        "process.pid" | "pid" => Value::from(scenario.pid),
+        "queue.name" => Value::String(
+            rng.choose(&["parquet-flush", "ingest", "embeddings", "exports"])
+                .to_string(),
+        ),
+        "partition" => Value::String(format!("p={:04}", rng.range(0, 64))),
+        "memory.type" => Value::String(rng.choose(&["rss", "heap", "external"]).to_string()),
+        "user_id" | "userid" => Value::String(scenario.user_id.clone()),
+        "session_id" | "sessionid" => Value::String(scenario.session_id.clone()),
+        "account_id" | "accountid" | "organization_id" | "org_id" => {
+            Value::String(scenario.account_id.clone())
+        }
+        "canvasid" | "canvas_id" | "documentid" | "document_id" => {
+            Value::String(scenario.canvas_id.clone())
+        }
+        "conversationmode" | "conversation_mode" => Value::String(
+            rng.choose(&["teaching", "editing", "debugging", "review"])
+                .to_string(),
+        ),
+        "agentphase" | "agent_phase" => {
+            Value::String(rng.choose(&["plan", "run", "verify", "repair"]).to_string())
+        }
+        "agenttype" | "agent_type" => {
+            Value::String(rng.choose(&["canvas", "code", "research"]).to_string())
+        }
+        "caller" => Value::String(format!(
+            "src/{}/{}.ts:{}",
+            scenario.service.replace('-', "_"),
+            rng.choose(&["handler", "worker", "tracer", "client"]),
+            rng.range(20, 900)
+        )),
+        "runid" | "run_id" if parent_key != "_loadtest" => Value::String(scenario.run_id.clone()),
+        "threadid" | "thread_id" => Value::String(scenario.thread_id.clone()),
+        "usermessageid" | "user_message_id" | "messageid" | "message_id" => {
+            Value::String(scenario.message_id.clone())
+        }
+        "turn" | "steeringgeneration" | "steering_generation" => Value::from(scenario.turn),
+        "model" | "modelid" | "model_id" => Value::String(scenario.model.to_owned()),
+        "finishreason" | "finish_reason" => Value::String(scenario.finish_reason.to_owned()),
+        "role" => Value::String(
+            rng.choose(&["system", "user", "assistant", "tool"])
+                .to_string(),
+        ),
+        "content" if current.is_string() => Value::String(llm_content(parent_key, scenario, rng)),
+        "title" => Value::String(
+            rng.choose(&[
+                "Checkout trace review",
+                "Canvas lesson draft",
+                "Latency investigation",
+                "Ingest smoke test",
+            ])
+            .to_string(),
+        ),
+        "metric_name" => Value::String(scenario.metric_name.to_owned()),
+        "metric_unit" => Value::String(scenario.metric_unit.to_owned()),
+        "metric_type" => Value::String(scenario.metric_type.to_owned()),
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn metric_scenario(
+    fixture_name: &str,
+    route: &str,
+    duration_ms: u64,
+    queue_depth: u64,
+    memory_bytes: u64,
+    rng: &mut TinyRng,
+) -> (&'static str, &'static str, &'static str, f64) {
+    let metric_name = match fixture_name {
+        "metric_counter" => "http.server.requests",
+        "metric_gauge" => "process.memory.usage",
+        "metric_histogram" | "metric" => "http.server.duration",
+        "metric_runtime" => "runtime.queue.depth",
+        _ => match route {
+            "/v1/chat/completions" => {
+                rng.choose_str(&["llm.tokens", "llm.duration", "llm.requests"])
+            }
+            "/api/canvas/{document_id}" => {
+                rng.choose_str(&["canvas.tool.duration", "canvas.elements.changed"])
+            }
+            _ => rng.choose_str(&[
+                "http.server.duration",
+                "http.server.requests",
+                "runtime.queue.depth",
+                "process.memory.usage",
+            ]),
+        },
+    };
+
+    let (metric_name, metric_type, metric_unit, mut metric_value) = match metric_name {
+        "http.server.duration" | "llm.duration" | "canvas.tool.duration" => {
+            (metric_name, "histogram", "ms", duration_ms as f64)
+        }
+        "http.server.requests" | "llm.requests" => {
+            (metric_name, "counter", "1", rng.range(1, 20) as f64)
+        }
+        "runtime.queue.depth" | "canvas.elements.changed" => {
+            (metric_name, "gauge", "1", queue_depth.max(1) as f64)
+        }
+        "process.memory.usage" => (metric_name, "gauge", "By", memory_bytes as f64),
+        "llm.tokens" => (
+            metric_name,
+            "histogram",
+            "tokens",
+            rng.range(100, 50_000) as f64,
+        ),
+        _ => (metric_name, "gauge", "1", rng.float_range(1.0, 1_200.0)),
+    };
+    if metric_value.round() as u64 == 231 {
+        metric_value += 17.0;
+    }
+    (metric_name, metric_type, metric_unit, metric_value)
+}
+
+fn service_for_route(route: &str, rng: &mut TinyRng) -> &'static str {
+    match route {
+        "/checkout" | "/cart" | "/orders/{order_id}" => {
+            rng.choose_str(&["api", "checkout", "payments"])
+        }
+        "/v1/chat/completions" => rng.choose_str(&["llm-gateway", "canvas-agent"]),
+        "/api/canvas/{document_id}" | "/api/canvases/{canvas_id}" | "/api/canvas-events" => {
+            rng.choose_str(&["api", "canvas-agent"])
+        }
+        "/api/traces" => rng.choose_str(&["api", "ingest"]),
+        _ => rng.choose_str(&["api", "worker"]),
+    }
+}
+
+fn signal_from_existing(current: &Value) -> String {
+    match current.as_str().unwrap_or_default() {
+        "span" | "span_start" | "span_end" | "trace" => "trace".to_owned(),
+        "metric" => "metric".to_owned(),
+        "log" => "log".to_owned(),
+        "analytics" | "track" | "page" | "screen" | "identify" | "group" | "alias" => {
+            "analytics".to_owned()
+        }
+        value if !value.is_empty() => value.to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+fn span_times(now: &str, duration_ms: u64, rng: &mut TinyRng) -> (String, String) {
+    let end = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|time| time.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+        - ChronoDuration::milliseconds(rng.range(2, 250) as i64);
+    let start = end - ChronoDuration::milliseconds(duration_ms as i64);
+    (
+        start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        end.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+}
+
+fn llm_content(parent_key: &str, scenario: &Scenario, rng: &mut TinyRng) -> String {
+    match parent_key {
+        "messages" => format!(
+            "{} request for {} on {}",
+            rng.choose(&["Trace", "Canvas", "Loadtest", "Debug"]),
+            scenario.service,
+            scenario.route
+        ),
+        _ => scenario.log_message(),
+    }
+}
+
+fn number_like(current: &Value, value: f64) -> Value {
+    if current.as_i64().is_some() || current.as_u64().is_some() {
+        Value::from(value.round() as u64)
+    } else {
+        serde_json::Number::from_f64(round(value, 3))
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::from(0))
+    }
+}
+
+fn seed_for(run_id: &str, fixture_name: &str, seq: u64) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in run_id.bytes().chain(fixture_name.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^ seq.wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+struct TinyRng {
+    state: u64,
+}
+
+impl TinyRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
+
+    fn range(&mut self, min: u64, max: u64) -> u64 {
+        if min >= max {
+            return min;
+        }
+        min + (self.next_u64() % (max - min + 1))
+    }
+
+    fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+        denominator != 0 && self.range(1, denominator) <= numerator
+    }
+
+    fn choose<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.range(0, items.len().saturating_sub(1) as u64) as usize]
+    }
+
+    fn choose_str(&mut self, items: &'static [&'static str]) -> &'static str {
+        items[self.range(0, items.len().saturating_sub(1) as u64) as usize]
+    }
+
+    fn float_range(&mut self, min: f64, max: f64) -> f64 {
+        let unit = (self.next_u64() >> 11) as f64 / ((1_u64 << 53) as f64);
+        min + ((max - min) * unit)
+    }
+
+    fn hex(&mut self, len: usize) -> String {
+        let mut output = String::with_capacity(len);
+        while output.len() < len {
+            output.push_str(&format!("{:016x}", self.next_u64()));
+        }
+        output.truncate(len);
+        output
+    }
+}
+
+fn uuid_like(rng: &mut TinyRng) -> String {
+    let hex = rng.hex(32);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 fn is_pass(config: &Config, stats: &StepStats) -> bool {
@@ -541,6 +1093,9 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
     let events_dir = root.join("fixtures/events");
     let names = [
         "log",
+        "log_variation_code_success",
+        "log_variation_excalidraw",
+        "log_variation_image_gen",
         "metric",
         "metric_counter",
         "metric_gauge",
@@ -569,13 +1124,23 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         .cloned()
         .ok_or_else(|| anyhow!("expected log fixture"))?;
     let rest = loaded
-        .into_iter()
+        .iter()
         .filter(|fixture| fixture.name != "log")
+        .filter(|fixture| !fixture.name.starts_with("log_variation_"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let log_variations = loaded
+        .into_iter()
+        .filter(|fixture| fixture.name.starts_with("log_variation_"))
         .collect::<Vec<_>>();
     if rest.is_empty() {
         bail!("expected at least one non-log fixture");
     }
-    Ok(Fixtures { log, rest })
+    Ok(Fixtures {
+        log,
+        log_variations,
+        rest,
+    })
 }
 
 fn validate_fixture(name: &str, fixture: &Value) -> Result<()> {
@@ -938,6 +1503,23 @@ fn list_env(key: &str, fallback: &[u64]) -> Result<Vec<u64>> {
     }
 }
 
+fn load_profile_env() -> Result<LoadProfile> {
+    match env::var("NANOTRACE_LOADTEST_PROFILE") {
+        Ok(value) if value.eq_ignore_ascii_case("realistic") => Ok(LoadProfile::Realistic),
+        Ok(value)
+            if value.eq_ignore_ascii_case("fixture")
+                || value.eq_ignore_ascii_case("default")
+                || value.eq_ignore_ascii_case("static") =>
+        {
+            Ok(LoadProfile::Fixture)
+        }
+        Ok(value) => bail!(
+            "NANOTRACE_LOADTEST_PROFILE must be realistic, fixture, default, or static; got {value}"
+        ),
+        Err(_) => Ok(LoadProfile::Fixture),
+    }
+}
+
 fn trim_trailing_slash(mut value: String) -> String {
     while value.ends_with('/') {
         value.pop();
@@ -1001,12 +1583,107 @@ mod tests {
     fn fixture_selection_uses_log_ratio_then_rest() {
         let context = test_context();
 
-        assert_eq!(choose_fixture(&context.fixtures, 0, 0.10).name, "log");
-        assert_eq!(choose_fixture(&context.fixtures, 9, 0.10).name, "log");
-        assert_eq!(choose_fixture(&context.fixtures, 10, 0.10).name, "metric");
+        assert_eq!(
+            choose_fixture(&context.fixtures, 0, 0.10, LoadProfile::Fixture).name,
+            "log"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 9, 0.10, LoadProfile::Fixture).name,
+            "log"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 10, 0.10, LoadProfile::Fixture).name,
+            "metric"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 1, 0.10, LoadProfile::Realistic).name,
+            "log_variation_code_success"
+        );
+    }
+
+    #[test]
+    fn bundled_fixtures_include_realistic_log_variations() {
+        let fixtures = load_fixtures(&repo_root()).expect("load fixtures");
+
+        assert_eq!(fixtures.log.name, "log");
+        assert!(fixtures.log_variations.len() >= 3);
+        assert!(
+            fixtures
+                .rest
+                .iter()
+                .any(|fixture| fixture.name == "span_start")
+        );
+        assert!(
+            fixtures
+                .rest
+                .iter()
+                .any(|fixture| fixture.name == "metric_runtime")
+        );
+    }
+
+    #[test]
+    fn realistic_profile_randomizes_log_data_but_preserves_shape() {
+        let context = test_context_with_profile(LoadProfile::Realistic);
+
+        let event = make_event(&context, "test_mix").expect("event");
+        let data = event["data"].as_object().expect("data object");
+
+        assert_eq!(data["tenant_id"], "loadtest");
+        assert_eq!(data["event_type"], "log");
+        assert_eq!(data["_loadtest"]["run_id"], "test-run");
+        assert_ne!(data["message"], "hello");
+        assert_ne!(data["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(data["trace_id"].as_str().unwrap().len(), 32);
+        assert_eq!(data["span_id"].as_str().unwrap().len(), 16);
+        assert_ne!(data["canvasId"], "9dc05d76-e919-4c53-9274-c8060774ee8a");
+        assert!(data["llm"].is_object());
+        assert!(data["llm"]["messages"].is_array());
+        assert_ne!(data["llm"]["messages"][0]["content"], "fixture prompt");
+    }
+
+    #[test]
+    fn realistic_profile_randomizes_metric_values_and_http_fields() {
+        let context = test_context_with_profile(LoadProfile::Realistic);
+        context.config.event_seq.store(10, Ordering::Relaxed);
+
+        let event = make_event(&context, "test_mix").expect("event");
+        let data = event["data"].as_object().expect("data object");
+
+        assert_eq!(data["event_type"], "metric");
+        assert_ne!(data["metric_value"], 231);
+        assert!(data["metric_value"].as_f64().unwrap() > 0.0);
+        assert!(data["http.route"].as_str().unwrap().starts_with('/'));
+        assert!(data["http.status_code"].as_u64().unwrap() >= 200);
+        assert!(data["duration_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn realistic_profile_is_deterministic_for_run_fixture_and_sequence() {
+        let first = test_context_with_profile(LoadProfile::Realistic);
+        let second = test_context_with_profile(LoadProfile::Realistic);
+
+        let first_event = make_event(&first, "test_mix").expect("first event");
+        let second_event = make_event(&second, "test_mix").expect("second event");
+
+        assert_eq!(
+            first_event["data"]["trace_id"],
+            second_event["data"]["trace_id"]
+        );
+        assert_eq!(
+            first_event["data"]["message"],
+            second_event["data"]["message"]
+        );
+        assert_eq!(
+            first_event["data"]["llm"]["messages"][0]["content"],
+            second_event["data"]["llm"]["messages"][0]["content"]
+        );
     }
 
     fn test_context() -> LoadContext {
+        test_context_with_profile(LoadProfile::Fixture)
+    }
+
+    fn test_context_with_profile(profile: LoadProfile) -> LoadContext {
         LoadContext {
             config: Arc::new(Config {
                 ingest_url: "http://127.0.0.1:3000".to_owned(),
@@ -1022,6 +1699,7 @@ mod tests {
                 max_p95_ms: 2_000.0,
                 max_in_flight: 1,
                 log_ratio: 0.10,
+                profile,
                 clickhouse_wait_ms: 1_000.0,
                 clickhouse_poll_ms: 100.0,
                 event_seq: AtomicU64::new(0),
@@ -1038,10 +1716,41 @@ mod tests {
                             "tenant_id": "fixture",
                             "service": "api",
                             "event_type": "log",
-                            "message": "hello"
+                            "message": "hello",
+                            "environment": "prod",
+                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                            "span_id": "00f067aa0ba902b7",
+                            "canvasId": "9dc05d76-e919-4c53-9274-c8060774ee8a",
+                            "llm": {
+                                "finishReason": "tool-calls",
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "fixture prompt"
+                                    }
+                                ],
+                                "model": "gpt-5.5"
+                            }
                         }
                     }),
                 },
+                log_variations: vec![Fixture {
+                    name: "log_variation_code_success".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-log-variation",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "api",
+                            "event_type": "log",
+                            "message": "variation",
+                            "environment": "prod",
+                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                            "span_id": "00f067aa0ba902b7"
+                        }
+                    }),
+                }],
                 rest: vec![Fixture {
                     name: "metric".to_owned(),
                     body: json!({
@@ -1052,7 +1761,12 @@ mod tests {
                             "tenant_id": "fixture",
                             "service": "api",
                             "event_type": "metric",
-                            "metric_name": "requests"
+                            "metric_name": "http.server.duration",
+                            "metric_value": 231,
+                            "http.method": "POST",
+                            "http.route": "/checkout",
+                            "http.status_code": 200,
+                            "duration_ms": 231
                         }
                     }),
                 }],

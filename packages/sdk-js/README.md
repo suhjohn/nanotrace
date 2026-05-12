@@ -5,6 +5,8 @@ The SDK shapes application events into Nanotrace's `/events` contract.
 It uses camelCase public parameters and emits schema fields such as
 `event_type`, `trace_id`, `duration_ms`, and `http.status_code`.
 
+Event methods are fire-and-forget. Call `flush()` when you need to wait for delivery.
+
 ```ts
 import { createNanotrace, httpTransport } from '@nanotrace/sdk'
 

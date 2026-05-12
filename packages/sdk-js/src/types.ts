@@ -36,6 +36,7 @@ export type CommonFields = {
   spanKind?: string
   spanStatusCode?: string
   spanStatusMessage?: string
+  isError?: boolean | number
   userId?: string
   anonymousId?: string
   sessionId?: string

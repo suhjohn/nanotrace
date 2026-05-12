@@ -48,6 +48,13 @@ const clickhouseDatabase =
   'observatory'
 const clickhouseTable =
   cfg.get('clickhouseTable') ?? process.env.CLICKHOUSE_TABLE ?? 'events'
+const clickhouseFacetsTable =
+  cfg.get('clickhouseFacetsTable') ??
+  process.env.CLICKHOUSE_FACETS_TABLE ??
+  'event_facets'
+const clickhouseMaxBytesToRead =
+  cfg.getNumber('clickhouseMaxBytesToRead') ??
+  numberEnv('CLICKHOUSE_MAX_BYTES_TO_READ', 1_000_000_000_000)
 
 const instanceType = cfg.get('instanceType') ?? 'c7g.large'
 const queryInstanceType =
@@ -343,6 +350,7 @@ const clickHouseSchema = new command.local.Command(
       CLICKHOUSE_PASSWORD: clickhousePassword,
       CLICKHOUSE_DATABASE: clickhouseDatabase,
       CLICKHOUSE_TABLE: clickhouseTable,
+      CLICKHOUSE_FACETS_TABLE: clickhouseFacetsTable,
       CLICKHOUSE_SCHEMA_PATH: 'deploy/clickhouse/schema.sql'
     },
     triggers: [
@@ -350,7 +358,8 @@ const clickHouseSchema = new command.local.Command(
       schemaScriptHash,
       clickhouseUrl,
       clickhouseDatabase,
-      clickhouseTable
+      clickhouseTable,
+      clickhouseFacetsTable
     ]
   },
   {
@@ -515,9 +524,11 @@ const userData = pulumi
         bucketName,
         clickhouseDatabase,
         clickhousePassword: resolvedClickhousePassword,
+        clickhouseFacetsTable,
         clickhouseTable,
         clickhouseUrl,
         clickhouseUser,
+        clickhouseMaxBytesToRead,
         imageUri: resolvedImageUri,
         loaderQueueUrl,
         modalServerApiKey: resolvedModalServerApiKey,
@@ -553,6 +564,7 @@ const queryUserData = pulumi
       clickhouseTable,
       clickhouseUrl,
       clickhouseUser,
+      clickhouseMaxBytesToRead,
       imageUri: resolvedImageUri,
       maxRequestBytes,
       port,
@@ -600,7 +612,7 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
     tags
   },
   {
-    dependsOn: imageBuild ? [imageBuild] : []
+    dependsOn: imageBuild ? [imageBuild, clickHouseSchema] : [clickHouseSchema]
   }
 )
 
@@ -630,7 +642,7 @@ const queryLaunchTemplate = new aws.ec2.LaunchTemplate(
     tags: { ...tags, Service: 'query' }
   },
   {
-    dependsOn: imageBuild ? [imageBuild] : []
+    dependsOn: imageBuild ? [imageBuild, clickHouseSchema] : [clickHouseSchema]
   }
 )
 
@@ -691,9 +703,11 @@ interface UserDataArgs {
   bucketName: string
   clickhouseDatabase: string
   clickhousePassword: string
+  clickhouseFacetsTable: string
   clickhouseTable: string
   clickhouseUrl: string
   clickhouseUser: string
+  clickhouseMaxBytesToRead: number
   imageUri: string
   loaderQueueUrl: string
   modalServerApiKey: string
@@ -725,6 +739,7 @@ interface QueryUserDataArgs {
   clickhouseTable: string
   clickhouseUrl: string
   clickhouseUser: string
+  clickhouseMaxBytesToRead: number
   imageUri: string
   maxRequestBytes: number
   port: number
@@ -826,6 +841,7 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e CLICKHOUSE_MAX_BYTES_TO_READ=${args.clickhouseMaxBytesToRead} \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
   -e MAX_EVENT_BYTES=${args.maxEventBytes} \\
   -e NANOTRACE_PART_MAX_BYTES=${args.partMaxBytes} \\
@@ -859,6 +875,7 @@ docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e CLICKHOUSE_FACETS_TABLE=${shellQuote(args.clickhouseFacetsTable)} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-loader
 `
@@ -915,6 +932,7 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e CLICKHOUSE_MAX_BYTES_TO_READ=${args.clickhouseMaxBytesToRead} \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-query

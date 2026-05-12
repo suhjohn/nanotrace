@@ -12,6 +12,7 @@
     "deploy:up": "pulumi -C deploy/pulumi/nanotrace up",
     "deploy:destroy": "pulumi -C deploy/pulumi/nanotrace destroy",
     "deploy:roll": "node scripts/deploy-roll-pulumi.mjs",
+    "backfill:facets": "node scripts/backfill-clickhouse-facets.mjs",
     "e2e:pulumi": "node scripts/e2e-pulumi.mjs",
     "loadtest:pulumi": "cargo run --release -p nanotrace-loadtest --",
     "scale": "node scripts/scale-pulumi-asg.mjs",
