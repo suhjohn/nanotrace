@@ -18,7 +18,7 @@ export type EventEnvelope = {
 }
 
 export type Transport = {
-  send(event: EventEnvelope): Promise<void>
+  send(event: EventEnvelope): void | Promise<void>
 }
 
 export type CommonFields = {
@@ -68,8 +68,8 @@ export type SpanHandle = {
   traceId: string
   spanId: string
   set(key: string, value: Json): void
-  event(name: string, data?: CommonFields): Promise<void>
-  end(data?: CommonFields): Promise<void>
+  event(name: string, data?: CommonFields): void
+  end(data?: CommonFields): void
 }
 
 export type HttpServerRequest = CommonFields & {

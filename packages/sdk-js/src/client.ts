@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { contextStorage, currentContext, withContext } from './context.js'
+import { currentContext, withContext } from './context.js'
 import { normalizeCommon, normalizeJson, withoutKeys } from './normalize.js'
 import type {
   CommonFields,
@@ -12,7 +12,6 @@ import type {
   Json,
   JsonObject,
   LogLevel,
-  MaybePromise,
   MessageOperation,
   PageEvent,
   RevenueEvent,
@@ -30,6 +29,8 @@ export type NanotraceOptions = CommonFields & {
 export class Nanotrace {
   private readonly baseContext: CommonFields
   private readonly transport: Transport
+  private readonly pending = new Set<Promise<void>>()
+  private readonly errors: unknown[] = []
 
   constructor(options: NanotraceOptions) {
     const { transport, ...baseContext } = options
@@ -40,8 +41,8 @@ export class Nanotrace {
   withContext = withContext
   currentContext = currentContext
 
-  async emit(event: EventEnvelope): Promise<void> {
-    await this.transport.send({
+  emit(event: EventEnvelope): void {
+    this.enqueue({
       event_id: event.event_id ?? randomUUID(),
       timestamp: event.timestamp ?? new Date().toISOString(),
       ...(event.observed_timestamp ? { observed_timestamp: event.observed_timestamp } : {}),
@@ -52,12 +53,23 @@ export class Nanotrace {
     })
   }
 
-  async event(name: string, data: CommonFields = {}): Promise<void> {
-    await this.write('analytics', { name, ...normalizeCommon(data) })
+  async flush(): Promise<void> {
+    while (this.pending.size > 0) {
+      await Promise.allSettled([...this.pending])
+    }
+
+    if (this.errors.length > 0) {
+      const errors = this.errors.splice(0)
+      throw new AggregateError(errors, 'Nanotrace flush failed.')
+    }
   }
 
-  async log(level: LogLevel, message: string, data: CommonFields = {}): Promise<void> {
-    await this.write('log', {
+  event(name: string, data: CommonFields = {}): void {
+    this.write('analytics', { name, ...normalizeCommon(data) })
+  }
+
+  log(level: LogLevel, message: string, data: CommonFields = {}): void {
+    this.write('log', {
       ...normalizeCommon(data),
       severity_text: level.toUpperCase(),
       severity_number: severityNumber(level),
@@ -66,28 +78,29 @@ export class Nanotrace {
     })
   }
 
-  debug(message: string, data?: CommonFields): Promise<void> {
-    return this.log('debug', message, data)
+  debug(message: string, data?: CommonFields): void {
+    this.log('debug', message, data)
   }
 
-  info(message: string, data?: CommonFields): Promise<void> {
-    return this.log('info', message, data)
+  info(message: string, data?: CommonFields): void {
+    this.log('info', message, data)
   }
 
-  warn(message: string, data?: CommonFields): Promise<void> {
-    return this.log('warn', message, data)
+  warn(message: string, data?: CommonFields): void {
+    this.log('warn', message, data)
   }
 
-  error(errorOrMessage: unknown, data: CommonFields = {}): Promise<void> {
+  error(errorOrMessage: unknown, data: CommonFields = {}): void {
     if (errorOrMessage instanceof Error) {
-      return this.captureException(errorOrMessage, data)
+      this.captureException(errorOrMessage, data)
+      return
     }
-    return this.log('error', String(errorOrMessage), data)
+    this.log('error', String(errorOrMessage), data)
   }
 
-  async captureException(error: unknown, data: CommonFields = {}): Promise<void> {
+  captureException(error: unknown, data: CommonFields = {}): void {
     const payload = errorPayload(error)
-    await this.write('log', {
+    this.write('log', {
       ...normalizeCommon(data),
       severity_text: 'ERROR',
       severity_number: 17,
@@ -99,24 +112,8 @@ export class Nanotrace {
     })
   }
 
-  async span<T>(
-    name: string,
-    fn: (span: SpanHandle) => MaybePromise<T>,
-    data: SpanOptions = {}
-  ): Promise<T> {
-    const span = this.startSpan(name, data)
-    try {
-      const result = await contextStorage().run(spanContext(span), () => fn(span))
-      await span.end({ spanStatusCode: 'ok' })
-      return result
-    } catch (error) {
-      await span.end({
-        spanStatusCode: 'error',
-        is_error: 1,
-        ...errorFields(error)
-      })
-      throw error
-    }
+  span(name: string, data: SpanOptions = {}): SpanHandle {
+    return this.startSpan(name, data)
   }
 
   startSpan(name: string, data: SpanOptions = {}): SpanHandle {
@@ -142,19 +139,19 @@ export class Nanotrace {
       set(key, value) {
         attrs[key] = normalizeJson(value)
       },
-      event: async (eventName, eventData = {}) => {
-        await this.write('log', {
+      event: (eventName, eventData = {}) => {
+        this.write('log', {
           ...normalizeCommon(eventData),
           trace_id: traceId,
           span_id: spanId,
           name: eventName
         })
       },
-      end: async (endData = {}) => {
+      end: (endData = {}) => {
         if (ended) return
         ended = true
         const endTime = new Date()
-        await this.emit({
+        this.emit({
           timestamp: endTime.toISOString(),
           data: {
             ...attrs,
@@ -167,10 +164,10 @@ export class Nanotrace {
     }
   }
 
-  recordSpan(data: SpanRecord): Promise<void> {
+  recordSpan(data: SpanRecord): void {
     const start = dateMs(data.startTime)
     const end = dateMs(data.endTime)
-    return this.write('span', {
+    this.write('span', {
       ...normalizeCommon(data),
       name: data.name,
       start_time: iso(data.startTime),
@@ -181,8 +178,8 @@ export class Nanotrace {
     })
   }
 
-  httpServerRequest(data: HttpServerRequest): Promise<void> {
-    return this.write('span', {
+  httpServerRequest(data: HttpServerRequest): void {
+    this.write('span', {
       ...normalizeCommon(withoutKeys(data, ['method', 'route', 'path', 'url', 'statusCode', 'durationMs'])),
       name: `${data.method} ${data.route ?? data.path ?? data.url ?? ''}`.trim(),
       span_kind: 'server',
@@ -197,8 +194,8 @@ export class Nanotrace {
     })
   }
 
-  httpClientRequest(data: HttpClientRequest): Promise<void> {
-    return this.write('span', {
+  httpClientRequest(data: HttpClientRequest): void {
+    this.write('span', {
       ...normalizeCommon(withoutKeys(data, ['method', 'url', 'statusCode', 'durationMs'])),
       name: `${data.method} ${data.url}`,
       span_kind: 'client',
@@ -211,8 +208,8 @@ export class Nanotrace {
     })
   }
 
-  dbQuery(data: DbQuery): Promise<void> {
-    return this.write('span', {
+  dbQuery(data: DbQuery): void {
+    this.write('span', {
       ...normalizeCommon(withoutKeys(data, ['system', 'operation', 'statement', 'durationMs'])),
       name: data.operation ?? data.system,
       span_kind: 'client',
@@ -223,8 +220,8 @@ export class Nanotrace {
     })
   }
 
-  rpcCall(data: RpcCall): Promise<void> {
-    return this.write('span', {
+  rpcCall(data: RpcCall): void {
+    this.write('span', {
       ...normalizeCommon(withoutKeys(data, ['system', 'service', 'method', 'durationMs'])),
       name: `${data.service}/${data.method}`,
       span_kind: 'client',
@@ -235,48 +232,48 @@ export class Nanotrace {
     })
   }
 
-  messagePublish(data: MessageOperation): Promise<void> {
-    return this.messageOperation('publish', data)
+  messagePublish(data: MessageOperation): void {
+    this.messageOperation('publish', data)
   }
 
-  messageConsume(data: MessageOperation): Promise<void> {
-    return this.messageOperation('consume', data)
+  messageConsume(data: MessageOperation): void {
+    this.messageOperation('consume', data)
   }
 
-  counter(name: string, value = 1, data?: CommonFields): Promise<void> {
-    return this.metric(name, 'counter', value, { 'metric.temporality': 'delta', 'metric.is_monotonic': true }, data)
+  counter(name: string, value = 1, data?: CommonFields): void {
+    this.metric(name, 'counter', value, { 'metric.temporality': 'delta', 'metric.is_monotonic': true }, data)
   }
 
-  gauge(name: string, value: number, data?: CommonFields): Promise<void> {
-    return this.metric(name, 'gauge', value, {}, data)
+  gauge(name: string, value: number, data?: CommonFields): void {
+    this.metric(name, 'gauge', value, {}, data)
   }
 
-  histogram(name: string, value: number, data?: CommonFields): Promise<void> {
-    return this.metric(name, 'histogram', value, {}, data)
+  histogram(name: string, value: number, data?: CommonFields): void {
+    this.metric(name, 'histogram', value, {}, data)
   }
 
-  timing(name: string, durationMs: number, data?: CommonFields): Promise<void> {
-    return this.histogram(name, durationMs, { metricUnit: 'ms', ...data })
+  timing(name: string, durationMs: number, data?: CommonFields): void {
+    this.histogram(name, durationMs, { metricUnit: 'ms', ...data })
   }
 
-  track(name: string, properties: CommonFields = {}): Promise<void> {
-    return this.write('track', { ...normalizeCommon(properties), name })
+  track(name: string, properties: CommonFields = {}): void {
+    this.write('track', { ...normalizeCommon(properties), name })
   }
 
-  identify(userId: string, traits: CommonFields = {}): Promise<void> {
-    return this.write('identify', { ...normalizeCommon(traits), user_id: userId })
+  identify(userId: string, traits: CommonFields = {}): void {
+    this.write('identify', { ...normalizeCommon(traits), user_id: userId })
   }
 
-  group(accountId: string, traits: CommonFields = {}): Promise<void> {
-    return this.write('group', { ...normalizeCommon(traits), account_id: accountId })
+  group(accountId: string, traits: CommonFields = {}): void {
+    this.write('group', { ...normalizeCommon(traits), account_id: accountId })
   }
 
-  alias(previousId: string, userId: string, data: CommonFields = {}): Promise<void> {
-    return this.write('alias', { ...normalizeCommon(data), previous_id: previousId, user_id: userId })
+  alias(previousId: string, userId: string, data: CommonFields = {}): void {
+    this.write('alias', { ...normalizeCommon(data), previous_id: previousId, user_id: userId })
   }
 
-  page(data: PageEvent): Promise<void> {
-    return this.write('page', {
+  page(data: PageEvent): void {
+    this.write('page', {
       ...normalizeCommon(withoutKeys(data, ['name', 'url', 'path', 'title', 'referrer'])),
       ...(data.name ? { name: data.name } : {}),
       ...(data.url ? { page_url: data.url } : {}),
@@ -286,24 +283,37 @@ export class Nanotrace {
     })
   }
 
-  screen(name: string, data: CommonFields = {}): Promise<void> {
-    return this.write('screen', { ...normalizeCommon(data), screen_name: name, name })
+  screen(name: string, data: CommonFields = {}): void {
+    this.write('screen', { ...normalizeCommon(data), screen_name: name, name })
   }
 
-  revenue(data: RevenueEvent): Promise<void> {
-    return this.write('track', { ...normalizeCommon(data), name: 'Revenue' })
+  revenue(data: RevenueEvent): void {
+    this.write('track', { ...normalizeCommon(data), name: 'Revenue' })
   }
 
-  experimentViewed(data: ExperimentViewedEvent): Promise<void> {
-    return this.write('track', { ...normalizeCommon(data), name: 'Experiment Viewed' })
+  experimentViewed(data: ExperimentViewedEvent): void {
+    this.write('track', { ...normalizeCommon(data), name: 'Experiment Viewed' })
   }
 
-  featureFlagEvaluated(data: FeatureFlagEvent): Promise<void> {
-    return this.write('track', { ...normalizeCommon(data), name: 'Feature Flag Evaluated' })
+  featureFlagEvaluated(data: FeatureFlagEvent): void {
+    this.write('track', { ...normalizeCommon(data), name: 'Feature Flag Evaluated' })
   }
 
-  private messageOperation(operation: 'publish' | 'consume', data: MessageOperation): Promise<void> {
-    return this.write('span', {
+  private enqueue(event: EventEnvelope): void {
+    let promise: Promise<void>
+    promise = Promise.resolve()
+      .then(() => this.transport.send(event))
+      .catch(error => {
+        this.errors.push(error)
+      })
+      .finally(() => {
+        this.pending.delete(promise)
+      })
+    this.pending.add(promise)
+  }
+
+  private messageOperation(operation: 'publish' | 'consume', data: MessageOperation): void {
+    this.write('span', {
       ...normalizeCommon(withoutKeys(data, ['system', 'destination', 'durationMs'])),
       name: `${operation} ${data.destination}`,
       span_kind: operation === 'publish' ? 'producer' : 'consumer',
@@ -320,8 +330,8 @@ export class Nanotrace {
     value: number,
     defaults: JsonObject,
     data: CommonFields = {}
-  ): Promise<void> {
-    return this.write('metric', {
+  ): void {
+    this.write('metric', {
       ...defaults,
       ...normalizeCommon(data),
       metric_name: name,
@@ -330,17 +340,13 @@ export class Nanotrace {
     })
   }
 
-  private write(eventType: string, data: JsonObject): Promise<void> {
-    return this.emit({ data: { ...data, event_type: eventType } })
+  private write(eventType: string, data: JsonObject): void {
+    this.emit({ data: { ...data, event_type: eventType } })
   }
 }
 
 export function createNanotrace(options: NanotraceOptions): Nanotrace {
   return new Nanotrace(options)
-}
-
-function spanContext(span: SpanHandle): CommonFields {
-  return { traceId: span.traceId, spanId: span.spanId }
 }
 
 function severityNumber(level: LogLevel): number {
@@ -365,15 +371,6 @@ function errorPayload(error: unknown): { name: string; message: string; stack?: 
     }
   }
   return { name: 'Error', message: String(error) }
-}
-
-function errorFields(error: unknown): CommonFields {
-  const payload = errorPayload(error)
-  return {
-    'exception.type': payload.name,
-    'exception.message': payload.message,
-    ...(payload.stack ? { 'exception.stacktrace': payload.stack } : {})
-  }
 }
 
 function randomHex(bytes: number): string {

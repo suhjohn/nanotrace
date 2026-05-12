@@ -1618,6 +1618,7 @@ name = "nanotrace-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "reqwest",
  "serde_json",
  "tokio",

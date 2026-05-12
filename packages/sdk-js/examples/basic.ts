@@ -6,16 +6,23 @@ const nt = createNanotrace({
   environment: 'test'
 })
 
-await nt.withContext({ tenantId: 'tenant_1', userId: 'user_1' }, async () => {
-  await nt.info('checkout started', { loggerName: 'checkout' })
-  await nt.span('POST /checkout', async () => {
-    await nt.counter('checkout.attempts')
-    await nt.httpServerRequest({
+nt.withContext({ tenantId: 'tenant_1', userId: 'user_1' }, () => {
+  nt.info('checkout started', { loggerName: 'checkout' })
+  const span = nt.span('POST /checkout')
+  try {
+    nt.counter('checkout.attempts')
+    nt.httpServerRequest({
       method: 'POST',
       route: '/checkout',
       statusCode: 200,
       durationMs: 42
     })
-  })
-  await nt.track('Checkout Completed', { revenue: 99, currency: 'USD' })
+    span.end({ spanStatusCode: 'ok' })
+  } catch (error) {
+    span.end({ spanStatusCode: 'error', isError: 1 })
+    throw error
+  }
+  nt.track('Checkout Completed', { revenue: 99, currency: 'USD' })
 })
+
+await nt.flush()

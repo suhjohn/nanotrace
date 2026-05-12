@@ -26,5 +26,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-client /usr/local/bin/nanotrace-client
 ENV NANOTRACE_CLIENT_BIND=0.0.0.0:4319
+ENV NANOTRACE_CLIENT_HTTP_BIND=0.0.0.0:4320
 EXPOSE 4319/udp
+EXPOSE 4320/tcp
 CMD ["/usr/local/bin/nanotrace-client"]

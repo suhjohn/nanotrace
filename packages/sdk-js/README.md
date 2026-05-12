@@ -17,10 +17,17 @@ const nt = createNanotrace({
   environment: 'prod'
 })
 
-await nt.span('POST /checkout', async () => {
+const span = nt.span('POST /checkout')
+try {
   nt.counter('checkout.attempts')
-  await nt.info('checkout started')
-})
+  nt.info('checkout started')
+  span.end({ spanStatusCode: 'ok' })
+} catch (error) {
+  span.end({ spanStatusCode: 'error', isError: 1 })
+  throw error
+}
+
+await nt.flush()
 ```
 
 Use the UDP transport with the Rust sidecar:
@@ -30,5 +37,15 @@ import { createNanotrace, udpTransport } from '@nanotrace/sdk'
 
 const nt = createNanotrace({
   transport: udpTransport({ port: 4319 })
+})
+```
+
+Use local HTTP with the Rust sidecar when UDP is not convenient:
+
+```ts
+import { createNanotrace, sidecarHttpTransport } from '@nanotrace/sdk'
+
+const nt = createNanotrace({
+  transport: sidecarHttpTransport({ url: 'http://127.0.0.1:4320' })
 })
 ```

@@ -48,3 +48,27 @@ export function udpTransport({
     }
   }
 }
+
+export function sidecarHttpTransport({
+  url = 'http://127.0.0.1:4320',
+  fetchImpl = globalThis.fetch
+}: {
+  url?: string
+  fetchImpl?: typeof fetch
+} = {}): Transport {
+  const eventsUrl = `${url.replace(/\/+$/, '')}/events`
+  return {
+    async send(event) {
+      const response = await fetchImpl(eventsUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify(event)
+      })
+      if (!response.ok) {
+        throw new Error(`Nanotrace sidecar ingest failed: HTTP ${response.status}`)
+      }
+    }
+  }
+}

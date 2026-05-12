@@ -1,7 +1,7 @@
 export { createNanotrace, Nanotrace } from './client.js'
 export type { NanotraceOptions } from './client.js'
 export { currentContext, withContext } from './context.js'
-export { httpTransport, udpTransport } from './transport.js'
+export { httpTransport, sidecarHttpTransport, udpTransport } from './transport.js'
 export type {
   CommonFields,
   DbQuery,

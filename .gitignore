@@ -8,6 +8,8 @@ packages/*/dist/
 *.log
 __pycache__/
 *.pyc
+*.egg-info/
+build/
 experiments/**/target/
 .env*
 !.env.example
