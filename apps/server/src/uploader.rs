@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use nanotrace_processor_runtime::ProcessorRuntime;
@@ -17,6 +17,8 @@ pub enum UploadError {
     Io(#[from] std::io::Error),
     #[error("S3 upload failed: {0}")]
     S3(String),
+    #[error("S3 upload timed out after {0:?}")]
+    S3Timeout(Duration),
     #[error("event error: {0}")]
     Event(#[from] event::EventError),
     #[error("processor failed: {0}")]
@@ -85,8 +87,8 @@ async fn upload_one(
     processors: &ProcessorRuntime,
 ) -> Result<Option<String>, UploadError> {
     let key = object_key(cfg, path)?;
-    let body = if processors.has_processors() {
-        let bytes = fs::read(path).await?;
+    let bytes = fs::read(path).await?;
+    let body_bytes = if processors.has_processors() {
         let transformed = processors
             .transform_ndjson(&bytes)
             .map_err(|err| UploadError::Processor(err.to_string()))?;
@@ -94,22 +96,26 @@ async fn upload_one(
         if restamped.is_empty() {
             return Ok(None);
         }
-        ByteStream::from(restamped)
+        restamped
     } else {
-        ByteStream::from_path(path)
-            .await
-            .map_err(|err| UploadError::S3(err.to_string()))?
+        bytes
     };
 
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&key)
-        .content_type("application/x-ndjson")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| UploadError::S3(err.to_string()))?;
+    let timeout = Duration::from_secs(60);
+    tokio::time::timeout(
+        timeout,
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .content_type("application/x-ndjson")
+            .content_length(body_bytes.len() as i64)
+            .body(ByteStream::from(body_bytes))
+            .send(),
+    )
+    .await
+    .map_err(|_| UploadError::S3Timeout(timeout))?
+    .map_err(|err| UploadError::S3(err.to_string()))?;
 
     Ok(Some(key))
 }

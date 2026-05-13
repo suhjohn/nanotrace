@@ -4,9 +4,16 @@
     {
       "Effect": "Allow",
       "Action": [
+        "acm:DescribeCertificate",
+        "acm:ListCertificates",
         "ec2:Describe*",
         "autoscaling:Describe*",
-        "elasticloadbalancing:Describe*"
+        "elasticloadbalancing:Describe*",
+        "route53:GetHostedZone",
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:ListResourceRecordSets",
+        "route53:ListTagsForResource"
       ],
       "Resource": "*"
     },
@@ -175,6 +182,45 @@
         "elasticloadbalancing:RegisterTargets"
       ],
       "Resource": "arn:aws:elasticloadbalancing:*:*:targetgroup/nanotrace-*/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "acm:AddTagsToCertificate",
+        "acm:DeleteCertificate",
+        "acm:RemoveTagsFromCertificate"
+      ],
+      "Resource": "arn:aws:acm:*:*:certificate/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "nanotrace" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "acm:RequestCertificate",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestTag/Project": "nanotrace" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "route53:CreateHostedZone",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "route53:ChangeTagsForResource",
+        "route53:DeleteHostedZone"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "route53:GetChange",
+      "Resource": "arn:aws:route53:::change/*"
     }
   ]
 }

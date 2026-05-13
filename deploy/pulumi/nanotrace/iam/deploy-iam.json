@@ -19,6 +19,20 @@
       "Resource": "arn:aws:iam::*:role/nanotrace-*-instance-role-*"
     },
     {
+      "Sid": "ManageNanotraceRoleSsmDebugPolicy",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/nanotrace-*-instance-role-*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        }
+      }
+    },
+    {
       "Sid": "PassNanotraceRoleToEc2",
       "Effect": "Allow",
       "Action": "iam:PassRole",
@@ -42,6 +56,17 @@
         "iam:UntagInstanceProfile"
       ],
       "Resource": "arn:aws:iam::*:instance-profile/nanotrace-*-instance-profile-*"
+    },
+    {
+      "Sid": "CreateRdsServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::*:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": "rds.amazonaws.com"
+        }
+      }
     },
     {
       "Sid": "ListNanotraceRoleRelations",

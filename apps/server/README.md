@@ -8,15 +8,14 @@ S3 is the raw log. ClickHouse is the query index.
 
 Event write path
 POST /events
--> read SECRET_KEY from env
--> validate Authorization: Bearer <SECRET_KEY>
+-> validate API key from Authorization: Bearer ntak_...
 -> parse JSON
 -> build event envelope
 -> append one NDJSON line to current local file
 -> record byte offset + byte length
 -> return 200 after local write durability policy is satisfied
 
-Requests without a matching bearer token are rejected before parsing or writing the event.
+Requests without a valid API key are rejected before parsing or writing the event.
 
 No ClickHouse call is made on the request path.
 No S3 call is made on the request path.
@@ -51,7 +50,13 @@ prefer an instance role and set only AWS_REGION.
 
 Application settings:
 
-SECRET_KEY
+NANOTRACE_DATABASE_URL
+NANOTRACE_BOOTSTRAP_API_KEY
+NANOTRACE_PUBLIC_BASE_URL
+NANOTRACE_EMAIL_FROM
+NANOTRACE_MAGIC_LINK_TTL_SECS
+NANOTRACE_ALLOWED_EMAILS
+NANOTRACE_ADMIN_EMAILS
 PORT
 NANOTRACE_DATA_DIR
 NANOTRACE_S3_BUCKET
@@ -176,7 +181,7 @@ So any ClickHouse row can point back to the exact raw bytes in S3.
 
 Minimal pseudocode
 on POST /events:
-if request.Authorization != "Bearer " + env.SECRET_KEY:
+if request.Authorization is not a valid API key:
 return 401
 
 event = normalize(request.json)

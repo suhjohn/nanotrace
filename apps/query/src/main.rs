@@ -6,20 +6,28 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use config::Config;
+use nanotrace_auth::{AuthError, AuthStore};
 use read::{QueryRequest, ReadError, ReadStore};
 use tokio::net::TcpListener;
-use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    limit::RequestBodyLimitLayer,
+};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
+    auth: Option<Arc<AuthStore>>,
     read: Arc<ReadStore>,
 }
 
@@ -31,10 +39,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::from_env()?);
+    let auth = nanotrace_auth::AuthStore::connect(cfg.auth.clone())
+        .await?
+        .map(Arc::new);
     let aws_config = aws_config::load_from_env().await;
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let state = AppState {
         cfg: cfg.clone(),
+        auth,
         read: Arc::new(ReadStore::new(cfg.clone(), s3)),
     };
     let address = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -49,13 +61,36 @@ async fn main() -> anyhow::Result<()> {
 
 fn router(state: AppState) -> Router {
     let limit = state.cfg.max_request_bytes;
-    Router::new()
+    let router = Router::new()
         .route("/query", post(post_query))
         .route("/events/{event_id}", get(get_event))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .layer(RequestBodyLimitLayer::new(limit))
-        .with_state(state)
+        .with_state(state.clone());
+
+    match cors_layer(&state.cfg.cors_allowed_origins) {
+        Some(layer) => router.layer(layer),
+        None => router,
+    }
+}
+
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let allowed_origins = origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if allowed_origins.is_empty() {
+        return None;
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed_origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+            .allow_credentials(true),
+    )
 }
 
 async fn post_query(
@@ -63,7 +98,7 @@ async fn post_query(
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state.cfg, &headers)?;
+    authorize(&state, &headers).await?;
     Ok(Json(state.read.query(request).await?))
 }
 
@@ -72,7 +107,7 @@ async fn get_event(
     headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    authorize(&state.cfg, &headers)?;
+    authorize(&state, &headers).await?;
     let bytes = state.read.event_bytes(&event_id).await?;
     Ok(([("content-type", "application/json")], bytes).into_response())
 }
@@ -91,17 +126,9 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<serde_json::Value>
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-fn authorize(cfg: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
-    let expected = format!("Bearer {}", cfg.secret_key);
-    let actual = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized)
-    }
+async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    nanotrace_auth::authorize_headers(headers, state.auth.as_deref()).await?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -109,6 +136,7 @@ enum ApiError {
     Unauthorized,
     Unavailable(&'static str),
     Read(ReadError),
+    Auth(AuthError),
 }
 
 impl From<ReadError> for ApiError {
@@ -141,8 +169,18 @@ impl IntoResponse for ApiError {
                 "S3 bucket is not configured".to_string(),
             ),
             Self::Read(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Self::Auth(err) => (err.status_code(), err.to_string()),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+impl From<AuthError> for ApiError {
+    fn from(value: AuthError) -> Self {
+        match value {
+            AuthError::Unauthorized => Self::Unauthorized,
+            other => Self::Auth(other),
+        }
     }
 }
 

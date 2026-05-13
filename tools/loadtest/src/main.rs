@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 use std::{
@@ -40,13 +40,13 @@ async fn main() -> Result<()> {
             value
         }
     });
-    let secret_key = required_env("SECRET_KEY")?;
+    let api_key = required_env("NANOTRACE_API_KEY")?;
     let fixtures = Arc::new(load_fixtures(&root)?);
     let clickhouse = clickhouse_config(outputs.as_ref())?;
 
     let config = Arc::new(Config {
         ingest_url,
-        secret_key,
+        api_key,
         run_id: env::var("NANOTRACE_LOADTEST_RUN_ID").unwrap_or_else(|_| default_run_id()),
         batch_sizes: list_env("NANOTRACE_LOADTEST_BATCH_SIZES", &[1, 10, 100])?,
         step_seconds: number_env("NANOTRACE_LOADTEST_STEP_SECONDS", 30.0)?,
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
 
 struct Config {
     ingest_url: String,
-    secret_key: String,
+    api_key: String,
     run_id: String,
     batch_sizes: Vec<u64>,
     step_seconds: f64,
@@ -156,6 +156,7 @@ struct Config {
 enum LoadProfile {
     Fixture,
     Realistic,
+    Llm,
 }
 
 impl LoadProfile {
@@ -163,7 +164,12 @@ impl LoadProfile {
         match self {
             Self::Fixture => "fixture",
             Self::Realistic => "realistic",
+            Self::Llm => "llm",
         }
+    }
+
+    fn is_realistic(self) -> bool {
+        matches!(self, Self::Realistic | Self::Llm)
     }
 }
 
@@ -434,10 +440,7 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
         let response = context
             .client
             .post(format!("{}/events", context.config.ingest_url))
-            .header(
-                AUTHORIZATION,
-                format!("Bearer {}", context.config.secret_key),
-            )
+            .header(AUTHORIZATION, format!("Bearer {}", context.config.api_key))
             .header(CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -476,7 +479,8 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
         context.config.log_ratio,
         context.config.profile,
     );
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let (timestamp, observed_timestamp) =
+        event_timestamps(context.config.profile, &context.config.run_id, seq);
 
     let mut event = fixture
         .body
@@ -488,16 +492,28 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| anyhow!("fixture {} must contain object data", fixture.name))?;
-    if context.config.profile == LoadProfile::Realistic {
-        randomize_realistic_data(&mut data, &fixture.name, &context.config.run_id, seq, &now);
+    if context.config.profile.is_realistic() {
+        randomize_realistic_data(
+            &mut data,
+            &fixture.name,
+            &context.config.run_id,
+            seq,
+            &timestamp,
+        );
+    }
+    if context.config.profile == LoadProfile::Llm {
+        apply_llm_loadtest_data(&mut data, &fixture.name, &context.config.run_id, seq);
     }
 
     event.insert(
         "event_id".to_owned(),
         Value::String(format!("{}-{seq}", context.config.run_id)),
     );
-    event.insert("timestamp".to_owned(), Value::String(now.clone()));
-    event.insert("observed_timestamp".to_owned(), Value::String(now));
+    event.insert("timestamp".to_owned(), Value::String(timestamp));
+    event.insert(
+        "observed_timestamp".to_owned(),
+        Value::String(observed_timestamp),
+    );
     data.insert("tenant_id".to_owned(), Value::String("loadtest".to_owned()));
     data.insert(
         "service".to_owned(),
@@ -526,8 +542,18 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
 }
 
 fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadProfile) -> &Fixture {
+    if profile == LoadProfile::Llm {
+        if fixtures.log_variations.is_empty() {
+            return &fixtures.log;
+        }
+        let index = seq as usize % (fixtures.log_variations.len() + 1);
+        if index == 0 {
+            return &fixtures.log;
+        }
+        return &fixtures.log_variations[index - 1];
+    }
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
-        if profile == LoadProfile::Realistic && !fixtures.log_variations.is_empty() {
+        if profile.is_realistic() && !fixtures.log_variations.is_empty() {
             let index = seq as usize % (fixtures.log_variations.len() + 1);
             if index == 0 {
                 &fixtures.log
@@ -543,6 +569,67 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
     }
 }
 
+fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, String) {
+    match profile {
+        LoadProfile::Llm => {
+            let timestamp = realistic_llm_timestamp(run_id, seq);
+            let mut rng = TinyRng::new(seed_for(run_id, "llm-observed-timestamp", seq));
+            let observed = timestamp + ChronoDuration::milliseconds(rng.range(20, 5_000) as i64);
+            (
+                timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                observed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+        }
+        LoadProfile::Fixture | LoadProfile::Realistic => {
+            let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            (now.clone(), now)
+        }
+    }
+}
+
+fn realistic_llm_timestamp(run_id: &str, seq: u64) -> DateTime<Utc> {
+    const WINDOW_DAYS: i64 = 7;
+    let window_end = Utc::now();
+    let window_start = window_end - ChronoDuration::days(WINDOW_DAYS);
+    let mut rng = TinyRng::new(seed_for(run_id, "llm-timestamp", seq));
+
+    let (day, hour) = loop {
+        let day = rng.range(0, (WINDOW_DAYS - 1) as u64) as i64;
+        let hour = rng.range(0, 23);
+        let candidate = window_start + ChronoDuration::days(day);
+        let weight = llm_traffic_weight(candidate, hour);
+        if rng.range(1, 100) <= weight {
+            break (day, hour);
+        }
+    };
+
+    window_start
+        + ChronoDuration::days(day)
+        + ChronoDuration::hours(hour as i64)
+        + ChronoDuration::minutes(rng.range(0, 59) as i64)
+        + ChronoDuration::seconds(rng.range(0, 59) as i64)
+        + ChronoDuration::milliseconds(rng.range(0, 999) as i64)
+}
+
+fn llm_traffic_weight(day: DateTime<Utc>, hour: u64) -> u64 {
+    let hourly = match hour {
+        0..=5 => 12,
+        6..=8 => 55,
+        9..=11 => 95,
+        12..=13 => 75,
+        14..=17 => 100,
+        18..=20 => 70,
+        _ => 35,
+    };
+    let weekday_factor = match day.weekday().number_from_monday() {
+        6 | 7 => 0.45,
+        1 => 0.85,
+        5 => 0.9,
+        _ => 1.0,
+    };
+    ((hourly as f64) * weekday_factor).round().clamp(5.0, 100.0) as u64
+}
+
 fn randomize_realistic_data(
     data: &mut Map<String, Value>,
     fixture_name: &str,
@@ -551,8 +638,133 @@ fn randomize_realistic_data(
     now: &str,
 ) {
     let mut rng = TinyRng::new(seed_for(run_id, fixture_name, seq));
-    let scenario = Scenario::new(&mut rng, fixture_name, now);
+    let scenario = Scenario::new(&mut rng, fixture_name, run_id, seq, now);
     apply_realistic_object(data, "", &scenario, &mut rng);
+}
+
+fn apply_llm_loadtest_data(
+    data: &mut Map<String, Value>,
+    fixture_name: &str,
+    run_id: &str,
+    seq: u64,
+) {
+    let mut rng = TinyRng::new(seed_for(run_id, "llm-loadtest", seq));
+    let model = llm_model(&mut rng);
+    let finish_reason = rng.choose_str(&[
+        "stop",
+        "stop",
+        "stop",
+        "stop",
+        "tool-calls",
+        "tool-calls",
+        "length",
+        "content-filter",
+    ]);
+    let service = rng.choose_str(&["llm-gateway", "llm-gateway", "canvas-agent", "api"]);
+
+    data.insert("service".to_owned(), Value::String(service.to_owned()));
+    data.insert("event_type".to_owned(), Value::String("log".to_owned()));
+    data.insert(
+        "name".to_owned(),
+        Value::String("POST /v1/chat/completions".to_owned()),
+    );
+    data.insert(
+        "http.route".to_owned(),
+        Value::String("/v1/chat/completions".to_owned()),
+    );
+    data.insert("http.method".to_owned(), Value::String("POST".to_owned()));
+    data.insert(
+        "message".to_owned(),
+        Value::String(format!(
+            "{model} completion usage generated from {fixture_name}"
+        )),
+    );
+
+    let usage = llm_total_usage(model, finish_reason, &mut rng);
+    let llm_value = data
+        .entry("llm".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !llm_value.is_object() {
+        *llm_value = Value::Object(Map::new());
+    }
+    let llm = llm_value
+        .as_object_mut()
+        .expect("llm value was normalized to object");
+    llm.insert("model".to_owned(), Value::String(model.to_owned()));
+    llm.insert(
+        "finishReason".to_owned(),
+        Value::String(finish_reason.to_owned()),
+    );
+    llm.insert("messages".to_owned(), Value::Array(Vec::new()));
+    llm.insert("totalUsage".to_owned(), usage);
+}
+
+fn llm_model(rng: &mut TinyRng) -> &'static str {
+    rng.choose_str(&[
+        "gpt-5.5",
+        "gpt-5.5",
+        "gpt-5",
+        "gpt-5-mini",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
+    ])
+}
+
+fn llm_total_usage(model: &str, finish_reason: &str, rng: &mut TinyRng) -> Value {
+    let long_context = rng.chance(8, 100);
+    let cached_input_tokens = if rng.chance(42, 100) {
+        0
+    } else if long_context {
+        rng.range(12_000, 180_000)
+    } else {
+        rng.range(256, 48_000)
+    };
+    let no_cache_tokens = if long_context {
+        rng.range(8_000, 80_000)
+    } else {
+        rng.range(80, 14_000)
+    };
+    let input_tokens = cached_input_tokens + no_cache_tokens;
+
+    let reasoning_tokens =
+        if model.contains("mini") || model.contains("haiku") || model.contains("flash-lite") {
+            rng.range(0, 3_000)
+        } else if finish_reason == "tool-calls" {
+            rng.range(0, 8_000)
+        } else {
+            rng.range(0, 18_000)
+        };
+    let text_tokens = if finish_reason == "length" {
+        rng.range(3_000, 16_000)
+    } else if finish_reason == "tool-calls" {
+        rng.range(20, 1_800)
+    } else {
+        rng.range(40, 6_000)
+    };
+    let output_tokens = reasoning_tokens + text_tokens;
+    let total_tokens = input_tokens + output_tokens;
+
+    json!({
+        "cachedInputTokens": cached_input_tokens,
+        "inputTokenDetails": {
+            "cacheReadTokens": cached_input_tokens,
+            "noCacheTokens": no_cache_tokens,
+        },
+        "inputTokens": input_tokens,
+        "outputTokenDetails": {
+            "reasoningTokens": reasoning_tokens,
+            "textTokens": text_tokens,
+        },
+        "outputTokens": output_tokens,
+        "reasoningTokens": reasoning_tokens,
+        "totalTokens": total_tokens,
+    })
 }
 
 struct Scenario {
@@ -588,7 +800,8 @@ struct Scenario {
 }
 
 impl Scenario {
-    fn new(rng: &mut TinyRng, fixture_name: &str, now: &str) -> Self {
+    fn new(rng: &mut TinyRng, fixture_name: &str, run_id: &str, seq: u64, now: &str) -> Self {
+        let hierarchy = Hierarchy::new(run_id, seq);
         let route = rng.choose_str(&[
             "/checkout",
             "/api/canvases/{canvas_id}",
@@ -655,27 +868,17 @@ impl Scenario {
             status_code,
             duration_ms,
             is_error,
-            user_id: format!("user_{}", rng.range(10_000, 99_999)),
-            session_id: format!("sess_{}", rng.hex(16)),
-            account_id: format!("acct_{}", rng.range(100, 999)),
-            trace_id: rng.hex(32),
-            span_id: rng.hex(16),
-            parent_span_id: if rng.chance(70, 100) {
-                rng.hex(16)
-            } else {
-                String::new()
-            },
+            user_id: hierarchy.user_id,
+            session_id: hierarchy.session_id,
+            account_id: hierarchy.account_id,
+            trace_id: hierarchy.trace_id,
+            span_id: hierarchy.span_id,
+            parent_span_id: hierarchy.parent_span_id,
             run_id: uuid_like(rng),
             thread_id: uuid_like(rng),
             canvas_id: uuid_like(rng),
             message_id: uuid_like(rng),
-            model: rng.choose_str(&[
-                "gpt-4.1",
-                "gpt-4.1-mini",
-                "gpt-5",
-                "gpt-5-mini",
-                "claude-3-7-sonnet",
-            ]),
+            model: llm_model(rng),
             finish_reason: rng.choose_str(&["stop", "tool-calls", "length", "content-filter"]),
             turn: rng.range(1, 80),
             start_time,
@@ -705,6 +908,60 @@ impl Scenario {
                 "{} {} completed with status {} in {}ms",
                 self.method, self.route, self.status_code, self.duration_ms
             )
+        }
+    }
+}
+
+struct Hierarchy {
+    user_id: String,
+    session_id: String,
+    account_id: String,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+}
+
+impl Hierarchy {
+    fn new(run_id: &str, seq: u64) -> Self {
+        const EVENTS_PER_TRACE: u64 = 24;
+        const TRACES_PER_SESSION: u64 = 12;
+        const SESSIONS_PER_USER: u64 = 6;
+        const USERS_PER_ACCOUNT: u64 = 25;
+
+        let trace_index = seq / EVENTS_PER_TRACE;
+        let session_index = trace_index / TRACES_PER_SESSION;
+        let user_index = session_index / SESSIONS_PER_USER;
+        let account_index = user_index / USERS_PER_ACCOUNT;
+        let session_in_user = session_index % SESSIONS_PER_USER;
+        let span_slot = (seq % EVENTS_PER_TRACE) / 2;
+
+        let trace_id = stable_hex(run_id, "trace", trace_index, 32);
+        let root_span_id = stable_hex(run_id, "span", trace_index * 1_000, 16);
+        let span_id = if span_slot == 0 {
+            root_span_id.clone()
+        } else {
+            stable_hex(run_id, "span", trace_index * 1_000 + span_slot, 16)
+        };
+        let parent_span_id = if span_slot == 0 {
+            String::new()
+        } else if span_slot <= 3 {
+            root_span_id
+        } else {
+            stable_hex(
+                run_id,
+                "span",
+                trace_index * 1_000 + ((span_slot - 1) / 2),
+                16,
+            )
+        };
+
+        Self {
+            user_id: format!("user_{user_index:06}"),
+            session_id: format!("sess_{user_index:06}_{session_in_user:02}"),
+            account_id: format!("acct_{account_index:05}"),
+            trace_id,
+            span_id,
+            parent_span_id,
         }
     }
 }
@@ -994,6 +1251,10 @@ fn seed_for(run_id: &str, fixture_name: &str, seq: u64) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash ^ seq.wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+fn stable_hex(run_id: &str, namespace: &str, index: u64, len: usize) -> String {
+    TinyRng::new(seed_for(run_id, namespace, index)).hex(len)
 }
 
 struct TinyRng {
@@ -1507,6 +1768,13 @@ fn load_profile_env() -> Result<LoadProfile> {
     match env::var("NANOTRACE_LOADTEST_PROFILE") {
         Ok(value) if value.eq_ignore_ascii_case("realistic") => Ok(LoadProfile::Realistic),
         Ok(value)
+            if value.eq_ignore_ascii_case("llm")
+                || value.eq_ignore_ascii_case("realistic_llm")
+                || value.eq_ignore_ascii_case("llm_realistic") =>
+        {
+            Ok(LoadProfile::Llm)
+        }
+        Ok(value)
             if value.eq_ignore_ascii_case("fixture")
                 || value.eq_ignore_ascii_case("default")
                 || value.eq_ignore_ascii_case("static") =>
@@ -1514,7 +1782,7 @@ fn load_profile_env() -> Result<LoadProfile> {
             Ok(LoadProfile::Fixture)
         }
         Ok(value) => bail!(
-            "NANOTRACE_LOADTEST_PROFILE must be realistic, fixture, default, or static; got {value}"
+            "NANOTRACE_LOADTEST_PROFILE must be llm, realistic, fixture, default, or static; got {value}"
         ),
         Err(_) => Ok(LoadProfile::Fixture),
     }
@@ -1679,15 +1947,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn llm_profile_generates_coherent_usage_and_historical_timestamp() {
+        let context = test_context_with_profile(LoadProfile::Llm);
+
+        let event = make_event(&context, "test_mix").expect("event");
+        let timestamp = DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap())
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let observed = DateTime::parse_from_rfc3339(event["observed_timestamp"].as_str().unwrap())
+            .expect("observed timestamp")
+            .with_timezone(&Utc);
+        let now = Utc::now();
+        assert!(timestamp <= now);
+        assert!(timestamp >= now - ChronoDuration::days(7) - ChronoDuration::seconds(1));
+        assert!(observed > timestamp);
+
+        let data = event["data"].as_object().expect("data object");
+        let llm = data["llm"].as_object().expect("llm object");
+        let usage = llm["totalUsage"].as_object().expect("usage object");
+        let cached = usage["cachedInputTokens"].as_u64().unwrap();
+        let no_cache = usage["inputTokenDetails"]["noCacheTokens"]
+            .as_u64()
+            .unwrap();
+        let input = usage["inputTokens"].as_u64().unwrap();
+        let reasoning = usage["reasoningTokens"].as_u64().unwrap();
+        let text = usage["outputTokenDetails"]["textTokens"].as_u64().unwrap();
+        let output = usage["outputTokens"].as_u64().unwrap();
+        let total = usage["totalTokens"].as_u64().unwrap();
+
+        assert_eq!(data["event_type"], "log");
+        assert_eq!(llm["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            usage["inputTokenDetails"]["cacheReadTokens"]
+                .as_u64()
+                .unwrap(),
+            cached
+        );
+        assert_eq!(input, cached + no_cache);
+        assert_eq!(
+            usage["outputTokenDetails"]["reasoningTokens"]
+                .as_u64()
+                .unwrap(),
+            reasoning
+        );
+        assert_eq!(output, reasoning + text);
+        assert_eq!(total, input + output);
+    }
+
+    #[test]
+    fn llm_timestamp_weights_favor_weekday_business_hours() {
+        let weekday = DateTime::parse_from_rfc3339("2026-05-13T00:00:00.000Z")
+            .expect("weekday")
+            .with_timezone(&Utc);
+        let weekend = DateTime::parse_from_rfc3339("2026-05-16T00:00:00.000Z")
+            .expect("weekend")
+            .with_timezone(&Utc);
+
+        assert!(llm_traffic_weight(weekday, 14) > llm_traffic_weight(weekday, 2));
+        assert!(llm_traffic_weight(weekday, 14) > llm_traffic_weight(weekend, 14));
+    }
+
+    #[test]
+    fn realistic_profile_builds_user_session_trace_hierarchy() {
+        let first = realistic_data_for_seq(0);
+        let same_trace_child = realistic_data_for_seq(7);
+        let next_trace_same_session = realistic_data_for_seq(24);
+        let next_session_same_user = realistic_data_for_seq(24 * 12);
+        let next_user = realistic_data_for_seq(24 * 12 * 6);
+
+        assert_eq!(first["user_id"], same_trace_child["user_id"]);
+        assert_eq!(first["session_id"], same_trace_child["session_id"]);
+        assert_eq!(first["trace_id"], same_trace_child["trace_id"]);
+        assert_ne!(first["span_id"], same_trace_child["span_id"]);
+        assert_eq!(same_trace_child["parent_span_id"], first["span_id"]);
+
+        assert_eq!(first["user_id"], next_trace_same_session["user_id"]);
+        assert_eq!(first["session_id"], next_trace_same_session["session_id"]);
+        assert_ne!(first["trace_id"], next_trace_same_session["trace_id"]);
+
+        assert_eq!(first["user_id"], next_session_same_user["user_id"]);
+        assert_ne!(first["session_id"], next_session_same_user["session_id"]);
+
+        assert_ne!(first["user_id"], next_user["user_id"]);
+        assert_ne!(first["session_id"], next_user["session_id"]);
+    }
+
     fn test_context() -> LoadContext {
         test_context_with_profile(LoadProfile::Fixture)
+    }
+
+    fn realistic_data_for_seq(seq: u64) -> Map<String, Value> {
+        let mut data = json!({
+            "tenant_id": "fixture",
+            "service": "api",
+            "event_type": "span_start",
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "span_id": "00f067aa0ba902b7",
+            "parent_span_id": "",
+            "user_id": "user_fixture",
+            "session_id": "sess_fixture",
+            "account_id": "acct_fixture"
+        })
+        .as_object()
+        .cloned()
+        .expect("data object");
+        randomize_realistic_data(
+            &mut data,
+            "span_start",
+            "test-run",
+            seq,
+            "2026-05-12T00:00:00.000Z",
+        );
+        data
     }
 
     fn test_context_with_profile(profile: LoadProfile) -> LoadContext {
         LoadContext {
             config: Arc::new(Config {
                 ingest_url: "http://127.0.0.1:3000".to_owned(),
-                secret_key: "secret".to_owned(),
+                api_key: "ntak_test".to_owned(),
                 run_id: "test-run".to_owned(),
                 batch_sizes: vec![1],
                 step_seconds: 1.0,

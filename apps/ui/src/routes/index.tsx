@@ -1,12 +1,13 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Columns3, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
+import { Check, Columns3, KeyRound, LogOut, PanelLeftOpen, Plus, Trash2, UserCircle, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { JsonObject, JsonValue } from '../lib/json'
 import { clamp, useCookieState, useIndexedDbState } from '../lib/hooks'
 import { cn } from '../lib/cn'
+import { useAppShell } from '../lib/app-shell'
 
 export const Route = createFileRoute('/')({
   validateSearch: parseObservatorySearch,
@@ -46,6 +47,11 @@ type LogGroupDetail = {
   fields?: LogField[]
   group: LogGroupSummary
   logs: TraceEvent[]
+}
+
+type LogGroupPage = {
+  groups: LogGroupSummary[]
+  nextOffset?: number
 }
 
 type LogEventsPage = {
@@ -104,7 +110,49 @@ type LogFlamegraph = Flamegraph & {
 type GroupOption = {
   cardinality: number
   capped: boolean
+  displayName?: string
   path: string
+  removable?: boolean
+  source?: string
+  valueType?: string
+}
+
+type HotFacet = {
+  display_name: string
+  path: string
+  removable: boolean
+  source: string
+  status: string
+  value_type: string
+}
+
+type FacetListResponse = {
+  facets: HotFacet[]
+}
+
+type AuthIdentity = {
+  auth_type: 'api_key' | 'session'
+  email?: string
+  name?: string
+  role: 'admin' | 'service' | 'viewer'
+  subject: string
+}
+
+type ApiKeyRecord = {
+  id: number
+  name: string
+  prefix: string
+  role: 'admin' | 'service' | 'viewer'
+  created_by: string
+  created_at: string
+  last_used_at?: string | null
+  expires_at?: string | null
+  revoked_at?: string | null
+}
+
+type CreatedApiKey = {
+  key: string
+  api_key: ApiKeyRecord
 }
 
 export type RouteSelection = {
@@ -119,6 +167,7 @@ export type ObservatorySearch = {
 
 type FlameKind = 'event' | 'run' | 'turn' | 'model' | 'tool'
 type GraphMode = 'flamegraph' | 'histogram'
+type GroupSortKey = 'count' | 'duration' | 'recent' | 'value'
 type TimeRangeKey = '15m' | '1h' | '6h' | '24h' | '7d' | 'custom'
 
 type FlameSpan = {
@@ -177,8 +226,10 @@ type JsonTreeNode =
     }
 
 const panelClass =
-  'flex min-h-0 flex-col bg-neutral-950'
+  'flex min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950'
 const eventMarkerWidth = 5
+const groupPageSize = 120
+const noGroupValue = '__nanotrace_no_group__'
 const defaultEventColumns: string[] = ['timestamp', 'name', 'traceId', 'data']
 const timeRangeOptions: { key: Exclude<TimeRangeKey, 'custom'>; label: string; minutes: number }[] = [
   { key: '15m', label: '15m', minutes: 15 },
@@ -241,14 +292,13 @@ export function ObservatoryHome({
 }) {
   const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [runsWidth, setRunsWidth] = useCookieState({
     cookieName: 'observatory-ui-runs-width',
     initialValue: 320
   })
-  const [runsOpen, setRunsOpen] = useCookieState({
-    cookieName: 'observatory-ui-runs-open',
-    initialValue: true
-  })
+  const runsOpen = true
   const [inspectorWidth, setInspectorWidth] = useCookieState({
     cookieName: 'observatory-ui-inspector-width',
     initialValue: 420
@@ -282,6 +332,8 @@ export function ObservatoryHome({
   const [highlightedEventIds, setHighlightedEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
+  const [facetDraft, setFacetDraft] = useState('')
+  const [facetValueType, setFacetValueType] = useState('string')
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
@@ -294,6 +346,8 @@ export function ObservatoryHome({
     parse: parseStringArray
   })
   const filterTouchedRef = useRef(false)
+  const groupListRef = useRef<HTMLDivElement | null>(null)
+  const groupLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const seededLatestGroupKeyRef = useRef('')
   const previousGroupKeyRef = useRef('')
   const workspaceRef = useRef<HTMLElement | null>(null)
@@ -302,10 +356,46 @@ export function ObservatoryHome({
     queryKey: ['logs', observatoryUrl, 'group-options'],
     queryFn: () => fetchGroupOptions({ apiBaseUrl: observatoryUrl, limit: 120 })
   })
+  const invalidateGroupOptions = () => queryClient.invalidateQueries({ queryKey: ['logs', observatoryUrl, 'group-options'] })
+  const addFacetMutation = useMutation({
+    mutationFn: () =>
+      putFacet({
+        apiBaseUrl: observatoryUrl,
+        path: facetDraft,
+        valueType: facetValueType
+      }),
+    onSuccess: async facet => {
+      setFacetDraft('')
+      setFacetValueType('string')
+      setManualGroupBy(facet.display_name || displayFacetPath(facet.path))
+      await invalidateGroupOptions()
+    }
+  })
+  const removeFacetMutation = useMutation({
+    mutationFn: (path: string) => deleteFacet({ apiBaseUrl: observatoryUrl, path }),
+    onSuccess: async (_facet, path) => {
+      if (facetKey(groupBy) === path) {
+        setManualGroupBy('')
+        void navigate({ search: {}, to: '/' })
+      }
+      await invalidateGroupOptions()
+    }
+  })
   const groupOptions = groupOptionsQuery.data?.fields ?? []
+  const activeFacetPaths = useMemo(() => {
+    const paths = new Set<string>()
+    for (const option of groupOptions) {
+      paths.add(option.path)
+      paths.add(facetKey(option.path))
+    }
+    return paths
+  }, [groupOptions])
   const defaultGroupBy = groupOptions.find(option => option.path === 'traceId')?.path || groupOptions[0]?.path || ''
+  const routeGroupBy = routeSelection?.field ?? ''
+  const groupingDisabled = manualGroupBy === noGroupValue
   const manualGroupByValid = groupOptions.some(option => option.path === manualGroupBy)
-  const groupBy = routeSelection?.field || (manualGroupByValid ? manualGroupBy : defaultGroupBy)
+  const groupBy = groupingDisabled ? '' : manualGroupByValid ? manualGroupBy : routeGroupBy || defaultGroupBy
+  const groupSortKey: GroupSortKey = isTraceLikeGroup(groupBy) ? 'recent' : 'count'
   const displayedGroupOptions = useMemo(
     () =>
       groupBy && !groupOptions.some(option => option.path === groupBy)
@@ -313,6 +403,10 @@ export function ObservatoryHome({
         : groupOptions,
     [groupBy, groupOptions]
   )
+  const customGroupOptions = displayedGroupOptions.filter(option => option.removable)
+  const selectedGroupOption = displayedGroupOptions.find(option => option.path === groupBy) ?? null
+  const groupByLabel = selectedGroupOption ? groupOptionLabel(selectedGroupOption) : groupBy
+  const facetMutationError = errorMessage(addFacetMutation.error) || errorMessage(removeFacetMutation.error)
   const selectedGroupValue = routeSelection?.field === groupBy ? routeSelection.value : ''
   const selectedTimeRange = useMemo(
     () =>
@@ -323,15 +417,58 @@ export function ObservatoryHome({
       }),
     [customRangeEnd, customRangeStart, timeRangeKey]
   )
-  const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}\u0000${selectedTimeRange.key}` : ''
-  const eventFilterReady = Boolean(selectedGroupKey) && eventFilterGroupKey === selectedGroupKey
+  const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}` : ''
+  const viewingGroupedEvents = Boolean(selectedGroupKey)
+  const eventScopeKey = selectedGroupKey || 'all-events'
+  const eventFilterReady = eventFilterGroupKey === eventScopeKey
   const hasEventQuery = eventFilterReady
-  const groupsQuery = useQuery({
+  const groupSearch = filter.trim()
+  const groupsQuery = useInfiniteQuery<LogGroupPage, Error, InfiniteData<LogGroupPage>, string[], number>({
     enabled: groupOptions.length > 0 && Boolean(groupBy),
-    queryKey: ['logs', observatoryUrl, 'groups', groupBy, selectedTimeRange.key],
-    queryFn: () => fetchGroups({ apiBaseUrl: observatoryUrl, groupBy, limit: 120, timeRange: selectedTimeRange })
+    getNextPageParam: lastPage => lastPage.nextOffset,
+    initialPageParam: 0,
+    queryKey: [
+      'logs',
+      observatoryUrl,
+      'groups',
+      groupBy,
+      selectedTimeRange.key,
+      selectedTimeRange.createdAfter ?? '',
+      selectedTimeRange.createdBefore ?? '',
+      groupSortKey,
+      groupSearch
+    ],
+    queryFn: ({ pageParam }) =>
+      fetchGroups({
+        apiBaseUrl: observatoryUrl,
+        groupBy,
+        limit: groupPageSize,
+        offset: pageParam,
+        search: groupSearch,
+        sortKey: groupSortKey,
+        timeRange: selectedTimeRange
+      })
   })
-  const traceList = groupsQuery.data?.groups ?? []
+  const traceList = groupsQuery.data?.pages.flatMap(page => page.groups) ?? []
+  useEffect(() => {
+    const sentinel = groupLoadMoreRef.current
+    const root = groupListRef.current
+    if (!sentinel || !root || !groupsQuery.hasNextPage) return
+
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries.some(entry => entry.isIntersecting) && !groupsQuery.isFetchingNextPage) {
+          void groupsQuery.fetchNextPage()
+        }
+      },
+      {
+        root,
+        rootMargin: '320px 0px 320px 0px'
+      }
+    )
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [groupsQuery.dataUpdatedAt, groupsQuery.hasNextPage, groupsQuery.isFetchingNextPage, groupsQuery.fetchNextPage])
   const selectedGroupSummary =
     traceList.find(trace => trace.groupBy === groupBy && trace.value === selectedGroupValue) ?? null
   const needsLatest = Boolean(groupBy && selectedGroupValue && !selectedGroupSummary?.endedAt)
@@ -343,17 +480,15 @@ export function ObservatoryHome({
   })
   const latestCreatedAt = selectedGroupSummary?.endedAt || latestQuery.data?.lastCreatedAt
   const eventDataKey = [
-    selectedGroupKey,
-    eventFilterParams.text,
-    eventFilterParams.createdAfter ?? '',
-    eventFilterParams.createdBefore ?? ''
+    eventScopeKey,
+    serializeEventFilter(eventFilterParams)
   ].join('\u0000')
   const eventAnchorTimestamp =
     eventAnchorOverride?.key === eventDataKey
       ? eventAnchorOverride.timestamp
-      : eventFilterParams.createdBefore || latestCreatedAt || eventFilterParams.createdAfter || ''
+      : eventFilterParams.createdBefore || latestCreatedAt || eventFilterParams.createdAfter || selectedTimeRange.createdBefore || ''
   const summaryQuery = useQuery({
-    enabled: Boolean(groupBy && selectedGroupValue && hasEventQuery),
+    enabled: Boolean(viewingGroupedEvents && hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
     queryFn: () =>
       fetchSummary({ apiBaseUrl: observatoryUrl, eventFilter: eventFilterParams, groupBy, selectedGroupValue }),
@@ -362,7 +497,7 @@ export function ObservatoryHome({
   const flamegraphDisabledBySummary = Boolean(summaryQuery.data?.capped)
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
-    enabled: Boolean(groupBy && selectedGroupValue && hasEventQuery),
+    enabled: Boolean(hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, eventAnchorTimestamp],
     initialPageParam: { around: eventAnchorTimestamp } as EventPageParam,
     queryFn: ({ pageParam }) =>
@@ -380,14 +515,14 @@ export function ObservatoryHome({
     retry: false
   })
   const flamegraphQuery = useQuery({
-    enabled: Boolean(groupBy && selectedGroupValue && hasEventQuery && summaryQuery.data && graphModeBeforeFlamegraph === 'flamegraph'),
+    enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphModeBeforeFlamegraph === 'flamegraph'),
     queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams],
     queryFn: () =>
       fetchFlamegraph({
         apiBaseUrl: observatoryUrl,
         eventFilter: eventFilterParams,
         groupBy,
-        maxSpans: 200_000,
+        maxSpans: 20_000,
         selectedGroupValue
       }),
     retry: false
@@ -395,7 +530,7 @@ export function ObservatoryHome({
   const flamegraphDisabled = flamegraphDisabledBySummary || Boolean(flamegraphQuery.data?.capped)
   const graphMode = flamegraphDisabled ? 'histogram' : selectedGraphMode
   const densityQuery = useQuery({
-    enabled: Boolean(groupBy && selectedGroupValue && hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
+    enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
     queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams],
     queryFn: () =>
       fetchDensity({
@@ -412,7 +547,7 @@ export function ObservatoryHome({
     () => eventPages.flatMap(page => page.events),
     [eventPages]
   )
-  const traceDetail = eventPages[0]?.group
+  const traceDetail = viewingGroupedEvents && eventPages[0]?.group
     ? {
         fields: mergeLogFields(eventPages.flatMap(page => page.fields)),
         group: eventPages[0].group,
@@ -420,8 +555,17 @@ export function ObservatoryHome({
         relatedEvents: []
       }
     : null
+  const eventDetail =
+    eventPages.length > 0
+      ? {
+          fields: mergeLogFields(eventPages.flatMap(page => page.fields)),
+          group: eventPages[0]?.group ?? pageGroupSummary({ events: allEvents, groupBy: '', selectedGroupValue: 'events' }),
+          events: allEvents,
+          relatedEvents: []
+        }
+      : null
   const flamegraph = flamegraphQuery.data ?? emptyFlamegraph
-  const listError = errorMessage(groupOptionsQuery.error) || errorMessage(groupsQuery.error)
+  const listError = errorMessage(groupOptionsQuery.error) || errorMessage(groupsQuery.error) || facetMutationError
   const traceError =
     (!hasEventQuery && needsLatest ? errorMessage(latestQuery.error) : '') ||
     errorMessage(summaryQuery.error) ||
@@ -429,15 +573,15 @@ export function ObservatoryHome({
     (graphMode === 'histogram' ? errorMessage(densityQuery.error) : errorMessage(flamegraphQuery.error))
   const loadingList = groupOptionsQuery.isPending || (Boolean(groupBy) && groupsQuery.isPending)
   const emptyObservatory = !loadingList && !listError && groupOptions.length === 0
-  const emptyGroup = !loadingList && !listError && groupOptions.length > 0 && traceList.length === 0
+  const emptyGroup = !loadingList && !listError && Boolean(groupBy) && !groupSearch && groupOptions.length > 0 && traceList.length === 0
   const waitingForLatest = Boolean(needsLatest && latestQuery.isPending && !hasEventQuery)
-  const waitingForSummary = Boolean(selectedGroupValue && hasEventQuery && summaryQuery.isPending)
+  const waitingForSummary = Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.isPending)
   const loadingGraph =
     graphMode === 'histogram'
       ? densityQuery.isPending || densityQuery.isFetching
       : flamegraphQuery.isPending || flamegraphQuery.isFetching
-  const loadingDetail = Boolean(selectedGroupValue) && (waitingForLatest || waitingForSummary || loadingGraph)
-  const loadingTableDetail = Boolean(selectedGroupValue) && (eventsQuery.isPending || eventsQuery.isFetching)
+  const loadingDetail = viewingGroupedEvents && (waitingForLatest || waitingForSummary || loadingGraph)
+  const loadingTableDetail = hasEventQuery && (eventsQuery.isPending || eventsQuery.isFetching)
   const loadingAnchoredEvents = Boolean(
     eventAnchorOverride?.key === eventDataKey &&
     eventsQuery.isFetching &&
@@ -445,85 +589,139 @@ export function ObservatoryHome({
     !eventsQuery.isFetchingPreviousPage
   )
   const draftEventFilterParams = useMemo(
-    () => parseEventFilter({ referenceTimestamp: traceDetail?.group.startedAt ?? latestCreatedAt, value: eventFilterDraft }),
-    [eventFilterDraft, latestCreatedAt, traceDetail?.group.startedAt]
+    () =>
+      parseEventFilter({
+        facetPaths: activeFacetPaths,
+        referenceTimestamp: eventDetail?.group.startedAt ?? latestCreatedAt,
+        value: eventFilterDraft
+      }),
+    [activeFacetPaths, eventDetail?.group.startedAt, eventFilterDraft, latestCreatedAt]
   )
   const eventFilterDirty =
-    draftEventFilterParams.text !== eventFilterParams.text ||
+    eventFilterInputText(draftEventFilterParams) !== eventFilterInputText(eventFilterParams) ||
     draftEventFilterParams.createdAfter !== eventFilterParams.createdAfter ||
     draftEventFilterParams.createdBefore !== eventFilterParams.createdBefore
   const hasEventFilter =
     eventFilterParams.text !== '' ||
     Boolean(eventFilterParams.createdAfter) ||
     Boolean(eventFilterParams.createdBefore) ||
+    Boolean(eventFilterParams.facets?.length) ||
     eventFilterDraft !== ''
-
   function setFilterSearch(value: string) {
     void navigate({
       search: (current: ObservatorySearch) => ({
         ...current,
-        filter: value
+        filter: value || undefined
       })
     } as never)
   }
 
+  function commitEventFilter(nextFilter: ParsedEventFilter, { syncUrl = true }: { syncUrl?: boolean } = {}) {
+    const nextFilterText = eventFilterInputText(nextFilter)
+    setEventFilterGroupKey(eventScopeKey)
+    setEventFilterDraft(nextFilterText)
+    setEventFilterParams(nextFilter)
+    if (syncUrl) {
+      setFilterSearch(nextFilterText)
+    }
+  }
+
+  function filterWithTimeRange(filter: ParsedEventFilter, range: ResolvedTimeRange): ParsedEventFilter {
+    const nextFilter: ParsedEventFilter = {
+      ...(filter.facets?.length ? { facets: filter.facets } : {}),
+      text: filter.text
+    }
+    if (range.createdAfter) nextFilter.createdAfter = range.createdAfter
+    if (range.createdBefore) nextFilter.createdBefore = range.createdBefore
+    return nextFilter
+  }
+
+  function syncTimeRangeControlsFromFilter(filter: ParsedEventFilter) {
+    if (!filter.createdAfter && !filter.createdBefore) {
+      return
+    }
+
+    if (filter.createdAfter) {
+      setCustomRangeStart(formatDateTimeLocalInput(new Date(filter.createdAfter)))
+    }
+    if (filter.createdBefore) {
+      setCustomRangeEnd(formatDateTimeLocalInput(new Date(filter.createdBefore)))
+    }
+    setTimeRangeKey('custom')
+  }
+
+  function applyRangeFilter(range: ResolvedTimeRange, { syncUrl = true }: { syncUrl?: boolean } = {}) {
+    filterTouchedRef.current = true
+    commitEventFilter(filterWithTimeRange(eventFilterParams, range), { syncUrl })
+  }
+
+  function selectTimeRange(key: TimeRangeKey) {
+    setTimeRangeKey(key)
+    applyRangeFilter(resolveTimeRange({ customEnd: customRangeEnd, customStart: customRangeStart, key }), {
+      syncUrl: key === 'custom'
+    })
+  }
+
+  function setCustomStartRange(value: string) {
+    setCustomRangeStart(value)
+    setTimeRangeKey('custom')
+    applyRangeFilter(resolveTimeRange({ customEnd: customRangeEnd, customStart: value, key: 'custom' }))
+  }
+
+  function setCustomEndRange(value: string) {
+    setCustomRangeEnd(value)
+    setTimeRangeKey('custom')
+    applyRangeFilter(resolveTimeRange({ customEnd: value, customStart: customRangeStart, key: 'custom' }))
+  }
+
   function applyEventFilter() {
     filterTouchedRef.current = true
-    const appliedFilter = eventFilterText(draftEventFilterParams)
-    setEventFilterGroupKey(selectedGroupKey)
-    setEventFilterDraft(appliedFilter)
-    setEventFilterParams(draftEventFilterParams)
-    setFilterSearch(appliedFilter)
+    syncTimeRangeControlsFromFilter(draftEventFilterParams)
+    commitEventFilter(draftEventFilterParams)
   }
 
   function clearEventFilter() {
     filterTouchedRef.current = true
-    setEventFilterGroupKey(selectedGroupKey)
-    setEventFilterDraft('')
-    setEventFilterParams({ text: '' })
-    setFilterSearch('')
+    commitEventFilter(filterWithTimeRange({ text: '' }, selectedTimeRange))
   }
 
   function applyTimeRange({ createdAfter, createdBefore }: { createdAfter: string; createdBefore: string }) {
     filterTouchedRef.current = true
-    const nextFilter = {
-      ...eventFilterParams,
-      createdAfter,
-      createdBefore
-    }
-    setEventFilterGroupKey(selectedGroupKey)
-    setEventFilterDraft(eventFilterText(nextFilter))
-    setEventFilterParams(nextFilter)
-    setFilterSearch(eventFilterText(nextFilter))
+    const nextFilter = filterWithTimeRange(eventFilterParams, { createdAfter, createdBefore, key: `custom:${createdAfter}:${createdBefore}` })
+    syncTimeRangeControlsFromFilter(nextFilter)
+    commitEventFilter(nextFilter)
   }
 
   useEffect(() => {
-    if (previousGroupKeyRef.current === selectedGroupKey) {
+    if (previousGroupKeyRef.current === eventScopeKey) {
       return
     }
 
-    previousGroupKeyRef.current = selectedGroupKey
+    previousGroupKeyRef.current = eventScopeKey
     seededLatestGroupKeyRef.current = ''
     filterTouchedRef.current = false
     setEventFilterGroupKey('')
     setEventFilterDraft('')
     setEventFilterParams({ text: '' })
-  }, [selectedGroupKey])
+  }, [eventScopeKey])
 
   useEffect(() => {
-    if (!selectedGroupKey || eventFilterSearchText === undefined) {
+    if (eventFilterSearchText === undefined) {
       return
     }
 
     filterTouchedRef.current = true
-    seededLatestGroupKeyRef.current = selectedGroupKey
-    setEventFilterGroupKey(selectedGroupKey)
-    setEventFilterDraft(eventFilterSearchText)
-    setEventFilterParams(parseEventFilter({
-      referenceTimestamp: traceDetail?.group.startedAt ?? latestCreatedAt,
+    seededLatestGroupKeyRef.current = eventScopeKey
+    setEventFilterGroupKey(eventScopeKey)
+    const parsedFilter = parseEventFilter({
+      facetPaths: activeFacetPaths,
+      referenceTimestamp: eventDetail?.group.startedAt ?? latestCreatedAt,
       value: eventFilterSearchText
-    }))
-  }, [eventFilterSearchText, latestCreatedAt, selectedGroupKey, traceDetail?.group.startedAt])
+    })
+    setEventFilterDraft(eventFilterInputText(parsedFilter))
+    setEventFilterParams(parsedFilter)
+    syncTimeRangeControlsFromFilter(parsedFilter)
+  }, [activeFacetPaths, eventDetail?.group.startedAt, eventFilterSearchText, eventScopeKey, latestCreatedAt])
 
   useEffect(() => {
     if (flamegraphDisabled && selectedGraphMode !== 'histogram') {
@@ -538,53 +736,60 @@ export function ObservatoryHome({
     })
     if (
       eventFilterSearchText !== undefined ||
-      !selectedGroupKey ||
       !defaultFilter ||
       filterTouchedRef.current ||
-      seededLatestGroupKeyRef.current === selectedGroupKey
+      seededLatestGroupKeyRef.current === eventScopeKey
     ) {
       return
     }
 
-    seededLatestGroupKeyRef.current = selectedGroupKey
-    const defaultFilterText = eventFilterText(defaultFilter)
-    setEventFilterGroupKey(selectedGroupKey)
+    seededLatestGroupKeyRef.current = eventScopeKey
+    const defaultFilterText = eventFilterInputText(defaultFilter)
+    setEventFilterGroupKey(eventScopeKey)
     setEventFilterDraft(defaultFilterText)
     setEventFilterParams(defaultFilter)
-    setFilterSearch(defaultFilterText)
-  }, [eventFilterSearchText, latestCreatedAt, selectedGroupKey, selectedTimeRange])
+    setFilterSearch('')
+  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, selectedTimeRange])
 
-  const filteredTraces = useMemo(() => {
-    const query = filter.trim().toLowerCase()
-    if (!query) {
-      return traceList
+  useEffect(() => {
+    if (viewingGroupedEvents || timeRangeKey === 'custom' || !hasEventQuery) {
+      return
     }
 
-    return traceList.filter(trace =>
-      [trace.value, trace.groupBy, ...Object.values(trace.fields ?? {}).map(String)]
-        .filter((value): value is string => Boolean(value))
-        .some(value => value.toLowerCase().includes(query))
-      )
-  }, [filter, traceList])
-  const emptyFilter = !loadingList && !listError && traceList.length > 0 && filteredTraces.length === 0
+    const interval = window.setInterval(() => {
+      const range = resolveTimeRange({
+        customEnd: customRangeEnd,
+        customStart: customRangeStart,
+        key: timeRangeKey
+      })
+      commitEventFilter(filterWithTimeRange(eventFilterParams, range), { syncUrl: false })
+    }, 5000)
+
+    return () => window.clearInterval(interval)
+  }, [customRangeEnd, customRangeStart, eventFilterParams, hasEventQuery, timeRangeKey, viewingGroupedEvents])
+
+  const filteredTraces = traceList
+  const emptyFilter = !loadingList && !listError && Boolean(groupSearch) && traceList.length === 0
 
   const eventTableScrollKey = useMemo(
     () =>
       [
         'observatory-ui-events-scroll',
-        `/${encodeURIComponent(groupBy)}/${encodeURIComponent(selectedGroupValue)}`,
+        viewingGroupedEvents
+          ? `/${encodeURIComponent(groupBy)}/${encodeURIComponent(selectedGroupValue)}`
+          : '/events',
         eventFilterParams.text,
         eventFilterParams.createdAfter ?? '',
         eventFilterParams.createdBefore ?? ''
       ].join('\u0000'),
-    [eventFilterParams.createdAfter, eventFilterParams.createdBefore, eventFilterParams.text, groupBy, selectedGroupValue]
+    [eventFilterParams.createdAfter, eventFilterParams.createdBefore, eventFilterParams.text, groupBy, selectedGroupValue, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
-    if (!traceDetail) return selectedEventColumns
-    const available = new Set(['timestamp', 'data', ...traceDetail.fields.map(field => field.path)])
+    if (!eventDetail) return selectedEventColumns
+    const available = new Set(['timestamp', 'data', ...eventDetail.fields.map(field => field.path)])
     const kept = selectedEventColumns.filter(path => available.has(path))
     return kept.length > 0 ? kept : [...defaultEventColumns].filter(path => available.has(path))
-  }, [selectedEventColumns, traceDetail])
+  }, [eventDetail, selectedEventColumns])
   const selectedEvent = allEvents.find(event => event.id === selectedEventId) ?? null
   const pendingAnchoredEvent = Boolean(
     selectedEventId &&
@@ -636,7 +841,7 @@ export function ObservatoryHome({
   }
 
   function inspectSpan(span: FlameSpan) {
-    const nextHighlightedEventIds = span.kind === 'event' ? [span.id] : span.eventIds
+    const nextHighlightedEventIds = span.eventIds.length > 0 ? span.eventIds : [span.id]
     const nextEventId = nextHighlightedEventIds[0] ?? ''
     setEventSearch(nextEventId)
     setHighlightedEventIds(nextHighlightedEventIds)
@@ -774,32 +979,97 @@ export function ObservatoryHome({
   }, [dragging, flamegraphHeight, inspectorWidth, runsOpen, runsWidth, setFlamegraphHeight, setInspectorWidth, setRunsWidth])
 
   return (
-    <main className="flex h-screen flex-col overflow-hidden bg-black text-[13px] text-neutral-100">
-      <header className="flex h-10 shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-950 px-3">
-        <div className="min-w-0 truncate text-[13px] text-white">Nanotrace Observatory</div>
-        <div className="flex shrink-0 items-center gap-2">
-          <span className="text-[11px] uppercase tracking-[0.08em] text-neutral-500">Range</span>
+    <main className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-black text-[13px] text-neutral-100">
+      <header className="relative z-40 flex h-10 shrink-0 items-center gap-2 overflow-visible border-b border-neutral-800 bg-neutral-950 px-2">
+        {!sidebarOpen ? (
+          <div className="flex shrink-0 items-center gap-2 pr-2">
+            <button
+              aria-label="Expand navigation"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
+              title="Expand navigation"
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+            >
+              <PanelLeftOpen size={15} strokeWidth={1.8} />
+            </button>
+          </div>
+        ) : null}
+        <form
+          className="flex min-w-0 flex-1 items-center gap-1.5"
+          onSubmit={event => {
+            event.preventDefault()
+            applyEventFilter()
+          }}
+        >
+          <input
+            className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+            value={eventFilterDraft}
+            onChange={event => setEventFilterDraft(event.target.value)}
+            placeholder="filter events, e.g. name=llm service=api"
+          />
+          <button
+            aria-label="Apply filter"
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white disabled:text-neutral-700"
+            disabled={!eventFilterDirty}
+            title="Apply filter"
+            type="submit"
+          >
+            <Check size={13} strokeWidth={1.8} />
+          </button>
+          {hasEventFilter ? (
+            <button
+              aria-label="Clear event filter"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
+              title="Clear filter"
+              type="button"
+              onClick={clearEventFilter}
+            >
+              <X size={13} strokeWidth={1.8} />
+            </button>
+          ) : null}
+        </form>
+        <label className="flex shrink-0 items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Group</span>
+          <select
+            aria-label="Group by"
+            className="h-7 w-[132px] min-w-0 border border-neutral-800 bg-black px-1.5 text-[11px] text-white outline-none focus:border-neutral-600"
+            value={groupBy || noGroupValue}
+            onChange={event => {
+              setManualGroupBy(event.target.value)
+              setFilter('')
+              void navigate({ search: {}, to: '/' })
+            }}
+          >
+            <option value={noGroupValue}>No grouping</option>
+            {displayedGroupOptions.map(option => (
+              <option key={option.path} value={option.path}>
+                {groupOptionLabel(option)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="ml-auto flex shrink-0 items-center justify-end gap-1.5">
           <div className="flex overflow-hidden border border-neutral-800 bg-black">
             {timeRangeOptions.map(option => (
               <button
                 key={option.key}
                 className={cn(
-                  'h-7 border-l border-neutral-800 px-2 text-[11px] text-neutral-400 first:border-l-0 hover:bg-white/[0.04] hover:text-white',
+                  'h-7 border-l border-neutral-800 px-1.5 text-[10px] text-neutral-400 first:border-l-0 hover:bg-white/[0.04] hover:text-white',
                   timeRangeKey === option.key && 'bg-neutral-800 text-white'
                 )}
                 type="button"
-                onClick={() => setTimeRangeKey(option.key)}
+                onClick={() => selectTimeRange(option.key)}
               >
                 {option.label}
               </button>
             ))}
             <button
               className={cn(
-                'h-7 border-l border-neutral-800 px-2 text-[11px] text-neutral-400 hover:bg-white/[0.04] hover:text-white',
+                'h-7 border-l border-neutral-800 px-1.5 text-[10px] text-neutral-400 hover:bg-white/[0.04] hover:text-white',
                 timeRangeKey === 'custom' && 'bg-neutral-800 text-white'
               )}
               type="button"
-              onClick={() => setTimeRangeKey('custom')}
+              onClick={() => selectTimeRange('custom')}
             >
               Custom
             </button>
@@ -808,23 +1078,21 @@ export function ObservatoryHome({
             <div className="flex items-center gap-1">
               <input
                 aria-label="Custom range start"
-                className="h-7 w-[170px] border border-neutral-800 bg-black px-2 text-[11px] text-white outline-none"
+                className="h-7 w-[140px] border border-neutral-800 bg-black px-1.5 text-[10px] text-white outline-none"
                 type="datetime-local"
                 value={customRangeStart}
                 onChange={event => {
-                  setCustomRangeStart(event.target.value)
-                  setTimeRangeKey('custom')
+                  setCustomStartRange(event.target.value)
                 }}
               />
               <span className="text-[11px] text-neutral-600">to</span>
               <input
                 aria-label="Custom range end"
-                className="h-7 w-[170px] border border-neutral-800 bg-black px-2 text-[11px] text-white outline-none"
+                className="h-7 w-[140px] border border-neutral-800 bg-black px-1.5 text-[10px] text-white outline-none"
                 type="datetime-local"
                 value={customRangeEnd}
                 onChange={event => {
-                  setCustomRangeEnd(event.target.value)
-                  setTimeRangeKey('custom')
+                  setCustomEndRange(event.target.value)
                 }}
               />
             </div>
@@ -841,59 +1109,27 @@ export function ObservatoryHome({
           Trace detail failed: {traceError}
         </div>
       ) : null}
-
-      <section ref={workspaceRef} className="flex min-h-0 flex-1 overflow-hidden">
-        {runsOpen ? (
+      <section ref={workspaceRef} className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        {runsOpen && groupBy ? (
           <aside className={cn(panelClass, 'border-r border-neutral-800')} style={{ width: runsWidth, minWidth: runsWidth, maxWidth: runsWidth }}>
-          <div className="flex items-center justify-between gap-2 border-b border-neutral-800 px-3 py-3">
-            <div className="min-w-0">
-              <h2 className="text-[15px]">Observatory</h2>
-            </div>
-            <button
-              aria-label="Close observatory sidebar"
-              className="inline-flex h-7 w-7 items-center justify-center bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white"
-              title="Close observatory sidebar"
-              type="button"
-              onClick={() => setRunsOpen(false)}
-            >
-              <PanelLeftClose size={16} strokeWidth={1.8} />
-            </button>
-          </div>
-
-          <div className="grid gap-1.5 border-b border-neutral-800 px-2 py-1.5">
-            <div className="flex items-center gap-2">
-              <span className="w-12 shrink-0 text-[11px] uppercase tracking-[0.08em] text-neutral-500">Group</span>
-              <select
-                className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none disabled:text-neutral-700"
-                disabled={displayedGroupOptions.length === 0}
-                value={groupBy}
-                onChange={event => {
-                  setManualGroupBy(event.target.value)
-                  void navigate({ search: {}, to: '/' })
-                }}
-              >
-                {displayedGroupOptions.map(option => (
-                  <option key={option.path} value={option.path}>
-                    {option.path}
-                  </option>
-                ))}
-                {displayedGroupOptions.length === 0 ? <option value="">No groups</option> : null}
-              </select>
+          <div className="grid gap-2 border-b border-neutral-800 bg-black/30 px-2 py-2">
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="truncate text-[12px] font-medium text-white">{groupByLabel || 'Groups'}</div>
+              </div>
             </div>
             {traceList.length > 0 || filter ? (
-              <div className="flex items-center gap-2">
-                <span className="w-12 shrink-0 text-[11px] uppercase tracking-[0.08em] text-neutral-500">Search</span>
-                <input
-                  className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600"
-                  value={filter}
-                  onChange={event => setFilter(event.target.value)}
-                  placeholder="search groups..."
-                />
-              </div>
+              <input
+                aria-label="Search groups"
+                className="h-7 w-full min-w-0 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+                value={filter}
+                onChange={event => setFilter(event.target.value)}
+                placeholder="exact group value..."
+              />
             ) : null}
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 py-1.5">
+	          <div ref={groupListRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 py-1.5">
             <div className="grid content-start gap-px">
               {filteredTraces.map(trace => (
                 <button
@@ -927,11 +1163,7 @@ export function ObservatoryHome({
                       {trace.value}
                     </span>
                   </div>
-                  <div className="mt-0.5 flex items-center gap-1.5 pl-1.5 text-[11px] text-neutral-500">
-                    <span className="truncate">{formatDateTimeUs(trace.startedAt)}</span>
-                    <span className="text-neutral-700">&middot;</span>
-                    <span className="shrink-0">{formatDurationMs(trace.durationMs)}</span>
-                  </div>
+                  <GroupRowMeta groupBy={groupBy} trace={trace} />
                   {trace.fields ? (
                     <div className="mt-0.5 truncate pl-1.5 text-[11px] text-neutral-600">
                       {previewGroupFields(trace.fields)}
@@ -940,19 +1172,24 @@ export function ObservatoryHome({
                 </button>
               ))}
               {loadingList ? (
-                <div className="px-3 py-6 text-center text-[12px] text-neutral-600">
-                  Loading groups...
+                <div className="px-3 py-5 text-center text-[12px] text-neutral-600">
+                  Loading dimensions...
                 </div>
               ) : null}
               {emptyObservatory ? <EmptyState label="No observations yet." /> : null}
               {emptyGroup ? <EmptyState label="No groups found." /> : null}
-              {emptyFilter ? <EmptyState label="No groups matched filter." /> : null}
+              {emptyFilter ? <EmptyState label="No exact group match." /> : null}
+              {groupsQuery.hasNextPage || groupsQuery.isFetchingNextPage ? (
+                <div ref={groupLoadMoreRef} className="px-3 py-3 text-center text-[11px] text-neutral-600">
+                  {groupsQuery.isFetchingNextPage ? 'Loading more...' : 'Scroll for more'}
+                </div>
+              ) : null}
             </div>
           </div>
           </aside>
         ) : null}
 
-        {runsOpen ? <ResizeHandle onPointerDown={() => setDragging('runs')} /> : null}
+        {runsOpen && groupBy ? <ResizeHandle onPointerDown={() => setDragging('runs')} /> : null}
 
         <section
           ref={centerRef}
@@ -966,59 +1203,14 @@ export function ObservatoryHome({
         >
           <div className="flex items-center justify-between gap-2 border-b border-neutral-800 px-2 py-2">
             <div className="flex min-w-0 items-center gap-2">
-              {!runsOpen && (
-                <button
-                  aria-label="Open traces sidebar"
-                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white"
-                  title="Open traces sidebar"
-                  type="button"
-                  onClick={() => setRunsOpen(true)}
-                >
-                  <PanelLeftOpen size={16} strokeWidth={1.8} />
-                </button>
-              )}
-              <h2 className="truncate">{selectedGroupValue ? `${groupBy}=${selectedGroupValue}` : 'Select group'}</h2>
+              <h2 className="truncate">{selectedGroupValue ? `${groupByLabel}=${selectedGroupValue}` : 'Events'}</h2>
             </div>
           </div>
 
-          {selectedGroupValue ? (
-            <form
-              className="flex min-w-0 items-center gap-2 overflow-hidden border-b border-neutral-800 px-2 py-1.5"
-              onSubmit={event => {
-                event.preventDefault()
-                applyEventFilter()
-              }}
-            >
-              <span className="shrink-0 text-[11px] uppercase tracking-[0.08em] text-neutral-500">Filter</span>
-              <input
-                className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600"
-                value={eventFilterDraft}
-                onChange={event => setEventFilterDraft(event.target.value)}
-                placeholder="name=llm timestamp>=16:33:00 timestamp<16:34:00"
-              />
-              <button
-                className="h-7 shrink-0 border border-neutral-700 px-2 text-[11px] text-neutral-200 hover:bg-white/[0.04] disabled:border-neutral-900 disabled:text-neutral-700"
-                disabled={!eventFilterDirty}
-                type="submit"
-              >
-                Apply
-              </button>
-              {hasEventFilter ? (
-                <button
-                  aria-label="Clear event filter"
-                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-neutral-400 hover:bg-white/[0.04] hover:text-white"
-                  type="button"
-                  onClick={clearEventFilter}
-                >
-                  <X size={13} strokeWidth={1.8} />
-                </button>
-              ) : null}
-            </form>
-          ) : null}
-
+          {viewingGroupedEvents ? (
+          <>
           <div className="overflow-hidden border-b border-neutral-800 bg-black" style={{ height: flamegraphHeight, minHeight: flamegraphHeight }}>
             {loadingDetail ? <EmptyState label="Loading trace detail." /> : null}
-            {!loadingDetail && !selectedGroupValue ? <EmptyState label="Pick trace from left rail." /> : null}
             {!loadingDetail && selectedGroupValue && graphMode === 'histogram' && densityQuery.data ? (
               <DensityHistogramCanvas
                 density={densityQuery.data}
@@ -1054,8 +1246,10 @@ export function ObservatoryHome({
           >
             <div className="absolute inset-x-0 -top-[3px] h-[6px] group-hover:bg-white" />
           </div>
+          </>
+          ) : null}
 
-          {selectedGroupValue ? (
+          {viewingGroupedEvents ? (
             <div className="flex items-center gap-2 border-b border-neutral-800 bg-neutral-950 px-2 py-1.5">
               <div className="inline-flex border border-neutral-800 bg-black">
                 <button
@@ -1081,17 +1275,17 @@ export function ObservatoryHome({
                 </button>
               </div>
               {flamegraphDisabled ? (
-                <span className="truncate text-[11px] text-neutral-600">Flamegraph disabled above 200k events.</span>
+                <span className="truncate text-[11px] text-neutral-600">Flamegraph preview capped at 20k events.</span>
               ) : null}
             </div>
           ) : null}
 
-          {traceDetail ? (
+          {eventDetail ? (
             <EventPanel
               anchorIndex={eventPages[0]?.anchorIndex ?? 0}
               events={allEvents}
               emptyLabel={hasAppliedEventFilter(eventFilterParams) ? 'No events matched filter.' : 'No events.'}
-              fields={traceDetail.fields}
+              fields={eventDetail.fields}
               hasMore={eventsQuery.hasNextPage}
               hasPrevious={eventsQuery.hasPreviousPage}
               highlightedEventIds={highlightedEventIds}
@@ -1365,6 +1559,258 @@ function previewGroupFields(fields: JsonObject | undefined) {
       .slice(0, 2)
       .map(([key, value]) => `${key}=${String(value)}`)
       .join('  ') || 'no scalar fields'
+  )
+}
+
+function groupOptionLabel(option: GroupOption) {
+  return option.displayName || displayFacetPath(option.path)
+}
+
+function isTraceLikeGroup(groupBy: string) {
+  return ['trace_id', 'span_id', 'parent_span_id'].includes(facetKey(groupBy))
+}
+
+function formatCount(value: number, singular: string, plural = `${singular}s`) {
+  const rounded = Math.max(0, Math.floor(value))
+  return `${rounded.toLocaleString()} ${rounded === 1 ? singular : plural}`
+}
+
+function GroupRowMeta({ groupBy, trace }: { groupBy: string; trace: LogGroupSummary }) {
+  const errorCount = trace.errorCount ?? 0
+  if (isTraceLikeGroup(groupBy)) {
+    return (
+      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 pl-1.5 text-[11px] text-neutral-500">
+        <span className="shrink-0">{formatCount(trace.count, 'event')}</span>
+        {errorCount > 0 ? (
+          <>
+            <span className="text-neutral-700">&middot;</span>
+            <span className="shrink-0 text-red-300">{formatCount(errorCount, 'error')}</span>
+          </>
+        ) : null}
+        <span className="text-neutral-700">&middot;</span>
+        <span className="min-w-0 truncate">{formatDurationMs(trace.durationMs)}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-0.5 flex min-w-0 items-center gap-1.5 pl-1.5 text-[11px] text-neutral-500">
+      <span className="shrink-0">{formatCount(trace.count, 'event')}</span>
+      <span className="text-neutral-700">&middot;</span>
+      <span className={cn('shrink-0', errorCount > 0 ? 'text-red-300' : 'text-neutral-500')}>
+        {formatCount(errorCount, 'error')}
+      </span>
+      <span className="text-neutral-700">&middot;</span>
+      <span className="min-w-0 truncate">{formatDurationMs(trace.durationMs)} active</span>
+    </div>
+  )
+}
+
+function identityInitial(label: string) {
+  const trimmed = label.trim()
+  return (trimmed[0] || '?').toUpperCase()
+}
+
+function FacetMenu({
+  customGroupOptions,
+  facetDraft,
+  facetValueType,
+  mutating,
+  onAdd,
+  onFacetDraft,
+  onFacetValueType,
+  onRemove
+}: {
+  customGroupOptions: GroupOption[]
+  facetDraft: string
+  facetValueType: string
+  mutating: boolean
+  onAdd: () => void
+  onFacetDraft: (value: string) => void
+  onFacetValueType: (value: string) => void
+  onRemove: (path: string) => void
+}) {
+  return (
+    <div className="grid gap-2 border-b border-neutral-800 pb-2">
+      <div className="flex items-center justify-between gap-2 px-2">
+        <div className="inline-flex items-center gap-1.5 text-[12px] text-white">
+          <Columns3 size={13} strokeWidth={1.8} />
+          Facets
+        </div>
+        <span className="text-[11px] text-neutral-600">{customGroupOptions.length} custom</span>
+      </div>
+      <div className="grid grid-cols-[1fr_76px_auto] gap-1.5">
+        <input
+          className="h-8 min-w-0 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+          value={facetDraft}
+          onChange={event => onFacetDraft(event.target.value)}
+          placeholder="path.to.field"
+        />
+        <select
+          aria-label="Facet type"
+          className="h-8 border border-neutral-800 bg-black px-1.5 text-[12px] text-white outline-none focus:border-neutral-600"
+          value={facetValueType}
+          onChange={event => onFacetValueType(event.target.value)}
+        >
+          <option value="string">string</option>
+          <option value="low_cardinality_string">low card</option>
+          <option value="integer">int</option>
+          <option value="unsigned">uint</option>
+          <option value="float">float</option>
+          <option value="bool">bool</option>
+          <option value="datetime">date</option>
+        </select>
+        <button
+          aria-label="Add facet"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white disabled:text-neutral-700"
+          disabled={!facetDraft.trim() || mutating}
+          title="Add facet"
+          type="button"
+          onClick={onAdd}
+        >
+          <Plus size={14} strokeWidth={1.8} />
+        </button>
+      </div>
+      {customGroupOptions.length > 0 ? (
+        <div className="max-h-32 overflow-y-auto border border-neutral-900 bg-black/40">
+          {customGroupOptions.map(option => (
+            <div
+              key={option.path}
+              className="flex h-8 items-center gap-2 border-b border-neutral-900 px-2 text-[11px] text-neutral-300 last:border-b-0"
+            >
+              <span className="min-w-0 flex-1 truncate">{groupOptionLabel(option)}</span>
+              <button
+                aria-label={`Remove ${groupOptionLabel(option)}`}
+                className="inline-flex h-5 w-5 shrink-0 items-center justify-center text-neutral-500 hover:text-white disabled:text-neutral-700"
+                disabled={mutating}
+                title={`Remove ${groupOptionLabel(option)}`}
+                type="button"
+                onClick={() => onRemove(facetKey(option.path))}
+              >
+                <Trash2 size={12} strokeWidth={1.8} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function ApiKeyMenu({
+  activeApiKeyCount,
+  apiKeyName,
+  apiKeyRole,
+  apiKeys,
+  createdApiKey,
+  creating,
+  error,
+  loading,
+  revoking,
+  onApiKeyName,
+  onApiKeyRole,
+  onClearCreated,
+  onCreate,
+  onRevoke
+}: {
+  activeApiKeyCount: number
+  apiKeyName: string
+  apiKeyRole: 'admin' | 'service' | 'viewer'
+  apiKeys: ApiKeyRecord[]
+  createdApiKey: string
+  creating: boolean
+  error: unknown
+  loading: boolean
+  revoking: boolean
+  onApiKeyName: (value: string) => void
+  onApiKeyRole: (value: 'admin' | 'service' | 'viewer') => void
+  onClearCreated: () => void
+  onCreate: () => void
+  onRevoke: (id: number) => void
+}) {
+  return (
+    <div className="grid gap-2 border-b border-neutral-800 pb-2">
+      <div className="flex items-center justify-between gap-2 px-2">
+        <div className="inline-flex items-center gap-1.5 text-[12px] text-white">
+          <KeyRound size={13} strokeWidth={1.8} />
+          API keys
+        </div>
+        <span className="text-[11px] text-neutral-600">{loading ? 'loading' : `${activeApiKeyCount} active`}</span>
+      </div>
+      <div className="grid grid-cols-[1fr_90px_auto] gap-1.5">
+        <input
+          className="h-8 min-w-0 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+          value={apiKeyName}
+          onChange={event => onApiKeyName(event.target.value)}
+          placeholder="key name"
+        />
+        <select
+          className="h-8 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none focus:border-neutral-600"
+          value={apiKeyRole}
+          onChange={event => onApiKeyRole(event.target.value as 'admin' | 'service' | 'viewer')}
+        >
+          <option value="service">service</option>
+          <option value="viewer">viewer</option>
+          <option value="admin">admin</option>
+        </select>
+        <button
+          className="h-8 border border-neutral-700 bg-black px-2 text-[12px] text-neutral-200 hover:bg-white/[0.04] disabled:border-neutral-900 disabled:text-neutral-700"
+          disabled={!apiKeyName.trim() || creating}
+          type="button"
+          onClick={onCreate}
+        >
+          Create
+        </button>
+      </div>
+      {createdApiKey ? (
+        <div className="flex items-center gap-1.5">
+          <input
+            readOnly
+            className="h-8 min-w-0 flex-1 border border-neutral-800 bg-black px-2 font-mono text-[11px] text-white outline-none"
+            value={createdApiKey}
+            onFocus={event => event.currentTarget.select()}
+          />
+          <button
+            aria-label="Clear created key"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-500 hover:bg-white/[0.04] hover:text-white"
+            type="button"
+            onClick={onClearCreated}
+          >
+            <X size={13} strokeWidth={1.8} />
+          </button>
+        </div>
+      ) : null}
+      {error ? <div className="px-2 text-[11px] text-red-300">{errorMessage(error)}</div> : null}
+      {apiKeys.length > 0 ? (
+        <div className="max-h-40 overflow-y-auto border border-neutral-900 bg-black/40">
+          {apiKeys.slice(0, 12).map(apiKey => (
+            <div
+              key={apiKey.id}
+              className={cn(
+                'flex h-8 items-center gap-2 border-b border-neutral-900 px-2 text-[11px] last:border-b-0',
+                apiKey.revoked_at ? 'text-neutral-600' : 'text-neutral-300'
+              )}
+            >
+              <span className="min-w-0 flex-1 truncate">{apiKey.name}</span>
+              <span className="text-neutral-600">{apiKey.role}</span>
+              <span className="font-mono text-neutral-500">{apiKey.prefix}</span>
+              {!apiKey.revoked_at ? (
+                <button
+                  aria-label={`Revoke ${apiKey.name}`}
+                  className="inline-flex h-5 w-5 shrink-0 items-center justify-center text-neutral-500 hover:text-white disabled:text-neutral-700"
+                  disabled={revoking}
+                  title={`Revoke ${apiKey.name}`}
+                  type="button"
+                  onClick={() => onRevoke(apiKey.id)}
+                >
+                  <X size={12} strokeWidth={1.8} />
+                </button>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -2858,8 +3304,23 @@ type EventRow = {
   trace_id?: string
 }
 
+type FlamegraphEventRow = {
+  duration_ms?: number
+  end_time?: string
+  event_id: string
+  event_type?: string
+  name?: string
+  parent_span_id?: string
+  signal?: string
+  span_id?: string
+  start_time?: string
+  timestamp: string
+  trace_id?: string
+}
+
 const defaultTableName = 'observatory.events'
 const defaultFacetsTableName = 'observatory.event_facets'
+const defaultEventIndexTableName = 'observatory.event_facet_index'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -2883,6 +3344,70 @@ const groupableFields = [
 ]
 
 async function fetchGroupOptions({
+  apiBaseUrl,
+  limit
+}: {
+  apiBaseUrl: string
+  limit: number
+}): Promise<{ fields: GroupOption[] }> {
+  let facetsResponse: FacetListResponse
+  try {
+    facetsResponse = await fetchFacets({ apiBaseUrl })
+  } catch (error) {
+    if (error instanceof HTTPError && error.status === 404) {
+      return fetchLegacyGroupOptions({ apiBaseUrl, limit })
+    }
+    throw error
+  }
+  const facets = facetsResponse.facets.filter(facet => facet.status === 'active').slice(0, limit)
+  const keys = facets.map(facet => facet.path)
+  const keyList = keys.map(key => `'${sqlString(key)}'`).join(', ')
+  const countResponse = keys.length
+    ? await postQuery<{
+        capped: boolean
+        cardinality: number
+        path: string
+      }>({
+        apiBaseUrl,
+        parameters: { limit },
+        query: [
+          'SELECT key AS path',
+          ', uniqCombined64(value) AS cardinality',
+          ', toBool(0) AS capped',
+          `FROM ${facetsTable()}`,
+          `WHERE key IN (${keyList}) AND value != ''`,
+          'GROUP BY path',
+          'ORDER BY sum(count) DESC, path ASC',
+          'LIMIT {limit:UInt64}'
+        ].join(' ')
+      })
+    : { data: [] }
+  const counts = new Map((countResponse.data ?? []).map(field => [field.path, field]))
+  const fields = facets.map(facet => {
+    const count = counts.get(facet.path)
+    return {
+      cardinality: Number(count?.cardinality) || 0,
+      capped: Boolean(count?.capped),
+      displayName: facet.display_name || displayFacetPath(facet.path),
+      path: facet.display_name || displayFacetPath(facet.path),
+      removable: Boolean(facet.removable),
+      source: facet.source,
+      valueType: facet.value_type
+    }
+  })
+  if (fields.length > 0) {
+    return { fields }
+  }
+  return {
+    fields: groupableFields.slice(0, limit).map(path => ({
+      cardinality: 0,
+      capped: false,
+      path
+    }))
+  }
+}
+
+async function fetchLegacyGroupOptions({
   apiBaseUrl,
   limit
 }: {
@@ -2928,14 +3453,98 @@ async function fetchGroups({
   apiBaseUrl,
   groupBy,
   limit,
+  offset,
+  search,
+  sortKey,
   timeRange
 }: {
   apiBaseUrl: string
   groupBy: string
   limit: number
+  offset: number
+  search: string
+  sortKey: GroupSortKey
   timeRange: ResolvedTimeRange
-}): Promise<{ groups: LogGroupSummary[] }> {
+}): Promise<LogGroupPage> {
   const timeFilter = timeRangeWhereClause(timeRange, 'bucket_time')
+  const exactFilter = search ? ' AND value = {group_value:String}' : ''
+  const pageLimit = limit + 1
+  const baseParameters = {
+    group_key: facetKey(groupBy),
+    limit: pageLimit,
+    offset,
+    ...(search ? { group_value: search } : {}),
+    ...timeRangeParameters(timeRange)
+  }
+  if (search) {
+    const indexTimeFilter = timeRangeWhereClause(timeRange, 'timestamp')
+    try {
+      const response = await postQuery<{
+        count: number
+        durationMs: number
+        endedAt: string
+        errorCount: number
+        startedAt: string
+        value: string
+      }>({
+        apiBaseUrl,
+        parameters: baseParameters,
+        query: [
+          'SELECT value',
+          ', min(timestamp) AS startedAt',
+          ', max(timestamp) AS endedAt',
+          ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
+          ', count() AS count',
+          ", countIf(endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
+          `FROM ${eventIndexTable()}`,
+          `PREWHERE key = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
+          'GROUP BY value',
+          'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
+        ].join(' ')
+      })
+      if ((response.data ?? []).length > 0) {
+        return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
+      }
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
+  try {
+    const response = await postQuery<{
+      count: number
+      durationMs: number
+      endedAt: string
+      errorCount: number
+      startedAt: string
+      value: string
+    }>({
+      apiBaseUrl,
+      parameters: baseParameters,
+      query: [
+        'SELECT value',
+        ', min(bucket_time) AS startedAt',
+        ', max(bucket_time) AS endedAt',
+        ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs",
+        ', sum(count) AS count',
+        ', sum(error_count) AS errorCount',
+        `FROM ${facetsTable()}`,
+        `PREWHERE key = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
+        `WHERE value != ''${exactFilter}`,
+        'GROUP BY value',
+        groupOrderByClause({ groupBy, hasErrorCount: true, sortKey }),
+        'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
+      ].join(' ')
+    })
+    return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
+  } catch (error) {
+    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+      throw error
+    }
+  }
+
   const response = await postQuery<{
     count: number
     durationMs: number
@@ -2944,7 +3553,7 @@ async function fetchGroups({
     value: string
   }>({
     apiBaseUrl,
-    parameters: { group_key: facetKey(groupBy), limit, ...timeRangeParameters(timeRange) },
+    parameters: baseParameters,
     query: [
       'SELECT value',
       ', min(bucket_time) AS startedAt',
@@ -2953,22 +3562,66 @@ async function fetchGroups({
       ', sum(count) AS count',
       `FROM ${facetsTable()}`,
       `PREWHERE key = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
-      "WHERE value != ''",
+      `WHERE value != ''${exactFilter}`,
       'GROUP BY value',
-      'ORDER BY endedAt DESC',
-      'LIMIT {limit:UInt64}'
+      groupOrderByClause({ groupBy, hasErrorCount: false, sortKey }),
+      'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
     ].join(' ')
   })
 
+  return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
+}
+
+function groupPageFromResponse(
+  rows: Array<{
+    count: number
+    durationMs: number
+    endedAt: string
+    errorCount?: number
+    startedAt: string
+    value: string
+  }>,
+  groupBy: string,
+  limit: number,
+  offset: number
+): LogGroupPage {
+  const pageRows = rows.slice(0, limit)
+  const groups = pageRows.map(group => ({
+    groupBy,
+    value: group.value,
+    startedAt: normalizeTimestamp(group.startedAt),
+    endedAt: normalizeTimestamp(group.endedAt),
+    durationMs: Number(group.durationMs) || 0,
+    count: Number(group.count) || 0,
+    errorCount: Number(group.errorCount) || 0
+  }))
   return {
-    groups: (response.data ?? []).map(group => ({
-      groupBy,
-      value: group.value,
-      startedAt: normalizeTimestamp(group.startedAt),
-      endedAt: normalizeTimestamp(group.endedAt),
-      durationMs: Number(group.durationMs) || 0,
-      count: Number(group.count) || 0
-    }))
+    groups,
+    nextOffset: rows.length > limit ? offset + limit : undefined
+  }
+}
+
+function groupOrderByClause({
+  groupBy,
+  hasErrorCount,
+  sortKey
+}: {
+  groupBy: string
+  hasErrorCount: boolean
+  sortKey: GroupSortKey
+}) {
+  const errorTie = hasErrorCount ? ', errorCount DESC' : ''
+  switch (sortKey) {
+    case 'count':
+      return `ORDER BY count DESC${errorTie}, value ASC`
+    case 'duration':
+      return `ORDER BY durationMs DESC, count DESC${errorTie}, value ASC`
+    case 'value':
+      return 'ORDER BY value ASC'
+    case 'recent':
+      return isTraceLikeGroup(groupBy)
+        ? `ORDER BY endedAt DESC, count DESC${errorTie}, value ASC`
+        : `ORDER BY count DESC${errorTie}, value ASC`
   }
 }
 
@@ -3005,7 +3658,17 @@ async function fetchSummary({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogSummary> {
-  const filters = eventFilterClauses({ eventFilter, groupBy })
+  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+    try {
+      return await fetchSummaryFromIndex({ apiBaseUrl, eventFilter, groupBy, selectedGroupValue })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
+  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
   const response = await postQuery<{ count: number }>({
     apiBaseUrl,
     parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
@@ -3014,6 +3677,32 @@ async function fetchSummary({
       `FROM ${eventsTable()} AS e`,
       filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
       filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : ''
+    ].join(' ')
+  })
+  const count = Number(response.data?.[0]?.count) || 0
+  return { capped: false, count, limit: count }
+}
+
+async function fetchSummaryFromIndex({
+  apiBaseUrl,
+  eventFilter,
+  groupBy,
+  selectedGroupValue
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  selectedGroupValue: string
+}): Promise<LogSummary> {
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
+  const response = await postQuery<{ count: number }>({
+    apiBaseUrl,
+    parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+    query: [
+      'SELECT count() AS count',
+      `FROM ${eventIndexTable()} AS i`,
+      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
     ].join(' ')
   })
   const count = Number(response.data?.[0]?.count) || 0
@@ -3035,6 +3724,16 @@ async function fetchEvents({
   pageParam: EventPageParam
   selectedGroupValue: string
 }): Promise<LogEventsPage> {
+  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+    try {
+      return await fetchEventsFromIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
   const direction = pageParam.before ? 'before' : 'forward'
   const pageFilter = pageParam.before
     ? "e.timestamp < {cursor:DateTime64(3, 'UTC')}"
@@ -3054,13 +3753,14 @@ async function fetchEvents({
   const filters = eventFilterClauses({
     eventFilter,
     groupBy,
+    selectedGroupValue,
     prewhere: pageFilter ? [pageFilter] : []
   })
-  const response = await postQuery<EventRow>({
+  const response = await postQuery<FlamegraphEventRow>({
     apiBaseUrl,
     parameters,
     query: [
-      'SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id, e.data AS data',
+      eventMetadataSelect('e'),
       `FROM ${eventsTable()} AS e`,
       filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
       'WHERE (e.event_id, e.timestamp) IN (',
@@ -3076,7 +3776,65 @@ async function fetchEvents({
       `ORDER BY e.timestamp ${order}, e.event_id ${order}`,
     ].join(' ')
   })
-  const events = (response.data ?? []).map(rowToTraceEvent)
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
+  if (order === 'DESC') events.reverse()
+
+  return {
+    events,
+    fields: orderLogFields(inferLogFields(events)),
+    group: pageGroupSummary({ events, groupBy, selectedGroupValue }),
+    nextCursor: pageParam.after && events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
+    prevCursor: events.length >= limit ? events[0]?.createdAt : undefined
+  }
+}
+
+async function fetchEventsFromIndex({
+  apiBaseUrl,
+  eventFilter,
+  groupBy,
+  limit,
+  pageParam,
+  selectedGroupValue
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  limit: number
+  pageParam: EventPageParam
+  selectedGroupValue: string
+}): Promise<LogEventsPage> {
+  const direction = pageParam.before ? 'before' : 'forward'
+  const cursorFilter = pageParam.before
+    ? "i.timestamp < {cursor:DateTime64(3, 'UTC')}"
+    : pageParam.after
+      ? "i.timestamp > {cursor:DateTime64(3, 'UTC')}"
+      : pageParam.around
+        ? "i.timestamp <= {cursor:DateTime64(3, 'UTC')}"
+        : ''
+  const order = direction === 'before' || pageParam.around ? 'DESC' : 'ASC'
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter })
+  const parameters = {
+    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+    limit,
+    ...(pageParam.before || pageParam.after || pageParam.around
+      ? { cursor: clickHouseDateTime64(pageParam.before || pageParam.after || pageParam.around || '') }
+      : {})
+  }
+  const response = await postQuery<FlamegraphEventRow>({
+    apiBaseUrl,
+    parameters,
+    query: [
+      'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
+      ', i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
+      ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
+      `FROM ${eventIndexTable()} AS i`,
+      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
+      `ORDER BY i.timestamp ${order}, i.event_id ${order}`,
+      'LIMIT {limit:UInt64}'
+    ].join(' ')
+  })
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
   if (order === 'DESC') events.reverse()
 
   return {
@@ -3101,18 +3859,81 @@ async function fetchFlamegraph({
   maxSpans: number
   selectedGroupValue: string
 }): Promise<LogFlamegraph> {
-  const page = await fetchEvents({
+  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+    try {
+      return await fetchFlamegraphFromIndex({ apiBaseUrl, eventFilter, groupBy, maxSpans, selectedGroupValue })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
+  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
+  const response = await postQuery<FlamegraphEventRow>({
     apiBaseUrl,
-    eventFilter,
-    groupBy,
-    limit: maxSpans,
-    pageParam: {},
-    selectedGroupValue
+    parameters: {
+      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+      limit: maxSpans
+    },
+    query: [
+      'SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id',
+      ", ifNull(toString(e.data.parent_span_id), '') AS parent_span_id",
+      ", ifNull(toString(e.data.name), '') AS name",
+      ", ifNull(toString(e.data.start_time), '') AS start_time",
+      ", ifNull(toString(e.data.end_time), '') AS end_time",
+      ', toFloat64OrZero(toString(e.data.duration_ms)) AS duration_ms',
+      `FROM ${eventsTable()} AS e`,
+      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
+      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : '',
+      'ORDER BY e.timestamp ASC, e.event_id ASC',
+      'LIMIT {limit:UInt64}'
+    ].join(' ')
   })
-  const flamegraph = buildFlamegraph(page.events)
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
+  const flamegraph = buildFlamegraph(events)
   return {
     ...flamegraph,
-    capped: page.events.length >= maxSpans,
+    capped: events.length >= maxSpans,
+    spanCount: flamegraph.rows.reduce((count, row) => count + row.length, 0)
+  }
+}
+
+async function fetchFlamegraphFromIndex({
+  apiBaseUrl,
+  eventFilter,
+  groupBy,
+  maxSpans,
+  selectedGroupValue
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  maxSpans: number
+  selectedGroupValue: string
+}): Promise<LogFlamegraph> {
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
+  const response = await postQuery<FlamegraphEventRow>({
+    apiBaseUrl,
+    parameters: {
+      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+      limit: maxSpans
+    },
+    query: [
+      'SELECT i.event_id AS event_id, i.timestamp AS timestamp, i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
+      ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
+      `FROM ${eventIndexTable()} AS i`,
+      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
+      'ORDER BY i.timestamp ASC, i.event_id ASC',
+      'LIMIT {limit:UInt64}'
+    ].join(' ')
+  })
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
+  const flamegraph = buildFlamegraph(events)
+  return {
+    ...flamegraph,
+    capped: events.length >= maxSpans,
     spanCount: flamegraph.rows.reduce((count, row) => count + row.length, 0)
   }
 }
@@ -3130,8 +3951,18 @@ async function fetchDensity({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogDensity> {
+  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+    try {
+      return await fetchDensityFromIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
   const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue })
-  const filters = eventFilterClauses({ eventFilter, groupBy })
+  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
   const range = await postQuery<{ count: number; from: string; to: string }>({
     apiBaseUrl,
     parameters,
@@ -3179,6 +4010,69 @@ async function fetchDensity({
   }
 }
 
+async function fetchDensityFromIndex({
+  apiBaseUrl,
+  buckets,
+  eventFilter,
+  groupBy,
+  selectedGroupValue
+}: {
+  apiBaseUrl: string
+  buckets: number
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  selectedGroupValue: string
+}): Promise<LogDensity> {
+  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue })
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
+  const indexWhere = eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
+  const range = await postQuery<{ count: number; from: string; to: string }>({
+    apiBaseUrl,
+    parameters,
+    query: [
+      'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, count() AS count',
+      `FROM ${eventIndexTable()} AS i`,
+      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      indexWhere
+    ].join(' ')
+  })
+  const row = range.data?.[0]
+  const from = normalizeTimestamp(row?.from)
+  const to = normalizeTimestamp(row?.to)
+  const fromMs = Date.parse(from)
+  const toMs = Date.parse(to)
+  if (!Number(row?.count) || !Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+    return { bucketMs: 1, buckets: [], from: '', to: '' }
+  }
+
+  const bucketMs = niceTimeInterval(Math.max(1, (toMs - fromMs) / buckets))
+  const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
+    apiBaseUrl,
+    parameters: { ...parameters, bucket_ms: bucketMs },
+    query: [
+      'WITH intDiv(toUnixTimestamp64Milli(i.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
+      'SELECT bucket, count() AS count',
+      ", countIf(endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
+      `FROM ${eventIndexTable()} AS i`,
+      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      indexWhere,
+      'GROUP BY bucket',
+      'ORDER BY bucket ASC'
+    ].join(' ')
+  })
+
+  return {
+    bucketMs,
+    buckets: (density.data ?? []).map(bucket => ({
+      count: Number(bucket.count) || 0,
+      errorCount: Number(bucket.errorCount) || 0,
+      start: new Date(Number(bucket.bucket)).toISOString()
+    })),
+    from,
+    to
+  }
+}
+
 async function fetchEvent({
   apiBaseUrl,
   eventId
@@ -3188,6 +4082,7 @@ async function fetchEvent({
 }): Promise<LogEventPayload> {
   try {
     const response = await fetch(eventUrl(apiBaseUrl, eventId), {
+      credentials: 'include',
       headers: queryHeaders(),
       method: 'GET'
     })
@@ -3199,12 +4094,12 @@ async function fetchEvent({
     // Fall back to /query. Some local deployments do not have S3 reads configured.
   }
 
-  const response = await postQuery<EventRow>({
+  const response = await postQuery<FlamegraphEventRow>({
     apiBaseUrl,
     parameters: { event_id: eventId },
     query: [
-      'SELECT event_id, timestamp, event_type, signal, trace_id, span_id, data',
-      `FROM ${eventsTable()}`,
+      eventMetadataSelect('e'),
+      `FROM ${eventsTable()} AS e`,
       'WHERE event_id = {event_id:String}',
       'ORDER BY timestamp ASC',
       'LIMIT 1'
@@ -3212,7 +4107,7 @@ async function fetchEvent({
   })
   const row = response.data?.[0]
   if (!row) throw new HTTPError({ message: 'event not found', status: 404 })
-  return { event: rowToTraceEvent(row) }
+  return { event: rowToFlamegraphEvent(row) }
 }
 
 async function postQuery<T>({
@@ -3226,6 +4121,7 @@ async function postQuery<T>({
 }): Promise<ClickHouseResponse<T>> {
   const response = await fetch(queryUrl(apiBaseUrl), {
     body: JSON.stringify({ parameters, query }),
+    credentials: 'include',
     headers: queryHeaders(),
     method: 'POST'
   })
@@ -3239,9 +4135,168 @@ async function postQuery<T>({
   return (await response.json()) as ClickHouseResponse<T>
 }
 
+async function fetchFacets({ apiBaseUrl }: { apiBaseUrl: string }): Promise<FacetListResponse> {
+  const response = await fetch(facetsUrl(apiBaseUrl), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as FacetListResponse
+}
+
+async function putFacet({
+  apiBaseUrl,
+  path,
+  valueType
+}: {
+  apiBaseUrl: string
+  path: string
+  valueType: string
+}): Promise<HotFacet> {
+  const response = await fetch(facetsUrl(apiBaseUrl), {
+    body: JSON.stringify({
+      path: path.trim(),
+      value_type: valueType
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  const body = (await response.json()) as { facet?: HotFacet }
+  if (!body.facet) throw new HTTPError({ message: 'facet response missing facet', status: 502 })
+  return body.facet
+}
+
+async function deleteFacet({
+  apiBaseUrl,
+  path
+}: {
+  apiBaseUrl: string
+  path: string
+}): Promise<HotFacet> {
+  const response = await fetch(`${facetsUrl(apiBaseUrl)}/${encodeURIComponent(path)}`, {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'DELETE'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  const body = (await response.json()) as { facet?: HotFacet }
+  if (!body.facet) throw new HTTPError({ message: 'facet response missing facet', status: 502 })
+  return body.facet
+}
+
+async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthIdentity> {
+  const response = await fetch(authUrl(apiBaseUrl, '/me'), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as AuthIdentity
+}
+
+async function requestLoginLink({
+  apiBaseUrl,
+  email
+}: {
+  apiBaseUrl: string
+  email: string
+}): Promise<{ ok: boolean }> {
+  const returnTo =
+    typeof window === 'undefined'
+      ? '/'
+      : `${window.location.pathname}${window.location.search}${window.location.hash}`
+  const response = await fetch(authUrl(apiBaseUrl, '/login'), {
+    body: JSON.stringify({ email: email.trim(), return_to: returnTo }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as { ok: boolean }
+}
+
+async function fetchApiKeys({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ api_keys: ApiKeyRecord[] }> {
+  const response = await fetch(apiKeysUrl(apiBaseUrl), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as { api_keys: ApiKeyRecord[] }
+}
+
+async function createApiKey({
+  apiBaseUrl,
+  name,
+  role
+}: {
+  apiBaseUrl: string
+  name: string
+  role: 'admin' | 'service' | 'viewer'
+}): Promise<CreatedApiKey> {
+  const response = await fetch(apiKeysUrl(apiBaseUrl), {
+    body: JSON.stringify({ name: name.trim(), role }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as CreatedApiKey
+}
+
+async function revokeApiKey({
+  apiBaseUrl,
+  id
+}: {
+  apiBaseUrl: string
+  id: number
+}): Promise<ApiKeyRecord> {
+  const response = await fetch(`${apiKeysUrl(apiBaseUrl)}/${id}`, {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'DELETE'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  const body = (await response.json()) as { api_key?: ApiKeyRecord }
+  if (!body.api_key) throw new HTTPError({ message: 'API key response missing api_key', status: 502 })
+  return body.api_key
+}
+
 function queryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/query` : '/query'
+}
+
+function facetsUrl(apiBaseUrl: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/facets` : '/facets'
 }
 
 function eventUrl(apiBaseUrl: string, eventId: string) {
@@ -3250,11 +4305,41 @@ function eventUrl(apiBaseUrl: string, eventId: string) {
   return base ? `${base}${path}` : path
 }
 
+function authUrl(apiBaseUrl: string, path: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/auth${path}` : `/auth${path}`
+}
+
+function apiKeysUrl(apiBaseUrl: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/api-keys` : '/api-keys'
+}
+
 function queryHeaders() {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = import.meta.env.VITE_NANOTRACE_KEY
+  const token = runtimeNanotraceApiKey()
   if (token) headers.Authorization = `Bearer ${token}`
   return headers
+}
+
+function runtimeNanotraceApiKey() {
+  const configured = import.meta.env.VITE_NANOTRACE_API_KEY
+  if (configured) return configured
+  if (typeof window === 'undefined') return ''
+
+  const params = new URLSearchParams(window.location.search)
+  const urlKey = params.get('nanotrace_api_key') || params.get('api_key') || ''
+  if (urlKey) {
+    window.localStorage.setItem('nanotrace.api_key', urlKey)
+    params.delete('nanotrace_api_key')
+    params.delete('api_key')
+    const search = params.toString()
+    const nextUrl = `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`
+    window.history.replaceState(window.history.state, '', nextUrl)
+    return urlKey
+  }
+
+  return window.localStorage.getItem('nanotrace.api_key') || ''
 }
 
 function eventsTable() {
@@ -3275,6 +4360,31 @@ function facetsTable() {
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFacetsTableName
+}
+
+function eventIndexTable() {
+  const configured = String(import.meta.env.VITE_NANOTRACE_EVENT_INDEX_TABLE || '').trim()
+  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
+    return configured
+  }
+  const table = eventsTable()
+  const database = table.includes('.') ? table.split('.')[0] : ''
+  const derived = database ? `${database}.event_facet_index` : 'event_facet_index'
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
+    ? derived
+    : defaultEventIndexTableName
+}
+
+function eventMetadataSelect(alias: string) {
+  return [
+    `SELECT ${alias}.event_id AS event_id, ${alias}.timestamp AS timestamp`,
+    `, ${alias}.event_type AS event_type, ${alias}.signal AS signal, ${alias}.trace_id AS trace_id, ${alias}.span_id AS span_id`,
+    `, ifNull(toString(${alias}.data.parent_span_id), '') AS parent_span_id`,
+    `, ifNull(toString(${alias}.data.name), '') AS name`,
+    `, ifNull(toString(${alias}.data.start_time), '') AS start_time`,
+    `, ifNull(toString(${alias}.data.end_time), '') AS end_time`,
+    `, toFloat64OrZero(ifNull(toString(${alias}.data.duration_ms), '0')) AS duration_ms`
+  ].join('')
 }
 
 function resolveTimeRange({
@@ -3325,6 +4435,51 @@ function timeRangeParameters(range: ResolvedTimeRange): QueryParameters {
   }
 }
 
+function eventIndexPrewhere({
+  eventFilter,
+  includeAlias,
+  includeCursor = ''
+}: {
+  eventFilter: ParsedEventFilter
+  includeAlias: boolean
+  includeCursor?: string
+}) {
+  const column = includeAlias ? 'i.timestamp' : 'timestamp'
+  return [
+    includeCursor,
+    eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
+    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : ''
+  ].filter(Boolean).join(' AND ')
+}
+
+function eventIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string) {
+  const column = `${alias}.timestamp`
+  return [
+    eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
+    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : ''
+  ].filter(Boolean).join(' AND ')
+}
+
+function eventIndexFacetWhere({
+  eventFilter,
+  outerAlias
+}: {
+  eventFilter: ParsedEventFilter
+  outerAlias: string
+}) {
+  const clauses = (eventFilter.facets ?? []).map((_filter, index) => {
+      const alias = `f${index}`
+      const timePrewhere = eventIndexTimePrewhere(eventFilter, alias)
+      return [
+        `${outerAlias}.event_id IN (`,
+        `SELECT ${alias}.event_id FROM ${eventIndexTable()} AS ${alias}`,
+        `PREWHERE ${alias}.key = {facet_filter_${index}_key:String} AND ${alias}.value = {facet_filter_${index}_value:String}${timePrewhere ? ` AND ${timePrewhere}` : ''}`,
+        ')'
+      ].join(' ')
+    })
+  return clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+}
+
 function nullableStringExpression(path: string) {
   const column = promotedStringColumn(path)
   if (column) return `ifNull(toString(nullIf(${column}, '')), '')`
@@ -3336,7 +4491,7 @@ function jsonFieldExpression(path: string, alias = '') {
   if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(normalized)) {
     throw new Error(`Unsupported field path: ${path}`)
   }
-  return `getSubcolumn(${alias ? `${alias}.` : ''}data, '${sqlString(normalized)}')`
+  return `${alias ? `${alias}.` : ''}data.${normalized}`
 }
 
 function nanotracePath(path: string) {
@@ -3400,27 +4555,32 @@ function mergeGroupOptions(fields: GroupOption[], limit: number) {
 function eventFilterClauses({
   eventFilter,
   groupBy,
+  selectedGroupValue,
   prewhere = []
 }: {
   eventFilter: ParsedEventFilter
   groupBy: string
+  selectedGroupValue?: string
   prewhere?: string[]
 }) {
-  const exactColumn = promotedStringColumn(groupBy, 'e')
-  const valueExpression = exactColumn ? '' : eventValueExpression(groupBy)
   const clauses = {
     prewhere: [...prewhere],
     where: [] as string[]
   }
-  if (exactColumn) {
-    clauses.prewhere.unshift(`${exactColumn} = {group_value:String}`)
-  } else {
-    clauses.where.push(
-      `(${valueExpression} = {group_value:String} OR position(${valueExpression}, concat(char(39), {group_value:String}, char(39))) > 0)`
-    )
+  if (groupBy && selectedGroupValue) {
+    const exactColumn = promotedStringColumn(groupBy, 'e')
+    const valueExpression = exactColumn ? '' : eventValueExpression(groupBy)
+    if (exactColumn) {
+      clauses.prewhere.unshift(`${exactColumn} = {group_value:String}`)
+    } else {
+      clauses.prewhere.unshift(`${valueExpression} = {group_value:String}`)
+    }
   }
   if (eventFilter.createdAfter) clauses.prewhere.push("e.timestamp >= {created_after:DateTime64(3, 'UTC')}")
   if (eventFilter.createdBefore) clauses.prewhere.push("e.timestamp <= {created_before:DateTime64(3, 'UTC')}")
+  for (const [index, filter] of (eventFilter.facets ?? []).entries()) {
+    clauses.prewhere.push(`${eventValueExpression(filter.path)} = {facet_filter_${index}_value:String}`)
+  }
   const textFilter = eventTextWhereClause(eventFilter)
   if (textFilter) clauses.where.push(textFilter)
   return clauses
@@ -3465,12 +4625,19 @@ function eventQueryParameters({
   groupBy: string
   selectedGroupValue: string
 }): QueryParameters {
+  const facetParameters = Object.fromEntries(
+    (eventFilter.facets ?? []).flatMap((filter, index) => [
+      [`facet_filter_${index}_key`, facetKey(filter.path)],
+      [`facet_filter_${index}_value`, filter.value]
+    ])
+  )
   return {
     group_key: facetKey(groupBy),
     group_value: selectedGroupValue,
     ...(eventFilter.createdAfter ? { created_after: clickHouseDateTime64(eventFilter.createdAfter) } : {}),
     ...(eventFilter.createdBefore ? { created_before: clickHouseDateTime64(eventFilter.createdBefore) } : {}),
-    ...(eventFilter.text ? { event_filter: eventFilter.text } : {})
+    ...(eventFilter.text ? { event_filter: eventFilter.text } : {}),
+    ...facetParameters
   }
 }
 
@@ -3496,14 +4663,46 @@ function clickHouseDateTime64(value: string) {
 
 function errorExpression() {
   return [
-    "lowerUTF8(ifNull(toString(getSubcolumn(e.data, 'is_error')), '')) IN ('1', 'true')",
-    "lowerUTF8(ifNull(toString(getSubcolumn(e.data, 'span_status_code')), '')) = 'error'",
-    "endsWith(lowerUTF8(ifNull(toString(getSubcolumn(e.data, 'event_type')), '')), '_error')"
+    "lowerUTF8(ifNull(toString(e.data.is_error), '')) IN ('1', 'true')",
+    "lowerUTF8(ifNull(toString(e.data.span_status_code), '')) = 'error'",
+    "endsWith(lowerUTF8(ifNull(toString(e.data.event_type), '')), '_error')"
   ].join(' OR ')
 }
 
 function rowToTraceEvent(row: EventRow): TraceEvent {
   const data = normalizeEventData(row)
+  return {
+    id: String(row.event_id),
+    createdAt: normalizeTimestamp(row.timestamp),
+    data
+  }
+}
+
+function rowToFlamegraphEvent(row: FlamegraphEventRow): TraceEvent {
+  const traceId = row.trace_id || ''
+  const spanId = row.span_id || ''
+  const parentSpanId = row.parent_span_id || ''
+  const startedAt = normalizeTimestamp(row.start_time)
+  const endedAt = normalizeTimestamp(row.end_time)
+  const durationMs = Number(row.duration_ms) || 0
+  const data: JsonObject = {
+    ...compactObject({
+      event_type: row.event_type,
+      name: row.name,
+      parentSpanId,
+      parent_span_id: parentSpanId,
+      signal: row.signal,
+      spanId,
+      span_id: spanId,
+      startedAt,
+      start_time: startedAt,
+      traceId,
+      trace_id: traceId,
+      type: row.event_type
+    }),
+    ...(endedAt ? compactObject({ endedAt, end_time: endedAt }) : {}),
+    ...(durationMs > 0 ? { durationMs, duration_ms: durationMs } : {})
+  }
   return {
     id: String(row.event_id),
     createdAt: normalizeTimestamp(row.timestamp),
@@ -3754,7 +4953,14 @@ function isErrorPayload(data: JsonObject) {
 type ParsedEventFilter = {
   createdAfter?: string
   createdBefore?: string
+  facets?: ParsedFacetFilter[]
   text: string
+}
+
+type ParsedFacetFilter = {
+  indexed: boolean
+  path: string
+  value: string
 }
 
 function defaultTimeRangeFilter({
@@ -3784,21 +4990,40 @@ function defaultTimeRangeFilter({
   }
 }
 
-function eventFilterText(filter: ParsedEventFilter) {
+function eventFilterInputText(filter: ParsedEventFilter) {
   return [
-    filter.text,
+    ...(filter.facets ?? []).map(facet => `${facet.path}=${quoteFilterValue(facet.value)}`),
+    filter.text
+  ].filter(Boolean).join(' ')
+}
+
+function serializeEventFilter(filter: ParsedEventFilter) {
+  return [
+    eventFilterInputText(filter),
     filter.createdAfter ? `timestamp>=${filter.createdAfter}` : '',
     filter.createdBefore ? `timestamp<=${filter.createdBefore}` : ''
   ].filter(Boolean).join(' ')
 }
 
 function hasAppliedEventFilter(filter: ParsedEventFilter) {
-  return filter.text !== '' || Boolean(filter.createdAfter) || Boolean(filter.createdBefore)
+  return filter.text !== '' || Boolean(filter.createdAfter) || Boolean(filter.createdBefore) || Boolean(filter.facets?.length)
 }
 
-function parseEventFilter({ referenceTimestamp, value }: { referenceTimestamp?: string; value: string }): ParsedEventFilter {
+function canUseFacetIndex(filter: ParsedEventFilter) {
+  return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed)
+}
+
+function parseEventFilter({
+  facetPaths,
+  referenceTimestamp,
+  value
+}: {
+  facetPaths?: Set<string>
+  referenceTimestamp?: string
+  value: string
+}): ParsedEventFilter {
   const filter: ParsedEventFilter = { text: '' }
-  const text = value.replace(
+  const withoutTimestamps = value.replace(
     /(?:^|\s)(?:createdAt|timestamp)\s*(>=|>|<=|<)\s*("[^"]+"|'[^']+'|\S+)/gi,
     (match: string, operator: string, rawTimestamp: string) => {
       const timestamp = normalizeFilterTimestamp({ referenceTimestamp, value: rawTimestamp })
@@ -3814,8 +5039,42 @@ function parseEventFilter({ referenceTimestamp, value }: { referenceTimestamp?: 
     }
   )
 
+  const facetFilters: ParsedFacetFilter[] = []
+  const text = withoutTimestamps.replace(
+    /(?:^|\s)([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*("[^"]*"|'[^']*'|\S+)/g,
+    (match: string, rawPath: string, rawValue: string) => {
+      const path = normalizedPayloadPath(rawPath)
+      const parsedValue = unquoteFilterValue(rawValue)
+      if (!isSupportedFacetFilterPath(path) || !parsedValue) {
+        return match
+      }
+      const displayPath = displayFacetPath(path)
+      facetFilters.push({
+        indexed: Boolean(facetPaths?.has(path) || facetPaths?.has(displayPath)),
+        path: displayPath,
+        value: parsedValue
+      })
+      return ' '
+    }
+  )
+
+  if (facetFilters.length > 0) {
+    filter.facets = facetFilters
+  }
   filter.text = trimBooleanOperators(text.trim().split(/\s+/).filter(Boolean)).join(' ')
   return filter
+}
+
+function isSupportedFacetFilterPath(path: string) {
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:[.-][A-Za-z0-9_]+)*$/.test(path)
+}
+
+function unquoteFilterValue(value: string) {
+  return value.trim().replace(/^"([^"]*)"$/, '$1').replace(/^'([^']*)'$/, '$1')
+}
+
+function quoteFilterValue(value: string) {
+  return /\s/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value
 }
 
 function trimBooleanOperators(tokens: string[]) {

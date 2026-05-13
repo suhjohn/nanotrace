@@ -71,6 +71,7 @@ mod tests {
 
     use super::should_delete;
     use crate::config::Config;
+    use nanotrace_auth::AuthConfig;
 
     #[tokio::test]
     async fn retention_disabled_never_deletes() {
@@ -104,9 +105,9 @@ mod tests {
 
     fn test_config(data_dir: std::path::PathBuf, done_retention: Option<Duration>) -> Config {
         Config {
-            secret_key: "secret".to_owned(),
             port: 18473,
             data_dir,
+            ui_dir: std::path::PathBuf::from("/tmp/nanotrace-ui"),
             s3_bucket: Some("bucket".to_owned()),
             s3_prefix: "events".to_owned(),
             clickhouse_url: None,
@@ -114,6 +115,9 @@ mod tests {
             clickhouse_password: None,
             clickhouse_database: "observatory".to_owned(),
             clickhouse_table: "events".to_owned(),
+            clickhouse_facets_table: "event_facets".to_owned(),
+            clickhouse_event_index_table: "event_facet_index".to_owned(),
+            clickhouse_hot_dimensions_table: "hot_dimensions".to_owned(),
             clickhouse_max_result_rows: 100_000,
             clickhouse_max_execution_secs: 30,
             clickhouse_max_bytes_to_read: 1_000_000_000,
@@ -131,6 +135,23 @@ mod tests {
             compact_batch_receipts: false,
             processor_poll_interval: Duration::from_secs(30),
             processor_builder_cmd: "true".to_string(),
+            auth: test_auth_config(),
+            email_from: None,
+            cors_allowed_origins: Vec::new(),
+        }
+    }
+
+    fn test_auth_config() -> AuthConfig {
+        AuthConfig {
+            database_url: None,
+            bootstrap_api_key: None,
+            public_base_url: None,
+            session_cookie_name: "nanotrace_session".to_string(),
+            session_ttl: Duration::from_secs(3600),
+            session_secure: false,
+            magic_link_ttl: Duration::from_secs(600),
+            allowed_emails: Vec::new(),
+            admin_emails: Vec::new(),
         }
     }
 }

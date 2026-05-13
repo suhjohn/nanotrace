@@ -33,6 +33,8 @@
       "Sid": "ReadCleanupComputeState",
       "Effect": "Allow",
       "Action": [
+        "acm:DescribeCertificate",
+        "acm:ListCertificates",
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribePolicies",
         "ec2:DescribeLaunchTemplates",
@@ -48,9 +50,31 @@
         "elasticloadbalancing:DescribeListenerAttributes",
         "elasticloadbalancing:DescribeLoadBalancers",
         "elasticloadbalancing:DescribeTargetGroups",
-        "elasticloadbalancing:DescribeTargetHealth"
+        "elasticloadbalancing:DescribeTargetHealth",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBSubnetGroups",
+        "route53:GetHostedZone",
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:ListResourceRecordSets",
+        "route53:ListTagsForResource"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "DeletePostgres",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBSubnetGroup",
+        "rds:ListTagsForResource",
+        "rds:ModifyDBInstance",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": [
+        "arn:aws:rds:*:*:db:nanotrace-*",
+        "arn:aws:rds:*:*:subgrp:nanotrace-*"
+      ]
     },
     {
       "Sid": "DeleteAutoScaling",
@@ -106,6 +130,37 @@
         "arn:aws:elasticloadbalancing:*:*:listener/app/nanotrace-*/*/*",
         "arn:aws:elasticloadbalancing:*:*:targetgroup/nanotrace-*/*"
       ]
+    },
+    {
+      "Sid": "DeleteCertificates",
+      "Effect": "Allow",
+      "Action": [
+        "acm:DeleteCertificate",
+        "acm:RemoveTagsFromCertificate"
+      ],
+      "Resource": "arn:aws:acm:*:*:certificate/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "nanotrace" } }
+    },
+    {
+      "Sid": "DeleteDnsRecords",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "DeleteHostedZones",
+      "Effect": "Allow",
+      "Action": [
+        "route53:ChangeTagsForResource",
+        "route53:DeleteHostedZone"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "WaitForDnsChanges",
+      "Effect": "Allow",
+      "Action": "route53:GetChange",
+      "Resource": "arn:aws:route53:::change/*"
     },
     {
       "Sid": "ListQueuesForCleanup",

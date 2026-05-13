@@ -10,15 +10,29 @@ const password = requiredEnv("CLICKHOUSE_PASSWORD");
 const database = identifier(process.env.CLICKHOUSE_DATABASE || "observatory", "CLICKHOUSE_DATABASE");
 const table = identifier(process.env.CLICKHOUSE_TABLE || "events", "CLICKHOUSE_TABLE");
 const facetsTable = identifier(process.env.CLICKHOUSE_FACETS_TABLE || "event_facets", "CLICKHOUSE_FACETS_TABLE");
+const eventIndexTable = identifier(
+    process.env.CLICKHOUSE_EVENT_INDEX_TABLE || "event_facet_index",
+    "CLICKHOUSE_EVENT_INDEX_TABLE",
+);
+const hotDimensionsTable = identifier(
+    process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE || "hot_dimensions",
+    "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
+);
 const schemaPath = path.resolve(root, process.env.CLICKHOUSE_SCHEMA_PATH || "deploy/clickhouse/schema.sql");
 
 const eventTableToken = "__NANOTRACE_EVENTS_TABLE__";
 const facetsTableToken = "__NANOTRACE_EVENT_FACETS_TABLE__";
+const eventIndexTableToken = "__NANOTRACE_EVENT_FACET_INDEX_TABLE__";
+const hotDimensionsTableToken = "__NANOTRACE_HOT_DIMENSIONS_TABLE__";
 const schema = readFileSync(schemaPath, "utf8")
+    .replace(/\bobservatory\.hot_dimensions\b/g, hotDimensionsTableToken)
+    .replace(/\bobservatory\.event_facet_index\b/g, eventIndexTableToken)
     .replace(/\bobservatory\.event_facets\b/g, facetsTableToken)
     .replace(/\bobservatory\.events\b/g, eventTableToken)
     .replaceAll(eventTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(table)}`)
-    .replaceAll(facetsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(facetsTable)}`);
+    .replaceAll(facetsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(facetsTable)}`)
+    .replaceAll(eventIndexTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(eventIndexTable)}`)
+    .replaceAll(hotDimensionsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(hotDimensionsTable)}`);
 
 await query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(database)}`);
 await recreateLegacyFacetTable(database, facetsTable);
@@ -31,9 +45,17 @@ for (const statement of compatibilityAlters(database, table)) {
 for (const statement of facetCompatibilityAlters(database, facetsTable)) {
     await query(statement);
 }
+for (const statement of eventIndexCompatibilityAlters(database, eventIndexTable)) {
+    await query(statement);
+}
+for (const statement of hotDimensionsCompatibilityAlters(database, hotDimensionsTable)) {
+    await query(statement);
+}
 
 console.log(`clickhouse_schema=${database}.${table}`);
 console.log(`clickhouse_facets_schema=${database}.${facetsTable}`);
+console.log(`clickhouse_event_index_schema=${database}.${eventIndexTable}`);
+console.log(`clickhouse_hot_dimensions_schema=${database}.${hotDimensionsTable}`);
 
 async function query(sql) {
     await queryResponse(sql);
@@ -278,6 +300,7 @@ function compatibilityAlters(database, table) {
         `ALTER TABLE ${target} MODIFY COLUMN signal LowCardinality(String) MATERIALIZED multiIf(ifNull(data.event_type, '') IN ('span', 'span_start', 'span_end'), 'trace', ifNull(data.event_type, '') = 'metric', 'metric', ifNull(data.event_type, '') = 'log', 'log', ifNull(data.event_type, '') IN ('analytics', 'track', 'page', 'screen', 'identify', 'group', 'alias'), 'analytics', 'other')`,
         `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1`,
         `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 1`,
+        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 1`,
     ];
 }
 
@@ -289,9 +312,51 @@ function facetCompatibilityAlters(database, table) {
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value String DEFAULT '' CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS count UInt64 DEFAULT 0 CODEC(Delta, ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS error_count UInt64 DEFAULT 0 CODEC(Delta, ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN bucket_time DateTime64(3, 'UTC') CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN key String CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN value String CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN count UInt64 CODEC(Delta, ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN error_count UInt64 CODEC(Delta, ZSTD(1))`,
+    ];
+}
+
+function eventIndexCompatibilityAlters(database, table) {
+    const target = `${quoteIdentifier(database)}.${quoteIdentifier(table)}`;
+    return [
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS key LowCardinality(String) DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS timestamp DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS bucket_time DateTime64(3, 'UTC') DEFAULT timestamp CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_id String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_type LowCardinality(String) DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS signal LowCardinality(String) DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS trace_id String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS span_id String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS parent_span_id String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS name String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS start_time Nullable(DateTime64(3, 'UTC')) CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS end_time Nullable(DateTime64(3, 'UTC')) CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS duration_ms Float64 DEFAULT 0 CODEC(ZSTD(1))`,
+    ];
+}
+
+function hotDimensionsCompatibilityAlters(database, table) {
+    const target = `${quoteIdentifier(database)}.${quoteIdentifier(table)}`;
+    return [
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS path String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'active'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS display_name String DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT 'user'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS created_at DateTime64(3, 'UTC') DEFAULT now64(3)`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS updated_at DateTime64(3, 'UTC') DEFAULT now64(3)`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS created_by String DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS error String DEFAULT ''`,
+        `ALTER TABLE ${target} MODIFY COLUMN path String CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} MODIFY COLUMN value_type LowCardinality(String)`,
+        `ALTER TABLE ${target} MODIFY COLUMN status LowCardinality(String)`,
+        `ALTER TABLE ${target} MODIFY COLUMN source LowCardinality(String) DEFAULT 'user'`,
     ];
 }

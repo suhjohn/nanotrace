@@ -1,6 +1,7 @@
 mod config;
 mod event;
 mod event_log;
+mod facets;
 mod http;
 mod processors;
 mod read;
@@ -16,8 +17,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
 
 use crate::{
-    config::Config, event_log::EventLogWriter, http::AppState, processors::ProcessorStore,
-    read::ReadStore,
+    config::Config, event_log::EventLogWriter, facets::FacetStore, http::AppState,
+    processors::ProcessorStore, read::ReadStore,
 };
 
 #[tokio::main]
@@ -28,8 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = Arc::new(Config::from_env()?);
+    let auth = nanotrace_auth::AuthStore::connect(cfg.auth.clone())
+        .await?
+        .map(Arc::new);
     let aws_config = aws_config::load_from_env().await;
     let s3 = aws_sdk_s3::Client::new(&aws_config);
+    let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let upload_processors = match cfg.s3_bucket.clone() {
         Some(bucket) => ProcessorRuntime::start(
             s3.clone(),
@@ -44,7 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let writer = Arc::new(EventLogWriter::new(cfg.clone()).await?);
     let read_store = Arc::new(ReadStore::new(cfg.clone(), s3.clone()));
+    let facet_store = Arc::new(FacetStore::connect(cfg.clone()).await?);
     let processor_store = Arc::new(ProcessorStore::new(cfg.clone(), s3));
+
+    {
+        let facet_store = facet_store.clone();
+        tokio::spawn(async move { facet_store.run_backfill_worker().await });
+    }
 
     {
         let cfg = cfg.clone();
@@ -73,8 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = http::router(AppState {
         cfg: cfg.clone(),
+        auth,
+        facets: facet_store.clone(),
         processors: processor_store.clone(),
         read: read_store.clone(),
+        ses,
         writer: writer.clone(),
     });
     let address = format!("0.0.0.0:{}", cfg.port);

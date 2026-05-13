@@ -21,6 +21,7 @@ if (!Number.isInteger(target) || target < 0) {
 
 const wait = !args.includes("--no-wait");
 const strictWait = args.includes("--strict");
+const allowMixedLaunchTemplates = args.includes("--allow-mixed-launch-templates");
 const envFile = optionValue("--env") ?? process.env.NANOTRACE_ENV_FILE;
 const pollMs = numberOption("--poll-ms", numberEnv("NANOTRACE_SCALE_POLL_MS", 10_000));
 const waitMs = numberOption("--wait-ms", numberEnv("NANOTRACE_SCALE_WAIT_MS", 15 * 60_000));
@@ -101,9 +102,11 @@ async function waitForCapacity(name, capacity, timeoutMs, intervalMs) {
             instance.LifecycleState === "InService" &&
             instance.HealthStatus === "Healthy"
         );
-        const allLatest = capacity === 0 || inService.every((instance) =>
+        const latestInService = inService.filter((instance) =>
             String(instance.LaunchTemplate?.Version ?? "") === String(latestVersion)
         );
+        const launchTemplateReady = capacity === 0 ||
+            (allowMixedLaunchTemplates ? latestInService.length > 0 : latestInService.length === inService.length);
         const targetHealth = await targetGroupHealth(group, inService.map((instance) => instance.InstanceId));
         const targetsHealthy = targetHealth === null ||
             (targetHealth.length === inService.length && targetHealth.every((target) => target.State === "healthy"));
@@ -113,7 +116,8 @@ async function waitForCapacity(name, capacity, timeoutMs, intervalMs) {
             `active=${activeInstances.length}`,
             `inService=${inService.length}`,
             `latestLt=${latestVersion}`,
-            `allLatest=${allLatest}`,
+            `latestInService=${latestInService.length}`,
+            `launchTemplateReady=${launchTemplateReady}`,
             targetHealth === null ? "targetHealth=unknown" : `targetHealth=${targetHealth.map((target) => `${target.Id}:${target.State}`).join(",")}`,
         ].join(" ");
         console.log(lastStatus);
@@ -125,7 +129,7 @@ async function waitForCapacity(name, capacity, timeoutMs, intervalMs) {
             capacity > 0 &&
             (strictWait ? instances.length === capacity : activeInstances.length === capacity) &&
             inService.length === capacity &&
-            allLatest &&
+            launchTemplateReady &&
             targetsHealthy
         ) {
             return;

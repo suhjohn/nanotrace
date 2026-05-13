@@ -131,7 +131,7 @@ landed safely on disk.
 All protected endpoints use:
 
 ```http
-Authorization: Bearer <SECRET_KEY>
+Authorization: Bearer ntak_...
 ```
 
 Requests without the exact bearer token are rejected before the server parses or
@@ -657,7 +657,10 @@ reads; the loader handles S3-to-ClickHouse indexing.
 Important server settings:
 
 ```text
-SECRET_KEY
+NANOTRACE_DATABASE_URL
+NANOTRACE_BOOTSTRAP_API_KEY
+NANOTRACE_ALLOWED_EMAILS
+NANOTRACE_ADMIN_EMAILS
 PORT
 NANOTRACE_DATA_DIR
 NANOTRACE_S3_BUCKET

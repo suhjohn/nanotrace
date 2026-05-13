@@ -118,9 +118,9 @@ impl Config {
         let url = required_env("NANOTRACE_URL")
             .or_else(|_| required_env("NANOTRACE_INGEST_URL"))
             .context("NANOTRACE_URL or NANOTRACE_INGEST_URL is required")?;
-        let key = required_env("NANOTRACE_KEY")
-            .or_else(|_| required_env("SECRET_KEY"))
-            .context("NANOTRACE_KEY or SECRET_KEY is required")?;
+        let key = required_env("NANOTRACE_API_KEY")
+            .or_else(|_| required_env("NANOTRACE_KEY"))
+            .context("NANOTRACE_API_KEY is required")?;
         let batch_max_events = usize_env("NANOTRACE_CLIENT_BATCH_MAX_EVENTS", 100)?;
         let batch_max_bytes = usize_env("NANOTRACE_CLIENT_BATCH_MAX_BYTES", 1024 * 1024)?;
         let flush_ms = u64_env("NANOTRACE_CLIENT_FLUSH_MS", 25)?;

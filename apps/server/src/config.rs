@@ -1,12 +1,13 @@
 use std::{env, path::PathBuf, time::Duration};
 
+use nanotrace_auth::AuthConfig;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub secret_key: String,
     pub port: u16,
     pub data_dir: PathBuf,
+    pub ui_dir: PathBuf,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
     pub clickhouse_url: Option<String>,
@@ -14,6 +15,9 @@ pub struct Config {
     pub clickhouse_password: Option<String>,
     pub clickhouse_database: String,
     pub clickhouse_table: String,
+    pub clickhouse_facets_table: String,
+    pub clickhouse_event_index_table: String,
+    pub clickhouse_hot_dimensions_table: String,
     pub clickhouse_max_result_rows: u64,
     pub clickhouse_max_execution_secs: u64,
     pub clickhouse_max_bytes_to_read: u64,
@@ -31,12 +35,13 @@ pub struct Config {
     pub compact_batch_receipts: bool,
     pub processor_poll_interval: Duration,
     pub processor_builder_cmd: String,
+    pub auth: AuthConfig,
+    pub email_from: Option<String>,
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("{0} is required")]
-    Missing(&'static str),
     #[error("{key} must be a valid {kind}: {value}")]
     Invalid {
         key: &'static str,
@@ -47,10 +52,13 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let secret_key = required("SECRET_KEY")?;
         let port = parse_env("PORT", 18_473)?;
         let data_dir = PathBuf::from(
             env::var("NANOTRACE_DATA_DIR").unwrap_or_else(|_| "/data/events".to_string()),
+        );
+        let ui_dir = PathBuf::from(
+            env::var("NANOTRACE_UI_DIR")
+                .unwrap_or_else(|_| "/usr/local/share/nanotrace/ui".to_string()),
         );
         let s3_bucket = env::var("NANOTRACE_S3_BUCKET")
             .or_else(|_| env::var("S3_BUCKET"))
@@ -71,6 +79,18 @@ impl Config {
             .to_string();
         let clickhouse_table = env::var("CLICKHOUSE_TABLE")
             .unwrap_or_else(|_| "events".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_facets_table = env::var("CLICKHOUSE_FACETS_TABLE")
+            .unwrap_or_else(|_| "event_facets".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_event_index_table = env::var("CLICKHOUSE_EVENT_INDEX_TABLE")
+            .unwrap_or_else(|_| "event_facet_index".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_hot_dimensions_table = env::var("CLICKHOUSE_HOT_DIMENSIONS_TABLE")
+            .unwrap_or_else(|_| "hot_dimensions".to_string())
             .trim()
             .to_string();
         let clickhouse_max_result_rows = parse_env("CLICKHOUSE_MAX_RESULT_ROWS", 100_000)?;
@@ -94,6 +114,30 @@ impl Config {
             .unwrap_or_else(|_| "python3 /usr/local/bin/modal_processor_builder.py".to_string())
             .trim()
             .to_string();
+        let public_base_url = optional_string("NANOTRACE_PUBLIC_BASE_URL");
+        let session_secure = optional_bool_env("NANOTRACE_SESSION_SECURE")?.unwrap_or_else(|| {
+            public_base_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))
+        });
+        let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
+        let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 10 * 60)?;
+        let auth = AuthConfig {
+            database_url: optional_string("NANOTRACE_DATABASE_URL")
+                .or_else(|| optional_string("DATABASE_URL")),
+            bootstrap_api_key: optional_string("NANOTRACE_BOOTSTRAP_API_KEY"),
+            public_base_url,
+            session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
+                .unwrap_or_else(|_| "nanotrace_session".to_string())
+                .trim()
+                .to_string(),
+            session_ttl: Duration::from_secs(session_ttl_secs),
+            session_secure,
+            magic_link_ttl: Duration::from_secs(magic_link_ttl_secs),
+            allowed_emails: parse_list_env("NANOTRACE_ALLOWED_EMAILS"),
+            admin_emails: parse_list_env("NANOTRACE_ADMIN_EMAILS"),
+        };
+        let cors_allowed_origins = parse_list_env("NANOTRACE_CORS_ALLOWED_ORIGINS");
         ensure_nonzero("NANOTRACE_WRITER_LANES", writer_lanes)?;
         ensure_nonzero("NANOTRACE_WRITER_QUEUE_CAPACITY", writer_queue_capacity)?;
         ensure_nonzero(
@@ -102,8 +146,19 @@ impl Config {
         )?;
         ensure_nonzero("NANOTRACE_WRITER_FLUSH_BYTES", writer_flush_bytes)?;
         ensure_nonzero("PROCESSOR_POLL_INTERVAL_SECS", processor_poll_interval_secs)?;
+        ensure_nonzero("NANOTRACE_SESSION_TTL_SECS", session_ttl_secs)?;
+        ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
         ensure_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         ensure_identifier("CLICKHOUSE_TABLE", &clickhouse_table)?;
+        ensure_identifier("CLICKHOUSE_FACETS_TABLE", &clickhouse_facets_table)?;
+        ensure_identifier(
+            "CLICKHOUSE_EVENT_INDEX_TABLE",
+            &clickhouse_event_index_table,
+        )?;
+        ensure_identifier(
+            "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
+            &clickhouse_hot_dimensions_table,
+        )?;
         ensure_nonzero("CLICKHOUSE_MAX_RESULT_ROWS", clickhouse_max_result_rows)?;
         ensure_nonzero(
             "CLICKHOUSE_MAX_EXECUTION_SECS",
@@ -112,9 +167,9 @@ impl Config {
         ensure_nonzero("CLICKHOUSE_MAX_BYTES_TO_READ", clickhouse_max_bytes_to_read)?;
 
         Ok(Self {
-            secret_key,
             port,
             data_dir,
+            ui_dir,
             s3_bucket,
             s3_prefix,
             clickhouse_url,
@@ -122,6 +177,9 @@ impl Config {
             clickhouse_password,
             clickhouse_database,
             clickhouse_table,
+            clickhouse_facets_table,
+            clickhouse_event_index_table,
+            clickhouse_hot_dimensions_table,
             clickhouse_max_result_rows,
             clickhouse_max_execution_secs,
             clickhouse_max_bytes_to_read,
@@ -143,6 +201,9 @@ impl Config {
             compact_batch_receipts,
             processor_poll_interval: Duration::from_secs(processor_poll_interval_secs),
             processor_builder_cmd,
+            auth,
+            email_from: optional_string("NANOTRACE_EMAIL_FROM"),
+            cors_allowed_origins,
         })
     }
 }
@@ -152,13 +213,6 @@ fn optional_string(key: &'static str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn required(key: &'static str) -> Result<String, ConfigError> {
-    env::var(key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or(ConfigError::Missing(key))
 }
 
 fn parse_env<T>(key: &'static str, default: T) -> Result<T, ConfigError>
@@ -176,18 +230,36 @@ where
 }
 
 fn parse_bool_env(key: &'static str, default: bool) -> Result<bool, ConfigError> {
+    Ok(optional_bool_env(key)?.unwrap_or(default))
+}
+
+fn optional_bool_env(key: &'static str) -> Result<Option<bool>, ConfigError> {
     match env::var(key) {
         Ok(value) => match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
             _ => Err(ConfigError::Invalid {
                 key,
                 kind: "bool",
                 value,
             }),
         },
-        Err(_) => Ok(default),
+        Err(_) => Ok(None),
     }
+}
+
+fn parse_list_env(key: &'static str) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn ensure_nonzero<T>(key: &'static str, value: T) -> Result<(), ConfigError>

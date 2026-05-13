@@ -5,6 +5,8 @@
       "Sid": "ObserveComputeAndNetwork",
       "Effect": "Allow",
       "Action": [
+        "acm:DescribeCertificate",
+        "acm:ListCertificates",
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribePolicies",
         "autoscaling:DescribeScalingActivities",
@@ -27,9 +29,25 @@
         "elasticloadbalancing:DescribeListenerAttributes",
         "elasticloadbalancing:DescribeLoadBalancers",
         "elasticloadbalancing:DescribeTargetGroups",
-        "elasticloadbalancing:DescribeTargetHealth"
+        "elasticloadbalancing:DescribeTargetHealth",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBSubnetGroups",
+        "route53:GetHostedZone",
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:ListResourceRecordSets",
+        "route53:ListTagsForResource"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "ObserveNanotracePostgres",
+      "Effect": "Allow",
+      "Action": "rds:ListTagsForResource",
+      "Resource": [
+        "arn:aws:rds:*:*:db:nanotrace-*",
+        "arn:aws:rds:*:*:subgrp:nanotrace-*"
+      ]
     },
     {
       "Sid": "ListCloudWatchLogGroups",
@@ -53,6 +71,16 @@
         "arn:aws:logs:*:*:log-group:nanotrace-*",
         "arn:aws:logs:*:*:log-group:nanotrace-*:*"
       ]
+    },
+    {
+      "Sid": "ObserveSsmManagedInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:DescribeDocument",
+        "ssm:DescribeInstanceInformation",
+        "ssm:DescribeInstanceProperties"
+      ],
+      "Resource": "*"
     },
     {
       "Sid": "UseSsmShellScriptDocumentForDiagnostics",
@@ -134,6 +162,16 @@
         "ecr:ListTagsForResource"
       ],
       "Resource": "arn:aws:ecr:*:*:repository/nanotrace-*"
+    },
+    {
+      "Sid": "ObserveSesLoginIdentity",
+      "Effect": "Allow",
+      "Action": [
+        "ses:GetEmailIdentity",
+        "ses:ListEmailIdentities",
+        "ses:ListTagsForResource"
+      ],
+      "Resource": "*"
     },
     {
       "Sid": "GetEcrLoginToken",

@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     path::PathBuf,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,6 +12,7 @@ use aws_sdk_sqs::{Client as SqsClient, types::Message};
 use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,6 +25,9 @@ struct Config {
     clickhouse_database: String,
     clickhouse_table: String,
     clickhouse_facets_table: String,
+    clickhouse_event_index_table: String,
+    clickhouse_hot_dimensions_table: String,
+    hot_dimensions_refresh: Duration,
     poll_wait: u32,
     max_messages: i32,
     visibility_timeout: i32,
@@ -39,6 +44,13 @@ struct Loader {
     processors: ProcessorRuntime,
     s3: S3Client,
     sqs: SqsClient,
+    hot_dimensions: Arc<RwLock<HotDimensionCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct HotDimensionCache {
+    keys: Vec<String>,
+    refreshed_at: Option<Instant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +87,36 @@ struct FacetRow {
     value: String,
     value_type: String,
     count: u64,
+    error_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EventFacetIndexRow {
+    key: String,
+    value: String,
+    value_type: String,
+    timestamp: String,
+    bucket_time: String,
+    event_id: String,
+    event_type: String,
+    signal: String,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    name: String,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    duration_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HotDimensionPath {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClickHouseResponse<T> {
+    data: Vec<T>,
 }
 
 #[tokio::main]
@@ -105,6 +147,10 @@ async fn main() -> Result<()> {
         processors,
         s3,
         sqs: SqsClient::new(&aws_config),
+        hot_dimensions: Arc::new(RwLock::new(HotDimensionCache {
+            keys: builtin_indexed_facet_keys(),
+            refreshed_at: None,
+        })),
     };
 
     info!("nanotrace loader starting");
@@ -116,9 +162,21 @@ impl Config {
         let clickhouse_database = env_or("CLICKHOUSE_DATABASE", "observatory");
         let clickhouse_table = env_or("CLICKHOUSE_TABLE", "events");
         let clickhouse_facets_table = env_or("CLICKHOUSE_FACETS_TABLE", "event_facets");
+        let clickhouse_event_index_table =
+            env_or("CLICKHOUSE_EVENT_INDEX_TABLE", "event_facet_index");
+        let clickhouse_hot_dimensions_table =
+            env_or("CLICKHOUSE_HOT_DIMENSIONS_TABLE", "hot_dimensions");
         validate_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         validate_identifier("CLICKHOUSE_TABLE", &clickhouse_table)?;
         validate_identifier("CLICKHOUSE_FACETS_TABLE", &clickhouse_facets_table)?;
+        validate_identifier(
+            "CLICKHOUSE_EVENT_INDEX_TABLE",
+            &clickhouse_event_index_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
+            &clickhouse_hot_dimensions_table,
+        )?;
 
         Ok(Self {
             sqs_queue_url: required("LOADER_SQS_QUEUE_URL")?,
@@ -129,6 +187,12 @@ impl Config {
             clickhouse_database,
             clickhouse_table,
             clickhouse_facets_table,
+            clickhouse_event_index_table,
+            clickhouse_hot_dimensions_table,
+            hot_dimensions_refresh: Duration::from_secs(parse_env(
+                "LOADER_HOT_DIMENSIONS_REFRESH_SECS",
+                30,
+            )?),
             poll_wait: parse_env("LOADER_POLL_WAIT_SECS", 20)?,
             max_messages: parse_env("LOADER_MAX_MESSAGES", 10)?,
             visibility_timeout: parse_env("LOADER_VISIBILITY_TIMEOUT_SECS", 300)?,
@@ -152,6 +216,20 @@ impl Config {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_facets_table
+        )
+    }
+
+    fn event_index_table_name(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_event_index_table
+        )
+    }
+
+    fn hot_dimensions_table_name(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_hot_dimensions_table
         )
     }
 }
@@ -268,15 +346,93 @@ impl Loader {
             self.insert_clickhouse(&self.cfg.facets_table_name(), &facets)
                 .await?;
         }
+        let indexed_keys = self.indexed_facet_keys().await;
+        let event_index =
+            event_facet_index_ndjson(&processed, &indexed_keys).context("generate event index")?;
+        if !event_index.is_empty() {
+            self.insert_clickhouse(&self.cfg.event_index_table_name(), &event_index)
+                .await?;
+        }
         info!(
             bucket,
             key,
             rows,
             bytes = processed.len(),
             facet_bytes = facets.len(),
+            event_index_bytes = event_index.len(),
+            indexed_keys = indexed_keys.len(),
             "loaded event object"
         );
         Ok(())
+    }
+
+    async fn indexed_facet_keys(&self) -> Vec<String> {
+        let now = Instant::now();
+        {
+            let cache = self.hot_dimensions.read().await;
+            if cache.refreshed_at.is_some_and(|refreshed| {
+                now.duration_since(refreshed) < self.cfg.hot_dimensions_refresh
+            }) && !cache.keys.is_empty()
+            {
+                return cache.keys.clone();
+            }
+        }
+
+        let mut cache = self.hot_dimensions.write().await;
+        if cache.refreshed_at.is_some_and(|refreshed| {
+            now.duration_since(refreshed) < self.cfg.hot_dimensions_refresh
+        }) && !cache.keys.is_empty()
+        {
+            return cache.keys.clone();
+        }
+
+        match self.fetch_hot_dimension_keys().await {
+            Ok(keys) if !keys.is_empty() => {
+                cache.keys = keys;
+                cache.refreshed_at = Some(now);
+            }
+            Ok(_) => {
+                cache.keys = builtin_indexed_facet_keys();
+                cache.refreshed_at = Some(now);
+                warn!("hot dimension registry was empty; using builtin index keys");
+            }
+            Err(err) => {
+                if cache.keys.is_empty() {
+                    cache.keys = builtin_indexed_facet_keys();
+                }
+                cache.refreshed_at = Some(now);
+                warn!(error = %err, "failed to refresh hot dimension registry; using cached index keys");
+            }
+        }
+        cache.keys.clone()
+    }
+
+    async fn fetch_hot_dimension_keys(&self) -> Result<Vec<String>> {
+        let builtins = builtin_indexed_facet_keys();
+        let query = format!(
+            "SELECT path \
+             FROM (SELECT path, status, source, updated_at \
+                   FROM {} ORDER BY updated_at DESC LIMIT 1 BY path) \
+             WHERE status = 'active' AND source = 'user' \
+             ORDER BY path ASC FORMAT JSON",
+            self.cfg.hot_dimensions_table_name()
+        );
+        let response: ClickHouseResponse<HotDimensionPath> =
+            serde_json::from_str(&self.clickhouse_query(&query).await?)
+                .context("parse hot dimension registry response")?;
+
+        let mut seen = BTreeSet::new();
+        let mut keys = Vec::new();
+        for key in builtins
+            .into_iter()
+            .chain(response.data.into_iter().map(|row| row.path))
+        {
+            let key = key.trim().to_string();
+            if is_valid_facet_path(&key) && seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
     }
 
     async fn insert_clickhouse(&self, table: &str, body: &[u8]) -> Result<()> {
@@ -304,10 +460,32 @@ impl Loader {
 
         Ok(())
     }
+
+    async fn clickhouse_query(&self, query: &str) -> Result<String> {
+        let mut request = self
+            .http
+            .post(&self.cfg.clickhouse_url)
+            .timeout(self.cfg.request_timeout)
+            .query(&[("database", self.cfg.clickhouse_database.as_str())])
+            .body(query.to_string());
+
+        if let Some(user) = self.cfg.clickhouse_user.as_deref() {
+            request = request.basic_auth(user, self.cfg.clickhouse_password.as_deref());
+        }
+
+        let response = request.send().await.context("send ClickHouse query")?;
+        let status = response.status();
+        let text = response.text().await.context("read ClickHouse response")?;
+        if !status.is_success() {
+            bail!("ClickHouse query failed: {status} {text}");
+        }
+
+        Ok(text)
+    }
 }
 
 fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut counts = BTreeMap::<(String, String, String, String), u64>::new();
+    let mut counts = BTreeMap::<(String, String, String, String), (u64, u64)>::new();
     let mut out = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -318,12 +496,14 @@ fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
             continue;
         };
         for facet in facet_rows(row) {
-            *counts
+            let count = counts
                 .entry((facet.bucket_time, facet.key, facet.value, facet.value_type))
-                .or_insert(0) += facet.count;
+                .or_insert((0, 0));
+            count.0 += facet.count;
+            count.1 += facet.error_count;
         }
     }
-    for ((bucket_time, key, value, value_type), count) in counts {
+    for ((bucket_time, key, value, value_type), (count, error_count)) in counts {
         serde_json::to_writer(
             &mut out,
             &FacetRow {
@@ -332,6 +512,7 @@ fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
                 value,
                 value_type,
                 count,
+                error_count,
             },
         )
         .context("serialize facet row")?;
@@ -352,6 +533,7 @@ fn facet_rows(row: &Map<String, Value>) -> Vec<FacetRow> {
         .unwrap_or_default();
     let context = FacetContext {
         bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
+        error_count: if is_error_row(row) { 1 } else { 0 },
         signal: signal_for_event_type(&event_type).to_string(),
     };
 
@@ -373,8 +555,181 @@ fn facet_rows(row: &Map<String, Value>) -> Vec<FacetRow> {
     facets
 }
 
+fn event_facet_index_ndjson(bytes: &[u8], indexed_keys: &[String]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_slice(line).context("parse event row for index")?;
+        let Some(row) = row.as_object() else {
+            continue;
+        };
+        for index_row in event_facet_index_rows(row, indexed_keys) {
+            serde_json::to_writer(&mut out, &index_row).context("serialize event index row")?;
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+fn event_facet_index_rows(
+    row: &Map<String, Value>,
+    indexed_keys: &[String],
+) -> Vec<EventFacetIndexRow> {
+    let timestamp = string_value(row.get("timestamp"));
+    if timestamp.is_empty() {
+        return Vec::new();
+    }
+    let Some(data) = row.get("data").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let event_id = string_value(row.get("event_id"));
+    let event_type = string_value(data.get("event_type"));
+    let signal = signal_for_event_type(&event_type).to_string();
+    let context = EventIndexContext {
+        timestamp: timestamp.clone(),
+        bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
+        event_id,
+        event_type,
+        signal,
+        trace_id: string_value(data.get("trace_id")),
+        span_id: string_value(data.get("span_id")),
+        parent_span_id: string_value(data.get("parent_span_id")),
+        name: string_value(data.get("name")),
+        start_time: optional_time(data.get("start_time")),
+        end_time: optional_time(data.get("end_time")),
+        duration_ms: number_value(data.get("duration_ms")),
+    };
+
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in indexed_keys {
+        if key == "signal" {
+            collect_event_index_facets(
+                &context,
+                key,
+                &Value::String(context.signal.clone()),
+                &mut seen,
+                &mut rows,
+            );
+        } else if let Some(value) = value_at_path(data, key) {
+            collect_event_index_facets(&context, key, value, &mut seen, &mut rows);
+        }
+    }
+    rows
+}
+
+struct EventIndexContext {
+    timestamp: String,
+    bucket_time: String,
+    event_id: String,
+    event_type: String,
+    signal: String,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    name: String,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    duration_ms: f64,
+}
+
+fn builtin_indexed_facet_keys() -> Vec<String> {
+    [
+        "tenant_id",
+        "service",
+        "environment",
+        "event_type",
+        "name",
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "user_id",
+        "session_id",
+        "account_id",
+        "http.route",
+        "http.method",
+        "http.status_code",
+        "severity_text",
+        "metric_name",
+        "signal",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn collect_event_index_facets(
+    context: &EventIndexContext,
+    key: &str,
+    value: &Value,
+    seen: &mut BTreeSet<String>,
+    rows: &mut Vec<EventFacetIndexRow>,
+) {
+    match value {
+        Value::Null => {}
+        Value::Bool(value) => push_event_index_row(
+            context,
+            key,
+            if *value { "true" } else { "false" }.to_string(),
+            "bool",
+            seen,
+            rows,
+        ),
+        Value::Number(value) => {
+            push_event_index_row(context, key, value.to_string(), "number", seen, rows)
+        }
+        Value::String(value) => {
+            push_event_index_row(context, key, value.clone(), "string", seen, rows)
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_event_index_facets(context, key, value, seen, rows);
+            }
+        }
+        Value::Object(_) => {}
+    }
+}
+
+fn push_event_index_row(
+    context: &EventIndexContext,
+    key: &str,
+    value: String,
+    value_type: &str,
+    seen: &mut BTreeSet<String>,
+    rows: &mut Vec<EventFacetIndexRow>,
+) {
+    if key.is_empty() || value.is_empty() {
+        return;
+    }
+    let dedupe_key = format!("{key}\u{0}{value_type}\u{0}{value}");
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+    rows.push(EventFacetIndexRow {
+        key: key.to_string(),
+        value,
+        value_type: value_type.to_string(),
+        timestamp: context.timestamp.clone(),
+        bucket_time: context.bucket_time.clone(),
+        event_id: context.event_id.clone(),
+        event_type: context.event_type.clone(),
+        signal: context.signal.clone(),
+        trace_id: context.trace_id.clone(),
+        span_id: context.span_id.clone(),
+        parent_span_id: context.parent_span_id.clone(),
+        name: context.name.clone(),
+        start_time: context.start_time.clone(),
+        end_time: context.end_time.clone(),
+        duration_ms: context.duration_ms,
+    });
+}
+
 struct FacetContext {
     bucket_time: String,
+    error_count: u64,
     signal: String,
 }
 
@@ -448,6 +803,7 @@ fn push_facet(
         value,
         value_type: value_type.to_string(),
         count: 1,
+        error_count: context.error_count,
     });
 }
 
@@ -480,6 +836,62 @@ fn string_value(value: Option<&Value>) -> String {
         }
         _ => String::new(),
     }
+}
+
+fn optional_time(value: Option<&Value>) -> Option<String> {
+    string_value(value).into_non_empty()
+}
+
+fn number_value(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(value)) => value.as_f64().unwrap_or_default(),
+        Some(Value::String(value)) => value.parse().unwrap_or_default(),
+        _ => 0.0,
+    }
+}
+
+fn is_error_row(row: &Map<String, Value>) -> bool {
+    let data = row.get("data").and_then(Value::as_object);
+    boolish_value(data.and_then(|data| data.get("is_error")))
+        || data
+            .and_then(|data| string_value(data.get("span_status_code")).into_non_empty())
+            .is_some_and(|value| value.eq_ignore_ascii_case("error"))
+        || {
+            let event_type = string_value(row.get("event_type"))
+                .into_non_empty()
+                .or_else(|| {
+                    data.and_then(|data| string_value(data.get("event_type")).into_non_empty())
+                })
+                .unwrap_or_default();
+            event_type.to_ascii_lowercase().ends_with("_error")
+        }
+}
+
+fn boolish_value(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_u64().is_some_and(|value| value > 0),
+        Some(Value::String(value)) => {
+            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        }
+        _ => false,
+    }
+}
+
+fn value_at_path<'a>(data: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    if let Some(value) = data.get(path) {
+        return Some(value);
+    }
+    let mut current: Option<&'a Value> = None;
+    for part in path.split('.') {
+        let object: &'a Map<String, Value> = match current {
+            Some(Value::Object(object)) => object,
+            None => data,
+            _ => return None,
+        };
+        current = object.get(part);
+    }
+    current
 }
 
 fn signal_for_event_type(event_type: &str) -> &'static str {
@@ -549,6 +961,17 @@ fn validate_identifier(key: &'static str, value: &str) -> Result<()> {
     }
 }
 
+fn is_valid_facet_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 256
+        && !path.starts_with('.')
+        && !path.ends_with('.')
+        && !path.contains("..")
+        && path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-')
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -575,7 +998,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_ndjson_rows, facets_ndjson, parse_s3_records};
+    use super::{count_ndjson_rows, event_facet_index_ndjson, facets_ndjson, parse_s3_records};
     use serde_json::Value;
 
     #[test]
@@ -648,12 +1071,13 @@ mod tests {
                 .all(|row| row["bucket_time"] == "2026-05-12 00:00:00.000")
         );
         assert!(parsed.iter().all(|row| row["count"] == 1));
+        assert!(parsed.iter().all(|row| row["error_count"] == 0));
     }
 
     #[test]
     fn aggregates_facets_by_minute_key_and_value() {
         let facets = facets_ndjson(
-            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:01.000Z","data":{"name":"GET /users"}}
+            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:01.000Z","data":{"name":"GET /users","is_error":true}}
 {"event_id":"evt_2","timestamp":"2026-05-12T00:00:59.000Z","data":{"name":"GET /users"}}
 "#,
         )
@@ -667,6 +1091,48 @@ mod tests {
         assert!(parsed.iter().any(|row| row["key"] == "name"
             && row["value"] == "GET /users"
             && row["bucket_time"] == "2026-05-12 00:00:00.000"
-            && row["count"] == 2));
+            && row["count"] == 2
+            && row["error_count"] == 1));
+    }
+
+    #[test]
+    fn generates_event_index_for_configured_hot_dimensions_only() {
+        let index = event_facet_index_ndjson(
+            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","data":{"tenant_id":"tenant-a","event_type":"span_start","trace_id":"trace-1","span_id":"span-1","parent_span_id":"root","name":"GET /users","user_id":"user-1","session_id":"session-1","http":{"route":"/users/:id","method":"GET"},"ignored":"cold"}}"#,
+            &[
+                "trace_id".to_string(),
+                "session_id".to_string(),
+                "http.route".to_string(),
+                "signal".to_string(),
+            ],
+        )
+        .expect("generate event index");
+        let rows = String::from_utf8(index).expect("utf8");
+        let parsed: Vec<Value> = rows
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert!(parsed.iter().any(|row| row["key"] == "trace_id"
+            && row["value"] == "trace-1"
+            && row["trace_id"] == "trace-1"
+            && row["span_id"] == "span-1"));
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row["key"] == "session_id" && row["value"] == "session-1")
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row["key"] == "http.route" && row["value"] == "/users/:id")
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row["key"] == "signal" && row["value"] == "trace")
+        );
+        assert!(!parsed.iter().any(|row| row["key"] == "ignored"));
+        assert!(!parsed.iter().any(|row| row["key"] == "user_id"));
     }
 }

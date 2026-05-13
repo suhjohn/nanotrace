@@ -19,6 +19,8 @@ const password = requiredEnv("CLICKHOUSE_PASSWORD");
 const database = identifier(process.env.CLICKHOUSE_DATABASE || "observatory", "CLICKHOUSE_DATABASE");
 const eventsTable = identifier(process.env.CLICKHOUSE_TABLE || "events", "CLICKHOUSE_TABLE");
 const facetsTable = identifier(process.env.CLICKHOUSE_FACETS_TABLE || "event_facets", "CLICKHOUSE_FACETS_TABLE");
+const eventIndexTable = identifier(process.env.CLICKHOUSE_EVENT_INDEX_TABLE || "event_facet_index", "CLICKHOUSE_EVENT_INDEX_TABLE");
+const hotDimensionsTable = identifier(process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE || "hot_dimensions", "CLICKHOUSE_HOT_DIMENSIONS_TABLE");
 const batchSize = numberOption("--batch-size", numberEnv("NANOTRACE_FACET_BACKFILL_BATCH_SIZE", 50_000));
 const sourceMode = optionValue("--source") ?? process.env.NANOTRACE_FACET_BACKFILL_SOURCE ?? "clickhouse";
 const s3Bucket = optionValue("--bucket") ?? process.env.NANOTRACE_S3_BUCKET ?? process.env.S3_BUCKET ?? "";
@@ -43,9 +45,13 @@ if (limit && !/^\d+$/.test(limit)) {
 
 const source = `${quoteIdentifier(database)}.${quoteIdentifier(eventsTable)}`;
 const target = `${quoteIdentifier(database)}.${quoteIdentifier(facetsTable)}`;
+const eventIndexTarget = `${quoteIdentifier(database)}.${quoteIdentifier(eventIndexTable)}`;
+const indexedFacetKeys = await loadHotDimensionKeys();
 
 console.log(`source=${database}.${eventsTable}`);
 console.log(`target=${database}.${facetsTable}`);
+console.log(`eventIndexTarget=${database}.${eventIndexTable}`);
+console.log(`indexedFacetKeys=${indexedFacetKeys.length}`);
 console.log(`sourceMode=${sourceMode}`);
 if (sourceMode === "s3") {
     console.log(`bucket=${s3Bucket}`);
@@ -57,12 +63,16 @@ console.log(`batchSize=${batchSize}`);
 if (truncate) {
     console.log(`truncate=${database}.${facetsTable}`);
     await clickhouse(`TRUNCATE TABLE ${target}`);
+    console.log(`truncate=${database}.${eventIndexTable}`);
+    await clickhouse(`TRUNCATE TABLE ${eventIndexTarget}`);
 }
 
 let eventRows = 0;
 let facetRows = 0;
+let eventIndexRows = 0;
 let batches = 0;
 let pending = new Map();
+let pendingEventIndex = [];
 
 if (sourceMode === "s3") {
     await backfillFromS3();
@@ -71,7 +81,7 @@ if (sourceMode === "s3") {
 }
 await flush();
 
-console.log(`backfill complete eventRows=${eventRows} facetRows=${facetRows} batches=${batches}`);
+console.log(`backfill complete eventRows=${eventRows} facetRows=${facetRows} eventIndexRows=${eventIndexRows} batches=${batches}`);
 
 async function backfillFromClickHouse() {
     const query = [
@@ -142,6 +152,7 @@ async function indexEvent(row) {
         const existing = pending.get(key);
         if (existing) {
             existing.count += facet.count;
+            existing.error_count += facet.error_count;
         } else {
             pending.set(key, facet);
         }
@@ -149,20 +160,35 @@ async function indexEvent(row) {
             await flush();
         }
     }
+    for (const indexRow of eventIndexRowsForEvent(row, indexedFacetKeys)) {
+        pendingEventIndex.push(indexRow);
+        if (pendingEventIndex.length >= batchSize) {
+            await flush();
+        }
+    }
     if (eventRows % 100_000 === 0) {
-        console.log(`progress eventRows=${eventRows} facetRows=${facetRows} batches=${batches}`);
+        console.log(`progress eventRows=${eventRows} facetRows=${facetRows} eventIndexRows=${eventIndexRows} batches=${batches}`);
     }
 }
 
 async function flush() {
-    if (pending.size === 0) {
+    if (pending.size === 0 && pendingEventIndex.length === 0) {
         return;
     }
-    const rows = [...pending.values()];
-    const body = `INSERT INTO ${target} FORMAT JSONEachRow\n${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
-    pending = new Map();
-    await clickhouse(body);
-    facetRows += rows.length;
+    if (pending.size > 0) {
+        const rows = [...pending.values()];
+        const body = `INSERT INTO ${target} FORMAT JSONEachRow\n${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+        pending = new Map();
+        await clickhouse(body);
+        facetRows += rows.length;
+    }
+    if (pendingEventIndex.length > 0) {
+        const rows = pendingEventIndex;
+        const body = `INSERT INTO ${eventIndexTarget} FORMAT JSONEachRow\n${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+        pendingEventIndex = [];
+        await clickhouse(body);
+        eventIndexRows += rows.length;
+    }
     batches += 1;
 }
 
@@ -291,6 +317,51 @@ async function clickhouseResponse(sql, settings = {}) {
     return response;
 }
 
+async function loadHotDimensionKeys() {
+    const keys = new Set(builtinIndexedFacetKeys());
+    try {
+        const table = `${quoteIdentifier(database)}.${quoteIdentifier(hotDimensionsTable)}`;
+        const response = await clickhouseResponse([
+            "SELECT path",
+            "FROM (SELECT path, status, source, updated_at",
+            `FROM ${table} ORDER BY updated_at DESC LIMIT 1 BY path)`,
+            "WHERE status = 'active' AND source = 'user'",
+            "ORDER BY path ASC FORMAT JSON",
+        ].join(" "));
+        const body = await response.json();
+        for (const row of body.data ?? []) {
+            if (isValidFacetPath(row.path)) {
+                keys.add(row.path);
+            }
+        }
+    } catch (error) {
+        console.warn(`warning: failed to load hot dimension registry, using builtin keys: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return [...keys];
+}
+
+function builtinIndexedFacetKeys() {
+    return [
+        "tenant_id",
+        "service",
+        "environment",
+        "event_type",
+        "name",
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "user_id",
+        "session_id",
+        "account_id",
+        "http.route",
+        "http.method",
+        "http.status_code",
+        "severity_text",
+        "metric_name",
+        "signal",
+    ];
+}
+
 function facetRowsForEvent(row) {
     const timestamp = stringValue(row.timestamp);
     if (!timestamp) {
@@ -301,6 +372,7 @@ function facetRowsForEvent(row) {
     const signal = stringValue(row.signal) || signalForEventType(eventType);
     const context = {
         bucket_time: minuteBucket(timestamp),
+        error_count: isErrorEvent(row) ? 1 : 0,
         signal,
     };
 
@@ -311,6 +383,97 @@ function facetRowsForEvent(row) {
     }
     pushFacetRow(context, "signal", signal, "string", seen, rows);
     return rows;
+}
+
+function eventIndexRowsForEvent(row, indexedKeys) {
+    const timestamp = stringValue(row.timestamp);
+    if (!timestamp) {
+        return [];
+    }
+    const data = isPlainObject(row.data) ? row.data : {};
+    const eventType = stringValue(row.event_type) || stringValue(data.event_type);
+    const signal = stringValue(row.signal) || signalForEventType(eventType);
+    const context = {
+        bucket_time: minuteBucket(timestamp),
+        duration_ms: numberValue(data.duration_ms),
+        end_time: optionalString(data.end_time),
+        event_id: stringValue(row.event_id),
+        event_type: eventType,
+        name: stringValue(data.name),
+        parent_span_id: stringValue(data.parent_span_id),
+        signal,
+        span_id: stringValue(row.span_id) || stringValue(data.span_id),
+        start_time: optionalString(data.start_time),
+        timestamp,
+        trace_id: stringValue(row.trace_id) || stringValue(data.trace_id),
+    };
+    const rows = [];
+    const seen = new Set();
+    for (const key of indexedKeys) {
+        if (key === "signal") {
+            collectEventIndexRows(context, key, signal, seen, rows);
+            continue;
+        }
+        const value = valueAtPath(data, key);
+        if (value !== undefined) {
+            collectEventIndexRows(context, key, value, seen, rows);
+        }
+    }
+    return rows;
+}
+
+function collectEventIndexRows(context, key, value, seen, rows) {
+    if (value === null || value === undefined) {
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            collectEventIndexRows(context, key, item, seen, rows);
+        }
+        return;
+    }
+    if (isPlainObject(value)) {
+        return;
+    }
+    if (typeof value === "string") {
+        pushEventIndexRow(context, key, value, "string", seen, rows);
+        return;
+    }
+    if (typeof value === "number" || typeof value === "bigint") {
+        pushEventIndexRow(context, key, String(value), "number", seen, rows);
+        return;
+    }
+    if (typeof value === "boolean") {
+        pushEventIndexRow(context, key, value ? "true" : "false", "bool", seen, rows);
+    }
+}
+
+function pushEventIndexRow(context, key, value, valueType, seen, rows) {
+    if (!key || !value) {
+        return;
+    }
+    const dedupeKey = `${key}\0${valueType}\0${value}`;
+    if (seen.has(dedupeKey)) {
+        return;
+    }
+    seen.add(dedupeKey);
+    rows.push({
+        key,
+        value,
+        value_type: valueType,
+        timestamp: context.timestamp,
+        bucket_time: context.bucket_time,
+        event_id: context.event_id,
+        event_type: context.event_type,
+        signal: context.signal,
+        trace_id: context.trace_id,
+        span_id: context.span_id,
+        parent_span_id: context.parent_span_id,
+        name: context.name,
+        start_time: context.start_time,
+        end_time: context.end_time,
+        duration_ms: context.duration_ms,
+    });
 }
 
 function collectFacetRows(context, key, value, seen, rows) {
@@ -357,6 +520,7 @@ function pushFacetRow(context, key, value, valueType, seen, rows) {
         value,
         value_type: valueType,
         count: 1,
+        error_count: context.error_count,
     });
 }
 
@@ -398,6 +562,60 @@ function stringValue(value) {
     if (typeof value === "number" || typeof value === "bigint") return String(value);
     if (typeof value === "boolean") return value ? "true" : "false";
     return "";
+}
+
+function optionalString(value) {
+    const string = stringValue(value);
+    return string || null;
+}
+
+function numberValue(value) {
+    if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+    if (typeof value === "bigint") return Number(value);
+    if (typeof value === "string") {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+    return 0;
+}
+
+function isErrorEvent(row) {
+    const data = isPlainObject(row.data) ? row.data : {};
+    const eventType = stringValue(row.event_type) || stringValue(data.event_type);
+    return boolishValue(data.is_error)
+        || stringValue(data.span_status_code).toLowerCase() === "error"
+        || eventType.toLowerCase().endsWith("_error");
+}
+
+function boolishValue(value) {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number" || typeof value === "bigint") return Number(value) > 0;
+    if (typeof value === "string") return ["1", "true", "yes"].includes(value.toLowerCase());
+    return false;
+}
+
+function valueAtPath(data, key) {
+    if (Object.hasOwn(data, key)) {
+        return data[key];
+    }
+    let current = data;
+    for (const part of key.split(".")) {
+        if (!isPlainObject(current) || !Object.hasOwn(current, part)) {
+            return undefined;
+        }
+        current = current[part];
+    }
+    return current;
+}
+
+function isValidFacetPath(path) {
+    return typeof path === "string"
+        && path.length > 0
+        && path.length <= 256
+        && !path.startsWith(".")
+        && !path.endsWith(".")
+        && !path.includes("..")
+        && /^[A-Za-z0-9_.-]+$/.test(path);
 }
 
 function isPlainObject(value) {
@@ -495,7 +713,7 @@ function quoteIdentifier(value) {
 function usage() {
     console.log(`Usage: node scripts/backfill-clickhouse-facets.mjs [--env .env.aws] [--truncate] [--source clickhouse|s3] [--bucket S3_BUCKET] [--prefix events/dt=] [--concurrency N] [--where "WHERE timestamp >= ..."] [--limit N] [--batch-size N]
 
-Streams existing ClickHouse events and writes generated scalar JSON facets into CLICKHOUSE_FACETS_TABLE.
+Streams existing ClickHouse events and writes generated scalar JSON facets into CLICKHOUSE_FACETS_TABLE plus hot-dimension event rows into CLICKHOUSE_EVENT_INDEX_TABLE.
 
 Examples:
   node scripts/backfill-clickhouse-facets.mjs --env .env.aws --truncate

@@ -1,10 +1,10 @@
 use std::{env, time::Duration};
 
+use nanotrace_auth::AuthConfig;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub secret_key: String,
     pub port: u16,
     pub s3_bucket: Option<String>,
     pub clickhouse_url: Option<String>,
@@ -17,12 +17,12 @@ pub struct Config {
     pub clickhouse_max_bytes_to_read: u64,
     pub max_request_bytes: usize,
     pub request_timeout: Duration,
+    pub auth: AuthConfig,
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("{0} is required")]
-    Missing(&'static str),
     #[error("{key} must be a valid {kind}: {value}")]
     Invalid {
         key: &'static str,
@@ -57,9 +57,33 @@ impl Config {
 
         let request_timeout_secs = parse_env("QUERY_REQUEST_TIMEOUT_SECS", 60)?;
         ensure_nonzero("QUERY_REQUEST_TIMEOUT_SECS", request_timeout_secs)?;
+        let public_base_url = optional_string("NANOTRACE_PUBLIC_BASE_URL");
+        let session_secure = optional_bool_env("NANOTRACE_SESSION_SECURE")?.unwrap_or_else(|| {
+            public_base_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))
+        });
+        let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
+        ensure_nonzero("NANOTRACE_SESSION_TTL_SECS", session_ttl_secs)?;
+        let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 10 * 60)?;
+        ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
+        let auth = AuthConfig {
+            database_url: optional_string("NANOTRACE_DATABASE_URL")
+                .or_else(|| optional_string("DATABASE_URL")),
+            bootstrap_api_key: optional_string("NANOTRACE_BOOTSTRAP_API_KEY"),
+            public_base_url,
+            session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
+                .unwrap_or_else(|_| "nanotrace_session".to_string())
+                .trim()
+                .to_string(),
+            session_ttl: Duration::from_secs(session_ttl_secs),
+            session_secure,
+            magic_link_ttl: Duration::from_secs(magic_link_ttl_secs),
+            allowed_emails: parse_list_env("NANOTRACE_ALLOWED_EMAILS"),
+            admin_emails: parse_list_env("NANOTRACE_ADMIN_EMAILS"),
+        };
 
         Ok(Self {
-            secret_key: required("SECRET_KEY")?,
             port: parse_env("PORT", 18_473)?,
             s3_bucket: optional_string("NANOTRACE_S3_BUCKET")
                 .or_else(|| optional_string("S3_BUCKET")),
@@ -74,6 +98,8 @@ impl Config {
             clickhouse_max_bytes_to_read,
             max_request_bytes: parse_env("MAX_REQUEST_BYTES", 16 * 1024 * 1024)?,
             request_timeout: Duration::from_secs(request_timeout_secs),
+            auth,
+            cors_allowed_origins: parse_list_env("NANOTRACE_CORS_ALLOWED_ORIGINS"),
         })
     }
 }
@@ -83,13 +109,6 @@ fn optional_string(key: &'static str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn required(key: &'static str) -> Result<String, ConfigError> {
-    env::var(key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or(ConfigError::Missing(key))
 }
 
 fn parse_env<T>(key: &'static str, default: T) -> Result<T, ConfigError>
@@ -104,6 +123,35 @@ where
         }),
         Err(_) => Ok(default),
     }
+}
+
+fn optional_bool_env(key: &'static str) -> Result<Option<bool>, ConfigError> {
+    match env::var(key) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            _ => Err(ConfigError::Invalid {
+                key,
+                kind: "bool",
+                value,
+            }),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_list_env(key: &'static str) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn ensure_nonzero<T>(key: &'static str, value: T) -> Result<(), ConfigError>

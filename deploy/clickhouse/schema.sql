@@ -228,7 +228,8 @@ CREATE TABLE
         /* The sort key starts with tenant_id, so trace/span lookups by id
            alone scan a wide range. Bloom filters cut that to matching parts. */
         INDEX idx_trace_id trace_id TYPE bloom_filter (0.01) GRANULARITY 1,
-        INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 1
+        INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 1,
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 1
     ) ENGINE = MergeTree
 PARTITION BY
     toYYYYMMDD (timestamp)
@@ -241,9 +242,48 @@ CREATE TABLE
         key String CODEC (ZSTD (1)),
         value String CODEC (ZSTD (1)),
         value_type LowCardinality (String),
-        count UInt64 CODEC (Delta, ZSTD (1))
+        count UInt64 CODEC (Delta, ZSTD (1)),
+        error_count UInt64 CODEC (Delta, ZSTD (1))
     ) ENGINE = SummingMergeTree
 PARTITION BY
     toYYYYMMDD (bucket_time)
 ORDER BY
     (key, bucket_time, value, value_type);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.event_facet_index (
+        key LowCardinality (String),
+        value String CODEC (ZSTD (1)),
+        value_type LowCardinality (String),
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type LowCardinality (String),
+        signal LowCardinality (String),
+        trace_id String CODEC (ZSTD (1)),
+        span_id String CODEC (ZSTD (1)),
+        parent_span_id String CODEC (ZSTD (1)),
+        name String CODEC (ZSTD (1)),
+        start_time Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
+        end_time Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
+        duration_ms Float64 CODEC (ZSTD (1))
+    ) ENGINE = MergeTree
+PARTITION BY
+    toYYYYMMDD (timestamp)
+ORDER BY
+    (key, value, timestamp, event_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.hot_dimensions (
+        path String CODEC (ZSTD (1)),
+        value_type LowCardinality (String),
+        status LowCardinality (String),
+        display_name String DEFAULT '',
+        source LowCardinality (String) DEFAULT 'user',
+        created_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
+        updated_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
+        created_by String DEFAULT '',
+        error String DEFAULT ''
+    ) ENGINE = ReplacingMergeTree (updated_at)
+ORDER BY
+    path;

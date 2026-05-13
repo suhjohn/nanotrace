@@ -1,6 +1,8 @@
 import * as aws from '@pulumi/aws'
+import * as cloudflare from '@pulumi/cloudflare'
 import * as command from '@pulumi/command'
 import * as pulumi from '@pulumi/pulumi'
+import * as random from '@pulumi/random'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
@@ -26,8 +28,6 @@ const prefix =
 const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, '')
 const region = awsCfg.get('region') ?? process.env.AWS_REGION ?? 'us-west-1'
 const port = cfg.getNumber('port') ?? 18473
-const secretKey =
-  cfg.getSecret('secretKey') ?? pulumi.secret(requireEnv('SECRET_KEY'))
 const clickhouseUrl = cfg.get('clickhouseUrl') ?? requireEnv('CLICKHOUSE_URL')
 const clickhouseUser =
   cfg.get('clickhouseUser') ?? requireEnv('CLICKHOUSE_USER')
@@ -52,6 +52,14 @@ const clickhouseFacetsTable =
   cfg.get('clickhouseFacetsTable') ??
   process.env.CLICKHOUSE_FACETS_TABLE ??
   'event_facets'
+const clickhouseEventIndexTable =
+  cfg.get('clickhouseEventIndexTable') ??
+  process.env.CLICKHOUSE_EVENT_INDEX_TABLE ??
+  'event_facet_index'
+const clickhouseHotDimensionsTable =
+  cfg.get('clickhouseHotDimensionsTable') ??
+  process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE ??
+  'hot_dimensions'
 const clickhouseMaxBytesToRead =
   cfg.getNumber('clickhouseMaxBytesToRead') ??
   numberEnv('CLICKHOUSE_MAX_BYTES_TO_READ', 1_000_000_000_000)
@@ -72,7 +80,7 @@ const dataVolumeType = cfg.get('dataVolumeType') ?? 'gp3'
 const dataVolumeIops = cfg.getNumber('dataVolumeIops') ?? 3000
 const dataVolumeThroughput = cfg.getNumber('dataVolumeThroughput') ?? 250
 const localDataDir = cfg.get('dataDir') ?? '/data/events'
-const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 64 * 1024 * 1024
+const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 1024 * 1024
 const partMaxAgeSecs =
   cfg.getNumber('partMaxAgeSecs') ?? numberEnv('NANOTRACE_PART_MAX_AGE_SECS', 1)
 const uploadPollIntervalMs =
@@ -102,6 +110,63 @@ const writerFlushBytes =
 const compactBatchReceipts =
   cfg.getBoolean('compactBatchReceipts') ??
   booleanEnv('NANOTRACE_COMPACT_BATCH_RECEIPTS', false)
+const databaseName = cfg.get('databaseName') ?? 'nanotrace'
+const databaseUsername = cfg.get('databaseUsername') ?? 'nanotrace'
+const databaseInstanceClass = cfg.get('databaseInstanceClass') ?? 'db.t4g.micro'
+const databaseAllocatedStorageGb =
+  cfg.getNumber('databaseAllocatedStorageGb') ?? 20
+const databaseBackupRetentionDays =
+  cfg.getNumber('databaseBackupRetentionDays') ?? 1
+const databaseSkipFinalSnapshot =
+  cfg.getBoolean('databaseSkipFinalSnapshot') ?? true
+const databaseDeletionProtection =
+  cfg.getBoolean('databaseDeletionProtection') ?? false
+const emailFrom = cfg.get('emailFrom') ?? process.env.NANOTRACE_EMAIL_FROM ?? ''
+const allowedEmails =
+  cfg.get('allowedEmails') ??
+  process.env.NANOTRACE_ALLOWED_EMAILS ??
+  ''
+const adminEmails =
+  cfg.get('adminEmails') ?? process.env.NANOTRACE_ADMIN_EMAILS ?? ''
+const corsAllowedOrigins =
+  cfg.get('corsAllowedOrigins') ??
+  process.env.NANOTRACE_CORS_ALLOWED_ORIGINS ??
+  ''
+const domainName = normalizeDomainName(
+  requireConfigOrEnv('domainName', 'NANOTRACE_DOMAIN_NAME')
+)
+const hostedZoneName = normalizeDomainName(
+  cfg.get('hostedZoneName') ??
+    process.env.NANOTRACE_HOSTED_ZONE_NAME ??
+    domainName
+)
+const dnsProvider =
+  cfg.get('dnsProvider') ??
+  process.env.NANOTRACE_DNS_PROVIDER ??
+  (process.env.CLOUDFLARE_API_TOKEN ? 'cloudflare' : 'route53')
+if (dnsProvider !== 'route53' && dnsProvider !== 'cloudflare') {
+  throw new Error('nanotrace:dnsProvider must be route53 or cloudflare')
+}
+const edgeTlsMode =
+  cfg.get('edgeTlsMode') ??
+  process.env.NANOTRACE_EDGE_TLS_MODE ??
+  (dnsProvider === 'cloudflare' ? 'cloudflare-flexible' : 'alb')
+if (edgeTlsMode !== 'alb' && edgeTlsMode !== 'cloudflare-flexible') {
+  throw new Error('nanotrace:edgeTlsMode must be alb or cloudflare-flexible')
+}
+const hostedZoneIdOverride =
+  cfg.get('hostedZoneId') ?? process.env.NANOTRACE_HOSTED_ZONE_ID
+const cloudflareZoneIdOverride =
+  cfg.get('cloudflareZoneId') ?? process.env.CLOUDFLARE_ZONE_ID
+const manageDns = edgeTlsMode === 'alb'
+const cloudflareProvider = manageDns && dnsProvider === 'cloudflare'
+  ? new cloudflare.Provider(`${name}-cloudflare`, {
+    apiToken: requireConfigOrEnv('cloudflareApiToken', 'CLOUDFLARE_API_TOKEN')
+  })
+  : undefined
+const sessionSecure =
+  cfg.getBoolean('sessionSecure') ??
+  booleanEnv('NANOTRACE_SESSION_SECURE', true)
 const imageUriOverride = cfg.get('imageUri')
 const buildImage = cfg.getBoolean('buildImage') ?? !imageUriOverride
 const schemaHash = createHash('sha256')
@@ -122,6 +187,31 @@ const tags = {
   Project: 'nanotrace',
   Deployment: deploymentId
 }
+const managedLoginEmailIdentity = emailFrom.trim()
+  ? new aws.sesv2.EmailIdentity(`${name}-login-email`, {
+    emailIdentity: emailFrom.trim(),
+    tags
+  })
+  : undefined
+
+const databasePassword =
+  cfg.getSecret('databasePassword') ??
+  new random.RandomPassword(`${name}-database-password`, {
+    length: 32,
+    special: false
+  }).result
+const generatedBootstrapApiKey = new random.RandomPassword(
+  `${name}-bootstrap-api-key`,
+  {
+    length: 43,
+    special: false
+  }
+)
+const bootstrapApiKey =
+  cfg.getSecret('bootstrapApiKey') ??
+  (process.env.NANOTRACE_BOOTSTRAP_API_KEY
+    ? pulumi.secret(process.env.NANOTRACE_BOOTSTRAP_API_KEY)
+    : pulumi.interpolate`ntak_${generatedBootstrapApiKey.result}`)
 
 const azs = aws.getAvailabilityZonesOutput({ state: 'available' })
 
@@ -144,13 +234,17 @@ const routeTable = new aws.ec2.RouteTable(`${name}-public-rt`, {
 })
 
 const subnets = [0, 1].map(i => {
-  const subnet = new aws.ec2.Subnet(`${name}-public-${i}`, {
-    vpcId: vpc.id,
-    availabilityZone: azs.names.apply(names => names[i]),
-    cidrBlock: `10.42.${i}.0/24`,
-    mapPublicIpOnLaunch: true,
-    tags: { ...tags, Name: `${name}-public-${i}` }
-  })
+  const subnet = new aws.ec2.Subnet(
+    `${name}-public-${i}`,
+    {
+      vpcId: vpc.id,
+      availabilityZone: azs.names.apply(names => names[i]),
+      cidrBlock: `10.42.${i}.0/24`,
+      mapPublicIpOnLaunch: true,
+      tags: { ...tags, Name: `${name}-public-${i}` }
+    },
+    { ignoreChanges: ['availabilityZone'] }
+  )
 
   new aws.ec2.RouteTableAssociation(`${name}-public-${i}`, {
     subnetId: subnet.id,
@@ -242,12 +336,12 @@ const imageBuild = buildImage
   ? new command.local.Command(
       `${name}-image`,
       {
-        create: pulumi.interpolate`aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${repository.repositoryUrl.apply(
+        create: pulumi.interpolate`mkdir -p .pulumi-docker && ECR_PASSWORD="$(aws ecr get-login-password --region ${region})" && ECR_AUTH="$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" && printf '{"auths":{"${repository.repositoryUrl.apply(
           value => value.split('/')[0]
-        )} && docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker push ${imageUri}`,
-        update: pulumi.interpolate`aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${repository.repositoryUrl.apply(
+        )}":{"auth":"%s"}}}\n' "$ECR_AUTH" > .pulumi-docker/config.json && docker --config .pulumi-docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker --config .pulumi-docker push ${imageUri}`,
+        update: pulumi.interpolate`mkdir -p .pulumi-docker && ECR_PASSWORD="$(aws ecr get-login-password --region ${region})" && ECR_AUTH="$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" && printf '{"auths":{"${repository.repositoryUrl.apply(
           value => value.split('/')[0]
-        )} && docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker push ${imageUri}`,
+        )}":{"auth":"%s"}}}\n' "$ECR_AUTH" > .pulumi-docker/config.json && docker --config .pulumi-docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker --config .pulumi-docker push ${imageUri}`,
         delete: `true`,
         dir: repoRoot,
         triggers: [cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest']
@@ -309,6 +403,12 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
             Resource: queueArn
           },
           {
+            Sid: 'SendLoginEmail',
+            Effect: 'Allow',
+            Action: ['ses:SendEmail', 'ses:SendRawEmail'],
+            Resource: '*'
+          },
+          {
             Sid: 'ReadEcrAuth',
             Effect: 'Allow',
             Action: 'ecr:GetAuthorizationToken',
@@ -327,6 +427,11 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
         ]
       })
     )
+})
+
+new aws.iam.RolePolicyAttachment(`${name}-instance-ssm`, {
+  role: role.name,
+  policyArn: 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
 })
 
 const instanceProfile = new aws.iam.InstanceProfile(
@@ -351,6 +456,8 @@ const clickHouseSchema = new command.local.Command(
       CLICKHOUSE_DATABASE: clickhouseDatabase,
       CLICKHOUSE_TABLE: clickhouseTable,
       CLICKHOUSE_FACETS_TABLE: clickhouseFacetsTable,
+      CLICKHOUSE_EVENT_INDEX_TABLE: clickhouseEventIndexTable,
+      CLICKHOUSE_HOT_DIMENSIONS_TABLE: clickhouseHotDimensionsTable,
       CLICKHOUSE_SCHEMA_PATH: 'deploy/clickhouse/schema.sql'
     },
     triggers: [
@@ -359,7 +466,9 @@ const clickHouseSchema = new command.local.Command(
       clickhouseUrl,
       clickhouseDatabase,
       clickhouseTable,
-      clickhouseFacetsTable
+      clickhouseFacetsTable,
+      clickhouseEventIndexTable,
+      clickhouseHotDimensionsTable
     ]
   },
   {
@@ -375,7 +484,13 @@ const albSg = new aws.ec2.SecurityGroup(`${name}-alb-sg`, {
       fromPort: 80,
       toPort: 80,
       cidrBlocks: ['0.0.0.0/0']
-    }
+    },
+    ...(edgeTlsMode === 'alb' ? [{
+      protocol: 'tcp',
+      fromPort: 443,
+      toPort: 443,
+      cidrBlocks: ['0.0.0.0/0']
+    }] : [])
   ],
   egress: [
     {
@@ -386,7 +501,7 @@ const albSg = new aws.ec2.SecurityGroup(`${name}-alb-sg`, {
     }
   ],
   tags: { ...tags, Name: `${name}-alb-sg` }
-})
+}, { ignoreChanges: ['ingress'] })
 
 const instanceSg = new aws.ec2.SecurityGroup(`${name}-instance-sg`, {
   vpcId: vpc.id,
@@ -407,6 +522,52 @@ const instanceSg = new aws.ec2.SecurityGroup(`${name}-instance-sg`, {
     }
   ],
   tags: { ...tags, Name: `${name}-instance-sg` }
+})
+
+const databaseSg = new aws.ec2.SecurityGroup(`${name}-postgres-sg`, {
+  vpcId: vpc.id,
+  ingress: [
+    {
+      protocol: 'tcp',
+      fromPort: 5432,
+      toPort: 5432,
+      securityGroups: [instanceSg.id]
+    }
+  ],
+  egress: [
+    {
+      protocol: '-1',
+      fromPort: 0,
+      toPort: 0,
+      cidrBlocks: ['0.0.0.0/0']
+    }
+  ],
+  tags: { ...tags, Name: `${name}-postgres-sg` }
+})
+
+const databaseSubnetGroup = new aws.rds.SubnetGroup(`${name}-postgres-subnets`, {
+  subnetIds: subnets.map(subnet => subnet.id),
+  tags
+})
+
+const database = new aws.rds.Instance(`${name}-postgres`, {
+  allocatedStorage: databaseAllocatedStorageGb,
+  autoMinorVersionUpgrade: true,
+  backupRetentionPeriod: databaseBackupRetentionDays,
+  dbName: databaseName,
+  dbSubnetGroupName: databaseSubnetGroup.name,
+  deletionProtection: databaseDeletionProtection,
+  engine: 'postgres',
+  identifier: `${name}-postgres`,
+  instanceClass: databaseInstanceClass,
+  multiAz: false,
+  password: databasePassword,
+  publiclyAccessible: false,
+  skipFinalSnapshot: databaseSkipFinalSnapshot,
+  storageEncrypted: true,
+  username: databaseUsername,
+  vpcSecurityGroupIds: [databaseSg.id],
+  tags
 })
 
 const lb = new aws.lb.LoadBalancer(`${name}-alb`, {
@@ -452,12 +613,129 @@ const queryTargetGroup = new aws.lb.TargetGroup(`${name}-query-tg`, {
   tags: { ...tags, Service: 'query' }
 })
 
-const listener = new aws.lb.Listener(`${name}-http`, {
+const hostedZone = manageDns && dnsProvider === 'route53' && !hostedZoneIdOverride
+  ? new aws.route53.Zone(`${name}-zone`, {
+    name: hostedZoneName,
+    tags
+  })
+  : undefined
+const hostedZoneId = hostedZoneIdOverride ?? hostedZone?.zoneId
+const cloudflareZone = manageDns && dnsProvider === 'cloudflare' && !cloudflareZoneIdOverride
+  ? cloudflare.getZoneOutput(
+    { filter: { name: hostedZoneName } },
+    { provider: cloudflareProvider }
+  )
+  : undefined
+const cloudflareZoneId = cloudflareZoneIdOverride ?? cloudflareZone?.zoneId
+
+let certificateValidation: aws.acm.CertificateValidation | undefined
+if (edgeTlsMode === 'alb') {
+  const certificate = new aws.acm.Certificate(`${name}-certificate`, {
+    domainName,
+    validationMethod: 'DNS',
+    tags
+  })
+  const certificateDomainValidationOption =
+    certificate.domainValidationOptions.apply(options => {
+      return options?.[0] ?? {
+        domainName,
+        resourceRecordName: `_pending-validation.${domainName}`,
+        resourceRecordType: 'CNAME',
+        resourceRecordValue: 'pending-validation'
+      }
+    })
+
+  const certificateValidationRecordFqdn =
+    dnsProvider === 'cloudflare'
+      ? new cloudflare.Record(`${name}-certificate-validation`, {
+        content: certificateDomainValidationOption.resourceRecordValue,
+        name: certificateDomainValidationOption.resourceRecordName,
+        proxied: false,
+        ttl: 1,
+        type: 'CNAME',
+        zoneId: cloudflareZoneId
+      }, { provider: cloudflareProvider }).name
+      : new aws.route53.Record(
+        `${name}-certificate-validation`,
+        {
+          allowOverwrite: true,
+          name: certificateDomainValidationOption.resourceRecordName,
+          records: [
+            certificateDomainValidationOption.resourceRecordValue
+          ],
+          ttl: 60,
+          type: certificateDomainValidationOption.resourceRecordType,
+          zoneId: hostedZoneId!
+        }
+      ).fqdn
+
+  certificateValidation = new aws.acm.CertificateValidation(
+    `${name}-certificate-validation`,
+    {
+      certificateArn: certificate.arn,
+      validationRecordFqdns: [certificateValidationRecordFqdn]
+    }
+  )
+
+  if (dnsProvider === 'cloudflare') {
+    new cloudflare.Record(`${name}-alias`, {
+      content: lb.dnsName,
+      name: cloudflareRecordName(domainName, hostedZoneName),
+      proxied: false,
+      ttl: 1,
+      type: 'CNAME',
+      zoneId: cloudflareZoneId
+    }, { provider: cloudflareProvider })
+  } else {
+    new aws.route53.Record(`${name}-alias`, {
+      aliases: [
+        {
+          evaluateTargetHealth: true,
+          name: lb.dnsName,
+          zoneId: lb.zoneId
+        }
+      ],
+      name: domainName,
+      type: 'A',
+      zoneId: hostedZoneId!
+    })
+  }
+}
+
+const httpListener = new aws.lb.Listener(`${name}-http`, {
   loadBalancerArn: lb.arn,
   port: 80,
   protocol: 'HTTP',
-  defaultActions: [{ type: 'forward', targetGroupArn: targetGroup.arn }]
+  defaultActions: edgeTlsMode === 'alb'
+    ? [
+      {
+        type: 'redirect',
+        redirect: {
+          port: '443',
+          protocol: 'HTTPS',
+          statusCode: 'HTTP_301'
+        }
+      }
+    ]
+    : [{ type: 'forward', targetGroupArn: targetGroup.arn }]
 })
+
+const listener = edgeTlsMode === 'alb'
+  ? new aws.lb.Listener(`${name}-https`, {
+    certificateArn: certificateValidation!.certificateArn,
+    loadBalancerArn: lb.arn,
+    port: 443,
+    protocol: 'HTTPS',
+    sslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+    defaultActions: [{ type: 'forward', targetGroupArn: targetGroup.arn }]
+  })
+  : httpListener
+
+const publicBaseUrl =
+  cfg.get('publicBaseUrl') ??
+  process.env.NANOTRACE_PUBLIC_BASE_URL ??
+  `https://${domainName}`
+const databaseUrl = pulumi.interpolate`postgres://${databaseUsername}:${databasePassword}@${database.address}:5432/${databaseName}`
 
 new aws.lb.ListenerRule(`${name}-query-route`, {
   listenerArn: listener.arn,
@@ -500,31 +778,39 @@ const ami = aws.ec2.getAmiOutput({
 
 const userData = pulumi
   .all([
-    secretKey,
     bucket.bucket,
     imageUri,
     clickhousePassword,
+    databaseUrl,
+    bootstrapApiKey,
     loaderQueue.url,
     modalTokenId,
     modalTokenSecret,
-    modalServerApiKey
+    modalServerApiKey,
+    publicBaseUrl
   ])
   .apply(
     ([
-      resolvedSecretKey,
       bucketName,
       resolvedImageUri,
       resolvedClickhousePassword,
+      resolvedDatabaseUrl,
+      resolvedBootstrapApiKey,
       loaderQueueUrl,
       resolvedModalTokenId,
       resolvedModalTokenSecret,
-      resolvedModalServerApiKey
+      resolvedModalServerApiKey,
+      resolvedPublicBaseUrl
     ]) =>
       renderUserData({
         bucketName,
+        adminEmails,
+        bootstrapApiKey: resolvedBootstrapApiKey,
         clickhouseDatabase,
+        clickhouseEventIndexTable,
         clickhousePassword: resolvedClickhousePassword,
         clickhouseFacetsTable,
+        clickhouseHotDimensionsTable,
         clickhouseTable,
         clickhouseUrl,
         clickhouseUser,
@@ -544,21 +830,27 @@ const userData = pulumi
         port,
         prefix,
         region,
-        secretKey: resolvedSecretKey,
         uploadPollIntervalMs,
         writerFlushBytes,
         writerFlushIntervalMs,
         writerLanes,
         writerQueueCapacity,
-        compactBatchReceipts
+        compactBatchReceipts,
+        databaseUrl: resolvedDatabaseUrl,
+        allowedEmails,
+        corsAllowedOrigins,
+        emailFrom,
+        publicBaseUrl: resolvedPublicBaseUrl,
+        sessionSecure
       })
   )
 
 const queryUserData = pulumi
-  .all([secretKey, bucket.bucket, imageUri, clickhousePassword])
-  .apply(([resolvedSecretKey, bucketName, resolvedImageUri, resolvedClickhousePassword]) =>
+  .all([bucket.bucket, imageUri, clickhousePassword, databaseUrl, bootstrapApiKey, publicBaseUrl])
+  .apply(([bucketName, resolvedImageUri, resolvedClickhousePassword, resolvedDatabaseUrl, resolvedBootstrapApiKey, resolvedPublicBaseUrl]) =>
     renderQueryUserData({
       bucketName,
+      bootstrapApiKey: resolvedBootstrapApiKey,
       clickhouseDatabase,
       clickhousePassword: resolvedClickhousePassword,
       clickhouseTable,
@@ -570,7 +862,10 @@ const queryUserData = pulumi
       port,
       prefix,
       region,
-      secretKey: resolvedSecretKey
+      databaseUrl: resolvedDatabaseUrl,
+      publicBaseUrl: resolvedPublicBaseUrl,
+      corsAllowedOrigins,
+      sessionSecure
     })
   )
 
@@ -580,6 +875,11 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
     imageId: ami.id,
     instanceType,
     iamInstanceProfile: { arn: instanceProfile.arn },
+    metadataOptions: {
+      httpEndpoint: 'enabled',
+      httpTokens: 'required',
+      httpPutResponseHopLimit: 2
+    },
     vpcSecurityGroupIds: [instanceSg.id],
     userData: userData.apply(value => Buffer.from(value).toString('base64')),
     blockDeviceMappings: [
@@ -622,6 +922,11 @@ const queryLaunchTemplate = new aws.ec2.LaunchTemplate(
     imageId: ami.id,
     instanceType: queryInstanceType,
     iamInstanceProfile: { arn: instanceProfile.arn },
+    metadataOptions: {
+      httpEndpoint: 'enabled',
+      httpTokens: 'required',
+      httpPutResponseHopLimit: 2
+    },
     vpcSecurityGroupIds: [instanceSg.id],
     userData: queryUserData.apply(value => Buffer.from(value).toString('base64')),
     blockDeviceMappings: [
@@ -686,7 +991,14 @@ const queryAsg = new aws.autoscaling.Group(`${name}-query-asg`, {
 })
 
 export const albDnsName = lb.dnsName
-export const ingestUrl = pulumi.interpolate`http://${lb.dnsName}`
+export const domainNameOutput = domainName
+export const dnsProviderOutput = dnsProvider
+export const edgeTlsModeOutput = edgeTlsMode
+export const hostedZoneNameOutput = hostedZoneName
+export const hostedZoneNameServers = hostedZone
+  ? hostedZone.nameServers
+  : []
+export const ingestUrl = publicBaseUrl
 export const queryTargetGroupArn = queryTargetGroup.arn
 export const ingestAutoScalingGroupName = asg.name
 export const queryAutoScalingGroupName = queryAsg.name
@@ -696,14 +1008,28 @@ export const loaderSqsQueueUrl = loaderQueue.url
 export const loaderSqsQueueArn = loaderQueue.arn
 export const clickhouseDatabaseOutput = clickhouseDatabase
 export const clickhouseTableOutput = clickhouseTable
+export const clickhouseEventIndexTableOutput = clickhouseEventIndexTable
+export const clickhouseHotDimensionsTableOutput = clickhouseHotDimensionsTable
+export const databaseEndpoint = database.address
+export const loginEmailIdentity = managedLoginEmailIdentity
+  ? managedLoginEmailIdentity.emailIdentity
+  : ''
+export const loginEmailVerifiedForSending = managedLoginEmailIdentity
+  ? managedLoginEmailIdentity.verifiedForSendingStatus
+  : false
+export const bootstrapApiKeyOutput = pulumi.secret(bootstrapApiKey)
 export const ecrRepositoryUrl = repository.repositoryUrl
 export const serverImageUri = imageUri
 
 interface UserDataArgs {
   bucketName: string
+  adminEmails: string
+  bootstrapApiKey: string
   clickhouseDatabase: string
+  clickhouseEventIndexTable: string
   clickhousePassword: string
   clickhouseFacetsTable: string
+  clickhouseHotDimensionsTable: string
   clickhouseTable: string
   clickhouseUrl: string
   clickhouseUser: string
@@ -723,7 +1049,12 @@ interface UserDataArgs {
   port: number
   prefix: string
   region: string
-  secretKey: string
+  databaseUrl: string
+  allowedEmails: string
+  corsAllowedOrigins: string
+  emailFrom: string
+  publicBaseUrl: string
+  sessionSecure: boolean
   uploadPollIntervalMs: number
   writerFlushBytes: number
   writerFlushIntervalMs: number
@@ -734,6 +1065,7 @@ interface UserDataArgs {
 
 interface QueryUserDataArgs {
   bucketName: string
+  bootstrapApiKey: string
   clickhouseDatabase: string
   clickhousePassword: string
   clickhouseTable: string
@@ -745,7 +1077,10 @@ interface QueryUserDataArgs {
   port: number
   prefix: string
   region: string
-  secretKey: string
+  databaseUrl: string
+  publicBaseUrl: string
+  corsAllowedOrigins: string
+  sessionSecure: boolean
 }
 
 function renderUserData (args: UserDataArgs): string {
@@ -770,7 +1105,7 @@ upload_debug() {
   (docker inspect nanotrace-loader 2>&1 || true) > /tmp/docker-loader-inspect.txt
   (journalctl -u docker --no-pager 2>&1 || true) > /tmp/docker-journal.txt
   (cat /var/log/cloud-init-output.log 2>&1 || true) > /tmp/cloud-init-output.log
-  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
+  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-loader-logs.txt /tmp/docker-inspect.txt /tmp/docker-loader-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
     aws s3 cp "$f" "$S3_DEBUG_PREFIX/$(basename "$f")" --region ${shellQuote(
       args.region
     )} || true
@@ -780,8 +1115,9 @@ trap upload_debug EXIT
 
 set -e
 dnf update -y
-dnf install -y docker awscli xfsprogs
+dnf install -y docker awscli xfsprogs amazon-ssm-agent
 systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent || true
 
 mkdir -p /data
 ROOT_SOURCE="$(findmnt -no SOURCE / || true)"
@@ -831,9 +1167,17 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
   -v ${shellQuote(args.localDataDir)}:${shellQuote(args.localDataDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
-  -e SECRET_KEY=${shellQuote(args.secretKey)} \\
   -e PORT=${args.port} \\
+  -e NANOTRACE_DATABASE_URL=${shellQuote(args.databaseUrl)} \\
+  -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
+  -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
+  -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
+  -e NANOTRACE_EMAIL_FROM=${shellQuote(args.emailFrom)} \\
+  -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
+  -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
+  -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_DATA_DIR=${shellQuote(args.localDataDir)} \\
+  -e NANOTRACE_UI_DIR=${shellQuote('/usr/local/share/nanotrace/ui')} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e S3_PREFIX=${shellQuote(args.prefix)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
@@ -841,6 +1185,7 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e CLICKHOUSE_HOT_DIMENSIONS_TABLE=${shellQuote(args.clickhouseHotDimensionsTable)} \\
   -e CLICKHOUSE_MAX_BYTES_TO_READ=${args.clickhouseMaxBytesToRead} \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
   -e MAX_EVENT_BYTES=${args.maxEventBytes} \\
@@ -860,22 +1205,20 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e MODAL_TOKEN_SECRET=${shellQuote(args.modalTokenSecret)} \\
   -e MODAL_SERVER_API_KEY=${shellQuote(args.modalServerApiKey)} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
-  -e PROCESSOR_POLL_INTERVAL_SECS=30 \\
   -e PROCESSOR_BUILDER_CMD=${shellQuote('python3 /usr/local/bin/modal_processor_builder.py')} \\
-  -e PROCESSOR_TARGET=${shellQuote('aarch64-unknown-linux-gnu')} \\
   ${shellQuote(args.imageUri)}
 docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e LOADER_SQS_QUEUE_URL=${shellQuote(args.loaderQueueUrl)} \\
-  -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
-  -e PROCESSOR_POLL_INTERVAL_SECS=30 \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
   -e CLICKHOUSE_FACETS_TABLE=${shellQuote(args.clickhouseFacetsTable)} \\
+  -e CLICKHOUSE_EVENT_INDEX_TABLE=${shellQuote(args.clickhouseEventIndexTable)} \\
+  -e CLICKHOUSE_HOT_DIMENSIONS_TABLE=${shellQuote(args.clickhouseHotDimensionsTable)} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-loader
 `
@@ -911,8 +1254,9 @@ trap upload_debug EXIT
 
 set -e
 dnf update -y
-dnf install -y docker awscli
+dnf install -y docker awscli amazon-ssm-agent
 systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent || true
 
 aws ecr get-login-password --region ${shellQuote(
     args.region
@@ -924,8 +1268,12 @@ docker rm -f nanotrace-query >/dev/null 2>&1 || true
 docker run -d --name nanotrace-query --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
-  -e SECRET_KEY=${shellQuote(args.secretKey)} \\
   -e PORT=${args.port} \\
+  -e NANOTRACE_DATABASE_URL=${shellQuote(args.databaseUrl)} \\
+  -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
+  -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
+  -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
+  -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
@@ -946,11 +1294,38 @@ function shellQuote (value: unknown): string {
 function requireEnv (key: string): string {
   const value = process.env[key]
   if (!value) {
+    throw new Error(`Missing required Pulumi config or ${key} environment variable`)
+  }
+  return value
+}
+
+function requireConfigOrEnv (configKey: string, envKey: string): string {
+  const value = cfg.get(configKey) ?? process.env[envKey]
+  if (!value) {
     throw new Error(
-      `Missing required Pulumi config "secretKey" or ${key} environment variable`
+      `Missing required Pulumi config nanotrace:${configKey} or ${envKey} environment variable`
     )
   }
   return value
+}
+
+function normalizeDomainName (value: string): string {
+  const normalized = value.trim().replace(/\.$/, '')
+  if (!normalized || normalized.includes('/') || normalized.includes(':')) {
+    throw new Error(`Invalid domain name: ${value}`)
+  }
+  return normalized
+}
+
+function cloudflareRecordName (recordName: string, zoneName: string): string {
+  if (recordName === zoneName) {
+    return '@'
+  }
+  const suffix = `.${zoneName}`
+  if (!recordName.endsWith(suffix)) {
+    throw new Error(`${recordName} is not in Cloudflare zone ${zoneName}`)
+  }
+  return recordName.slice(0, -suffix.length)
 }
 
 function numberEnv (key: string, fallback: number): number {

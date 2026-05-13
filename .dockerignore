@@ -2,11 +2,13 @@
 .env
 .env.*
 .nanotrace
+.pulumi-docker
 
 node_modules
 target
 dist
 packages/*/dist
+fixtures/generated
 
 *.log
 __pycache__

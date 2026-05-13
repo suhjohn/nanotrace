@@ -11,8 +11,8 @@ const pulumiCwd = path.join(root, "deploy/pulumi/nanotrace");
 
 loadEnvFile(process.env.NANOTRACE_ENV_FILE);
 
-const secretKey = requiredEnv("SECRET_KEY");
 const outputs = await pulumiOutputs();
+const apiKey = process.env.NANOTRACE_API_KEY || requiredOutput(outputs, "bootstrapApiKeyOutput");
 const ingestUrl = trimTrailingSlash(requiredOutput(outputs, "ingestUrl"));
 const bucketName = requiredOutput(outputs, "bucketName");
 const waitMs = numberEnv("NANOTRACE_E2E_WAIT_MS", 180_000);
@@ -31,12 +31,12 @@ await expectUnauthorized(ingestUrl);
 let processorRegistered = false;
 try {
     console.log(`registering processor=${processorName}`);
-    await putProcessor(ingestUrl, secretKey, processorName);
+    await putProcessor(ingestUrl, apiKey, processorName);
     processorRegistered = true;
-    await waitForProcessorReady(ingestUrl, secretKey, processorName, clickhouseWaitMs, pollMs);
+    await waitForProcessorReady(ingestUrl, apiKey, processorName, clickhouseWaitMs, pollMs);
     await sleep(numberEnv("NANOTRACE_E2E_PROCESSOR_HOTLOAD_WAIT_MS", 10_000));
 
-    const receipt = await postEvent(ingestUrl, secretKey, {
+    const receipt = await postEvent(ingestUrl, apiKey, {
         event_id: eventId,
         timestamp,
         observed_timestamp: timestamp,
@@ -98,7 +98,7 @@ try {
 } finally {
     if (processorRegistered) {
         console.log(`deleting processor=${processorName}`);
-        await deleteProcessor(ingestUrl, secretKey, processorName);
+        await deleteProcessor(ingestUrl, apiKey, processorName);
     }
 }
 
@@ -279,7 +279,7 @@ async function clickHouseCount(url, user, password, database, table, eventId) {
 }
 
 async function pulumiOutputs() {
-    const result = await run("pulumi", ["stack", "output", "--json"], { cwd: pulumiCwd });
+    const result = await run("pulumi", ["stack", "output", "--json", "--show-secrets"], { cwd: pulumiCwd });
     return JSON.parse(result.stdout);
 }
 

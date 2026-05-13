@@ -69,6 +69,48 @@
         "sqs:UntagQueue"
       ],
       "Resource": "arn:aws:sqs:*:*:nanotrace-*"
+    },
+    {
+      "Sid": "ReadRdsForPulumiRefresh",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBSubnetGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageNanotracePostgres",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddTagsToResource",
+        "rds:CreateDBInstance",
+        "rds:CreateDBSubnetGroup",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBSubnetGroup",
+        "rds:ListTagsForResource",
+        "rds:ModifyDBInstance",
+        "rds:ModifyDBSubnetGroup",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": [
+        "arn:aws:rds:*:*:db:nanotrace-*",
+        "arn:aws:rds:*:*:subgrp:nanotrace-*"
+      ]
+    },
+    {
+      "Sid": "ManageNanotraceSesLoginIdentity",
+      "Effect": "Allow",
+      "Action": [
+        "ses:CreateEmailIdentity",
+        "ses:DeleteEmailIdentity",
+        "ses:GetEmailIdentity",
+        "ses:ListEmailIdentities",
+        "ses:ListTagsForResource",
+        "ses:TagResource",
+        "ses:UntagResource"
+      ],
+      "Resource": "*"
     }
   ]
 }

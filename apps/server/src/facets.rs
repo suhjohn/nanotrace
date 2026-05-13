@@ -1,0 +1,1200 @@
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use tokio::sync::OnceCell;
+use tracing::{error, info, warn};
+
+use crate::config::Config;
+
+#[derive(Clone)]
+pub struct FacetStore {
+    cfg: Arc<Config>,
+    http: reqwest::Client,
+    pg: Option<PgPool>,
+    table_ready: Arc<OnceCell<()>>,
+    control_ready: Arc<OnceCell<()>>,
+    worker_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutFacetRequest {
+    pub path: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub value_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FacetListResponse {
+    pub facets: Vec<HotDimension>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FacetBackfillResponse {
+    pub job_id: String,
+    pub path: String,
+    pub status: String,
+    pub total_chunks: u64,
+    pub completed_chunks: u64,
+    pub failed_chunks: u64,
+    pub indexed_events: u64,
+    pub values: u64,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FacetBackfillListResponse {
+    pub backfills: Vec<FacetBackfillResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HotDimension {
+    pub path: String,
+    pub value_type: String,
+    pub status: String,
+    pub display_name: String,
+    pub source: String,
+    pub removable: bool,
+}
+
+#[derive(Debug)]
+struct BackfillChunk {
+    chunk_id: i64,
+    job_id: String,
+    path: String,
+    value_type: String,
+    chunk_start: DateTime<Utc>,
+    chunk_end: DateTime<Utc>,
+    attempts: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClickHouseResponse<T> {
+    data: Vec<T>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FacetError {
+    #[error("ClickHouse is not configured")]
+    ClickHouseNotConfigured,
+    #[error("Postgres is not configured")]
+    PostgresNotConfigured,
+    #[error("invalid facet path")]
+    InvalidPath,
+    #[error("invalid facet value_type")]
+    InvalidValueType,
+    #[error("built-in facets cannot be removed")]
+    BuiltinFacet,
+    #[error("ClickHouse request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("Postgres request failed: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("ClickHouse query failed: {status} {body}")]
+    ClickHouseResponse { status: StatusCode, body: String },
+    #[error("invalid ClickHouse response: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl FacetStore {
+    pub async fn connect(cfg: Arc<Config>) -> Result<Self, FacetError> {
+        let pg = match cfg.auth.database_url.clone() {
+            Some(database_url) => Some(
+                PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            cfg,
+            http: reqwest::Client::new(),
+            pg,
+            table_ready: Arc::new(OnceCell::new()),
+            control_ready: Arc::new(OnceCell::new()),
+            worker_id: backfill_worker_id(),
+        })
+    }
+
+    pub async fn list(&self) -> Result<Vec<HotDimension>, FacetError> {
+        self.ensure_table().await?;
+        let mut facets = builtin_dimensions();
+        for custom in self.active_custom_dimensions().await? {
+            if !facets.iter().any(|facet| facet.path == custom.path) {
+                facets.push(custom);
+            }
+        }
+        Ok(facets)
+    }
+
+    pub async fn put(&self, request: PutFacetRequest) -> Result<HotDimension, FacetError> {
+        self.ensure_table().await?;
+        let path = validate_path(&request.path)?;
+        if builtin_dimensions().iter().any(|facet| facet.path == path) {
+            return Err(FacetError::BuiltinFacet);
+        }
+        let value_type = validate_value_type(request.value_type.as_deref().unwrap_or("string"))?;
+        let display_name = request
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&path)
+            .to_string();
+
+        let mut dimensions = self.active_custom_dimensions().await?;
+        dimensions.retain(|dimension| dimension.path != path);
+        dimensions.push(HotDimension {
+            path: path.clone(),
+            value_type: value_type.to_string(),
+            status: "active".to_string(),
+            display_name: display_name.clone(),
+            source: "user".to_string(),
+            removable: true,
+        });
+        self.reconcile_data_type(&dimensions).await?;
+
+        let facet = HotDimension {
+            path,
+            value_type: value_type.to_string(),
+            status: "active".to_string(),
+            display_name,
+            source: "user".to_string(),
+            removable: true,
+        };
+        self.insert_dimension(&facet).await?;
+        Ok(facet)
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<HotDimension, FacetError> {
+        self.ensure_table().await?;
+        let path = validate_path(path)?;
+        if builtin_dimensions().iter().any(|facet| facet.path == path) {
+            return Err(FacetError::BuiltinFacet);
+        }
+
+        let mut dimensions = self.active_custom_dimensions().await?;
+        dimensions.retain(|dimension| dimension.path != path);
+        self.reconcile_data_type(&dimensions).await?;
+
+        let facet = HotDimension {
+            path,
+            value_type: "string".to_string(),
+            status: "disabled".to_string(),
+            display_name: String::new(),
+            source: "user".to_string(),
+            removable: true,
+        };
+        self.insert_dimension(&facet).await?;
+        Ok(facet)
+    }
+
+    pub async fn enqueue_backfill(&self, path: &str) -> Result<FacetBackfillResponse, FacetError> {
+        self.ensure_table().await?;
+        self.ensure_control_plane().await?;
+        let path = validate_path(path)?;
+        let dimensions = self.list().await?;
+        let Some(dimension) = dimensions.iter().find(|dimension| dimension.path == path) else {
+            return Err(FacetError::InvalidPath);
+        };
+        let index_value_type = event_index_value_type(&dimension.value_type)?;
+        let value_expr = facet_value_expression(&path);
+
+        #[derive(Deserialize)]
+        struct Bounds {
+            events: u64,
+            values: u64,
+            min_ms: i64,
+            max_ms: i64,
+        }
+
+        let bounds_query = format!(
+            "SELECT events, values, \
+                    if(events = 0, 0, toInt64(toUnixTimestamp64Milli(min_ts))) AS min_ms, \
+                    if(events = 0, 0, toInt64(toUnixTimestamp64Milli(max_ts))) AS max_ms \
+             FROM (SELECT count() AS events, uniqExact(value) AS values, min(timestamp) AS min_ts, max(timestamp) AS max_ts \
+                   FROM (SELECT timestamp, {} AS value FROM {}) WHERE value != '')",
+            value_expr,
+            self.events_table()
+        );
+        let response: ClickHouseResponse<Bounds> =
+            serde_json::from_str(&self.clickhouse_query(&bounds_query).await?)?;
+        let bounds = response.data.into_iter().next().unwrap_or(Bounds {
+            events: 0,
+            values: 0,
+            min_ms: 0,
+            max_ms: 0,
+        });
+
+        let job_id = backfill_job_id(&path);
+        let chunks = backfill_chunks(bounds.min_ms, bounds.max_ms);
+        let total_chunks = chunks.len() as i64;
+        let status = if total_chunks == 0 {
+            "completed"
+        } else {
+            "queued"
+        };
+
+        let pg = self.pg_pool()?;
+        let mut tx = pg.begin().await?;
+        sqlx::query(
+            "INSERT INTO nanotrace_facet_backfill_jobs
+             (job_id, path, value_type, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error)
+             VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, '')",
+        )
+        .bind(&job_id)
+        .bind(&path)
+        .bind(index_value_type)
+        .bind(status)
+        .bind(total_chunks)
+        .bind(if total_chunks == 0 {
+            bounds.events as i64
+        } else {
+            0
+        })
+        .bind(if total_chunks == 0 {
+            bounds.values as i64
+        } else {
+            0
+        })
+        .execute(&mut *tx)
+        .await?;
+
+        for (chunk_start, chunk_end) in chunks {
+            sqlx::query(
+                "INSERT INTO nanotrace_facet_backfill_chunks
+                 (job_id, path, chunk_start, chunk_end, status)
+                 VALUES ($1, $2, $3, $4, 'queued')",
+            )
+            .bind(&job_id)
+            .bind(&path)
+            .bind(chunk_start)
+            .bind(chunk_end)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        self.backfill_status(&job_id).await
+    }
+
+    pub async fn backfill_status(&self, job_id: &str) -> Result<FacetBackfillResponse, FacetError> {
+        self.ensure_control_plane().await?;
+        let job_id = validate_job_id(job_id)?;
+        let row = sqlx::query_as::<_, (String, String, String, i64, i64, i64, i64, i64, String)>(
+            "SELECT job_id, path, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error
+             FROM nanotrace_facet_backfill_jobs
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(self.pg_pool()?)
+        .await?;
+        row.map(backfill_response_from_row)
+            .ok_or(FacetError::InvalidPath)
+    }
+
+    pub async fn backfill_list(&self) -> Result<Vec<FacetBackfillResponse>, FacetError> {
+        self.ensure_control_plane().await?;
+        let rows = sqlx::query_as::<_, (String, String, String, i64, i64, i64, i64, i64, String)>(
+            "SELECT job_id, path, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error
+             FROM nanotrace_facet_backfill_jobs
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 100",
+        )
+        .fetch_all(self.pg_pool()?)
+        .await?;
+        Ok(rows.into_iter().map(backfill_response_from_row).collect())
+    }
+
+    pub async fn run_backfill_worker(self: Arc<Self>) {
+        if self.pg.is_none() {
+            warn!("facet backfill worker disabled because Postgres is not configured");
+            return;
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match self.process_next_backfill_chunk().await {
+                Ok(Some(job_id)) => info!(%job_id, "processed facet backfill chunk"),
+                Ok(None) => {}
+                Err(err) => warn!(error = %err, "facet backfill worker iteration failed"),
+            }
+        }
+    }
+
+    async fn process_next_backfill_chunk(&self) -> Result<Option<String>, FacetError> {
+        self.ensure_table().await?;
+        self.ensure_control_plane().await?;
+        let Some(chunk) = self.claim_backfill_chunk().await? else {
+            return Ok(None);
+        };
+        let job_id = chunk.job_id.clone();
+        if let Err(err) = self.process_backfill_chunk(&chunk).await {
+            error!(job_id = %chunk.job_id, path = %chunk.path, error = %err, "facet backfill chunk failed");
+            self.mark_backfill_chunk_failed(&chunk, &err.to_string())
+                .await?;
+        }
+        self.refresh_backfill_job(&job_id).await?;
+        Ok(Some(job_id))
+    }
+
+    async fn claim_backfill_chunk(&self) -> Result<Option<BackfillChunk>, FacetError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                i32,
+            ),
+        >(
+            "WITH next_chunk AS (
+                SELECT c.chunk_id
+                FROM nanotrace_facet_backfill_chunks c
+                INNER JOIN nanotrace_facet_backfill_jobs j ON j.job_id = c.job_id
+                WHERE j.status IN ('queued', 'running')
+                  AND c.attempts < 3
+                  AND (
+                    c.status = 'queued'
+                    OR (c.status = 'running' AND c.lease_expires_at < now())
+                  )
+                ORDER BY c.updated_at ASC, c.chunk_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+             )
+             UPDATE nanotrace_facet_backfill_chunks c
+             SET status = 'running',
+                 attempts = c.attempts + 1,
+                 lease_owner = $1,
+                 lease_expires_at = now() + interval '10 minutes',
+                 updated_at = now()
+             FROM next_chunk, nanotrace_facet_backfill_jobs j
+             WHERE c.chunk_id = next_chunk.chunk_id
+               AND j.job_id = c.job_id
+             RETURNING c.chunk_id, c.job_id, c.path, j.value_type, c.chunk_start, c.chunk_end, c.attempts",
+        )
+        .bind(&self.worker_id)
+        .fetch_optional(self.pg_pool()?)
+        .await?;
+        let Some((chunk_id, job_id, path, value_type, chunk_start, chunk_end, attempts)) = row
+        else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE nanotrace_facet_backfill_jobs
+             SET status = 'running', updated_at = now(), error = ''
+             WHERE job_id = $1 AND status = 'queued'",
+        )
+        .bind(&job_id)
+        .execute(self.pg_pool()?)
+        .await?;
+        Ok(Some(BackfillChunk {
+            chunk_id,
+            job_id,
+            path,
+            value_type,
+            chunk_start,
+            chunk_end,
+            attempts,
+        }))
+    }
+
+    async fn process_backfill_chunk(&self, chunk: &BackfillChunk) -> Result<(), FacetError> {
+        let value_expr = facet_value_expression(&chunk.path);
+        let error_expr = error_count_expression();
+        let (bucket_delete_start, bucket_delete_end) =
+            clickhouse_minute_bucket_bounds(chunk.chunk_start, chunk.chunk_end);
+        self.clickhouse_exec_sync_mutation(&format!(
+            "ALTER TABLE {} DELETE WHERE key = {} AND bucket_time >= {} AND bucket_time < {}",
+            self.facets_table(),
+            quote_literal(&chunk.path),
+            bucket_delete_start,
+            bucket_delete_end
+        ))
+        .await?;
+        self.clickhouse_exec_sync_mutation(&format!(
+            "ALTER TABLE {} DELETE WHERE key = {} AND timestamp >= {} AND timestamp < {}",
+            self.event_index_table(),
+            quote_literal(&chunk.path),
+            clickhouse_datetime_literal(chunk.chunk_start),
+            clickhouse_datetime_literal(chunk.chunk_end)
+        ))
+        .await?;
+        self.clickhouse_exec(&format!(
+            "INSERT INTO {} (bucket_time, key, value, value_type, count, error_count) \
+             SELECT toStartOfMinute(timestamp) AS bucket_time, {} AS key, value, {} AS value_type, count() AS count, sum(error) AS error_count \
+             FROM (SELECT timestamp, {} AS value, if({}, 1, 0) AS error FROM {} \
+                   WHERE timestamp >= {} AND timestamp < {}) \
+             WHERE value != '' \
+             GROUP BY bucket_time, value",
+            self.facets_table(),
+            quote_literal(&chunk.path),
+            quote_literal(&chunk.value_type),
+            value_expr,
+            error_expr,
+            self.events_table(),
+            clickhouse_datetime_literal(chunk.chunk_start),
+            clickhouse_datetime_literal(chunk.chunk_end)
+        ))
+        .await?;
+        self.clickhouse_exec(&format!(
+            "INSERT INTO {} \
+             (key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms) \
+             SELECT {}, value, {}, timestamp, toStartOfMinute(timestamp), event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms \
+             FROM (SELECT timestamp, event_id, {} AS value, \
+                    ifNull(toString(data.event_type), '') AS event_type, \
+                    multiIf( \
+                        ifNull(toString(data.event_type), '') IN ('span', 'span_start', 'span_end'), 'trace', \
+                        ifNull(toString(data.event_type), '') = 'metric', 'metric', \
+                        ifNull(toString(data.event_type), '') = 'log', 'log', \
+                        ifNull(toString(data.event_type), '') IN ('analytics', 'track', 'page', 'screen', 'identify', 'group', 'alias'), 'analytics', \
+                        'other' \
+                    ) AS signal, \
+                    ifNull(toString(data.trace_id), '') AS trace_id, ifNull(toString(data.span_id), '') AS span_id, \
+                    ifNull(toString(data.parent_span_id), '') AS parent_span_id, ifNull(toString(data.name), '') AS name, \
+                    parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')) AS start_time, \
+                    parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')) AS end_time, \
+                    toFloat64OrZero(ifNull(toString(data.duration_ms), '0')) AS duration_ms \
+                   FROM {} WHERE timestamp >= {} AND timestamp < {}) \
+             WHERE value != ''",
+            self.event_index_table(),
+            quote_literal(&chunk.path),
+            quote_literal(&chunk.value_type),
+            value_expr,
+            self.events_table(),
+            clickhouse_datetime_literal(chunk.chunk_start),
+            clickhouse_datetime_literal(chunk.chunk_end)
+        ))
+        .await?;
+
+        #[derive(Deserialize)]
+        struct ChunkRows {
+            rows: u64,
+        }
+        let query = format!(
+            "SELECT count() AS rows FROM {} WHERE key = {} AND timestamp >= {} AND timestamp < {}",
+            self.event_index_table(),
+            quote_literal(&chunk.path),
+            clickhouse_datetime_literal(chunk.chunk_start),
+            clickhouse_datetime_literal(chunk.chunk_end)
+        );
+        let response: ClickHouseResponse<ChunkRows> =
+            serde_json::from_str(&self.clickhouse_query(&query).await?)?;
+        let rows = response.data.first().map(|row| row.rows).unwrap_or(0);
+        sqlx::query(
+            "UPDATE nanotrace_facet_backfill_chunks
+             SET status = 'completed',
+                 rows = $2,
+                 error = '',
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = now()
+             WHERE chunk_id = $1",
+        )
+        .bind(chunk.chunk_id)
+        .bind(rows as i64)
+        .execute(self.pg_pool()?)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_backfill_chunk_failed(
+        &self,
+        chunk: &BackfillChunk,
+        error: &str,
+    ) -> Result<(), FacetError> {
+        let status = if chunk.attempts >= 3 {
+            "failed"
+        } else {
+            "queued"
+        };
+        sqlx::query(
+            "UPDATE nanotrace_facet_backfill_chunks
+             SET status = $2,
+                 error = $3,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = now()
+             WHERE chunk_id = $1",
+        )
+        .bind(chunk.chunk_id)
+        .bind(status)
+        .bind(truncate_error(error))
+        .execute(self.pg_pool()?)
+        .await?;
+        Ok(())
+    }
+
+    async fn refresh_backfill_job(&self, job_id: &str) -> Result<(), FacetError> {
+        let progress = sqlx::query_as::<_, (String, i64, i64, i64, i64, Option<String>)>(
+            "SELECT
+                j.path,
+                count(c.chunk_id)::bigint AS total_chunks,
+                count(*) FILTER (WHERE c.status = 'completed')::bigint AS completed_chunks,
+                count(*) FILTER (WHERE c.status = 'failed')::bigint AS failed_chunks,
+                COALESCE(sum(c.rows), 0)::bigint AS indexed_events,
+                max(NULLIF(c.error, '')) AS error
+             FROM nanotrace_facet_backfill_jobs j
+             LEFT JOIN nanotrace_facet_backfill_chunks c ON c.job_id = j.job_id
+             WHERE j.job_id = $1
+             GROUP BY j.job_id, j.path",
+        )
+        .bind(job_id)
+        .fetch_optional(self.pg_pool()?)
+        .await?;
+        let Some((path, total_chunks, completed_chunks, failed_chunks, indexed_events, error)) =
+            progress
+        else {
+            return Ok(());
+        };
+        let status = if failed_chunks > 0 {
+            "failed"
+        } else if completed_chunks >= total_chunks {
+            "completed"
+        } else {
+            "running"
+        };
+        let values = if status == "completed" {
+            self.count_backfill_values(&path).await? as i64
+        } else {
+            0
+        };
+        sqlx::query(
+            "UPDATE nanotrace_facet_backfill_jobs
+             SET status = $2,
+                 total_chunks = $3,
+                 completed_chunks = $4,
+                 failed_chunks = $5,
+                 indexed_events = $6,
+                 values = $7,
+                 error = $8,
+                 updated_at = now()
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(status)
+        .bind(total_chunks)
+        .bind(completed_chunks)
+        .bind(failed_chunks)
+        .bind(indexed_events)
+        .bind(values)
+        .bind(error.unwrap_or_default())
+        .execute(self.pg_pool()?)
+        .await?;
+        Ok(())
+    }
+
+    async fn count_backfill_values(&self, path: &str) -> Result<u64, FacetError> {
+        #[derive(Deserialize)]
+        struct ValueCount {
+            values: u64,
+        }
+        let query = format!(
+            "SELECT uniqExact(value) AS values FROM {} WHERE key = {}",
+            self.event_index_table(),
+            quote_literal(path)
+        );
+        let response: ClickHouseResponse<ValueCount> =
+            serde_json::from_str(&self.clickhouse_query(&query).await?)?;
+        Ok(response.data.first().map(|row| row.values).unwrap_or(0))
+    }
+
+    async fn active_custom_dimensions(&self) -> Result<Vec<HotDimension>, FacetError> {
+        let query = format!(
+            "SELECT path, value_type, status, display_name, source, toBool(1) AS removable \
+             FROM (SELECT path, value_type, status, display_name, source, updated_at \
+                   FROM {} ORDER BY updated_at DESC LIMIT 1 BY path) \
+             WHERE status = 'active' AND source = 'user' \
+             ORDER BY path ASC",
+            self.hot_dimensions_table()
+        );
+        let response: ClickHouseResponse<HotDimension> =
+            serde_json::from_str(&self.clickhouse_query(&query).await?)?;
+        Ok(response.data)
+    }
+
+    async fn insert_dimension(&self, dimension: &HotDimension) -> Result<(), FacetError> {
+        let body = serde_json::json!({
+            "path": dimension.path,
+            "value_type": dimension.value_type,
+            "status": dimension.status,
+            "display_name": dimension.display_name,
+            "source": dimension.source,
+        });
+        let query = format!(
+            "INSERT INTO {} FORMAT JSONEachRow\n{}",
+            self.hot_dimensions_table(),
+            serde_json::to_string(&body)?
+        );
+        self.clickhouse_exec(&query).await
+    }
+
+    async fn ensure_table(&self) -> Result<(), FacetError> {
+        self.table_ready
+            .get_or_try_init(|| async { self.create_table().await })
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_control_plane(&self) -> Result<(), FacetError> {
+        self.control_ready
+            .get_or_try_init(|| async { self.create_control_plane().await })
+            .await?;
+        Ok(())
+    }
+
+    fn pg_pool(&self) -> Result<&PgPool, FacetError> {
+        self.pg.as_ref().ok_or(FacetError::PostgresNotConfigured)
+    }
+
+    async fn create_control_plane(&self) -> Result<(), FacetError> {
+        let pg = self.pg_pool()?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS nanotrace_facet_backfill_jobs (
+                job_id text PRIMARY KEY,
+                path text NOT NULL,
+                value_type text NOT NULL,
+                status text NOT NULL,
+                total_chunks bigint NOT NULL DEFAULT 0,
+                completed_chunks bigint NOT NULL DEFAULT 0,
+                failed_chunks bigint NOT NULL DEFAULT 0,
+                indexed_events bigint NOT NULL DEFAULT 0,
+                values bigint NOT NULL DEFAULT 0,
+                error text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(pg)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS nanotrace_facet_backfill_chunks (
+                chunk_id bigserial PRIMARY KEY,
+                job_id text NOT NULL REFERENCES nanotrace_facet_backfill_jobs(job_id) ON DELETE CASCADE,
+                path text NOT NULL,
+                chunk_start timestamptz NOT NULL,
+                chunk_end timestamptz NOT NULL,
+                status text NOT NULL DEFAULT 'queued',
+                attempts integer NOT NULL DEFAULT 0,
+                rows bigint NOT NULL DEFAULT 0,
+                error text NOT NULL DEFAULT '',
+                lease_owner text,
+                lease_expires_at timestamptz,
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (job_id, chunk_start)
+            )",
+        )
+        .execute(pg)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS nanotrace_facet_backfill_chunks_claim_idx
+             ON nanotrace_facet_backfill_chunks (status, lease_expires_at, updated_at, chunk_id)",
+        )
+        .execute(pg)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_table(&self) -> Result<(), FacetError> {
+        let hot_dimensions = format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             path String, \
+             value_type LowCardinality(String), \
+             status LowCardinality(String), \
+             display_name String DEFAULT '', \
+             source LowCardinality(String) DEFAULT 'user', \
+             created_at DateTime64(3, 'UTC') DEFAULT now64(3), \
+             updated_at DateTime64(3, 'UTC') DEFAULT now64(3), \
+             created_by String DEFAULT '', \
+             error String DEFAULT ''\
+             ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY path",
+            self.hot_dimensions_table()
+        );
+        self.clickhouse_exec(&hot_dimensions).await
+    }
+
+    async fn reconcile_data_type(&self, custom: &[HotDimension]) -> Result<(), FacetError> {
+        let mut hints = BTreeMap::<String, String>::new();
+        for (path, value_type) in base_json_hints() {
+            hints.insert(path.to_string(), value_type.to_string());
+        }
+        for dimension in custom {
+            hints.insert(
+                dimension.path.clone(),
+                clickhouse_type_for_value_type(&dimension.value_type)?.to_string(),
+            );
+        }
+
+        let mut parts = vec!["JSON(".to_string()];
+        for (path, value_type) in hints {
+            parts.push(format!("{} {},", quote_identifier(&path), value_type));
+        }
+        parts.push("max_dynamic_paths = 8192,".to_string());
+        parts.push("max_dynamic_types = 8".to_string());
+        parts.push(")".to_string());
+
+        let query = format!(
+            "ALTER TABLE {} MODIFY COLUMN data {}",
+            self.events_table(),
+            parts.join(" ")
+        );
+        self.clickhouse_exec(&query).await
+    }
+
+    async fn clickhouse_query(&self, query: &str) -> Result<String, FacetError> {
+        self.clickhouse_request(query, true).await
+    }
+
+    async fn clickhouse_exec(&self, query: &str) -> Result<(), FacetError> {
+        self.clickhouse_request(query, false).await?;
+        Ok(())
+    }
+
+    async fn clickhouse_exec_sync_mutation(&self, query: &str) -> Result<(), FacetError> {
+        self.clickhouse_request_with_params(query, false, &[("mutations_sync", "2")])
+            .await?;
+        Ok(())
+    }
+
+    async fn clickhouse_request(&self, query: &str, json: bool) -> Result<String, FacetError> {
+        self.clickhouse_request_with_params(query, json, &[]).await
+    }
+
+    async fn clickhouse_request_with_params(
+        &self,
+        query: &str,
+        json: bool,
+        params: &[(&str, &str)],
+    ) -> Result<String, FacetError> {
+        let url = self
+            .cfg
+            .clickhouse_url
+            .as_deref()
+            .ok_or(FacetError::ClickHouseNotConfigured)?;
+        let mut request = self
+            .http
+            .post(url)
+            .query(&[
+                ("database", self.cfg.clickhouse_database.as_str()),
+                ("type_json_skip_duplicated_paths", "1"),
+                (
+                    "type_json_allow_duplicated_key_with_literal_and_nested_object",
+                    "1",
+                ),
+            ])
+            .query(params)
+            .body(if json {
+                format!("{query} FORMAT JSON")
+            } else {
+                query.to_string()
+            });
+
+        if let Some(user) = self.cfg.clickhouse_user.as_deref() {
+            request = request.basic_auth(user, self.cfg.clickhouse_password.as_deref());
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(FacetError::ClickHouseResponse { status, body });
+        }
+        Ok(body)
+    }
+
+    fn events_table(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.clickhouse_database),
+            quote_identifier(&self.cfg.clickhouse_table)
+        )
+    }
+
+    fn facets_table(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.clickhouse_database),
+            quote_identifier(&self.cfg.clickhouse_facets_table)
+        )
+    }
+
+    fn event_index_table(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.clickhouse_database),
+            quote_identifier(&self.cfg.clickhouse_event_index_table)
+        )
+    }
+
+    fn hot_dimensions_table(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.clickhouse_database),
+            quote_identifier(&self.cfg.clickhouse_hot_dimensions_table)
+        )
+    }
+}
+
+fn builtin_dimensions() -> Vec<HotDimension> {
+    [
+        ("trace_id", "string", "traceId"),
+        ("span_id", "string", "spanId"),
+        ("parent_span_id", "string", "parentSpanId"),
+        ("tenant_id", "low_cardinality_string", "tenant_id"),
+        ("service", "low_cardinality_string", "service"),
+        ("environment", "low_cardinality_string", "environment"),
+        ("event_type", "low_cardinality_string", "type"),
+        ("signal", "low_cardinality_string", "signal"),
+        ("name", "low_cardinality_string", "name"),
+        ("user_id", "string", "user_id"),
+        ("session_id", "string", "session_id"),
+        ("account_id", "string", "account_id"),
+        ("http.route", "low_cardinality_string", "http.route"),
+        ("http.method", "low_cardinality_string", "http.method"),
+        ("http.status_code", "integer", "http.status_code"),
+        ("severity_text", "low_cardinality_string", "severity_text"),
+        ("metric_name", "low_cardinality_string", "metric_name"),
+    ]
+    .into_iter()
+    .map(|(path, value_type, display_name)| HotDimension {
+        path: path.to_string(),
+        value_type: value_type.to_string(),
+        status: "active".to_string(),
+        display_name: display_name.to_string(),
+        source: "builtin".to_string(),
+        removable: false,
+    })
+    .collect()
+}
+
+fn base_json_hints() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("tenant_id", "LowCardinality(Nullable(String))"),
+        ("service", "LowCardinality(Nullable(String))"),
+        ("service.namespace", "LowCardinality(Nullable(String))"),
+        ("service.instance.id", "Nullable(String)"),
+        ("service_version", "LowCardinality(Nullable(String))"),
+        ("event_type", "LowCardinality(Nullable(String))"),
+        ("environment", "LowCardinality(Nullable(String))"),
+        ("host.name", "LowCardinality(Nullable(String))"),
+        ("host.id", "Nullable(String)"),
+        ("name", "LowCardinality(Nullable(String))"),
+        ("scope_name", "LowCardinality(Nullable(String))"),
+        ("scope_version", "LowCardinality(Nullable(String))"),
+        ("trace_id", "Nullable(String)"),
+        ("span_id", "Nullable(String)"),
+        ("parent_span_id", "Nullable(String)"),
+        ("trace_state", "Nullable(String)"),
+        ("span_kind", "LowCardinality(Nullable(String))"),
+        ("span_status_code", "LowCardinality(Nullable(String))"),
+        ("span_status_message", "Nullable(String)"),
+        ("start_time", "Nullable(DateTime64(3, 'UTC'))"),
+        ("end_time", "Nullable(DateTime64(3, 'UTC'))"),
+        ("span_start_time", "Nullable(DateTime64(3, 'UTC'))"),
+        ("span_end_time", "Nullable(DateTime64(3, 'UTC'))"),
+        ("duration_ms", "Nullable(Float64)"),
+        ("is_error", "Nullable(UInt8)"),
+        ("http.method", "LowCardinality(Nullable(String))"),
+        ("http.route", "LowCardinality(Nullable(String))"),
+        ("http.status_code", "Nullable(UInt16)"),
+        ("http.request.method", "LowCardinality(Nullable(String))"),
+        ("http.response.status_code", "Nullable(UInt16)"),
+        ("url.path", "Nullable(String)"),
+        ("url.full", "Nullable(String)"),
+        ("user_agent.original", "Nullable(String)"),
+        ("client.ip", "Nullable(String)"),
+        ("client.port", "Nullable(UInt16)"),
+        ("server.address", "LowCardinality(Nullable(String))"),
+        ("server.port", "Nullable(UInt16)"),
+        ("exception.type", "LowCardinality(Nullable(String))"),
+        ("exception.message", "Nullable(String)"),
+        ("exception.stacktrace", "Nullable(String)"),
+        ("severity_text", "LowCardinality(Nullable(String))"),
+        ("severity_number", "Nullable(UInt8)"),
+        ("body", "Nullable(String)"),
+        ("logger.name", "LowCardinality(Nullable(String))"),
+        ("thread.name", "LowCardinality(Nullable(String))"),
+        ("db.system", "LowCardinality(Nullable(String))"),
+        ("db.operation", "LowCardinality(Nullable(String))"),
+        ("db.statement", "Nullable(String)"),
+        ("rpc.system", "LowCardinality(Nullable(String))"),
+        ("rpc.service", "LowCardinality(Nullable(String))"),
+        ("rpc.method", "LowCardinality(Nullable(String))"),
+        ("messaging.system", "LowCardinality(Nullable(String))"),
+        (
+            "messaging.destination.name",
+            "LowCardinality(Nullable(String))",
+        ),
+        (
+            "messaging.operation.name",
+            "LowCardinality(Nullable(String))",
+        ),
+        ("metric_name", "LowCardinality(Nullable(String))"),
+        ("metric_type", "LowCardinality(Nullable(String))"),
+        ("metric_value", "Nullable(Float64)"),
+        ("metric_unit", "LowCardinality(Nullable(String))"),
+        ("metric.temporality", "LowCardinality(Nullable(String))"),
+        ("metric.is_monotonic", "Nullable(Bool)"),
+        ("count", "Nullable(UInt64)"),
+        ("sum", "Nullable(Float64)"),
+        ("metric_count", "Nullable(UInt64)"),
+        ("metric_sum", "Nullable(Float64)"),
+        ("metric_min", "Nullable(Float64)"),
+        ("metric_max", "Nullable(Float64)"),
+        ("user_id", "Nullable(String)"),
+        ("anonymous_id", "Nullable(String)"),
+        ("device_id", "Nullable(String)"),
+        ("session_id", "Nullable(String)"),
+        ("account_id", "Nullable(String)"),
+        ("page_url", "Nullable(String)"),
+        ("page_path", "LowCardinality(Nullable(String))"),
+        ("page_title", "Nullable(String)"),
+        ("referrer", "Nullable(String)"),
+        ("screen_name", "LowCardinality(Nullable(String))"),
+        ("utm_source", "LowCardinality(Nullable(String))"),
+        ("utm_medium", "LowCardinality(Nullable(String))"),
+        ("utm_campaign", "LowCardinality(Nullable(String))"),
+        ("utm_term", "LowCardinality(Nullable(String))"),
+        ("utm_content", "LowCardinality(Nullable(String))"),
+        ("country", "LowCardinality(Nullable(String))"),
+        ("region", "LowCardinality(Nullable(String))"),
+        ("city", "LowCardinality(Nullable(String))"),
+        ("continent", "LowCardinality(Nullable(String))"),
+        ("location_lat", "Nullable(Float64)"),
+        ("location_lng", "Nullable(Float64)"),
+        ("device_type", "LowCardinality(Nullable(String))"),
+        ("device_brand", "LowCardinality(Nullable(String))"),
+        ("device_manufacturer", "LowCardinality(Nullable(String))"),
+        ("device_model", "LowCardinality(Nullable(String))"),
+        ("browser", "LowCardinality(Nullable(String))"),
+        ("browser_version", "LowCardinality(Nullable(String))"),
+        ("os", "LowCardinality(Nullable(String))"),
+        ("os_version", "LowCardinality(Nullable(String))"),
+        ("app_version", "LowCardinality(Nullable(String))"),
+        ("locale", "LowCardinality(Nullable(String))"),
+        ("timezone", "LowCardinality(Nullable(String))"),
+        ("user_agent", "Nullable(String)"),
+        ("screen_height", "Nullable(UInt32)"),
+        ("screen_width", "Nullable(UInt32)"),
+        ("viewport_height", "Nullable(UInt32)"),
+        ("viewport_width", "Nullable(UInt32)"),
+        ("screen_dpi", "Nullable(UInt32)"),
+        ("ip", "Nullable(String)"),
+        ("revenue", "Nullable(Float64)"),
+        ("currency", "LowCardinality(Nullable(String))"),
+        ("price", "Nullable(Float64)"),
+        ("quantity", "Nullable(Float64)"),
+        ("product_id", "Nullable(String)"),
+        ("revenue_type", "LowCardinality(Nullable(String))"),
+        ("experiment_id", "LowCardinality(Nullable(String))"),
+        ("variant", "LowCardinality(Nullable(String))"),
+        ("feature_flag", "LowCardinality(Nullable(String))"),
+    ]
+}
+
+fn validate_path(path: &str) -> Result<String, FacetError> {
+    let path = path.trim().strip_prefix("data.").unwrap_or(path.trim());
+    if path.is_empty()
+        || path.len() > 256
+        || path.starts_with('.')
+        || path.ends_with('.')
+        || path.contains("..")
+        || !path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-')
+    {
+        return Err(FacetError::InvalidPath);
+    }
+    Ok(path.to_string())
+}
+
+fn validate_job_id(job_id: &str) -> Result<String, FacetError> {
+    let job_id = job_id.trim();
+    if job_id.is_empty()
+        || job_id.len() > 128
+        || !job_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(FacetError::InvalidPath);
+    }
+    Ok(job_id.to_string())
+}
+
+fn backfill_response_from_row(
+    row: (String, String, String, i64, i64, i64, i64, i64, String),
+) -> FacetBackfillResponse {
+    let (
+        job_id,
+        path,
+        status,
+        total_chunks,
+        completed_chunks,
+        failed_chunks,
+        indexed_events,
+        values,
+        error,
+    ) = row;
+    FacetBackfillResponse {
+        job_id,
+        path,
+        status,
+        total_chunks: nonnegative_u64(total_chunks),
+        completed_chunks: nonnegative_u64(completed_chunks),
+        failed_chunks: nonnegative_u64(failed_chunks),
+        indexed_events: nonnegative_u64(indexed_events),
+        values: nonnegative_u64(values),
+        error,
+    }
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+fn backfill_chunks(min_ms: i64, max_ms: i64) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    if min_ms <= 0 || max_ms < min_ms {
+        return Vec::new();
+    }
+    let chunk_ms = 60 * 60 * 1_000;
+    let mut chunks = Vec::new();
+    let mut start_ms = min_ms;
+    let exclusive_max_ms = max_ms.saturating_add(1);
+    while start_ms < exclusive_max_ms {
+        let end_ms = start_ms.saturating_add(chunk_ms).min(exclusive_max_ms);
+        let Some(start) = DateTime::<Utc>::from_timestamp_millis(start_ms) else {
+            break;
+        };
+        let Some(end) = DateTime::<Utc>::from_timestamp_millis(end_ms) else {
+            break;
+        };
+        chunks.push((start, end));
+        start_ms = end_ms;
+    }
+    chunks
+}
+
+fn backfill_job_id(path: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let timestamp = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_micros() * 1_000);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "bf_{:x}_{:x}_{:x}",
+        timestamp,
+        std::process::id(),
+        sequence ^ stable_path_hash(path)
+    )
+}
+
+fn backfill_worker_id() -> String {
+    format!(
+        "server-{}-{}",
+        std::process::id(),
+        stable_path_hash("worker")
+    )
+}
+
+fn clickhouse_datetime_literal(value: DateTime<Utc>) -> String {
+    quote_literal(&value.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+}
+
+fn clickhouse_minute_bucket_bounds(
+    start: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+) -> (String, String) {
+    const MINUTE_MS: i64 = 60_000;
+    let start_ms = start.timestamp_millis();
+    let last_included_ms = end_exclusive.timestamp_millis().saturating_sub(1);
+    let bucket_start_ms = start_ms - start_ms.rem_euclid(MINUTE_MS);
+    let bucket_end_ms = last_included_ms - last_included_ms.rem_euclid(MINUTE_MS) + MINUTE_MS;
+    (
+        clickhouse_datetime_literal(
+            DateTime::<Utc>::from_timestamp_millis(bucket_start_ms).unwrap_or(start),
+        ),
+        clickhouse_datetime_literal(
+            DateTime::<Utc>::from_timestamp_millis(bucket_end_ms).unwrap_or(end_exclusive),
+        ),
+    )
+}
+
+fn truncate_error(error: &str) -> String {
+    error.chars().take(4096).collect()
+}
+
+fn stable_path_hash(path: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn validate_value_type(value_type: &str) -> Result<&'static str, FacetError> {
+    match value_type {
+        "string" => Ok("string"),
+        "low_cardinality_string" => Ok("low_cardinality_string"),
+        "float" | "number" => Ok("float"),
+        "integer" => Ok("integer"),
+        "unsigned" => Ok("unsigned"),
+        "bool" => Ok("bool"),
+        "datetime" => Ok("datetime"),
+        _ => Err(FacetError::InvalidValueType),
+    }
+}
+
+fn clickhouse_type_for_value_type(value_type: &str) -> Result<&'static str, FacetError> {
+    match validate_value_type(value_type)? {
+        "string" => Ok("Nullable(String)"),
+        "low_cardinality_string" => Ok("LowCardinality(Nullable(String))"),
+        "float" => Ok("Nullable(Float64)"),
+        "integer" => Ok("Nullable(Int64)"),
+        "unsigned" => Ok("Nullable(UInt64)"),
+        "bool" => Ok("Nullable(Bool)"),
+        "datetime" => Ok("Nullable(DateTime64(3, 'UTC'))"),
+        _ => Err(FacetError::InvalidValueType),
+    }
+}
+
+fn event_index_value_type(value_type: &str) -> Result<&'static str, FacetError> {
+    match validate_value_type(value_type)? {
+        "string" | "low_cardinality_string" | "datetime" => Ok("string"),
+        "float" | "integer" | "unsigned" => Ok("number"),
+        "bool" => Ok("bool"),
+        _ => Err(FacetError::InvalidValueType),
+    }
+}
+
+fn facet_value_expression(path: &str) -> String {
+    format!("ifNull(toString(data.{}), '')", quote_identifier(path))
+}
+
+fn error_count_expression() -> &'static str {
+    "lowerUTF8(ifNull(toString(data.is_error), '')) IN ('1', 'true') \
+     OR lowerUTF8(ifNull(toString(data.span_status_code), '')) = 'error' \
+     OR endsWith(lowerUTF8(ifNull(toString(data.event_type), '')), '_error')"
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("`{}`", value.replace('`', "``"))
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}

@@ -44,16 +44,24 @@ cargo test --all-features
 
 ## AWS Quickstart
 
-Set AWS credentials and the server secret in the environment, or put them in an
-env file and point `NANOTRACE_ENV_FILE` at that file:
+Set AWS credentials and an API key in the environment, or put them in an env
+file and point `NANOTRACE_ENV_FILE` at that file:
 
 ```text
 AWS_REGION=us-west-1
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
-SECRET_KEY=...
+NANOTRACE_API_KEY=ntak_...
+NANOTRACE_EMAIL_FROM=nanotrace@example.com
+NANOTRACE_ALLOWED_EMAILS=alice@company.com,*@company.com,/^.+@engineering\\.company\\.com$/
+NANOTRACE_ADMIN_EMAILS=alice@company.com
 NANOTRACE_DEPLOYMENT_ID=prod
 ```
+
+Browser login uses one-time email links sent through AWS SES. The sender in
+`NANOTRACE_EMAIL_FROM` must be a verified SES identity in the deployment
+region; if the account is still in the SES sandbox, recipients must be verified
+too.
 
 When using an env file, run commands with `NANOTRACE_ENV_FILE=path/to/env-file`.
 

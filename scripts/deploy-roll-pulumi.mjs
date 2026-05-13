@@ -47,7 +47,7 @@ if (!skipRoll) {
     if (peakCapacity < finalCapacity) {
         throw new Error(`--peak (${peakCapacity}) must be >= --final (${finalCapacity})`);
     }
-    await run(process.execPath, scaleArgs(peakCapacity, envFile), {
+    await run(process.execPath, scaleArgs(peakCapacity, envFile, { allowMixedLaunchTemplates: true }), {
         cwd: root,
         env: deployEnv,
         inherit: true,
@@ -90,10 +90,13 @@ function loadEnvFile(file) {
     }
 }
 
-function scaleArgs(capacity, envFile) {
+function scaleArgs(capacity, envFile, options = {}) {
     const args = ["scripts/scale-pulumi-asg.mjs", String(capacity)];
     if (envFile) {
         args.push("--env", envFile);
+    }
+    if (options.allowMixedLaunchTemplates) {
+        args.push("--allow-mixed-launch-templates");
     }
     return args;
 }

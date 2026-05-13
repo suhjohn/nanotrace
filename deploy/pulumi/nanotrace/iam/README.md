@@ -1,6 +1,6 @@
 # Nanotrace IAM Policies
 
-These policies support the Pulumi EC2/EBS/S3/SQS/ECR deployment in
+These policies support the Pulumi EC2/EBS/S3/SQS/ECR/RDS deployment in
 `deploy/pulumi/nanotrace`.
 
 - `bootstrap.json`: for an administrator to create and attach the Nanotrace
@@ -9,8 +9,8 @@ These policies support the Pulumi EC2/EBS/S3/SQS/ECR deployment in
   `deploy-iam.json`: attach all four to the user or CI role that runs
   `pulumi up` and pushes the server image to ECR. These are split because AWS
   managed policies have a 6144 non-whitespace character limit.
-- `observe.json`: read-only inspection plus enough S3/SQS access to run the
-  deploy-aware E2E.
+- `observe.json`: read-only inspection plus S3/SQS/SSM access to run
+  deploy-aware E2E and live diagnostics on Nanotrace instances.
 - `cleanup.json`: for `pulumi destroy` and cleanup of partially-created
   Nanotrace resources.
 
@@ -21,12 +21,21 @@ creates unique physical names with Pulumi suffixes, for example
 `deploy-iam.json` includes `iam:PassRole` only for the Nanotrace instance-role
 pattern and only when passed to `ec2.amazonaws.com`. The stack needs that
 because EC2 launch templates pass the instance role to launched instances.
+It also allows attaching or detaching only the AWS-managed
+`AmazonSSMManagedInstanceCore` policy to Nanotrace instance roles, so live SSM
+diagnostics can be enabled temporarily without granting broad IAM mutation.
+
+The compute policy also grants ACM certificate management for Nanotrace-tagged
+certificates and Route 53 hosted-zone record changes so the stack can provision
+HTTPS for the deployer-provided domain name.
 
 Remaining `Resource: "*"` grants are limited to APIs that either do not support
 resource-level permissions or are read/list discovery calls Pulumi uses during
 refresh:
 
 - EC2, Auto Scaling, and ELB `Describe*`
+- ACM certificate read/list APIs
+- Route 53 hosted zone and record discovery APIs
 - SQS `ListQueues`
 - ECR `GetAuthorizationToken`
 - account/caller identity reads

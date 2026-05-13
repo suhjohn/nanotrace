@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/loader", "apps/query", "apps/server", "apps/sidecar", "crates/processor-runtime", "tools/loadtest"]
+members = ["apps/loader", "apps/query", "apps/server", "apps/sidecar", "crates/auth", "crates/processor-runtime", "tools/loadtest"]
 resolver = "3"
 
 [workspace.package]

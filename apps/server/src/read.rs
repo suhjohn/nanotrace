@@ -144,6 +144,11 @@ impl ReadStore {
             .query(&[
                 ("database", self.cfg.clickhouse_database.as_str()),
                 ("readonly", "1"),
+                ("type_json_skip_duplicated_paths", "1"),
+                (
+                    "type_json_allow_duplicated_key_with_literal_and_nested_object",
+                    "1",
+                ),
                 (
                     "max_execution_time",
                     &self.cfg.clickhouse_max_execution_secs.to_string(),
