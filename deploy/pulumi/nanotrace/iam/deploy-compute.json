@@ -5,6 +5,7 @@
       "Effect": "Allow",
       "Action": [
         "acm:DescribeCertificate",
+        "acm:ListTagsForCertificate",
         "acm:ListCertificates",
         "ec2:Describe*",
         "autoscaling:Describe*",
@@ -198,6 +199,28 @@
       "Action": "acm:RequestCertificate",
       "Resource": "*",
       "Condition": { "StringEquals": { "aws:RequestTag/Project": "nanotrace" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreateDistribution",
+        "cloudfront:CreateDistributionWithTags",
+        "cloudfront:CreateInvalidation",
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:DeleteDistribution",
+        "cloudfront:DeleteOriginAccessControl",
+        "cloudfront:GetDistribution",
+        "cloudfront:GetDistributionConfig",
+        "cloudfront:GetInvalidation",
+        "cloudfront:GetOriginAccessControl",
+        "cloudfront:GetOriginAccessControlConfig",
+        "cloudfront:ListTagsForResource",
+        "cloudfront:TagResource",
+        "cloudfront:UntagResource",
+        "cloudfront:UpdateDistribution",
+        "cloudfront:UpdateOriginAccessControl"
+      ],
+      "Resource": "*"
     },
     {
       "Effect": "Allow",

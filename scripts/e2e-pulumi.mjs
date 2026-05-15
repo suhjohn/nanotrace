@@ -12,7 +12,7 @@ const pulumiCwd = path.join(root, "deploy/pulumi/nanotrace");
 loadEnvFile(process.env.NANOTRACE_ENV_FILE);
 
 const outputs = await pulumiOutputs();
-const apiKey = process.env.NANOTRACE_E2E_API_KEY || requiredOutput(outputs, "bootstrapApiKeyOutput");
+const apiKey = requiredEnv("NANOTRACE_E2E_API_KEY");
 const ingestUrl = trimTrailingSlash(
     process.env.NANOTRACE_E2E_INGEST_URL || requiredOutput(outputs, "ingestUrl"),
 );

@@ -225,8 +225,9 @@ CREATE TABLE
             'other'
         ),
 
-        /* The sort key starts with tenant_id, so trace/span lookups by id
-           alone scan a wide range. Bloom filters cut that to matching parts. */
+        /* The sort key is tenant/time first because product reads, facet
+           backfills, retention, and event pages are tenant-scoped time scans.
+           Event kind stays as metadata, not a storage-order dimension. */
         INDEX idx_trace_id trace_id TYPE bloom_filter (0.01) GRANULARITY 1,
         INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 1,
         INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 1
@@ -234,7 +235,7 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, event_type, timestamp, trace_id, span_id);
+    (tenant_id, timestamp, trace_id, span_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_facets (
@@ -277,6 +278,7 @@ ORDER BY
 
 CREATE TABLE
     IF NOT EXISTS observatory.hot_dimensions (
+        tenant_id String DEFAULT 'org_default',
         path String CODEC (ZSTD (1)),
         value_type LowCardinality (String),
         status LowCardinality (String),
@@ -288,4 +290,4 @@ CREATE TABLE
         error String DEFAULT ''
     ) ENGINE = ReplacingMergeTree (updated_at)
 ORDER BY
-    path;
+    (tenant_id, path);

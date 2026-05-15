@@ -8,26 +8,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, repoRoot, '')
-  const apiTarget = env.NANOTRACE_URL || env.TRACER_URL || 'http://localhost:18473'
-  const apiToken = env.NANOTRACE_API_KEY || env.NANOTRACE_KEY
-  const proxyTarget = {
-    target: apiTarget,
-    changeOrigin: true,
-    ...(apiToken ? { headers: { Authorization: `Bearer ${apiToken}` } } : {})
-  }
+  const apiTarget = env.VITE_NANOTRACE_URL || env.NANOTRACE_URL || env.TRACER_URL || 'http://localhost:18473'
 
   return {
+    define: {
+      'import.meta.env.VITE_NANOTRACE_URL': JSON.stringify(apiTarget)
+    },
     envPrefix: ['VITE_'],
     server: {
       port: Number(env.NANOTRACE_UI_PORT || env.TRACER_UI_PORT || '41233'),
-      proxy: {
-        '/events': proxyTarget,
-        '/facets': proxyTarget,
-        '/auth': proxyTarget,
-        '/api-keys': proxyTarget,
-        '/dashboards': proxyTarget,
-        '/query': proxyTarget
-      },
       strictPort: true
     },
     plugins: [tailwindcss(), viteReact()]

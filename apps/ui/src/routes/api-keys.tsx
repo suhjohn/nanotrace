@@ -4,7 +4,7 @@ import { Check, Clipboard, KeyRound, PanelLeftOpen, Plus, Trash2, X } from 'luci
 import { useMemo, useState } from 'react'
 import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
-import { queryHeaders } from '../lib/nanotrace-api'
+import { nanotraceApiBaseUrl, queryHeaders } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/settings/api-keys')({
   component: ApiKeysRoute
@@ -45,7 +45,7 @@ class HTTPError extends Error {
 }
 
 function ApiKeysRoute() {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const queryClient = useQueryClient()
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [name, setName] = useState('')

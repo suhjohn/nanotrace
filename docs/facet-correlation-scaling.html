@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Facet vs Correlation Index Scaling</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --panel: #141820;
+      --panel-2: #10141b;
+      --text: #eef2f7;
+      --muted: #9aa6b2;
+      --line: #2a3340;
+      --blue: #76a9ff;
+      --green: #82d173;
+      --amber: #f2c66d;
+      --red: #ff7b7b;
+      --violet: #b59cff;
+      --code: #0a0c10;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }
+
+    header {
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(30px, 5vw, 58px);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 36px 0 14px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0 0 10px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+
+    strong {
+      color: var(--text);
+    }
+
+    code {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--code);
+      color: #dbe8ff;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      overflow: auto;
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--code);
+      color: #dbe8ff;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      color: #dbe8ff;
+      background: #171d27;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    th:last-child,
+    td:last-child {
+      border-right: 0;
+    }
+
+    .lede {
+      max-width: 860px;
+      color: #cbd5e1;
+      font-size: 18px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    .card p:last-child,
+    .note p:last-child {
+      margin-bottom: 0;
+    }
+
+    .note {
+      border-left: 3px solid var(--blue);
+      background: #0f1724;
+      padding: 14px 16px;
+      margin: 18px 0;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: #dbe8ff;
+      background: #101722;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .tag.green {
+      border-color: rgba(130, 209, 115, 0.4);
+      color: var(--green);
+    }
+
+    .tag.amber {
+      border-color: rgba(242, 198, 109, 0.45);
+      color: var(--amber);
+    }
+
+    .tag.red {
+      border-color: rgba(255, 123, 123, 0.45);
+      color: var(--red);
+    }
+
+    .tag.violet {
+      border-color: rgba(181, 156, 255, 0.45);
+      color: var(--violet);
+    }
+
+    .metric {
+      display: grid;
+      gap: 4px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+
+    .metric b {
+      font-size: 20px;
+      line-height: 1.1;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0;
+    }
+
+    .box {
+      min-height: 92px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .arrow {
+      color: var(--muted);
+      font-size: 24px;
+    }
+
+    .subtle {
+      color: var(--muted);
+    }
+
+    .good {
+      color: var(--green);
+    }
+
+    .warn {
+      color: var(--amber);
+    }
+
+    .bad {
+      color: var(--red);
+    }
+
+    .section {
+      margin-top: 26px;
+    }
+
+    .nowrap {
+      white-space: nowrap;
+    }
+
+    @media (max-width: 860px) {
+      main {
+        padding: 28px 14px 48px;
+      }
+
+      .two,
+      .three,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .arrow {
+        display: none;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Facet vs Correlation Index Scaling</h1>
+      <p class="lede">
+        The hard part is not storing arbitrary fields. The hard part is choosing which fields deserve fast
+        browseable group-by behavior, which fields only need exact lookup, and which fields should stay in the raw event body.
+      </p>
+    </header>
+
+    <section>
+      <h2>One Sentence Model</h2>
+      <div class="note">
+        <p>
+          <strong>Facets answer discovery questions.</strong> "What values exist, how many events do they have, and which groups are hottest?"
+          <strong>Correlation keys answer lookup questions.</strong> "I already have this ID. Show me the related events."
+        </p>
+      </div>
+
+      <div class="grid two">
+        <div class="card">
+          <h3>Facet Table</h3>
+          <p>
+            A facet table is optimized for browsing, grouping, and drilling into a selected dimension.
+            It usually has two pieces:
+          </p>
+          <pre>event_facets
+  tenant_id, key, value, bucket_time, count, error_count
+
+event_facet_index
+  tenant_id, key, value, timestamp, event_id, metadata...</pre>
+          <p>
+            The summary table makes top groups cheap. The membership table makes "open this group" cheap.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3>Correlation Table</h3>
+          <p>
+            A correlation table is optimized for exact lookup by known IDs. It is not meant to power the whole
+            group sidebar.
+          </p>
+          <pre>event_correlation_index
+  tenant_id, key, value, timestamp, event_id, metadata...</pre>
+          <p>
+            It is best for keys like <code>trace_id</code>, <code>request_id</code>, <code>span_id</code>, and <code>event_id</code>.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>The Shape Looks Similar, But The Workload Is Different</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Question</th>
+            <th>Example</th>
+            <th>Best Data Structure</th>
+            <th>Why</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>What groups exist?</td>
+            <td><code>top service</code>, <code>top user_id</code></td>
+            <td><span class="tag green">Facet summary</span></td>
+            <td>Reads aggregated counts instead of scanning every matching event membership row.</td>
+          </tr>
+          <tr>
+            <td>Open a selected group</td>
+            <td><code>service=api</code>, <code>user_id=u_123</code></td>
+            <td><span class="tag green">Facet membership index</span></td>
+            <td>Reads the exact <code>key=value</code> event list, ordered by time.</td>
+          </tr>
+          <tr>
+            <td>Find an exact ID</td>
+            <td><code>request_id=req_123</code>, <code>trace_id=abc</code></td>
+            <td><span class="tag violet">Correlation index</span></td>
+            <td>The value is already known. We do not need top-N counts or a browseable sidebar.</td>
+          </tr>
+          <tr>
+            <td>Ad hoc field before indexing</td>
+            <td><code>customer_tier=enterprise</code></td>
+            <td><span class="tag amber">Raw events scan</span></td>
+            <td>Zero extra write cost, but reads get slower as data grows.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Cardinality Scenarios</h2>
+      <div class="grid three">
+        <div class="metric">
+          <b>Low</b>
+          <span>10s of values. Example: <code>service</code>, <code>env</code>, <code>status_code</code></span>
+        </div>
+        <div class="metric">
+          <b>Medium</b>
+          <span>100s to 100k values. Example: <code>http.route</code>, <code>model</code>, <code>workspace_id</code></span>
+        </div>
+        <div class="metric">
+          <b>High</b>
+          <span>Millions of values. Example: <code>user_id</code>, <code>session_id</code>, <code>account_id</code></span>
+        </div>
+      </div>
+
+      <div class="section">
+        <table>
+          <thead>
+            <tr>
+              <th>Key Type</th>
+              <th>Examples</th>
+              <th>Facet Behavior</th>
+              <th>Correlation Behavior</th>
+              <th>Recommendation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tag green">Low cardinality</span></td>
+              <td><code>service</code>, <code>environment</code>, <code>signal</code>, <code>http.status_code</code></td>
+              <td>
+                Excellent. Summary rows are compact, group-by is cheap, and drilldown is useful.
+              </td>
+              <td>
+                Works for exact lookup, but misses the main value: top lists and aggregate navigation.
+              </td>
+              <td>
+                Make these default facets.
+              </td>
+            </tr>
+            <tr>
+              <td><span class="tag green">Medium cardinality</span></td>
+              <td><code>http.route</code>, <code>name</code>, <code>model</code>, <code>provider</code></td>
+              <td>
+                Usually good if the field is used often. Write cost is meaningful but controlled.
+              </td>
+              <td>
+                Good only if users paste a specific value. Weak for "show me top routes/models".
+              </td>
+              <td>
+                Make common ones default. Let users add the rest as hot dimensions.
+              </td>
+            </tr>
+            <tr>
+              <td><span class="tag amber">High cardinality</span></td>
+              <td><code>user_id</code>, <code>account_id</code>, <code>session_id</code></td>
+              <td>
+                Expensive but sometimes worth it. Product and support workflows often need "top users by errors"
+                and "open user X".
+              </td>
+              <td>
+                Excellent for "show user X" if the value is known. Does not cheaply answer "top users".
+              </td>
+              <td>
+                Treat as opt-in or carefully chosen default facets. Keep summaries bucketed and limit top-N reads.
+              </td>
+            </tr>
+            <tr>
+              <td><span class="tag red">Per event identity</span></td>
+              <td><code>event_id</code>, <code>span_id</code>, often <code>request_id</code></td>
+              <td>
+                Bad default. Nearly every value is unique, so group lists become huge and not analytically useful.
+              </td>
+              <td>
+                Excellent. Exact lookup is the actual workload.
+              </td>
+              <td>
+                Keep out of default facets. Put in correlation index or use dedicated columns/indexes.
+              </td>
+            </tr>
+            <tr>
+              <td><span class="tag violet">Trace identity</span></td>
+              <td><code>trace_id</code>, <code>parent_span_id</code></td>
+              <td>
+                Usually poor as a browseable facet. You do not want a sidebar of millions of trace IDs.
+              </td>
+              <td>
+                Strong. Trace view starts from a known trace ID or a clicked event and fetches related events.
+              </td>
+              <td>
+                Use correlation lookup or promoted columns on <code>events</code>.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Write-Time Cost</h2>
+      <p>
+        Write cost is roughly proportional to how many derived rows the loader emits per event.
+        If one event has values for 12 active facets, the generic facet membership index can write up to 12 extra rows.
+      </p>
+
+      <div class="flow">
+        <div class="box">
+          <h3>Raw Event</h3>
+          <p>Always one row in <code>events</code>. This is the source of truth.</p>
+        </div>
+        <div class="arrow">-></div>
+        <div class="box">
+          <h3>Facet Writes</h3>
+          <p>One membership row per active browseable <code>key=value</code>, plus summary rows.</p>
+        </div>
+        <div class="arrow">-></div>
+        <div class="box">
+          <h3>Correlation Writes</h3>
+          <p>Only a small fixed set of exact lookup IDs, usually 1 to 3 rows per event.</p>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Design</th>
+            <th>Rows Per Event</th>
+            <th>Loader Impact</th>
+            <th>Storage Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Only raw <code>events</code></td>
+            <td>1</td>
+            <td><span class="good">Lowest</span></td>
+            <td><span class="good">Lowest</span></td>
+          </tr>
+          <tr>
+            <td>Raw + correlation IDs</td>
+            <td>~2 to 4</td>
+            <td><span class="good">Low</span></td>
+            <td><span class="good">Low to medium</span></td>
+          </tr>
+          <tr>
+            <td>Raw + curated facets</td>
+            <td>~8 to 16</td>
+            <td><span class="warn">Medium</span></td>
+            <td><span class="warn">Medium</span></td>
+          </tr>
+          <tr>
+            <td>Raw + all possible facets</td>
+            <td>Unbounded</td>
+            <td><span class="bad">High and unpredictable</span></td>
+            <td><span class="bad">High and unpredictable</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Read-Time Cost</h2>
+      <p>
+        Read performance depends on whether the physical table order matches the question.
+        Exact lookup and top-N group-by want different physical layouts.
+      </p>
+
+      <div class="grid two">
+        <div class="card">
+          <h3>Exact Lookup Wants Value First</h3>
+          <pre>ORDER BY (tenant_id, key, value, timestamp)</pre>
+          <p>
+            This makes <code>request_id=req_123</code> or <code>trace_id=abc</code> fast because ClickHouse can jump to a narrow range.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Group-By Wants Time Buckets Or Time First</h3>
+          <pre>event_facets:
+ORDER BY (tenant_id, key, bucket_time, value)</pre>
+          <p>
+            This makes "top values in this time range" cheap because the query scans aggregated buckets instead of event membership rows.
+          </p>
+        </div>
+      </div>
+
+      <div class="section">
+        <table>
+          <thead>
+            <tr>
+              <th>Query</th>
+              <th>Correlation-Only</th>
+              <th>Facet Summary + Index</th>
+              <th>Principal Engineer Take</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>request_id=req_123</code></td>
+              <td><span class="good">Fast</span></td>
+              <td><span class="warn">Fast but wasteful if treated as a facet</span></td>
+              <td>Use correlation. This is not a browse dimension.</td>
+            </tr>
+            <tr>
+              <td><code>trace_id=abc</code></td>
+              <td><span class="good">Fast</span></td>
+              <td><span class="warn">Fast but bloats generic facet index</span></td>
+              <td>Use correlation or promoted <code>events.trace_id</code>.</td>
+            </tr>
+            <tr>
+              <td><code>top service</code></td>
+              <td><span class="warn">Possible, but scans many membership rows</span></td>
+              <td><span class="good">Fast</span></td>
+              <td>Use facet summary.</td>
+            </tr>
+            <tr>
+              <td><code>top user_id by errors</code></td>
+              <td><span class="bad">Expensive at millions of users</span></td>
+              <td><span class="good">Fast if summarized, storage cost is accepted</span></td>
+              <td>Make <code>user_id</code> an intentional hot facet, not an accidental one.</td>
+            </tr>
+            <tr>
+              <td><code>open user_id=u_123</code></td>
+              <td><span class="good">Fast if user_id is included</span></td>
+              <td><span class="good">Fast</span></td>
+              <td>User ID can be both correlation and facet. The question is whether we need top users.</td>
+            </tr>
+            <tr>
+              <td><code>top event_id</code></td>
+              <td><span class="bad">Meaningless</span></td>
+              <td><span class="bad">Meaningless and expensive</span></td>
+              <td>Never make per-event identity a browse facet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why User ID Is Different From Request ID</h2>
+      <div class="grid two">
+        <div class="card">
+          <h3><code>user_id</code></h3>
+          <p>
+            High cardinality, but product-support workflows justify it:
+            top users by errors, open a user's activity, compare affected users, build cohorts.
+          </p>
+          <p>
+            This can be worth the facet cost if we intentionally support it and keep the query surface bounded.
+          </p>
+        </div>
+        <div class="card">
+          <h3><code>request_id</code></h3>
+          <p>
+            Usually one request or a small cluster of events. Users normally paste it, click it, or arrive from an event detail.
+          </p>
+          <p>
+            It should be searchable, but a "top request IDs" sidebar is usually noise.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recommended Nanotrace Policy</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Class</th>
+            <th>Keys</th>
+            <th>Storage</th>
+            <th>UI Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Default facets</td>
+            <td><code>service</code>, <code>environment</code>, <code>event_type</code>, <code>signal</code>, <code>name</code>, <code>http.route</code>, <code>http.method</code>, <code>http.status_code</code>, <code>severity_text</code>, <code>metric_name</code></td>
+            <td><code>event_facets</code> + <code>event_facet_index</code></td>
+            <td>Appear in group menu and sidebar by default.</td>
+          </tr>
+          <tr>
+            <td>Intentional high-cardinality facets</td>
+            <td><code>user_id</code>, <code>account_id</code>, <code>session_id</code>, selected customer fields</td>
+            <td><code>event_facets</code> + <code>event_facet_index</code>, only when active</td>
+            <td>Can be enabled as hot dimensions. Backfill old data when enabled.</td>
+          </tr>
+          <tr>
+            <td>Correlation IDs</td>
+            <td><code>trace_id</code>, <code>span_id</code>, <code>parent_span_id</code>, <code>request_id</code>, <code>event_id</code></td>
+            <td><code>event_correlation_index</code> or promoted columns on <code>events</code></td>
+            <td>Search box, clickable links, trace/request views. Not normal group sidebar values.</td>
+          </tr>
+          <tr>
+            <td>Cold arbitrary fields</td>
+            <td>Everything else in <code>data</code></td>
+            <td>Raw JSON in <code>events</code></td>
+            <td>Ad hoc query works, but large-scale group-by requires promoting to hot dimension.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>The Engineering Rule</h2>
+      <div class="note">
+        <p>
+          Do not decide based only on cardinality. Decide based on the product question.
+          If users need to discover values and compare groups, it is a facet.
+          If users already have the value and want related events, it is correlation.
+          If users rarely query it, keep it raw until they ask for it.
+        </p>
+      </div>
+
+      <pre>Facet:
+  "What values exist, how many, and which should I click?"
+
+Correlation:
+  "I have this ID. Show me what happened."
+
+Raw event field:
+  "Store it now. Optimize it only after it becomes a real workflow."</pre>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG TARGETPLATFORM=linux/arm64
 ARG TARGETARCH=arm64
 FROM --platform=$TARGETPLATFORM rust:1-bookworm AS builder
@@ -22,17 +23,23 @@ COPY apps/sidecar/src apps/sidecar/src
 COPY crates/auth/src crates/auth/src
 COPY crates/processor-runtime/src crates/processor-runtime/src
 COPY tools/loadtest/src tools/loadtest/src
-RUN cargo build --release -p nanotrace-server -p nanotrace-loader -p nanotrace-query
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target-${TARGETARCH} \
+    cargo build --release -p nanotrace-server -p nanotrace-loader -p nanotrace-query \
+    && mkdir -p /app/build-output \
+    && cp "${CARGO_TARGET_DIR}/release/nanotrace-server" /app/build-output/nanotrace-server \
+    && cp "${CARGO_TARGET_DIR}/release/nanotrace-loader" /app/build-output/nanotrace-loader \
+    && cp "${CARGO_TARGET_DIR}/release/nanotrace-query" /app/build-output/nanotrace-query
 
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
-ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates python3 python3-pip \
     && pip3 install --break-system-packages boto3 modal \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-server /usr/local/bin/nanotrace-server
-COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-loader /usr/local/bin/nanotrace-loader
-COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-query /usr/local/bin/nanotrace-query
+COPY --from=builder /app/build-output/nanotrace-server /usr/local/bin/nanotrace-server
+COPY --from=builder /app/build-output/nanotrace-loader /usr/local/bin/nanotrace-loader
+COPY --from=builder /app/build-output/nanotrace-query /usr/local/bin/nanotrace-query
 COPY scripts/modal_processor_builder.py /usr/local/bin/modal_processor_builder.py
 ENV PORT=18473
 EXPOSE 18473

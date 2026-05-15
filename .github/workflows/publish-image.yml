@@ -12,7 +12,6 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
-  VITE_NANOTRACE_URL: ${{ vars.VITE_NANOTRACE_URL || 'https://api.nanotrace.dev' }}
 
 jobs:
   publish:
@@ -54,7 +53,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VITE_NANOTRACE_URL=${{ env.VITE_NANOTRACE_URL }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

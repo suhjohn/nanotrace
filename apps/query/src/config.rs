@@ -20,10 +20,6 @@ pub struct Config {
     pub clickhouse_max_bytes_to_read: u64,
     pub max_request_bytes: usize,
     pub request_timeout: Duration,
-    pub data_plane_organization_id: Option<String>,
-    pub data_plane_shared_secret: Option<String>,
-    pub shared_data_plane_query_url: Option<String>,
-    pub shared_data_plane_secret: Option<String>,
     pub auth: AuthConfig,
     pub cors_allowed_origins: Vec<String>,
 }
@@ -97,12 +93,13 @@ impl Config {
         ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
-            bootstrap_api_key: optional_string("NANOTRACE_BOOTSTRAP_API_KEY"),
+            bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),
             public_base_url,
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
                 .unwrap_or_else(|_| "nanotrace_session".to_string())
                 .trim()
                 .to_string(),
+            session_same_site: session_same_site_env()?,
             session_ttl: Duration::from_secs(session_ttl_secs),
             session_secure,
             magic_link_ttl: Duration::from_secs(magic_link_ttl_secs),
@@ -128,10 +125,6 @@ impl Config {
             clickhouse_max_bytes_to_read,
             max_request_bytes: parse_env("MAX_REQUEST_BYTES", 16 * 1024 * 1024)?,
             request_timeout: Duration::from_secs(request_timeout_secs),
-            data_plane_organization_id: optional_string("NANOTRACE_DATA_PLANE_ORGANIZATION_ID"),
-            data_plane_shared_secret: optional_string("NANOTRACE_DATA_PLANE_SHARED_SECRET"),
-            shared_data_plane_query_url: optional_string("NANOTRACE_SHARED_DATA_PLANE_QUERY_URL"),
-            shared_data_plane_secret: optional_string("NANOTRACE_SHARED_DATA_PLANE_SECRET"),
             auth,
             cors_allowed_origins: parse_list_env("NANOTRACE_CORS_ALLOWED_ORIGINS"),
         })
@@ -143,6 +136,23 @@ fn optional_string(key: &'static str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn session_same_site_env() -> Result<String, ConfigError> {
+    let value = env::var("NANOTRACE_SESSION_SAME_SITE")
+        .unwrap_or_else(|_| "Lax".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "strict" => Ok("Strict".to_string()),
+        "lax" => Ok("Lax".to_string()),
+        "none" => Ok("None".to_string()),
+        _ => Err(ConfigError::Invalid {
+            key: "NANOTRACE_SESSION_SAME_SITE",
+            kind: "SameSite value (Strict, Lax, or None)",
+            value,
+        }),
+    }
 }
 
 fn parse_env<T>(key: &'static str, default: T) -> Result<T, ConfigError>

@@ -1,7 +1,7 @@
 # Nanotrace
 
-Nanotrace is an observability ingest pipeline built around one `/events` API,
-S3, SQS, a Rust loader, and ClickHouse.
+Nanotrace is a single-tenant observability ingest pipeline built around one
+`/events` API, S3, SQS, a Rust loader, and ClickHouse.
 
 The current AWS deployment path is:
 
@@ -56,6 +56,10 @@ NANOTRACE_API_KEY=ntak_...
 NANOTRACE_EMAIL_FROM=nanotrace@example.com
 NANOTRACE_ALLOWED_EMAILS=alice@company.com,*@company.com,/^.+@engineering\\.company\\.com$/
 NANOTRACE_ADMIN_EMAILS=alice@company.com
+CLICKHOUSE_URL=https://...
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=...
+CLICKHOUSE_DATABASE=observatory
 ```
 
 Browser login uses one-time email links sent through AWS SES. The sender in
@@ -90,17 +94,40 @@ from `fixtures/events`, uses a 10% log / 90% rest event mix, and generates fresh
 npm run loadtest:pulumi
 ```
 
+To originate load from Modal instead of the local machine, set
+`NANOTRACE_INGEST_URL` and `NANOTRACE_API_KEY`, then run:
+
+```sh
+npm run loadtest:modal
+```
+
+The Modal wrapper starts `NANOTRACE_LOADTEST_GENERATORS` sandboxes, uploads this
+repo, and runs the same Rust loadtester in each sandbox. Event sequences are
+sharded with `NANOTRACE_LOADTEST_SEQUENCE_OFFSET` and
+`NANOTRACE_LOADTEST_SEQUENCE_STRIDE` so generators can share one run id without
+colliding event ids.
+
 Useful knobs:
 
 ```sh
 NANOTRACE_LOADTEST_BATCH_SIZES=1,10,100
+NANOTRACE_LOADTEST_PROFILE=realistic
+NANOTRACE_LOADTEST_TOTAL_EVENTS=1000
 NANOTRACE_LOADTEST_STEP_SECONDS=30
 NANOTRACE_LOADTEST_MAX_RPS=2000
 NANOTRACE_LOADTEST_MAX_P95_MS=2000
 NANOTRACE_LOADTEST_MAX_ERROR_RATE=0.01
 NANOTRACE_LOADTEST_CLICKHOUSE_WAIT_MS=300000
 NANOTRACE_LOADTEST_CLICKHOUSE_POLL_MS=5000
+NANOTRACE_LOADTEST_GENERATORS=4
 ```
+
+`NANOTRACE_LOADTEST_PROFILE` can be `realistic` for mixed logs/metrics/traces,
+`trace` for pure span traffic, `metrics` for pure metric traffic, `logs` for
+pure log traffic, `llm` for LLM log traffic, or `fixture` for mostly static
+fixture replay.
+Set `NANOTRACE_LOADTEST_TOTAL_EVENTS` when you want a fixed number of generated
+events instead of the normal timed RPS search.
 
 If `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, and `CLICKHOUSE_PASSWORD` are set, the
 load test waits for all accepted events for the run to become visible in
@@ -111,7 +138,8 @@ Pulumi outputs.
 The AWS deployment runs `nanotrace-loader` beside `nanotrace-server` on each EC2
 instance. S3 sends object-created notifications to SQS; loader instances share
 that queue, fetch raw NDJSON objects from S3, and insert JSONEachRow batches into
-`observatory.events`. The uploaded row fields match
+`observatory.events`. Processors are shared for the deployment under the
+`processors` S3 prefix. The uploaded row fields match
 [deploy/clickhouse/schema.sql](/Users/johnsuh/nanotrace/deploy/clickhouse/schema.sql).
 
 Destroy AWS resources:

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -128,10 +127,10 @@ impl FacetStore {
         })
     }
 
-    pub async fn list(&self, organization_id: &str) -> Result<Vec<HotDimension>, FacetError> {
+    pub async fn list(&self, tenant_id: &str) -> Result<Vec<HotDimension>, FacetError> {
         self.ensure_table().await?;
         let mut facets = builtin_dimensions();
-        for custom in self.active_custom_dimensions(organization_id).await? {
+        for custom in self.active_custom_dimensions(tenant_id).await? {
             if !facets.iter().any(|facet| facet.path == custom.path) {
                 facets.push(custom);
             }
@@ -141,7 +140,7 @@ impl FacetStore {
 
     pub async fn put(
         &self,
-        organization_id: &str,
+        tenant_id: &str,
         request: PutFacetRequest,
     ) -> Result<HotDimension, FacetError> {
         self.ensure_table().await?;
@@ -158,18 +157,6 @@ impl FacetStore {
             .unwrap_or(&path)
             .to_string();
 
-        let mut dimensions = self.active_custom_dimensions(organization_id).await?;
-        dimensions.retain(|dimension| dimension.path != path);
-        dimensions.push(HotDimension {
-            path: path.clone(),
-            value_type: value_type.to_string(),
-            status: "active".to_string(),
-            display_name: display_name.clone(),
-            source: "user".to_string(),
-            removable: true,
-        });
-        self.reconcile_data_type(&dimensions).await?;
-
         let facet = HotDimension {
             path,
             value_type: value_type.to_string(),
@@ -178,24 +165,16 @@ impl FacetStore {
             source: "user".to_string(),
             removable: true,
         };
-        self.insert_dimension(organization_id, &facet).await?;
+        self.insert_dimension(tenant_id, &facet).await?;
         Ok(facet)
     }
 
-    pub async fn delete(
-        &self,
-        organization_id: &str,
-        path: &str,
-    ) -> Result<HotDimension, FacetError> {
+    pub async fn delete(&self, tenant_id: &str, path: &str) -> Result<HotDimension, FacetError> {
         self.ensure_table().await?;
         let path = validate_path(path)?;
         if builtin_dimensions().iter().any(|facet| facet.path == path) {
             return Err(FacetError::BuiltinFacet);
         }
-
-        let mut dimensions = self.active_custom_dimensions(organization_id).await?;
-        dimensions.retain(|dimension| dimension.path != path);
-        self.reconcile_data_type(&dimensions).await?;
 
         let facet = HotDimension {
             path,
@@ -205,7 +184,7 @@ impl FacetStore {
             source: "user".to_string(),
             removable: true,
         };
-        self.insert_dimension(organization_id, &facet).await?;
+        self.insert_dimension(tenant_id, &facet).await?;
         Ok(facet)
     }
 
@@ -643,7 +622,7 @@ impl FacetStore {
     }
 
     async fn count_backfill_values(&self, job_id: &str, path: &str) -> Result<u64, FacetError> {
-        let organization_id = sqlx::query_scalar::<_, String>(
+        let tenant_id = sqlx::query_scalar::<_, String>(
             "SELECT organization_id FROM nanotrace_facet_backfill_jobs WHERE job_id = $1",
         )
         .bind(job_id)
@@ -656,7 +635,7 @@ impl FacetStore {
         let query = format!(
             "SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {}",
             self.event_index_table(),
-            quote_literal(&organization_id),
+            quote_literal(&tenant_id),
             quote_literal(path)
         );
         let response: ClickHouseResponse<ValueCount> =
@@ -666,16 +645,16 @@ impl FacetStore {
 
     async fn active_custom_dimensions(
         &self,
-        organization_id: &str,
+        tenant_id: &str,
     ) -> Result<Vec<HotDimension>, FacetError> {
         let query = format!(
             "SELECT path, value_type, status, display_name, source, toBool(1) AS removable \
              FROM (SELECT path, value_type, status, display_name, source, updated_at \
-                   FROM {} WHERE organization_id = {} ORDER BY updated_at DESC LIMIT 1 BY path) \
+                   FROM {} WHERE tenant_id = {} ORDER BY updated_at DESC LIMIT 1 BY path) \
              WHERE status = 'active' AND source = 'user' \
              ORDER BY path ASC",
             self.hot_dimensions_table(),
-            quote_literal(organization_id)
+            quote_literal(tenant_id)
         );
         let response: ClickHouseResponse<HotDimension> =
             serde_json::from_str(&self.clickhouse_query(&query).await?)?;
@@ -684,11 +663,11 @@ impl FacetStore {
 
     async fn insert_dimension(
         &self,
-        organization_id: &str,
+        tenant_id: &str,
         dimension: &HotDimension,
     ) -> Result<(), FacetError> {
         let body = serde_json::json!({
-            "organization_id": organization_id,
+            "tenant_id": tenant_id,
             "path": dimension.path,
             "value_type": dimension.value_type,
             "status": dimension.status,
@@ -774,7 +753,7 @@ impl FacetStore {
     async fn create_table(&self) -> Result<(), FacetError> {
         let hot_dimensions = format!(
             "CREATE TABLE IF NOT EXISTS {} (\
-             organization_id String DEFAULT 'org_default', \
+             tenant_id String DEFAULT 'org_default', \
              path String, \
              value_type LowCardinality(String), \
              status LowCardinality(String), \
@@ -784,39 +763,11 @@ impl FacetStore {
              updated_at DateTime64(3, 'UTC') DEFAULT now64(3), \
              created_by String DEFAULT '', \
              error String DEFAULT ''\
-             ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (organization_id, path)",
+             ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (tenant_id, path)",
             self.hot_dimensions_table()
         );
         self.clickhouse_exec(&hot_dimensions).await?;
         Ok(())
-    }
-
-    async fn reconcile_data_type(&self, custom: &[HotDimension]) -> Result<(), FacetError> {
-        let mut hints = BTreeMap::<String, String>::new();
-        for (path, value_type) in base_json_hints() {
-            hints.insert(path.to_string(), value_type.to_string());
-        }
-        for dimension in custom {
-            hints.insert(
-                dimension.path.clone(),
-                clickhouse_type_for_value_type(&dimension.value_type)?.to_string(),
-            );
-        }
-
-        let mut parts = vec!["JSON(".to_string()];
-        for (path, value_type) in hints {
-            parts.push(format!("{} {},", quote_identifier(&path), value_type));
-        }
-        parts.push("max_dynamic_paths = 8192,".to_string());
-        parts.push("max_dynamic_types = 8".to_string());
-        parts.push(")".to_string());
-
-        let query = format!(
-            "ALTER TABLE {} MODIFY COLUMN data {}",
-            self.events_table(),
-            parts.join(" ")
-        );
-        self.clickhouse_exec(&query).await
     }
 
     async fn clickhouse_query(&self, query: &str) -> Result<String, FacetError> {
@@ -855,10 +806,6 @@ impl FacetStore {
             .query(&[
                 ("database", self.cfg.clickhouse_database.as_str()),
                 ("type_json_skip_duplicated_paths", "1"),
-                (
-                    "type_json_allow_duplicated_key_with_literal_and_nested_object",
-                    "1",
-                ),
             ])
             .query(params)
             .body(if json {
@@ -921,7 +868,7 @@ fn builtin_dimensions() -> Vec<HotDimension> {
         ("tenant_id", "low_cardinality_string", "tenant_id"),
         ("service", "low_cardinality_string", "service"),
         ("environment", "low_cardinality_string", "environment"),
-        ("event_type", "low_cardinality_string", "type"),
+        ("event_type", "low_cardinality_string", "event_type"),
         ("signal", "low_cardinality_string", "signal"),
         ("name", "low_cardinality_string", "name"),
         ("user_id", "string", "user_id"),
@@ -943,131 +890,6 @@ fn builtin_dimensions() -> Vec<HotDimension> {
         removable: false,
     })
     .collect()
-}
-
-fn base_json_hints() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("tenant_id", "LowCardinality(Nullable(String))"),
-        ("service", "LowCardinality(Nullable(String))"),
-        ("service.namespace", "LowCardinality(Nullable(String))"),
-        ("service.instance.id", "Nullable(String)"),
-        ("service_version", "LowCardinality(Nullable(String))"),
-        ("event_type", "LowCardinality(Nullable(String))"),
-        ("environment", "LowCardinality(Nullable(String))"),
-        ("host.name", "LowCardinality(Nullable(String))"),
-        ("host.id", "Nullable(String)"),
-        ("name", "LowCardinality(Nullable(String))"),
-        ("scope_name", "LowCardinality(Nullable(String))"),
-        ("scope_version", "LowCardinality(Nullable(String))"),
-        ("trace_id", "Nullable(String)"),
-        ("span_id", "Nullable(String)"),
-        ("parent_span_id", "Nullable(String)"),
-        ("trace_state", "Nullable(String)"),
-        ("span_kind", "LowCardinality(Nullable(String))"),
-        ("span_status_code", "LowCardinality(Nullable(String))"),
-        ("span_status_message", "Nullable(String)"),
-        ("start_time", "Nullable(DateTime64(3, 'UTC'))"),
-        ("end_time", "Nullable(DateTime64(3, 'UTC'))"),
-        ("span_start_time", "Nullable(DateTime64(3, 'UTC'))"),
-        ("span_end_time", "Nullable(DateTime64(3, 'UTC'))"),
-        ("duration_ms", "Nullable(Float64)"),
-        ("is_error", "Nullable(UInt8)"),
-        ("http.method", "LowCardinality(Nullable(String))"),
-        ("http.route", "LowCardinality(Nullable(String))"),
-        ("http.status_code", "Nullable(UInt16)"),
-        ("http.request.method", "LowCardinality(Nullable(String))"),
-        ("http.response.status_code", "Nullable(UInt16)"),
-        ("url.path", "Nullable(String)"),
-        ("url.full", "Nullable(String)"),
-        ("user_agent.original", "Nullable(String)"),
-        ("client.ip", "Nullable(String)"),
-        ("client.port", "Nullable(UInt16)"),
-        ("server.address", "LowCardinality(Nullable(String))"),
-        ("server.port", "Nullable(UInt16)"),
-        ("exception.type", "LowCardinality(Nullable(String))"),
-        ("exception.message", "Nullable(String)"),
-        ("exception.stacktrace", "Nullable(String)"),
-        ("severity_text", "LowCardinality(Nullable(String))"),
-        ("severity_number", "Nullable(UInt8)"),
-        ("body", "Nullable(String)"),
-        ("logger.name", "LowCardinality(Nullable(String))"),
-        ("thread.name", "LowCardinality(Nullable(String))"),
-        ("db.system", "LowCardinality(Nullable(String))"),
-        ("db.operation", "LowCardinality(Nullable(String))"),
-        ("db.statement", "Nullable(String)"),
-        ("rpc.system", "LowCardinality(Nullable(String))"),
-        ("rpc.service", "LowCardinality(Nullable(String))"),
-        ("rpc.method", "LowCardinality(Nullable(String))"),
-        ("messaging.system", "LowCardinality(Nullable(String))"),
-        (
-            "messaging.destination.name",
-            "LowCardinality(Nullable(String))",
-        ),
-        (
-            "messaging.operation.name",
-            "LowCardinality(Nullable(String))",
-        ),
-        ("metric_name", "LowCardinality(Nullable(String))"),
-        ("metric_type", "LowCardinality(Nullable(String))"),
-        ("metric_value", "Nullable(Float64)"),
-        ("metric_unit", "LowCardinality(Nullable(String))"),
-        ("metric.temporality", "LowCardinality(Nullable(String))"),
-        ("metric.is_monotonic", "Nullable(Bool)"),
-        ("count", "Nullable(UInt64)"),
-        ("sum", "Nullable(Float64)"),
-        ("metric_count", "Nullable(UInt64)"),
-        ("metric_sum", "Nullable(Float64)"),
-        ("metric_min", "Nullable(Float64)"),
-        ("metric_max", "Nullable(Float64)"),
-        ("user_id", "Nullable(String)"),
-        ("anonymous_id", "Nullable(String)"),
-        ("device_id", "Nullable(String)"),
-        ("session_id", "Nullable(String)"),
-        ("account_id", "Nullable(String)"),
-        ("page_url", "Nullable(String)"),
-        ("page_path", "LowCardinality(Nullable(String))"),
-        ("page_title", "Nullable(String)"),
-        ("referrer", "Nullable(String)"),
-        ("screen_name", "LowCardinality(Nullable(String))"),
-        ("utm_source", "LowCardinality(Nullable(String))"),
-        ("utm_medium", "LowCardinality(Nullable(String))"),
-        ("utm_campaign", "LowCardinality(Nullable(String))"),
-        ("utm_term", "LowCardinality(Nullable(String))"),
-        ("utm_content", "LowCardinality(Nullable(String))"),
-        ("country", "LowCardinality(Nullable(String))"),
-        ("region", "LowCardinality(Nullable(String))"),
-        ("city", "LowCardinality(Nullable(String))"),
-        ("continent", "LowCardinality(Nullable(String))"),
-        ("location_lat", "Nullable(Float64)"),
-        ("location_lng", "Nullable(Float64)"),
-        ("device_type", "LowCardinality(Nullable(String))"),
-        ("device_brand", "LowCardinality(Nullable(String))"),
-        ("device_manufacturer", "LowCardinality(Nullable(String))"),
-        ("device_model", "LowCardinality(Nullable(String))"),
-        ("browser", "LowCardinality(Nullable(String))"),
-        ("browser_version", "LowCardinality(Nullable(String))"),
-        ("os", "LowCardinality(Nullable(String))"),
-        ("os_version", "LowCardinality(Nullable(String))"),
-        ("app_version", "LowCardinality(Nullable(String))"),
-        ("locale", "LowCardinality(Nullable(String))"),
-        ("timezone", "LowCardinality(Nullable(String))"),
-        ("user_agent", "Nullable(String)"),
-        ("screen_height", "Nullable(UInt32)"),
-        ("screen_width", "Nullable(UInt32)"),
-        ("viewport_height", "Nullable(UInt32)"),
-        ("viewport_width", "Nullable(UInt32)"),
-        ("screen_dpi", "Nullable(UInt32)"),
-        ("ip", "Nullable(String)"),
-        ("revenue", "Nullable(Float64)"),
-        ("currency", "LowCardinality(Nullable(String))"),
-        ("price", "Nullable(Float64)"),
-        ("quantity", "Nullable(Float64)"),
-        ("product_id", "Nullable(String)"),
-        ("revenue_type", "LowCardinality(Nullable(String))"),
-        ("experiment_id", "LowCardinality(Nullable(String))"),
-        ("variant", "LowCardinality(Nullable(String))"),
-        ("feature_flag", "LowCardinality(Nullable(String))"),
-    ]
 }
 
 fn validate_path(path: &str) -> Result<String, FacetError> {
@@ -1219,19 +1041,6 @@ fn validate_value_type(value_type: &str) -> Result<&'static str, FacetError> {
         "unsigned" => Ok("unsigned"),
         "bool" => Ok("bool"),
         "datetime" => Ok("datetime"),
-        _ => Err(FacetError::InvalidValueType),
-    }
-}
-
-fn clickhouse_type_for_value_type(value_type: &str) -> Result<&'static str, FacetError> {
-    match validate_value_type(value_type)? {
-        "string" => Ok("Nullable(String)"),
-        "low_cardinality_string" => Ok("LowCardinality(Nullable(String))"),
-        "float" => Ok("Nullable(Float64)"),
-        "integer" => Ok("Nullable(Int64)"),
-        "unsigned" => Ok("Nullable(UInt64)"),
-        "bool" => Ok("Nullable(Bool)"),
-        "datetime" => Ok("Nullable(DateTime64(3, 'UTC'))"),
         _ => Err(FacetError::InvalidValueType),
     }
 }

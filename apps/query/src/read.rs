@@ -59,6 +59,7 @@ impl ReadStore {
 
     pub async fn query(&self, request: QueryRequest, tenant_id: &str) -> Result<Value, ReadError> {
         let query = checked_select_query(&request.query)?;
+        let query = normalize_prewhere(&query);
         validate_query_sources(&query, &self.allowed_table_names())?;
         let query = self.scope_query(&query);
         let mut parameters = request.parameters;
@@ -162,10 +163,6 @@ impl ReadStore {
                 ("readonly", "1"),
                 ("type_json_skip_duplicated_paths", "1"),
                 (
-                    "type_json_allow_duplicated_key_with_literal_and_nested_object",
-                    "1",
-                ),
-                (
                     "max_execution_time",
                     &self.cfg.clickhouse_max_execution_secs.to_string(),
                 ),
@@ -209,9 +206,7 @@ impl ReadStore {
     fn scope_query(&self, query: &str) -> String {
         let mut scoped = query.to_string();
         for table in self.allowed_table_names().iter() {
-            let scoped_table = format!(
-                "(SELECT * FROM {table} WHERE tenant_id = {{__nanotrace_tenant_id:String}})"
-            );
+            let scoped_table = self.scoped_table_query(table);
             for keyword in ["FROM", "JOIN"] {
                 scoped = scoped.replace(
                     &format!("{keyword} {table}"),
@@ -224,6 +219,21 @@ impl ReadStore {
             }
         }
         scoped
+    }
+
+    fn scoped_table_query(&self, table: &str) -> String {
+        let events_table = self.cfg.clickhouse_table.as_str();
+        let qualified_events_table = self.table_name();
+        let projection = if table.eq_ignore_ascii_case(events_table)
+            || table.eq_ignore_ascii_case(&qualified_events_table)
+        {
+            "*, tenant_id, event_type, trace_id, span_id, signal"
+        } else {
+            "*"
+        };
+        format!(
+            "(SELECT {projection} FROM {table} WHERE tenant_id = {{__nanotrace_tenant_id:String}})"
+        )
     }
 
     fn allowed_table_names(&self) -> Vec<String> {
@@ -292,6 +302,76 @@ fn checked_select_query(query: &str) -> Result<String, ReadError> {
     }
 
     Ok(query)
+}
+
+fn normalize_prewhere(query: &str) -> String {
+    let mut normalized = replace_keyword(query, "PREWHERE", "WHERE");
+    while let Some(index) = duplicate_where_index(&normalized) {
+        normalized.replace_range(index..index + "WHERE".len(), "AND");
+    }
+    normalized
+}
+
+fn replace_keyword(query: &str, keyword: &str, replacement: &str) -> String {
+    let mut out = query.to_string();
+    loop {
+        let code = sql_code(&out);
+        let Some(index) = find_keyword(&code, keyword) else {
+            break;
+        };
+        out.replace_range(index..index + keyword.len(), replacement);
+    }
+    out
+}
+
+fn duplicate_where_index(query: &str) -> Option<usize> {
+    let code = sql_code(query);
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut seen_where_by_depth = vec![false];
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => {
+                depth += 1;
+                if seen_where_by_depth.len() <= depth {
+                    seen_where_by_depth.push(false);
+                } else {
+                    seen_where_by_depth[depth] = false;
+                }
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ if keyword_at(&code, index, "SELECT") => {
+                seen_where_by_depth[depth] = false;
+                index += "SELECT".len();
+            }
+            _ if keyword_at(&code, index, "WHERE") => {
+                if seen_where_by_depth[depth] {
+                    return Some(index);
+                }
+                seen_where_by_depth[depth] = true;
+                index += "WHERE".len();
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn keyword_at(value: &str, index: usize, keyword: &str) -> bool {
+    let bytes = value.as_bytes();
+    let end = index + keyword.len();
+    if end > bytes.len() || !value[index..end].eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    let before = index.checked_sub(1).and_then(|idx| bytes.get(idx)).copied();
+    let after = bytes.get(end).copied();
+    before.is_none_or(|ch| !is_identifier_byte(ch))
+        && after.is_none_or(|ch| !is_identifier_byte(ch))
 }
 
 fn validate_query_sources(query: &str, allowed_tables: &[String]) -> Result<(), ReadError> {
@@ -508,7 +588,10 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadError, checked_select_query, validate_parameter_name, validate_query_sources};
+    use super::{
+        ReadError, checked_select_query, normalize_prewhere, validate_parameter_name,
+        validate_query_sources,
+    };
 
     #[test]
     fn accepts_select_and_with_queries() {
@@ -545,6 +628,22 @@ mod tests {
             checked_select_query("SELECT 1 FORMAT JSON"),
             Err(ReadError::InvalidQuery(_))
         ));
+    }
+
+    #[test]
+    fn normalizes_prewhere_for_wrapped_tables() {
+        assert_eq!(
+            normalize_prewhere(
+                "SELECT value FROM observatory.event_facets PREWHERE key = 'service' WHERE value != ''"
+            ),
+            "SELECT value FROM observatory.event_facets WHERE key = 'service' AND value != ''"
+        );
+        assert_eq!(
+            normalize_prewhere(
+                "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.event_facet_index PREWHERE key = 'service' WHERE value = 'api')"
+            ),
+            "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.event_facet_index WHERE key = 'service' AND value = 'api')"
+        );
     }
 
     #[test]

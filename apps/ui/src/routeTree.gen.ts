@@ -12,8 +12,8 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiKeysRouteImport } from './routes/api-keys'
 import { Route as DashboardRouteImport } from './routes/dashboard'
+import { Route as FacetsRouteImport } from './routes/facets'
 import { Route as FieldValueRouteImport } from './routes/$field/$value'
-import { Route as OrganizationsRouteImport } from './routes/organizations'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -25,14 +25,14 @@ const ApiKeysRoute = ApiKeysRouteImport.update({
   path: '/settings/api-keys',
   getParentRoute: () => rootRouteImport,
 } as any)
-const OrganizationsRoute = OrganizationsRouteImport.update({
-  id: '/settings/organizations',
-  path: '/settings/organizations',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const DashboardRoute = DashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const FacetsRoute = FacetsRouteImport.update({
+  id: '/facets',
+  path: '/facets',
   getParentRoute: () => rootRouteImport,
 } as any)
 const FieldValueRoute = FieldValueRouteImport.update({
@@ -44,38 +44,38 @@ const FieldValueRoute = FieldValueRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
+  '/facets': typeof FacetsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
+  '/facets': typeof FacetsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
+  '/facets': typeof FacetsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
+  fullPaths: '/' | '/settings/api-keys' | '/dashboard' | '/facets' | '/$field/$value'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
-  id: '__root__' | '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
+  to: '/' | '/settings/api-keys' | '/dashboard' | '/facets' | '/$field/$value'
+  id: '__root__' | '/' | '/settings/api-keys' | '/dashboard' | '/facets' | '/$field/$value'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiKeysRoute: typeof ApiKeysRoute
-  OrganizationsRoute: typeof OrganizationsRoute
   DashboardRoute: typeof DashboardRoute
+  FacetsRoute: typeof FacetsRoute
   FieldValueRoute: typeof FieldValueRoute
 }
 
@@ -95,18 +95,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiKeysRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/settings/organizations': {
-      id: '/settings/organizations'
-      path: '/settings/organizations'
-      fullPath: '/settings/organizations'
-      preLoaderRoute: typeof OrganizationsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/dashboard': {
       id: '/dashboard'
       path: '/dashboard'
       fullPath: '/dashboard'
       preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/facets': {
+      id: '/facets'
+      path: '/facets'
+      fullPath: '/facets'
+      preLoaderRoute: typeof FacetsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/$field/$value': {
@@ -122,8 +122,8 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiKeysRoute: ApiKeysRoute,
-  OrganizationsRoute: OrganizationsRoute,
   DashboardRoute: DashboardRoute,
+  FacetsRoute: FacetsRoute,
   FieldValueRoute: FieldValueRoute,
 }
 export const routeTree = rootRouteImport

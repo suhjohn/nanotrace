@@ -32,7 +32,7 @@ pub async fn run(cfg: Arc<Config>, processors: ProcessorRuntime) {
     };
 
     let aws_config = aws_config::load_from_env().await;
-    let client = Client::new(&aws_config);
+    let client = s3_client(&aws_config);
     let mut interval = tokio::time::interval(cfg.upload_poll_interval);
 
     loop {
@@ -41,6 +41,20 @@ pub async fn run(cfg: Arc<Config>, processors: ProcessorRuntime) {
             error!(error = %err, "uploader pass failed");
         }
     }
+}
+
+fn s3_client(config: &aws_config::SdkConfig) -> Client {
+    let mut builder = aws_sdk_s3::config::Builder::from(config);
+    if env_bool("AWS_S3_FORCE_PATH_STYLE") || env_bool("AWS_S3_PATH_STYLE") {
+        builder.set_force_path_style(Some(true));
+    }
+    Client::from_conf(builder.build())
+}
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 async fn upload_ready_files(

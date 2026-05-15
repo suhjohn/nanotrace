@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nanotrace — Engineering Architecture</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --panel-2: #1b2027;
+    --line: #2a313b;
+    --text: #e6e8eb;
+    --muted: #9aa3ad;
+    --accent: #7cc5ff;
+    --accent-2: #b6f0c8;
+    --warn: #ffd27a;
+    --code-bg: #0e1216;
+    --max-width: 1100px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header.page {
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #11161c 0%, #0b0d10 100%);
+  }
+  header.page .inner {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 36px 24px 28px;
+  }
+  header.page h1 {
+    margin: 0 0 6px;
+    font-size: 28px;
+    letter-spacing: -0.01em;
+  }
+  header.page p.sub {
+    margin: 0;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  main {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 28px 24px 80px;
+  }
+  nav.toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    padding: 14px 16px;
+    margin: 0 0 28px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  nav.toc a { color: var(--muted); }
+  nav.toc a:hover { color: var(--text); }
+  section { margin: 0 0 40px; }
+  section h2 {
+    font-size: 20px;
+    margin: 0 0 14px;
+    padding: 0 0 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  section h3 {
+    font-size: 16px;
+    margin: 22px 0 8px;
+    color: var(--accent);
+  }
+  p { margin: 0 0 12px; }
+  ul, ol { margin: 0 0 12px; padding-left: 22px; }
+  li { margin: 0 0 4px; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #d4dadf;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 14px;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  .figure {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 18px;
+    margin: 0 0 18px;
+    overflow-x: auto;
+  }
+  .figure svg { display: block; margin: 0 auto; }
+  .figure-caption {
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+  }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--panel-2);
+    padding: 10px 14px;
+    border-radius: 0 6px 6px 0;
+    margin: 0 0 14px;
+    color: var(--muted);
+    font-size: 13.5px;
+  }
+  .callout.warn { border-left-color: var(--warn); }
+  footer {
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+    padding: 18px 24px;
+  }
+
+  /* ── Diagram unified styles ───────────────────────────── */
+  .fn { fill: #14181d; stroke: #252b33; stroke-width: 0.8; }
+  .ft { font: 600 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fs { fill: #8a929c; font: 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fa { stroke: #4a5a6a; stroke-width: 1.2; fill: none; }
+  .fad { stroke: #4a5a6a; stroke-width: 1; fill: none; stroke-dasharray: 4 3; }
+  .fg { fill: #0e1115; stroke: #1e242c; stroke-width: 0.8; }
+  .fgl { fill: #5a6a7a; font: 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fst { fill: #7cc5ff; font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fts { font: 600 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fss { fill: #8a929c; font: 9.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
+  .fsl { fill: #5a6a7a; font: italic 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .cc { fill: #7cc5ff; }
+  .cs { fill: #b6f0c8; }
+  .cq { fill: #ffd27a; }
+  .cd { fill: #c9b1ff; }
+  .ce { fill: #e6e8eb; }
+  .cm { fill: #9aa3ad; }
+</style>
+</head>
+<body>
+<header class="page">
+  <div class="inner">
+    <h1>Nanotrace — Engineering Architecture</h1>
+    <p class="sub">Tenant-keyed observability ingest pipeline. One <code>/events</code> API, object storage, a message queue, a Rust loader, and ClickHouse, deployed on AWS via Pulumi.</p>
+  </div>
+</header>
+
+<main>
+  <nav class="toc">
+    <a href="#overview">Overview</a>
+    <a href="#storage">Storage model</a>
+    <a href="#auth">Auth &amp; security</a>
+    <a href="#deployment">Deployment</a>
+  </nav>
+
+  <section id="overview">
+    <h2>1. System overview</h2>
+    <p>
+      Nanotrace ingests JSON events through an HTTP API, durably stages them
+      across multiple concurrent writer lanes into local NDJSON part files, uploads
+      closed parts to object storage, then loads each part into ClickHouse via
+      storage queue notifications. The data model is tenant-keyed end-to-end:
+      every write materializes a <code>tenant_id</code> and every read injects it
+      into the query plan. Reads go through a stateless query service backed by
+      ClickHouse for aggregates and object storage for raw event byte-range lookup.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 860 280" width="100%" style="max-width:860px" aria-label="High-level architecture">
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
+            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <!-- Backend group -->
+        <rect class="fg" x="155" y="12" width="692" height="258" rx="12" ry="12"/>
+        <text class="fgl" x="168" y="28">Backend</text>
+
+        <!-- UI / CDN -->
+        <rect class="fn" x="170" y="28" width="108" height="44" rx="10" ry="10"/>
+        <text class="ft ce" x="224" y="48" text-anchor="middle">UI</text>
+        <text class="fs" x="224" y="62" text-anchor="middle">CDN &middot; SPA</text>
+
+        <!-- App / SDK -->
+        <rect class="fn" x="10" y="112" width="118" height="50" rx="10" ry="10"/>
+        <text class="ft ce" x="69" y="134" text-anchor="middle">App / SDK</text>
+        <text class="fs" x="69" y="150" text-anchor="middle">HTTP &middot; UDP</text>
+
+        <!-- ALB -->
+        <rect class="fn" x="170" y="112" width="108" height="50" rx="10" ry="10"/>
+        <text class="ft cc" x="224" y="134" text-anchor="middle">Load Balancer</text>
+        <text class="fs" x="224" y="150" text-anchor="middle">HTTPS routing</text>
+
+        <!-- Server -->
+        <rect class="fn" x="325" y="36" width="152" height="70" rx="10" ry="10"/>
+        <text class="ft cc" x="401" y="58" text-anchor="middle">nanotrace-server</text>
+        <text class="fs" x="401" y="74" text-anchor="middle">ingest &middot; auth &middot; facets</text>
+        <text class="fs" x="401" y="88" text-anchor="middle">uploader &middot; retention</text>
+
+        <!-- Query -->
+        <rect class="fn" x="325" y="192" width="152" height="62" rx="10" ry="10"/>
+        <text class="ft cc" x="401" y="216" text-anchor="middle">nanotrace-query</text>
+        <text class="fs" x="401" y="232" text-anchor="middle">stateless reads</text>
+
+        <!-- S3 -->
+        <rect class="fn" x="530" y="36" width="124" height="50" rx="10" ry="10"/>
+        <text class="ft cs" x="592" y="56" text-anchor="middle">Object Storage</text>
+        <text class="fs" x="592" y="72" text-anchor="middle">events/ &middot; processors/</text>
+
+        <!-- SQS -->
+        <rect class="fn" x="530" y="112" width="124" height="46" rx="10" ry="10"/>
+        <text class="ft cq" x="592" y="132" text-anchor="middle">Message Queue</text>
+        <text class="fs" x="592" y="148" text-anchor="middle">notifications</text>
+
+        <!-- Loader -->
+        <rect class="fn" x="530" y="192" width="124" height="52" rx="10" ry="10"/>
+        <text class="ft cc" x="592" y="214" text-anchor="middle">nanotrace-loader</text>
+        <text class="fs" x="592" y="230" text-anchor="middle">JSONEachRow insert</text>
+
+        <!-- ClickHouse -->
+        <rect class="fn" x="708" y="112" width="124" height="54" rx="10" ry="10"/>
+        <text class="ft cd" x="770" y="134" text-anchor="middle">ClickHouse</text>
+        <text class="fs" x="770" y="150" text-anchor="middle">observatory.*</text>
+
+        <!-- Postgres -->
+        <rect class="fn" x="708" y="36" width="124" height="50" rx="10" ry="10"/>
+        <text class="ft cd" x="770" y="56" text-anchor="middle">Postgres</text>
+        <text class="fs" x="770" y="72" text-anchor="middle">auth &middot; sessions</text>
+
+        <!-- Arrows -->
+        <path class="fa" d="M128,137 L170,137" marker-end="url(#a1)"/>
+        <path class="fa" d="M224,72 L224,112" marker-end="url(#a1)"/>
+        <path class="fa" d="M278,127 C306,98 306,82 325,74" marker-end="url(#a1)"/>
+        <path class="fa" d="M278,148 C306,178 306,210 325,220" marker-end="url(#a1)"/>
+        <path class="fa" d="M477,66 L530,62" marker-end="url(#a1)"/>
+        <path class="fa" d="M477,78 L708,62" marker-end="url(#a1)"/>
+        <path class="fa" d="M592,86 L592,112" marker-end="url(#a1)"/>
+        <path class="fa" d="M592,158 L592,192" marker-end="url(#a1)"/>
+        <path class="fa" d="M654,220 C678,200 688,168 708,152" marker-end="url(#a1)"/>
+        <path class="fa" d="M477,218 C555,198 680,158 708,142" marker-end="url(#a1)"/>
+        <path class="fad" d="M430,192 C430,142 540,100 558,86" marker-end="url(#a1)"/>
+      </svg>
+      <div class="figure-caption">Solid lines show the primary flow; dashed line is the on-demand byte-range event fetch.</div>
+    </div>
+
+    <h3>Write path</h3>
+
+    <div class="figure">
+      <svg viewBox="0 0 940 210" width="100%" style="max-width:940px" aria-label="Write-path data flow">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
+            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <!-- POST /events -->
+        <rect class="fn" x="10" y="58" width="112" height="52" rx="10" ry="10"/>
+        <text class="ft cc" x="66" y="80" text-anchor="middle">POST /events</text>
+        <text class="fs" x="66" y="96" text-anchor="middle">validate</text>
+
+        <!-- EventLogWriter -->
+        <rect class="fn" x="162" y="58" width="138" height="52" rx="10" ry="10"/>
+        <text class="ft cc" x="231" y="80" text-anchor="middle">EventLogWriter</text>
+        <text class="fs" x="231" y="96" text-anchor="middle">4 lanes &middot; NDJSON</text>
+
+        <!-- Uploader -->
+        <rect class="fn" x="340" y="58" width="112" height="52" rx="10" ry="10"/>
+        <text class="ft cc" x="396" y="80" text-anchor="middle">Uploader</text>
+        <text class="fs" x="396" y="96" text-anchor="middle">processors &rarr; PUT</text>
+
+        <!-- Object Storage -->
+        <rect class="fn" x="495" y="18" width="128" height="48" rx="10" ry="10"/>
+        <text class="ft cs" x="559" y="38" text-anchor="middle">Object Storage</text>
+        <text class="fs" x="559" y="54" text-anchor="middle">system of record</text>
+
+        <!-- Message Queue -->
+        <rect class="fn" x="495" y="128" width="128" height="44" rx="10" ry="10"/>
+        <text class="ft cq" x="559" y="148" text-anchor="middle">Message Queue</text>
+        <text class="fs" x="559" y="164" text-anchor="middle">object notifications</text>
+
+        <!-- Loader -->
+        <rect class="fn" x="668" y="58" width="118" height="52" rx="10" ry="10"/>
+        <text class="ft cc" x="727" y="80" text-anchor="middle">Loader</text>
+        <text class="fs" x="727" y="96" text-anchor="middle">fetch &rarr; decode</text>
+
+        <!-- ClickHouse -->
+        <rect class="fn" x="830" y="48" width="100" height="72" rx="10" ry="10"/>
+        <text class="ft cd" x="880" y="76" text-anchor="middle">ClickHouse</text>
+        <text class="fs" x="880" y="92" text-anchor="middle">events</text>
+        <text class="fs" x="880" y="106" text-anchor="middle">+ facets</text>
+
+        <!-- Arrows -->
+        <path class="fa" d="M122,84 L162,84" marker-end="url(#a2)"/>
+        <path class="fa" d="M300,84 L340,84" marker-end="url(#a2)"/>
+        <path class="fa" d="M452,76 C472,56 478,46 495,42" marker-end="url(#a2)"/>
+        <path class="fa" d="M559,66 L559,128" marker-end="url(#a2)"/>
+        <path class="fa" d="M623,150 C645,134 648,108 668,96" marker-end="url(#a2)"/>
+        <path class="fa" d="M786,84 L830,80" marker-end="url(#a2)"/>
+
+        <!-- Step numbers -->
+        <text class="fst" x="142" y="52">1</text>
+        <text class="fst" x="322" y="52">2</text>
+        <text class="fst" x="468" y="52">3</text>
+        <text class="fst" x="636" y="170">4</text>
+        <text class="fst" x="810" y="52">5</text>
+
+        <!-- File lifecycle annotation -->
+        <text class="fsl" x="170" y="200">.tmp</text>
+        <text class="fs" x="203" y="200">&rarr;</text>
+        <text class="fsl" x="218" y="200">.ready</text>
+        <text class="fs" x="264" y="200">&rarr;</text>
+        <text class="fsl" x="279" y="200">.uploading</text>
+        <text class="fs" x="345" y="200">&rarr;</text>
+        <text class="fsl" x="360" y="200">.done</text>
+        <text class="fs" x="400" y="200">&rarr;</text>
+        <text class="fsl" x="415" y="200">cleanup</text>
+      </svg>
+      <div class="figure-caption">Write path: validate &rarr; durable NDJSON &rarr; object storage &rarr; queue &rarr; loader &rarr; ClickHouse. File states shown below.</div>
+    </div>
+
+    <ol>
+      <li><strong>Accept.</strong> Server validates each event against the schema-shaped JSON contract; rejects malformed payloads with 400.</li>
+      <li><strong>Stage.</strong> Accepted events are round-robin dispatched to one of <code>NANOTRACE_WRITER_LANES</code> (default 4) concurrent writer lanes, each backed by its own NDJSON part file on an XFS-formatted EBS volume. The writer flushes (fsyncs) at <code>NANOTRACE_WRITER_FLUSH_BYTES</code> (default 1 MiB) or <code>NANOTRACE_WRITER_FLUSH_INTERVAL_MS</code> (default 10 ms), whichever comes first. The HTTP 200 is returned after the event is committed to the lane queue. Parts rotate to <code>.ready</code> when they reach <code>NANOTRACE_PART_MAX_BYTES</code> (default 64 MiB) or <code>NANOTRACE_PART_MAX_AGE_SECS</code> (default 1 second).</li>
+      <li><strong>Upload.</strong> The background uploader picks up <code>.ready</code> files, renames them to <code>.uploading</code>, optionally runs upload-stage processors, and PUTs them to object storage. The S3 key layout is Hive-partitioned: <code>&lt;prefix&gt;/dt=YYYY-MM-DD/hour=HH/host=&lt;hostname&gt;/lane=&lt;id&gt;/part-&lt;timestamp_ms&gt;.ndjson</code>. On success the local file transitions to <code>.done</code>; on failure it becomes <code>.failed</code>.</li>
+      <li><strong>Notify.</strong> A bucket notification fans object creation events into the loader message queue.</li>
+      <li><strong>Load.</strong> The loader fetches each object, decodes lines, derives facet rows, and inserts via the ClickHouse HTTP <code>JSONEachRow</code> endpoint into <code>observatory.events</code>, <code>observatory.event_facets</code>, and <code>observatory.event_facet_index</code>.</li>
+    </ol>
+
+    <h3>Read path</h3>
+    <ul>
+      <li><code>POST /query</code> on <code>nanotrace-query</code> compiles a constrained query against <code>observatory.events</code> with tenant scoping pinned to the caller's identity.</li>
+      <li><code>GET /events/{event_id}</code> resolves the event's <code>source_file</code>, <code>source_offset</code>, and <code>source_length</code> from ClickHouse, then issues a ranged object storage GET to return the original line.</li>
+    </ul>
+
+    <h3>Sidecar / SDK</h3>
+    <p>
+      The UDP sidecar binds <code>127.0.0.1:4319</code>, batches events, and POSTs to <code>/events</code> so the application thread never blocks on the ingest path. SDKs (<code>packages/sdk-js</code>, <code>packages/sdk-py</code>) call the same HTTP API with an API key.
+    </p>
+  </section>
+
+  <section id="storage">
+    <h2>2. Storage model</h2>
+
+    <p>
+      All semantic fields live inside a typed JSON column on <code>observatory.events</code>.
+      Since ClickHouse 25.3, typed JSON paths are stored as physical columnar
+      subcolumns. A field is only promoted to a top-level <code>MATERIALIZED</code>
+      column when it must participate in <code>ORDER BY</code>, carry a skip
+      index, or use a non-default codec.
+    </p>
+
+    <h3>Tables</h3>
+    <table>
+      <tr><th>Table</th><th>Engine</th><th>Purpose</th></tr>
+      <tr>
+        <td><code>observatory.events</code></td>
+        <td>MergeTree</td>
+        <td>Canonical event store. <code>ORDER BY (tenant_id, event_type, timestamp, trace_id, span_id)</code>; partitioned by day. Bloom-filter indexes on <code>trace_id</code>, <code>span_id</code>, <code>event_id</code>.</td>
+      </tr>
+      <tr>
+        <td><code>observatory.event_facets</code></td>
+        <td>SummingMergeTree</td>
+        <td>Pre-aggregated counts per <code>(tenant_id, key, value, bucket_time)</code> for fast facet listings.</td>
+      </tr>
+      <tr>
+        <td><code>observatory.event_facet_index</code></td>
+        <td>MergeTree</td>
+        <td>Facet &rarr; event lookup index. Lets the UI jump from a value chip to matching events without scanning <code>events</code>.</td>
+      </tr>
+      <tr>
+        <td><code>observatory.hot_dimensions</code></td>
+        <td>ReplacingMergeTree</td>
+        <td>Per-tenant configuration of which JSON paths are tracked for facets. Refreshed by the loader.</td>
+      </tr>
+    </table>
+
+    <h3>Why JSON-first</h3>
+    <ul>
+      <li>Open schema for OTEL semantic conventions, product analytics, and exotic per-tenant fields without DDL changes.</li>
+      <li>Hot paths get type hints (e.g. <code>http.method LowCardinality(Nullable(String))</code>) so they compress and scan as columnar data.</li>
+      <li>Sort-key columns are <code>MATERIALIZED ifNull(data.x, '')</code> — columns in <code>ORDER BY</code> cannot be nullable, but the JSON path stays nullable so absent vs empty stays distinguishable.</li>
+      <li><code>signal</code> is a derived <code>multiIf</code> classifier so trace / metric / log / analytics rows can be filtered without inspecting <code>event_type</code> string-by-string.</li>
+    </ul>
+
+    <pre>data JSON (
+  tenant_id LowCardinality(Nullable(String)),
+  service   LowCardinality(Nullable(String)),
+  event_type LowCardinality(Nullable(String)),
+  trace_id  Nullable(String),
+  span_id   Nullable(String),
+  http.method LowCardinality(Nullable(String)),
+  http.status_code Nullable(UInt16),
+  duration_ms Nullable(Float64),
+  ...
+  max_dynamic_paths = 8192,
+  max_dynamic_types = 8
+)</pre>
+  </section>
+
+  <section id="auth">
+    <h2>3. Auth &amp; security</h2>
+
+    <h3>Authentication</h3>
+    <ul>
+      <li><strong>Browser login</strong> uses one-time magic links sent via AWS SES. Tokens are 256-bit random, SHA-256 hashed before storage in Postgres, and expire after <code>NANOTRACE_MAGIC_LINK_TTL_SECS</code> (default 10 min). Deleted on use to prevent replay.</li>
+      <li><strong>Sessions</strong> are SHA-256 hashed server-side. Cookies are <code>HttpOnly</code>, <code>SameSite=Lax</code>, and <code>Secure</code> when the public base URL is HTTPS. Default TTL is 7 days.</li>
+      <li><strong>API keys</strong> use <code>ntak_…</code> prefix with 32 bytes of random entropy. Only the SHA-256 hash and a short prefix are stored; the full key is revealed once at creation. Keys carry a role (Viewer, Service, Admin) and scoped permissions (<code>ingest:write</code>, <code>query:read</code>, <code>facets:write</code>, etc.), with optional expiration and revocation.</li>
+      <li><strong>Allowed emails</strong> are configured via <code>NANOTRACE_ALLOWED_EMAILS</code> / <code>NANOTRACE_ADMIN_EMAILS</code> (literal addresses, <code>*@domain</code> globs, or <code>/regex/</code>).</li>
+    </ul>
+
+    <h3>Tenant isolation</h3>
+    <p>
+      The data model is tenant-keyed end-to-end. <code>tenant_id</code> is the first column in every ClickHouse <code>ORDER BY</code> key. At query time, the auth layer injects a <code>WHERE tenant_id = {__nanotrace_tenant_id:String}</code> clause into every SQL plan — the parameter value comes from the caller's authenticated identity, never from user input. Every ingested event row is materialized with the same tenant key. A single deployment can carry several logical tenants behind one auth domain.
+    </p>
+
+    <h3>Query sandbox</h3>
+    <ul>
+      <li>Only <code>SELECT</code> / <code>WITH</code> statements allowed; DDL, DML, and multi-statement queries are rejected.</li>
+      <li>Table references are validated against a hard-coded whitelist (<code>events</code>, <code>event_facets</code>, <code>event_facet_index</code>, <code>hot_dimensions</code>). Access to <code>system.*</code> or other tables is blocked.</li>
+      <li>User values are passed as ClickHouse query parameters, not interpolated into SQL. Parameter names are validated as identifiers; only scalar types are accepted.</li>
+      <li>ClickHouse queries execute with <code>readonly=1</code>, <code>max_execution_time=30s</code>, <code>max_result_rows=100000</code>, and <code>max_bytes_to_read=1GB</code>.</li>
+      <li>SQL comments are stripped before analysis to prevent obfuscation.</li>
+    </ul>
+
+    <h3>Encryption</h3>
+    <ul>
+      <li><strong>At rest.</strong> S3 objects use SSE with a configurable KMS key or AES-256 default. EBS volumes and RDS storage are encrypted. ClickHouse Cloud manages its own encryption.</li>
+      <li><strong>In transit.</strong> TLS terminates at the ALB (ACM cert) or at the edge (Cloudflare). Internal traffic to S3, SQS, and SES uses the AWS SDK over TLS. RDS connections are within private subnets.</li>
+    </ul>
+
+    <h3>Network &amp; infrastructure</h3>
+    <ul>
+      <li><strong>VPC isolation.</strong> Per-stack VPC (<code>10.42.0.0/16</code>). ALB SG accepts 80/443 from the Internet; instance SG accepts the app port only from the ALB SG; Postgres SG accepts 5432 only from the instance SG.</li>
+      <li><strong>IMDSv2 enforced.</strong> <code>httpTokens=required</code> on all EC2 instances to prevent SSRF-based credential theft.</li>
+      <li><strong>IAM least-privilege.</strong> Instance role is scoped to specific S3 prefixes, the loader SQS queue, the ECR repository, SES sending, and the data KMS key. No wildcard resources.</li>
+    </ul>
+  </section>
+
+  <section id="deployment">
+    <h2>4. Deployment</h2>
+    <p>
+      One Pulumi program (<code>deploy/pulumi/nanotrace</code>) provisions a self-contained stack per deployment: VPC, ALB, two EC2 Auto Scaling Groups, S3, SQS, RDS Postgres, ECR, CloudFront, SES, and IAM. External dependencies are AWS credentials, ClickHouse connection settings, and DNS ownership.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 960 440" width="100%" style="max-width:960px" aria-label="Deployment topology">
+        <defs>
+          <marker id="a3" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
+            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <!-- Edge group -->
+        <rect class="fg" x="10" y="10" width="940" height="96" rx="12" ry="12"/>
+        <text class="ft cc" x="24" y="30">Edge / DNS</text>
+
+        <rect class="fn" x="30"  y="44" width="148" height="48" rx="8" ry="8"/>
+        <text class="fts ce" x="104" y="64" text-anchor="middle">Cloudflare DNS</text>
+        <text class="fss" x="104" y="78" text-anchor="middle">UI &middot; API aliases</text>
+
+        <rect class="fn" x="194" y="44" width="148" height="48" rx="8" ry="8"/>
+        <text class="fts ce" x="268" y="64" text-anchor="middle">Route53 zone</text>
+        <text class="fss" x="268" y="78" text-anchor="middle">SES &amp; ACM records</text>
+
+        <rect class="fn" x="358" y="44" width="160" height="48" rx="8" ry="8"/>
+        <text class="fts ce" x="438" y="64" text-anchor="middle">CloudFront (UI)</text>
+        <text class="fss" x="438" y="78" text-anchor="middle">OAC &rarr; S3 ui bucket</text>
+
+        <rect class="fn" x="534" y="44" width="160" height="48" rx="8" ry="8"/>
+        <text class="fts ce" x="614" y="64" text-anchor="middle">ACM (us-east-1)</text>
+        <text class="fss" x="614" y="78" text-anchor="middle">CloudFront cert</text>
+
+        <rect class="fn" x="710" y="44" width="226" height="48" rx="8" ry="8"/>
+        <text class="fts ce" x="823" y="64" text-anchor="middle">SES domain identity</text>
+        <text class="fss" x="823" y="78" text-anchor="middle">DKIM &middot; MAIL FROM &middot; DMARC</text>
+
+        <!-- VPC group -->
+        <rect class="fg" x="10" y="120" width="940" height="280" rx="12" ry="12"/>
+        <text class="ft cc" x="24" y="140">VPC (per-stack)</text>
+
+        <!-- Public subnets -->
+        <rect x="28" y="152" width="590" height="234" rx="10" ry="10" fill="none" stroke="#1e242c" stroke-width="0.6" stroke-dasharray="5 3"/>
+        <text class="fgl" x="40" y="168">Public subnets &middot; multi-AZ</text>
+
+        <rect class="fn" x="50" y="184" width="168" height="46" rx="8" ry="8"/>
+        <text class="fts cc" x="134" y="204" text-anchor="middle">ALB</text>
+        <text class="fss" x="134" y="218" text-anchor="middle">HTTP(S) &middot; path routing</text>
+
+        <rect class="fn" x="50"  y="250" width="168" height="56" rx="8" ry="8"/>
+        <text class="fts cc" x="134" y="272" text-anchor="middle">server ASG</text>
+        <text class="fss" x="134" y="286" text-anchor="middle">EC2 + EBS &middot; server+loader</text>
+        <text class="fss" x="134" y="298" text-anchor="middle">launch template</text>
+
+        <rect class="fn" x="240" y="250" width="168" height="56" rx="8" ry="8"/>
+        <text class="fts cc" x="324" y="272" text-anchor="middle">query ASG</text>
+        <text class="fss" x="324" y="286" text-anchor="middle">EC2 &middot; stateless reads</text>
+        <text class="fss" x="324" y="298" text-anchor="middle">launch template</text>
+
+        <rect class="fn" x="430" y="250" width="172" height="56" rx="8" ry="8"/>
+        <text class="fts cd" x="516" y="272" text-anchor="middle">RDS Postgres</text>
+        <text class="fss" x="516" y="286" text-anchor="middle">auth store</text>
+        <text class="fss" x="516" y="298" text-anchor="middle">private SG</text>
+
+        <!-- AWS data services -->
+        <rect x="636" y="152" width="300" height="234" rx="10" ry="10" fill="none" stroke="#1e242c" stroke-width="0.6" stroke-dasharray="5 3"/>
+        <text class="fgl" x="648" y="168">AWS data services</text>
+
+        <rect class="fn" x="654" y="184" width="126" height="46" rx="8" ry="8"/>
+        <text class="fts cs" x="717" y="204" text-anchor="middle">S3 events</text>
+        <text class="fss" x="717" y="218" text-anchor="middle">SSE &middot; versioned</text>
+
+        <rect class="fn" x="794" y="184" width="126" height="46" rx="8" ry="8"/>
+        <text class="fts cs" x="857" y="204" text-anchor="middle">S3 ui assets</text>
+        <text class="fss" x="857" y="218" text-anchor="middle">CloudFront origin</text>
+
+        <rect class="fn" x="654" y="248" width="126" height="46" rx="8" ry="8"/>
+        <text class="fts cq" x="717" y="268" text-anchor="middle">SQS loader</text>
+        <text class="fss" x="717" y="282" text-anchor="middle">S3 notifications</text>
+
+        <rect class="fn" x="794" y="248" width="126" height="46" rx="8" ry="8"/>
+        <text class="fts cm" x="857" y="268" text-anchor="middle">KMS key</text>
+        <text class="fss" x="857" y="282" text-anchor="middle">optional data key</text>
+
+        <rect class="fn" x="654" y="312" width="266" height="52" rx="8" ry="8"/>
+        <text class="fts cm" x="787" y="334" text-anchor="middle">ECR &middot; ClickHouse Cloud</text>
+        <text class="fss" x="787" y="348" text-anchor="middle">image registry &middot; OLAP store</text>
+
+        <!-- IAM strip -->
+        <rect class="fg" x="10" y="410" width="940" height="26" rx="8" ry="8"/>
+        <text class="fss" x="22" y="428">IAM: instance role &amp; policy (ECR pull, S3 read/write, SQS receive/delete, KMS use, SES send), SSM core attachment</text>
+      </svg>
+      <div class="figure-caption">AWS deployment topology provisioned by Pulumi.</div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Generated for <code>github.com/&lt;org&gt;/nanotrace</code> &middot; branch <code>suhjohn/multi-tenant</code>
+</footer>
+</body>
+</html>

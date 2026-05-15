@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let aws_config = aws_config::load_from_env().await;
-    let s3 = S3Client::new(&aws_config);
+    let s3 = s3_client(&aws_config);
     let processors = match cfg.processor_bucket.clone() {
         Some(bucket) => ProcessorRuntime::start(
             s3.clone(),
@@ -159,6 +159,20 @@ async fn main() -> Result<()> {
 
     info!("nanotrace loader starting");
     loader.run().await
+}
+
+fn s3_client(config: &aws_config::SdkConfig) -> S3Client {
+    let mut builder = aws_sdk_s3::config::Builder::from(config);
+    if env_bool("AWS_S3_FORCE_PATH_STYLE") || env_bool("AWS_S3_PATH_STYLE") {
+        builder.set_force_path_style(Some(true));
+    }
+    S3Client::from_conf(builder.build())
+}
+
+fn env_bool(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 impl Config {
@@ -204,7 +218,7 @@ impl Config {
             processor_bucket: optional("PROCESSOR_S3_BUCKET")
                 .or_else(|| optional("NANOTRACE_S3_BUCKET"))
                 .or_else(|| optional("S3_BUCKET")),
-            processor_prefix: env_or("PROCESSOR_PREFIX", "organizations/org_default/processors")
+            processor_prefix: env_or("PROCESSOR_PREFIX", "processors")
                 .trim_matches('/')
                 .to_string(),
             processor_poll_interval: Duration::from_secs(parse_env(
@@ -451,6 +465,7 @@ impl Loader {
             .query(&[
                 ("database", self.cfg.clickhouse_database.as_str()),
                 ("query", query.as_str()),
+                ("date_time_input_format", "best_effort"),
             ])
             .body(body.to_vec());
 
@@ -927,7 +942,15 @@ fn signal_for_event_type(event_type: &str) -> &'static str {
 }
 
 fn parse_s3_records(body: &str) -> Result<Vec<(String, String)>> {
-    let event: S3Event = serde_json::from_str(body).context("parse S3 event")?;
+    let value: Value = serde_json::from_str(body).context("parse S3 event")?;
+    if value
+        .get("Event")
+        .and_then(Value::as_str)
+        .is_some_and(|event| event == "s3:TestEvent")
+    {
+        return Ok(Vec::new());
+    }
+    let event: S3Event = serde_json::from_value(value).context("parse S3 event")?;
     let mut records = Vec::with_capacity(event.records.len());
     for record in event.records {
         records.push((

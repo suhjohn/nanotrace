@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
         max_in_flight: integer_env("NANOTRACE_LOADTEST_MAX_IN_FLIGHT", 2_000)?,
         log_ratio: number_env("NANOTRACE_LOADTEST_LOG_RATIO", 0.10)?,
         profile: load_profile_env()?,
+        trace_depth: integer_env("NANOTRACE_LOADTEST_TRACE_DEPTH", 96)?,
+        total_events: optional_integer_env("NANOTRACE_LOADTEST_TOTAL_EVENTS")?,
+        sequence_offset: integer_env_allow_zero("NANOTRACE_LOADTEST_SEQUENCE_OFFSET", 0)?,
+        sequence_stride: integer_env("NANOTRACE_LOADTEST_SEQUENCE_STRIDE", 1)?,
         clickhouse_wait_ms: number_env("NANOTRACE_LOADTEST_CLICKHOUSE_WAIT_MS", 300_000.0)?,
         clickhouse_poll_ms: number_env("NANOTRACE_LOADTEST_CLICKHOUSE_POLL_MS", 5_000.0)?,
         event_seq: AtomicU64::new(0),
@@ -98,6 +102,27 @@ async fn main() -> Result<()> {
         context.config.max_error_rate, context.config.max_p95_ms
     );
 
+    if let Some(total_events) = context.config.total_events {
+        let batch_size = *context
+            .config
+            .batch_sizes
+            .first()
+            .ok_or_else(|| anyhow!("at least one batch size is required"))?;
+        let stats = run_fixed_events(Arc::clone(&context), batch_size, total_events).await?;
+        print_step(&stats);
+
+        let accepted_events = context.config.accepted_events.load(Ordering::Relaxed);
+        println!("acceptedEvents={accepted_events}");
+        if let Some(clickhouse) = clickhouse {
+            wait_for_clickhouse(&context, &clickhouse, accepted_events).await?;
+        } else {
+            println!(
+                "clickhouseObservation=skipped reason=CLICKHOUSE_URL,CLICKHOUSE_USER,CLICKHOUSE_PASSWORD not all set"
+            );
+        }
+        return Ok(());
+    }
+
     let mut summary = Vec::new();
     for &batch_size in &context.config.batch_sizes {
         println!("\n=== batchSize={batch_size} events/request ===");
@@ -107,10 +132,13 @@ async fn main() -> Result<()> {
     println!("\n=== summary ===");
     for result in summary {
         println!(
-            "batchSize={} maxReqPerSec={} maxEventPerSec={} p50Ms={} p95Ms={} p99Ms={} errorRate={}",
+            "batchSize={} maxReqPerSec={} maxEventPerSec={} bodyBytesPerSec={} bodyMiBPerSec={} avgBodyBytesPerReq={} p50Ms={} p95Ms={} p99Ms={} errorRate={}",
             result.batch_size,
             result.max_req_per_sec,
             result.max_req_per_sec * result.batch_size,
+            result.stats.achieved_body_bytes_per_sec,
+            result.stats.achieved_body_mib_per_sec,
+            result.stats.average_body_bytes_per_request,
             result.stats.p50_ms,
             result.stats.p95_ms,
             result.stats.p99_ms,
@@ -146,6 +174,10 @@ struct Config {
     max_in_flight: u64,
     log_ratio: f64,
     profile: LoadProfile,
+    trace_depth: u64,
+    total_events: Option<u64>,
+    sequence_offset: u64,
+    sequence_stride: u64,
     clickhouse_wait_ms: f64,
     clickhouse_poll_ms: f64,
     event_seq: AtomicU64,
@@ -157,6 +189,9 @@ enum LoadProfile {
     Fixture,
     Realistic,
     Llm,
+    Trace,
+    Metrics,
+    Logs,
 }
 
 impl LoadProfile {
@@ -165,11 +200,17 @@ impl LoadProfile {
             Self::Fixture => "fixture",
             Self::Realistic => "realistic",
             Self::Llm => "llm",
+            Self::Trace => "trace",
+            Self::Metrics => "metrics",
+            Self::Logs => "logs",
         }
     }
 
     fn is_realistic(self) -> bool {
-        matches!(self, Self::Realistic | Self::Llm)
+        matches!(
+            self,
+            Self::Realistic | Self::Llm | Self::Trace | Self::Metrics | Self::Logs
+        )
     }
 }
 
@@ -190,6 +231,8 @@ struct LoadContext {
 struct Fixtures {
     log: Fixture,
     log_variations: Vec<Fixture>,
+    metric_fixtures: Vec<Fixture>,
+    trace_fixtures: Vec<Fixture>,
     rest: Vec<Fixture>,
 }
 
@@ -213,9 +256,14 @@ struct StepStats {
     ok: u64,
     failed: u64,
     accepted_events: u64,
+    attempted_body_bytes: u64,
+    accepted_body_bytes: u64,
     error_rate: f64,
     achieved_req_per_sec: f64,
     achieved_event_per_sec: f64,
+    achieved_body_bytes_per_sec: f64,
+    achieved_body_mib_per_sec: f64,
+    average_body_bytes_per_request: f64,
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
@@ -227,6 +275,7 @@ struct RequestResult {
     status: String,
     ok: bool,
     latency_ms: f64,
+    body_bytes: u64,
 }
 
 async fn find_max_rps(context: Arc<LoadContext>, batch_size: u64) -> Result<SearchResult> {
@@ -310,6 +359,8 @@ async fn run_step(
     let mut max_observed_in_flight = 0;
     let mut latencies = Vec::new();
     let mut statuses = HashMap::new();
+    let mut attempted_body_bytes = 0;
+    let mut accepted_body_bytes = 0;
     let mut next_at = started_at;
 
     while Instant::now() < deadline {
@@ -319,6 +370,8 @@ async fn run_step(
             &mut failed,
             &mut latencies,
             &mut statuses,
+            &mut attempted_body_bytes,
+            &mut accepted_body_bytes,
         );
 
         let now = Instant::now();
@@ -356,6 +409,8 @@ async fn run_step(
                 &mut failed,
                 &mut latencies,
                 &mut statuses,
+                &mut attempted_body_bytes,
+                &mut accepted_body_bytes,
             );
         } else {
             break;
@@ -383,6 +438,8 @@ async fn run_step(
         ok,
         failed,
         accepted_events,
+        attempted_body_bytes,
+        accepted_body_bytes,
         error_rate: if total == 0 {
             1.0
         } else {
@@ -390,10 +447,101 @@ async fn run_step(
         },
         achieved_req_per_sec: round(ok as f64 / elapsed_seconds, 2),
         achieved_event_per_sec: round((ok * batch_size) as f64 / elapsed_seconds, 2),
+        achieved_body_bytes_per_sec: round(accepted_body_bytes as f64 / elapsed_seconds, 2),
+        achieved_body_mib_per_sec: round(
+            accepted_body_bytes as f64 / elapsed_seconds / 1024.0 / 1024.0,
+            3,
+        ),
+        average_body_bytes_per_request: if ok == 0 {
+            0.0
+        } else {
+            round(accepted_body_bytes as f64 / ok as f64, 1)
+        },
         p50_ms: percentile(&latencies, 0.50),
         p95_ms: percentile(&latencies, 0.95),
         p99_ms: percentile(&latencies, 0.99),
         max_observed_in_flight,
+        statuses,
+    })
+}
+
+async fn run_fixed_events(
+    context: Arc<LoadContext>,
+    batch_size: u64,
+    total_events: u64,
+) -> Result<StepStats> {
+    if batch_size == 0 {
+        bail!("batch_size must be positive");
+    }
+    if total_events == 0 {
+        bail!("total_events must be positive");
+    }
+
+    let started_at = Instant::now();
+    let mut attempted = 0;
+    let mut failed = 0;
+    let mut ok = 0;
+    let mut accepted_events = 0;
+    let mut latencies = Vec::new();
+    let mut statuses = HashMap::new();
+    let mut attempted_body_bytes = 0;
+    let mut accepted_body_bytes = 0;
+    let mut remaining = total_events;
+
+    while remaining > 0 {
+        let request_events = remaining.min(batch_size);
+        attempted += 1;
+        let result = post_batch(Arc::clone(&context), request_events).await;
+        latencies.push(result.latency_ms);
+        *statuses.entry(result.status).or_insert(0) += 1;
+        attempted_body_bytes += result.body_bytes;
+        if result.ok {
+            ok += 1;
+            accepted_events += request_events;
+            accepted_body_bytes += result.body_bytes;
+        } else {
+            failed += 1;
+        }
+        remaining -= request_events;
+    }
+
+    context
+        .config
+        .accepted_events
+        .fetch_add(accepted_events, Ordering::Relaxed);
+
+    let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
+    let total = ok + failed;
+    Ok(StepStats {
+        batch_size,
+        target_rps: 0,
+        attempted,
+        ok,
+        failed,
+        accepted_events,
+        attempted_body_bytes,
+        accepted_body_bytes,
+        error_rate: if total == 0 {
+            1.0
+        } else {
+            round(failed as f64 / total as f64, 4)
+        },
+        achieved_req_per_sec: round(ok as f64 / elapsed_seconds, 2),
+        achieved_event_per_sec: round(accepted_events as f64 / elapsed_seconds, 2),
+        achieved_body_bytes_per_sec: round(accepted_body_bytes as f64 / elapsed_seconds, 2),
+        achieved_body_mib_per_sec: round(
+            accepted_body_bytes as f64 / elapsed_seconds / 1024.0 / 1024.0,
+            3,
+        ),
+        average_body_bytes_per_request: if ok == 0 {
+            0.0
+        } else {
+            round(accepted_body_bytes as f64 / ok as f64, 1)
+        },
+        p50_ms: percentile(&latencies, 0.50),
+        p95_ms: percentile(&latencies, 0.95),
+        p99_ms: percentile(&latencies, 0.99),
+        max_observed_in_flight: 1,
         statuses,
     })
 }
@@ -404,9 +552,19 @@ fn drain_results(
     failed: &mut u64,
     latencies: &mut Vec<f64>,
     statuses: &mut HashMap<String, u64>,
+    attempted_body_bytes: &mut u64,
+    accepted_body_bytes: &mut u64,
 ) {
     while let Ok(result) = rx.try_recv() {
-        record_result(result, in_flight, failed, latencies, statuses);
+        record_result(
+            result,
+            in_flight,
+            failed,
+            latencies,
+            statuses,
+            attempted_body_bytes,
+            accepted_body_bytes,
+        );
     }
 }
 
@@ -416,10 +574,16 @@ fn record_result(
     failed: &mut u64,
     latencies: &mut Vec<f64>,
     statuses: &mut HashMap<String, u64>,
+    attempted_body_bytes: &mut u64,
+    accepted_body_bytes: &mut u64,
 ) {
     *in_flight = in_flight.saturating_sub(1);
     latencies.push(result.latency_ms);
     *statuses.entry(result.status).or_insert(0) += 1;
+    *attempted_body_bytes += result.body_bytes;
+    if result.ok {
+        *accepted_body_bytes += result.body_bytes;
+    }
     if !result.ok {
         *failed += 1;
     }
@@ -436,6 +600,7 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
                 .collect::<Result<Vec<_>>>()?;
             serde_json::to_vec(&events)?
         };
+        let body_bytes = body.len() as u64;
 
         let response = context
             .client
@@ -447,15 +612,16 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
             .await?;
         let status = response.status().as_u16();
         let _ = response.bytes().await;
-        Ok::<_, anyhow::Error>(status)
+        Ok::<_, anyhow::Error>((status, body_bytes))
     }
     .await;
 
     match result {
-        Ok(status) => RequestResult {
+        Ok((status, body_bytes)) => RequestResult {
             status: status.to_string(),
             ok: (200..300).contains(&status),
             latency_ms: started_at.elapsed().as_secs_f64() * 1_000.0,
+            body_bytes,
         },
         Err(error) => RequestResult {
             status: error
@@ -467,12 +633,17 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
                 .to_owned(),
             ok: false,
             latency_ms: started_at.elapsed().as_secs_f64() * 1_000.0,
+            body_bytes: 0,
         },
     }
 }
 
 fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
-    let seq = context.config.event_seq.fetch_add(1, Ordering::Relaxed);
+    let local_seq = context.config.event_seq.fetch_add(1, Ordering::Relaxed);
+    let seq = context
+        .config
+        .sequence_offset
+        .saturating_add(local_seq.saturating_mul(context.config.sequence_stride));
     let fixture = choose_fixture(
         &context.fixtures,
         seq,
@@ -499,6 +670,8 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
             &context.config.run_id,
             seq,
             &timestamp,
+            context.config.trace_depth,
+            context.config.profile == LoadProfile::Trace,
         );
     }
     if context.config.profile == LoadProfile::Llm {
@@ -542,7 +715,7 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
 }
 
 fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadProfile) -> &Fixture {
-    if profile == LoadProfile::Llm {
+    if profile == LoadProfile::Logs || profile == LoadProfile::Llm {
         if fixtures.log_variations.is_empty() {
             return &fixtures.log;
         }
@@ -551,6 +724,14 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
             return &fixtures.log;
         }
         return &fixtures.log_variations[index - 1];
+    }
+    if profile == LoadProfile::Metrics {
+        let index = seq as usize % fixtures.metric_fixtures.len();
+        return &fixtures.metric_fixtures[index];
+    }
+    if profile == LoadProfile::Trace {
+        let index = seq as usize % fixtures.trace_fixtures.len();
+        return &fixtures.trace_fixtures[index];
     }
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
         if profile.is_realistic() && !fixtures.log_variations.is_empty() {
@@ -580,7 +761,11 @@ fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, St
                 observed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             )
         }
-        LoadProfile::Fixture | LoadProfile::Realistic => {
+        LoadProfile::Fixture
+        | LoadProfile::Realistic
+        | LoadProfile::Trace
+        | LoadProfile::Metrics
+        | LoadProfile::Logs => {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             (now.clone(), now)
         }
@@ -636,9 +821,19 @@ fn randomize_realistic_data(
     run_id: &str,
     seq: u64,
     now: &str,
+    trace_depth: u64,
+    deep_trace: bool,
 ) {
     let mut rng = TinyRng::new(seed_for(run_id, fixture_name, seq));
-    let scenario = Scenario::new(&mut rng, fixture_name, run_id, seq, now);
+    let scenario = Scenario::new(
+        &mut rng,
+        fixture_name,
+        run_id,
+        seq,
+        now,
+        trace_depth,
+        deep_trace,
+    );
     apply_realistic_object(data, "", &scenario, &mut rng);
 }
 
@@ -800,8 +995,16 @@ struct Scenario {
 }
 
 impl Scenario {
-    fn new(rng: &mut TinyRng, fixture_name: &str, run_id: &str, seq: u64, now: &str) -> Self {
-        let hierarchy = Hierarchy::new(run_id, seq);
+    fn new(
+        rng: &mut TinyRng,
+        fixture_name: &str,
+        run_id: &str,
+        seq: u64,
+        now: &str,
+        trace_depth: u64,
+        deep_trace: bool,
+    ) -> Self {
+        let hierarchy = Hierarchy::new(run_id, seq, trace_depth, deep_trace);
         let route = rng.choose_str(&[
             "/checkout",
             "/api/canvases/{canvas_id}",
@@ -922,18 +1125,23 @@ struct Hierarchy {
 }
 
 impl Hierarchy {
-    fn new(run_id: &str, seq: u64) -> Self {
+    fn new(run_id: &str, seq: u64, trace_depth: u64, deep_trace: bool) -> Self {
         const EVENTS_PER_TRACE: u64 = 24;
         const TRACES_PER_SESSION: u64 = 12;
         const SESSIONS_PER_USER: u64 = 6;
         const USERS_PER_ACCOUNT: u64 = 25;
 
-        let trace_index = seq / EVENTS_PER_TRACE;
+        let events_per_trace = if deep_trace {
+            trace_depth.max(1).saturating_mul(2)
+        } else {
+            EVENTS_PER_TRACE
+        };
+        let trace_index = seq / events_per_trace;
         let session_index = trace_index / TRACES_PER_SESSION;
         let user_index = session_index / SESSIONS_PER_USER;
         let account_index = user_index / USERS_PER_ACCOUNT;
         let session_in_user = session_index % SESSIONS_PER_USER;
-        let span_slot = (seq % EVENTS_PER_TRACE) / 2;
+        let span_slot = (seq % events_per_trace) / 2;
 
         let trace_id = stable_hex(run_id, "trace", trace_index, 32);
         let root_span_id = stable_hex(run_id, "span", trace_index * 1_000, 16);
@@ -944,6 +1152,8 @@ impl Hierarchy {
         };
         let parent_span_id = if span_slot == 0 {
             String::new()
+        } else if deep_trace {
+            stable_hex(run_id, "span", trace_index * 1_000 + span_slot - 1, 16)
         } else if span_slot <= 3 {
             root_span_id
         } else {
@@ -1326,7 +1536,7 @@ fn is_pass(config: &Config, stats: &StepStats) -> bool {
 
 fn print_step(stats: &StepStats) {
     println!(
-        "targetRps={} batchSize={} attempted={} ok={} failed={} acceptedEvents={} achievedRps={} eventsPerSec={} p50={}ms p95={}ms p99={}ms errorRate={} inFlightMax={} statuses={}",
+        "targetRps={} batchSize={} attempted={} ok={} failed={} acceptedEvents={} achievedRps={} eventsPerSec={} bodyBytesPerSec={} bodyMiBPerSec={} avgBodyBytesPerReq={} attemptedBodyBytes={} acceptedBodyBytes={} p50={}ms p95={}ms p99={}ms errorRate={} inFlightMax={} statuses={}",
         stats.target_rps,
         stats.batch_size,
         stats.attempted,
@@ -1335,6 +1545,11 @@ fn print_step(stats: &StepStats) {
         stats.accepted_events,
         stats.achieved_req_per_sec,
         stats.achieved_event_per_sec,
+        stats.achieved_body_bytes_per_sec,
+        stats.achieved_body_mib_per_sec,
+        stats.average_body_bytes_per_request,
+        stats.attempted_body_bytes,
+        stats.accepted_body_bytes,
         stats.p50_ms,
         stats.p95_ms,
         stats.p99_ms,
@@ -1390,6 +1605,16 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         .filter(|fixture| !fixture.name.starts_with("log_variation_"))
         .cloned()
         .collect::<Vec<_>>();
+    let metric_fixtures = loaded
+        .iter()
+        .filter(|fixture| fixture.name.starts_with("metric"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_fixtures = loaded
+        .iter()
+        .filter(|fixture| fixture.name == "span_start" || fixture.name == "span_end")
+        .cloned()
+        .collect::<Vec<_>>();
     let log_variations = loaded
         .into_iter()
         .filter(|fixture| fixture.name.starts_with("log_variation_"))
@@ -1397,9 +1622,17 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
     if rest.is_empty() {
         bail!("expected at least one non-log fixture");
     }
+    if metric_fixtures.is_empty() {
+        bail!("expected at least one metric fixture");
+    }
+    if trace_fixtures.is_empty() {
+        bail!("expected at least one trace fixture");
+    }
     Ok(Fixtures {
         log,
         log_variations,
+        metric_fixtures,
+        trace_fixtures,
         rest,
     })
 }
@@ -1556,11 +1789,12 @@ SELECT
     quantileExact(0.95)({ingest_lag}) AS p95_ingest_lag_ms,
     max({ingest_lag}) AS max_ingest_lag_ms
 FROM {}.{}
-WHERE tenant_id = 'loadtest'
+WHERE data._loadtest.run_id = '{}'
   AND startsWith(event_id, '{}')
 FORMAT JSON",
         quote_identifier(&clickhouse.database),
         quote_identifier(&clickhouse.table),
+        escape_sql_string(&context.config.run_id),
         escape_sql_string(&event_prefix)
     );
 
@@ -1745,6 +1979,30 @@ fn integer_env(key: &str, fallback: u64) -> Result<u64> {
     }
 }
 
+fn integer_env_allow_zero(key: &str, fallback: u64) -> Result<u64> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{key} must be an integer")),
+        Err(_) => Ok(fallback),
+    }
+}
+
+fn optional_integer_env(key: &str) -> Result<Option<u64>> {
+    match env::var(key) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<u64>()
+                .with_context(|| format!("{key} must be an integer"))?;
+            if parsed == 0 {
+                bail!("{key} must be positive");
+            }
+            Ok(Some(parsed))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn list_env(key: &str, fallback: &[u64]) -> Result<Vec<u64>> {
     match env::var(key) {
         Ok(value) => value
@@ -1768,6 +2026,28 @@ fn load_profile_env() -> Result<LoadProfile> {
     match env::var("NANOTRACE_LOADTEST_PROFILE") {
         Ok(value) if value.eq_ignore_ascii_case("realistic") => Ok(LoadProfile::Realistic),
         Ok(value)
+            if value.eq_ignore_ascii_case("trace")
+                || value.eq_ignore_ascii_case("traces")
+                || value.eq_ignore_ascii_case("realistic_trace")
+                || value.eq_ignore_ascii_case("realistic_traces") =>
+        {
+            Ok(LoadProfile::Trace)
+        }
+        Ok(value)
+            if value.eq_ignore_ascii_case("metrics")
+                || value.eq_ignore_ascii_case("metric")
+                || value.eq_ignore_ascii_case("pure_metrics") =>
+        {
+            Ok(LoadProfile::Metrics)
+        }
+        Ok(value)
+            if value.eq_ignore_ascii_case("logs")
+                || value.eq_ignore_ascii_case("log")
+                || value.eq_ignore_ascii_case("pure_logs") =>
+        {
+            Ok(LoadProfile::Logs)
+        }
+        Ok(value)
             if value.eq_ignore_ascii_case("llm")
                 || value.eq_ignore_ascii_case("realistic_llm")
                 || value.eq_ignore_ascii_case("llm_realistic") =>
@@ -1782,7 +2062,7 @@ fn load_profile_env() -> Result<LoadProfile> {
             Ok(LoadProfile::Fixture)
         }
         Ok(value) => bail!(
-            "NANOTRACE_LOADTEST_PROFILE must be llm, realistic, fixture, default, or static; got {value}"
+            "NANOTRACE_LOADTEST_PROFILE must be llm, realistic, trace, metrics, logs, fixture, default, or static; got {value}"
         ),
         Err(_) => Ok(LoadProfile::Fixture),
     }
@@ -1848,6 +2128,19 @@ mod tests {
     }
 
     #[test]
+    fn generated_event_sequence_can_be_sharded() {
+        let context = test_context_with_sequence(2, 4);
+
+        let first = make_event(&context, "test_mix").expect("first event");
+        let second = make_event(&context, "test_mix").expect("second event");
+
+        assert_eq!(first["event_id"], "test-run-2");
+        assert_eq!(first["data"]["_loadtest"]["sequence"], 2);
+        assert_eq!(second["event_id"], "test-run-6");
+        assert_eq!(second["data"]["_loadtest"]["sequence"], 6);
+    }
+
+    #[test]
     fn fixture_selection_uses_log_ratio_then_rest() {
         let context = test_context();
 
@@ -1866,6 +2159,22 @@ mod tests {
         assert_eq!(
             choose_fixture(&context.fixtures, 1, 0.10, LoadProfile::Realistic).name,
             "log_variation_code_success"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 0, 0.10, LoadProfile::Logs).name,
+            "log"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 1, 0.10, LoadProfile::Logs).name,
+            "log_variation_code_success"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 0, 0.10, LoadProfile::Metrics).name,
+            "metric"
+        );
+        assert_eq!(
+            choose_fixture(&context.fixtures, 0, 0.10, LoadProfile::Trace).name,
+            "span_start"
         );
     }
 
@@ -1886,6 +2195,18 @@ mod tests {
                 .rest
                 .iter()
                 .any(|fixture| fixture.name == "metric_runtime")
+        );
+        assert!(
+            fixtures
+                .metric_fixtures
+                .iter()
+                .all(|fixture| fixture.name.starts_with("metric"))
+        );
+        assert!(
+            fixtures
+                .trace_fixtures
+                .iter()
+                .all(|fixture| fixture.name == "span_start" || fixture.name == "span_end")
         );
     }
 
@@ -2058,11 +2379,29 @@ mod tests {
             "test-run",
             seq,
             "2026-05-12T00:00:00.000Z",
+            96,
+            false,
         );
         data
     }
 
     fn test_context_with_profile(profile: LoadProfile) -> LoadContext {
+        test_context_with_profile_and_sequence(profile, 0, 1)
+    }
+
+    fn test_context_with_sequence(sequence_offset: u64, sequence_stride: u64) -> LoadContext {
+        test_context_with_profile_and_sequence(
+            LoadProfile::Fixture,
+            sequence_offset,
+            sequence_stride,
+        )
+    }
+
+    fn test_context_with_profile_and_sequence(
+        profile: LoadProfile,
+        sequence_offset: u64,
+        sequence_stride: u64,
+    ) -> LoadContext {
         LoadContext {
             config: Arc::new(Config {
                 ingest_url: "http://127.0.0.1:3000".to_owned(),
@@ -2079,6 +2418,10 @@ mod tests {
                 max_in_flight: 1,
                 log_ratio: 0.10,
                 profile,
+                trace_depth: 96,
+                total_events: None,
+                sequence_offset,
+                sequence_stride,
                 clickhouse_wait_ms: 1_000.0,
                 clickhouse_poll_ms: 100.0,
                 event_seq: AtomicU64::new(0),
@@ -2127,6 +2470,45 @@ mod tests {
                             "environment": "prod",
                             "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
                             "span_id": "00f067aa0ba902b7"
+                        }
+                    }),
+                }],
+                metric_fixtures: vec![Fixture {
+                    name: "metric".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-metric",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "api",
+                            "event_type": "metric",
+                            "metric_name": "http.server.duration",
+                            "metric_value": 231,
+                            "http.method": "POST",
+                            "http.route": "/checkout",
+                            "http.status_code": 200,
+                            "duration_ms": 231
+                        }
+                    }),
+                }],
+                trace_fixtures: vec![Fixture {
+                    name: "span_start".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-span-start",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "api",
+                            "event_type": "span_start",
+                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                            "span_id": "00f067aa0ba902b7",
+                            "parent_span_id": "",
+                            "name": "POST /checkout",
+                            "start_time": "2026-05-08T01:23:45.000Z",
+                            "end_time": "2026-05-08T01:23:45.123Z",
+                            "duration_ms": 123
                         }
                     }),
                 }],

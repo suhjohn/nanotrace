@@ -3,7 +3,7 @@ import * as cloudflare from '@pulumi/cloudflare'
 import * as command from '@pulumi/command'
 import * as pulumi from '@pulumi/pulumi'
 import * as random from '@pulumi/random'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,9 @@ const repoRoot = path.resolve(
 const cfg = new pulumi.Config()
 const awsCfg = new pulumi.Config('aws')
 const usEast1 = new aws.Provider('useast1', { region: 'us-east-1' })
+if (cfg.get('bootstrapApiKey') || process.env.NANOTRACE_BOOTSTRAP_API_KEY) {
+  throw new Error('bootstrap API keys are not supported in cloud deployments; use magic-link admin login and created API keys instead')
+}
 
 const deploymentId = cfg.get('deploymentId') ?? pulumi.getStack()
 const name = cfg.get('name') ?? `nanotrace-${deploymentId}`
@@ -25,21 +28,11 @@ const prefix =
   process.env.NANOTRACE_OBJECT_PREFIX ??
   'events'
 const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, '')
-const dataPlaneOrganizationId =
-  cfg.get('dataPlaneOrganizationId') ??
-  process.env.NANOTRACE_DATA_PLANE_ORGANIZATION_ID ??
-  ''
-const isDataPlaneOnly = dataPlaneOrganizationId.trim() !== ''
-const createLoginEmailResources = !isDataPlaneOnly
-const dataPlaneSharedSecret =
-  cfg.getSecret('dataPlaneSharedSecret') ??
-  pulumi.secret(process.env.NANOTRACE_DATA_PLANE_SHARED_SECRET ?? '')
+const createLoginEmailResources = true
 const processorPrefix =
   cfg.get('processorPrefix') ??
   process.env.PROCESSOR_PREFIX ??
-  (dataPlaneOrganizationId
-    ? `organizations/${dataPlaneOrganizationId}/processors`
-    : 'organizations/org_default/processors')
+  'processors'
 const region = awsCfg.get('region') ?? process.env.AWS_REGION ?? 'us-west-1'
 const expectedAwsAccountId =
   cfg.get('awsAccountId') ??
@@ -54,52 +47,6 @@ if (expectedAwsAccountId) {
   }
 }
 const port = cfg.getNumber('port') ?? 18473
-const clickhouseMode = normalizeClickhouseMode(
-  process.env.NANOTRACE_CLICKHOUSE_MODE ??
-  (!process.env.CLICKHOUSE_URL &&
-  (process.env.CLICKHOUSE_CLOUD_API_KEY ?? process.env.CLICKHOUSE_CLOUD_API_KEY_ID) &&
-  (process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET) &&
-  process.env.CLICKHOUSE_CLOUD_ORG_ID
-    ? 'shared-service'
-    : 'external')
-)
-const createDefaultClickhouseCloudService =
-  clickhouseMode === 'dedicated-service' ||
-  (clickhouseMode === 'shared-service' && !isDataPlaneOnly)
-const clickhouseCloudOrgId = process.env.CLICKHOUSE_CLOUD_ORG_ID ?? ''
-const clickhouseCloudApiKey =
-  process.env.CLICKHOUSE_CLOUD_API_KEY ??
-  process.env.CLICKHOUSE_CLOUD_API_KEY_ID ??
-  ''
-const clickhouseCloudApiSecret =
-  ((process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET)
-    ? pulumi.secret(process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET!)
-    : undefined)
-const clickhouseCloudProvider =
-  process.env.CLICKHOUSE_CLOUD_PROVIDER ??
-  'aws'
-const clickhouseCloudRegion =
-  process.env.CLICKHOUSE_CLOUD_REGION ??
-  region
-const defaultClickhouseServiceName =
-  process.env.NANOTRACE_DEFAULT_CLICKHOUSE_SERVICE_NAME ??
-  (clickhouseMode === 'shared-service'
-    ? `${name}-default`
-    : `${name}-clickhouse`)
-const defaultClickhouseTier = process.env.NANOTRACE_DEFAULT_CLICKHOUSE_TIER
-const defaultClickhouseIdleScaling =
-  booleanEnv('NANOTRACE_DEFAULT_CLICKHOUSE_IDLE_SCALING', true)
-const defaultClickhouseIdleTimeoutMinutes =
-  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_IDLE_TIMEOUT_MINUTES', 15)
-const defaultClickhouseMinTotalMemoryGb =
-  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_MIN_TOTAL_MEMORY_GB', 24)
-const defaultClickhouseMaxTotalMemoryGb =
-  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_MAX_TOTAL_MEMORY_GB', 24)
-const defaultClickhouseNumReplicas = optionalNumberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_NUM_REPLICAS')
-const defaultClickhouseIpAccess = parseClickhouseIpAccess(
-  process.env.NANOTRACE_DEFAULT_CLICKHOUSE_IP_ACCESS ??
-  '0.0.0.0/0'
-)
 const modalTokenId =
   cfg.getSecret('modalTokenId') ?? pulumi.secret(process.env.MODAL_TOKEN_ID ?? '')
 const modalTokenSecret =
@@ -110,9 +57,7 @@ const modalServerApiKey =
   pulumi.secret(process.env.MODAL_SERVER_API_KEY ?? '')
 const clickhouseDatabase =
   process.env.CLICKHOUSE_DATABASE ??
-  (dataPlaneOrganizationId
-    ? clickhouseDatabaseName(dataPlaneOrganizationId)
-    : 'observatory')
+  'observatory'
 const clickhouseTable = process.env.CLICKHOUSE_TABLE ?? 'events'
 const clickhouseFacetsTable =
   process.env.CLICKHOUSE_FACETS_TABLE ??
@@ -219,7 +164,6 @@ const emailFrom = configuredEmailFrom?.trim() || `login@mail.${domainName}`
 const loginEmailIdentityDomain = normalizeDomainName(domainFromEmail(emailFrom))
 const loginEmailMailFromDomain = normalizeDomainName(`bounce.${loginEmailIdentityDomain}`)
 const manageLoginEmailDns =
-  !isDataPlaneOnly &&
   emailFrom.trim() !== '' &&
   booleanEnv('NANOTRACE_MANAGE_LOGIN_EMAIL_DNS', cfg.getBoolean('manageLoginEmailDns') ?? true)
 const apiDomainName = normalizeDomainName(
@@ -240,11 +184,20 @@ const uiApiBaseUrl =
   cfg.get('uiApiBaseUrl') ??
   process.env.VITE_NANOTRACE_URL ??
   apiBaseUrl
+const buildUi =
+  cfg.getBoolean('buildUi') ??
+  booleanEnv('NANOTRACE_BUILD_UI', true)
 const corsAllowedOrigins =
   cfg.get('corsAllowedOrigins') ??
   process.env.NANOTRACE_CORS_ALLOWED_ORIGINS ??
   [
     appBaseUrl,
+    'http://localhost:41233',
+    'http://127.0.0.1:41233',
+    'http://localhost:41234',
+    'http://127.0.0.1:41234',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
     'http://localhost:5174',
     'http://127.0.0.1:5174'
   ].join(',')
@@ -294,6 +247,10 @@ const cloudflareProvider = usesCloudflareDns
 const sessionSecure =
   cfg.getBoolean('sessionSecure') ??
   booleanEnv('NANOTRACE_SESSION_SECURE', true)
+const sessionSameSite =
+  cfg.get('sessionSameSite') ??
+  process.env.NANOTRACE_SESSION_SAME_SITE ??
+  'Lax'
 const imageUriOverride = cfg.get('imageUri')
 const buildImage = cfg.getBoolean('buildImage') ?? !imageUriOverride
 const imageBuildId = cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest'
@@ -310,13 +267,11 @@ const schemaScriptHash = createHash('sha256')
     )
   )
   .digest('hex')
-const clickhouseCloudScriptHash = createHash('sha256')
-  .update(
-    readFileSync(
-      path.join(repoRoot, 'scripts/clickhouse-cloud-service.mjs'),
-      'utf8'
-    )
-  )
+const uiSourceHash = createHash('sha256')
+  .update(hashDirectory(path.join(repoRoot, 'apps/ui')))
+  .update(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'))
+  .update(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'))
+  .update(readFileSync(path.join(repoRoot, 'scripts/deploy-ui.mjs'), 'utf8'))
   .digest('hex')
 
 const tags = {
@@ -340,161 +295,43 @@ const managedLoginEmailMailFrom = managedLoginEmailIdentity
   })
   : undefined
 
-const databasePassword = isDataPlaneOnly
-  ? (postgresMode === 'managed'
-      ? (cfg.getSecret('databasePassword') ??
-        new random.RandomPassword(`${name}-database-password`, {
-          length: 32,
-          special: false
-        }).result)
-      : pulumi.secret(''))
-  : postgresMode === 'managed'
-    ? (cfg.getSecret('databasePassword') ??
-      new random.RandomPassword(`${name}-database-password`, {
-        length: 32,
-        special: false
-      }).result)
-    : pulumi.secret('')
-const generatedBootstrapApiKey = new random.RandomPassword(
-  `${name}-bootstrap-api-key`,
-  {
-    length: 43,
-    special: false
-  }
-)
-const bootstrapApiKey = cfg.getSecret('bootstrapApiKey') ??
-  (process.env.NANOTRACE_BOOTSTRAP_API_KEY
-    ? pulumi.secret(process.env.NANOTRACE_BOOTSTRAP_API_KEY)
-    : pulumi.interpolate`ntak_${generatedBootstrapApiKey.result}`)
-const configuredDataPlaneKmsKeyArn =
-  cfg.get('dataPlaneKmsKeyArn') ??
-  process.env.NANOTRACE_DATA_PLANE_KMS_KEY_ARN ??
+const databasePassword = postgresMode === 'managed'
+  ? (cfg.getSecret('databasePassword') ??
+    new random.RandomPassword(`${name}-database-password`, {
+      length: 32,
+      special: false
+    }).result)
+  : pulumi.secret('')
+const configuredDataKmsKeyArn =
+  cfg.get('dataKmsKeyArn') ??
+  process.env.NANOTRACE_DATA_KMS_KEY_ARN ??
   ''
-const createDataPlaneKmsKey =
-  cfg.getBoolean('createDataPlaneKmsKey') ??
-  booleanEnv('NANOTRACE_CREATE_DATA_PLANE_KMS_KEY', false)
+const createDataKmsKey =
+  cfg.getBoolean('createDataKmsKey') ??
+  booleanEnv('NANOTRACE_CREATE_DATA_KMS_KEY', false)
 
 const azs = aws.getAvailabilityZonesOutput({ state: 'available' })
 
-if (createDefaultClickhouseCloudService) {
-  if (!clickhouseCloudOrgId || !clickhouseCloudApiKey || !clickhouseCloudApiSecret) {
-    throw new Error(
-      `NANOTRACE_CLICKHOUSE_MODE=${clickhouseMode} requires CLICKHOUSE_CLOUD_ORG_ID, CLICKHOUSE_CLOUD_API_KEY, and CLICKHOUSE_CLOUD_API_SECRET`
-    )
-  }
-}
+const clickhouseUrl = requireEnv('CLICKHOUSE_URL')
+const clickhouseUser = requireEnv('CLICKHOUSE_USER')
+const clickhousePassword = pulumi.secret(requireEnv('CLICKHOUSE_PASSWORD'))
 
-const defaultClickhousePassword = createDefaultClickhouseCloudService
-  ? new random.RandomPassword(`${name}-clickhouse-default-password`, {
-      length: 32,
-      special: true,
-      overrideSpecial: '_-'
-    }).result
-  : undefined
-
-const defaultClickhouseService = createDefaultClickhouseCloudService
-  ? new command.local.Command(
-      `${name}-clickhouse-default`,
-      {
-        create: 'node scripts/clickhouse-cloud-service.mjs create',
-        update: 'node scripts/clickhouse-cloud-service.mjs create',
-        delete: 'true',
-        dir: repoRoot,
-        environment: {
-          CLICKHOUSE_CLOUD_API_KEY: clickhouseCloudApiKey,
-          CLICKHOUSE_CLOUD_API_SECRET: clickhouseCloudApiSecret!,
-          CLICKHOUSE_CLOUD_ORG_ID: clickhouseCloudOrgId,
-          CLICKHOUSE_CLOUD_PROVIDER: clickhouseCloudProvider,
-          CLICKHOUSE_CLOUD_REGION: clickhouseCloudRegion,
-          CLICKHOUSE_CLOUD_SERVICE_NAME: defaultClickhouseServiceName,
-          CLICKHOUSE_CLOUD_PASSWORD: defaultClickhousePassword!,
-          CLICKHOUSE_CLOUD_IDLE_SCALING: String(defaultClickhouseIdleScaling),
-          CLICKHOUSE_CLOUD_IDLE_TIMEOUT_MINUTES: String(
-            defaultClickhouseIdleTimeoutMinutes
-          ),
-          CLICKHOUSE_CLOUD_IP_ACCESS: formatClickhouseIpAccess(
-            defaultClickhouseIpAccess
-          ),
-          CLICKHOUSE_CLOUD_TIER: defaultClickhouseTier ?? '',
-          CLICKHOUSE_CLOUD_MIN_TOTAL_MEMORY_GB:
-            defaultClickhouseTier === 'production'
-              ? String(defaultClickhouseMinTotalMemoryGb)
-              : '',
-          CLICKHOUSE_CLOUD_MAX_TOTAL_MEMORY_GB:
-            defaultClickhouseTier === 'production'
-              ? String(defaultClickhouseMaxTotalMemoryGb)
-              : '',
-          CLICKHOUSE_CLOUD_NUM_REPLICAS:
-            defaultClickhouseTier === 'production' &&
-            defaultClickhouseNumReplicas !== undefined
-              ? String(defaultClickhouseNumReplicas)
-              : '',
-          CLICKHOUSE_CLOUD_STATE_FILE: path.join(
-            '.nanotrace',
-            'clickhouse-cloud',
-            `${deploymentId}-${defaultClickhouseServiceName}.json`
-          )
-        },
-        triggers: [
-          clickhouseCloudScriptHash,
-          clickhouseCloudProvider,
-          clickhouseCloudRegion,
-          defaultClickhouseServiceName,
-          defaultClickhouseTier ?? '',
-          defaultClickhouseIdleScaling,
-          defaultClickhouseIdleTimeoutMinutes,
-          formatClickhouseIpAccess(defaultClickhouseIpAccess),
-          defaultClickhouseMinTotalMemoryGb,
-          defaultClickhouseMaxTotalMemoryGb,
-          defaultClickhouseNumReplicas ?? '',
-          defaultClickhousePassword!
-        ]
-      },
-      {
-        additionalSecretOutputs: ['stdout', 'stderr']
-      }
-    )
-  : undefined
-
-const defaultClickhouseServiceState = defaultClickhouseService?.stdout.apply(
-  value => JSON.parse(value) as ClickhouseCloudServiceState
-)
-const defaultClickhouseHttpsEndpoint =
-  defaultClickhouseServiceState?.apply(state => state.url)
-
-const clickhouseUrl =
-  defaultClickhouseHttpsEndpoint ??
-  requireEnv('CLICKHOUSE_URL')
-const clickhouseUser =
-  createDefaultClickhouseCloudService
-    ? 'default'
-    : requireEnv('CLICKHOUSE_USER')
-const clickhousePassword =
-  defaultClickhousePassword ??
-  pulumi.secret(requireEnv('CLICKHOUSE_PASSWORD'))
-const clickhouseCloudServiceId =
-  defaultClickhouseServiceState?.apply(state => state.id) ?? ''
-
-const managedDataPlaneKmsKey = createDataPlaneKmsKey
+const managedDataKmsKey = createDataKmsKey
   ? new aws.kms.Key(`${name}-data-key`, {
-      description: dataPlaneOrganizationId
-        ? `Nanotrace data-plane key for ${dataPlaneOrganizationId}`
-        : `Nanotrace data key for ${deploymentId}`,
+      description: `Nanotrace data key for ${deploymentId}`,
       deletionWindowInDays: cfg.getNumber('kmsDeletionWindowDays') ?? 7,
       enableKeyRotation: true
     })
   : undefined
 
-const dataPlaneKmsKeyArn = configuredDataPlaneKmsKeyArn
-  ? pulumi.output(configuredDataPlaneKmsKeyArn)
-  : managedDataPlaneKmsKey?.arn
+const dataKmsKeyArn = configuredDataKmsKeyArn
+  ? pulumi.output(configuredDataKmsKeyArn)
+  : managedDataKmsKey?.arn
 
-if (managedDataPlaneKmsKey) {
+if (managedDataKmsKey) {
   new aws.kms.Alias(`${name}-data-key-alias`, {
-    name: dataPlaneOrganizationId
-      ? `alias/nanotrace/${dataPlaneOrganizationId}`
-      : `alias/nanotrace/${deploymentId}`,
-    targetKeyId: managedDataPlaneKmsKey.keyId
+    name: `alias/nanotrace/${deploymentId}`,
+    targetKeyId: managedDataKmsKey.keyId
   })
 }
 
@@ -546,15 +383,15 @@ new aws.s3.BucketServerSideEncryptionConfigurationV2(`${name}-events-encryption`
   bucket: bucket.id,
   rules: [
     {
-      applyServerSideEncryptionByDefault: dataPlaneKmsKeyArn
+      applyServerSideEncryptionByDefault: dataKmsKeyArn
         ? {
-            kmsMasterKeyId: dataPlaneKmsKeyArn,
+            kmsMasterKeyId: dataKmsKeyArn,
             sseAlgorithm: 'aws:kms'
           }
         : {
             sseAlgorithm: 'AES256'
           },
-      bucketKeyEnabled: dataPlaneKmsKeyArn ? true : undefined
+      bucketKeyEnabled: dataKmsKeyArn ? true : undefined
     }
   ]
 })
@@ -573,7 +410,7 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
 })
 
 const loaderQueue = new aws.sqs.Queue(`${name}-loader-events`, {
-  kmsMasterKeyId: dataPlaneKmsKeyArn,
+  kmsMasterKeyId: dataKmsKeyArn,
   messageRetentionSeconds: 345_600,
   visibilityTimeoutSeconds: 300,
   tags
@@ -631,17 +468,61 @@ const imageTag = cfg.get('imageTag') ?? imageBuildId
 const imageUri = imageUriOverride
   ? pulumi.output(imageUriOverride)
   : pulumi.interpolate`${repository.repositoryUrl}:${imageTag}`
+const imageBuildCommand = pulumi
+  .all([repository.repositoryUrl, imageUri])
+  .apply(([repositoryUrl, resolvedImageUri]) => {
+    const registry = repositoryUrl.split('/')[0]
+    const platform = `linux/${cpuArchitecture}`
+    const localCache = '.pulumi-docker/buildx-cache'
+    const nextLocalCache = '.pulumi-docker/buildx-cache-next'
+    const cacheImage = `${repositoryUrl}:buildcache`
+    return [
+      'set -eu',
+      'mkdir -p .pulumi-docker',
+      `ECR_PASSWORD="$(aws ecr get-login-password --region ${shellQuote(region)})"`,
+      'ECR_AUTH="$(printf \'AWS:%s\' "$ECR_PASSWORD" | base64 | tr -d \'\\n\')"',
+      `printf '{"auths":{"${registry}":{"auth":"%s"}}}\\n' "$ECR_AUTH" > .pulumi-docker/config.json`,
+      'if docker --config .pulumi-docker buildx version >/dev/null 2>&1; then',
+      '  if ! docker --config .pulumi-docker buildx inspect nanotrace-builder >/dev/null 2>&1; then',
+      '    docker --config .pulumi-docker buildx create --name nanotrace-builder --driver docker-container >/dev/null',
+      '  fi',
+      '  docker --config .pulumi-docker buildx inspect nanotrace-builder --bootstrap >/dev/null',
+      `  mkdir -p ${shellQuote(localCache)}`,
+      `  rm -rf ${shellQuote(nextLocalCache)}`,
+      '  CACHE_FROM_ARGS=""',
+      `  if docker --config .pulumi-docker manifest inspect ${shellQuote(cacheImage)} >/dev/null 2>&1; then`,
+      `    CACHE_FROM_ARGS="$CACHE_FROM_ARGS --cache-from type=registry,ref=${shellQuote(cacheImage)}"`,
+      '  fi',
+      `  CACHE_FROM_ARGS="$CACHE_FROM_ARGS --cache-from type=local,src=${shellQuote(localCache)}"`,
+      '  if ! docker --config .pulumi-docker buildx build \\',
+      '    --builder nanotrace-builder \\',
+      `    --platform ${shellQuote(platform)} \\`,
+      '    $CACHE_FROM_ARGS \\',
+      `    --cache-to type=local,dest=${shellQuote(nextLocalCache)},mode=max \\`,
+      `    --cache-to type=registry,ref=${shellQuote(cacheImage)},mode=max,ignore-error=true \\`,
+      `    -t ${shellQuote(resolvedImageUri)} \\`,
+      '    --push .; then',
+      '    echo "buildx cached build failed; falling back to docker build without external cache" >&2',
+      `    DOCKER_BUILDKIT=1 docker --config .pulumi-docker build --platform ${shellQuote(platform)} -t ${shellQuote(resolvedImageUri)} .`,
+      `    docker --config .pulumi-docker push ${shellQuote(resolvedImageUri)}`,
+      '  fi',
+      `  if [ -d ${shellQuote(nextLocalCache)} ]; then`,
+      `    rm -rf ${shellQuote(localCache)}`,
+      `    mv ${shellQuote(nextLocalCache)} ${shellQuote(localCache)}`,
+      '  fi',
+      'else',
+      `  DOCKER_BUILDKIT=1 docker --config .pulumi-docker build --platform ${shellQuote(platform)} -t ${shellQuote(resolvedImageUri)} .`,
+      `  docker --config .pulumi-docker push ${shellQuote(resolvedImageUri)}`,
+      'fi'
+    ].join('\n')
+  })
 
 const imageBuild = buildImage
   ? new command.local.Command(
       `${name}-image`,
       {
-        create: pulumi.interpolate`mkdir -p .pulumi-docker && ECR_PASSWORD="$(aws ecr get-login-password --region ${region})" && ECR_AUTH="$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" && printf '{"auths":{"${repository.repositoryUrl.apply(
-          value => value.split('/')[0]
-        )}":{"auth":"%s"}}}\n' "$ECR_AUTH" > .pulumi-docker/config.json && docker --config .pulumi-docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker --config .pulumi-docker push ${imageUri}`,
-        update: pulumi.interpolate`mkdir -p .pulumi-docker && ECR_PASSWORD="$(aws ecr get-login-password --region ${region})" && ECR_AUTH="$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" && printf '{"auths":{"${repository.repositoryUrl.apply(
-          value => value.split('/')[0]
-        )}":{"auth":"%s"}}}\n' "$ECR_AUTH" > .pulumi-docker/config.json && docker --config .pulumi-docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker --config .pulumi-docker push ${imageUri}`,
+        create: imageBuildCommand,
+        update: imageBuildCommand,
         delete: `true`,
         dir: repoRoot,
         triggers: [imageBuildId]
@@ -673,7 +554,7 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
       bucket.arn,
       repository.arn,
       loaderQueue.arn,
-      dataPlaneKmsKeyArn ?? pulumi.output('')
+      dataKmsKeyArn ?? pulumi.output('')
     ])
     .apply(([bucketArn, repositoryArn, queueArn, kmsKeyArn]) =>
       JSON.stringify(
@@ -683,7 +564,7 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
             ...(kmsKeyArn
               ? [
                   {
-                    Sid: 'UseDataPlaneKmsKey',
+                    Sid: 'UseDataKmsKey',
                     Effect: 'Allow',
                     Action: [
                       'kms:Decrypt',
@@ -933,7 +814,7 @@ const database = !createManagedPostgres
       engine: 'postgres',
       identifier: `${name}-postgres`,
       instanceClass: databaseInstanceClass,
-      kmsKeyId: dataPlaneKmsKeyArn,
+      kmsKeyId: dataKmsKeyArn,
       multiAz: false,
       password: databasePassword,
       publiclyAccessible: false,
@@ -1012,11 +893,6 @@ type ManualDnsRecord = {
   purpose: string
 }
 const manualDnsRecords: ManualDnsRecord[] = []
-
-type ClickhouseCloudServiceState = {
-  id: string
-  url: string
-}
 
 const uiBucket = new aws.s3.BucketV2(`${name}-ui`, {
   forceDestroy: cfg.getBoolean('forceDestroyUiBucket') ?? false,
@@ -1154,7 +1030,7 @@ const uiDistribution = new aws.cloudfront.Distribution(`${name}-ui`, {
   tags: { ...tags, Service: 'ui' }
 })
 
-new aws.s3.BucketPolicy(`${name}-ui-policy`, {
+const uiBucketPolicy = new aws.s3.BucketPolicy(`${name}-ui-policy`, {
   bucket: uiBucket.id,
   policy: pulumi.all([uiBucket.arn, uiDistribution.arn]).apply(([bucketArn, distributionArn]) =>
     JSON.stringify({
@@ -1176,6 +1052,33 @@ new aws.s3.BucketPolicy(`${name}-ui-policy`, {
     })
   )
 })
+
+const uiBuild = buildUi
+  ? new command.local.Command(
+      `${name}-ui-build`,
+      {
+        create: 'node scripts/deploy-ui.mjs',
+        update: 'node scripts/deploy-ui.mjs',
+        delete: 'true',
+        dir: repoRoot,
+        environment: {
+          AWS_REGION: region,
+          NANOTRACE_UI_BUCKET: uiBucket.bucket,
+          NANOTRACE_UI_DISTRIBUTION_ID: uiDistribution.id,
+          VITE_NANOTRACE_URL: uiApiBaseUrl
+        },
+        triggers: [
+          uiSourceHash,
+          uiApiBaseUrl,
+          uiBucket.bucket,
+          uiDistribution.id
+        ]
+      },
+      {
+        dependsOn: [uiBucketPolicy, uiDistribution]
+      }
+    )
+  : undefined
 
 if (dnsProvider === 'external') {
   manualDnsRecords.push(
@@ -1486,31 +1389,11 @@ new aws.lb.ListenerRule(`${name}-query-route`, {
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
 })
 
-new aws.lb.ListenerRule(`${name}-internal-query-route`, {
-  listenerArn: listener.arn,
-  priority: 11,
-  conditions: [
-    { pathPattern: { values: ['/internal/query'] } },
-    { httpRequestMethod: { values: ['POST'] } }
-  ],
-  actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
-})
-
 new aws.lb.ListenerRule(`${name}-event-read-route`, {
   listenerArn: listener.arn,
   priority: 20,
   conditions: [
     { pathPattern: { values: ['/events/*'] } },
-    { httpRequestMethod: { values: ['GET'] } }
-  ],
-  actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
-})
-
-new aws.lb.ListenerRule(`${name}-internal-event-read-route`, {
-  listenerArn: listener.arn,
-  priority: 21,
-  conditions: [
-    { pathPattern: { values: ['/internal/events/*'] } },
     { httpRequestMethod: { values: ['GET'] } }
   ],
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
@@ -1543,12 +1426,10 @@ const userData = pulumi
     clickhouseUrl,
     clickhousePassword,
     databaseUrl,
-    bootstrapApiKey,
     loaderQueue.url,
     modalTokenId,
     modalTokenSecret,
     modalServerApiKey,
-    dataPlaneSharedSecret,
     publicBaseUrl
   ])
   .apply(
@@ -1559,20 +1440,17 @@ const userData = pulumi
       resolvedClickhouseUrl,
       resolvedClickhousePassword,
       resolvedDatabaseUrl,
-      resolvedBootstrapApiKey,
       loaderQueueUrl,
       resolvedModalTokenId,
       resolvedModalTokenSecret,
       resolvedModalServerApiKey,
-      resolvedDataPlaneSharedSecret,
       resolvedPublicBaseUrl
     ]) =>
       renderUserData({
-        bucketName,
-        adminEmails,
-        bootstrapApiKey: resolvedBootstrapApiKey,
-        clickhouseDatabase,
-        clickhouseEventIndexTable,
+      bucketName,
+      adminEmails,
+      clickhouseDatabase,
+      clickhouseEventIndexTable,
         clickhousePassword: resolvedClickhousePassword,
         clickhouseFacetsTable,
         clickhouseHotDimensionsTable,
@@ -1602,8 +1480,6 @@ const userData = pulumi
         writerLanes,
         writerQueueCapacity,
         compactBatchReceipts,
-        dataPlaneOrganizationId,
-        dataPlaneSharedSecret: resolvedDataPlaneSharedSecret,
         databaseUrl: resolvedDatabaseUrl,
         allowedEmails,
         appBaseUrl,
@@ -1611,16 +1487,16 @@ const userData = pulumi
         emailFrom,
         processorPrefix,
         publicBaseUrl: resolvedPublicBaseUrl,
-        sessionSecure
+        sessionSecure,
+        sessionSameSite
       })
   )
 
 const queryUserData = pulumi
-  .all([bucket.bucket, imageUri, imageBuildId, clickhouseUrl, clickhousePassword, databaseUrl, bootstrapApiKey, dataPlaneSharedSecret, publicBaseUrl])
-  .apply(([bucketName, resolvedImageUri, resolvedImageBuildId, resolvedClickhouseUrl, resolvedClickhousePassword, resolvedDatabaseUrl, resolvedBootstrapApiKey, resolvedDataPlaneSharedSecret, resolvedPublicBaseUrl]) =>
+  .all([bucket.bucket, imageUri, imageBuildId, clickhouseUrl, clickhousePassword, databaseUrl, publicBaseUrl])
+  .apply(([bucketName, resolvedImageUri, resolvedImageBuildId, resolvedClickhouseUrl, resolvedClickhousePassword, resolvedDatabaseUrl, resolvedPublicBaseUrl]) =>
     renderQueryUserData({
       bucketName,
-      bootstrapApiKey: resolvedBootstrapApiKey,
       clickhouseDatabase,
       clickhousePassword: resolvedClickhousePassword,
       clickhouseTable,
@@ -1635,11 +1511,10 @@ const queryUserData = pulumi
       region,
       databaseUrl: resolvedDatabaseUrl,
       appBaseUrl,
-      dataPlaneOrganizationId,
-      dataPlaneSharedSecret: resolvedDataPlaneSharedSecret,
       publicBaseUrl: resolvedPublicBaseUrl,
       corsAllowedOrigins,
-      sessionSecure
+      sessionSecure,
+      sessionSameSite
     })
   )
 
@@ -1664,7 +1539,7 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
           volumeType: 'gp3',
           deleteOnTermination: 'true',
           encrypted: 'true',
-          kmsKeyId: dataPlaneKmsKeyArn
+          kmsKeyId: dataKmsKeyArn
         }
       },
       {
@@ -1677,7 +1552,7 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
             dataVolumeType === 'gp3' ? dataVolumeThroughput : undefined,
           deleteOnTermination: 'true',
           encrypted: 'true',
-          kmsKeyId: dataPlaneKmsKeyArn
+          kmsKeyId: dataKmsKeyArn
         }
       }
     ],
@@ -1713,7 +1588,7 @@ const queryLaunchTemplate = new aws.ec2.LaunchTemplate(
           volumeType: 'gp3',
           deleteOnTermination: 'true',
           encrypted: 'true',
-          kmsKeyId: dataPlaneKmsKeyArn
+          kmsKeyId: dataKmsKeyArn
         }
       }
     ],
@@ -1772,8 +1647,7 @@ export const domainNameOutput = domainName
 export const apiDomainNameOutput = apiDomainName
 export const appBaseUrlOutput = appBaseUrl
 export const apiBaseUrlOutput = apiBaseUrl
-export const dataPlaneOrganizationIdOutput = dataPlaneOrganizationId
-export const dataPlaneKmsKeyArnOutput = dataPlaneKmsKeyArn ?? ''
+export const dataKmsKeyArnOutput = dataKmsKeyArn ?? ''
 export const processorPrefixOutput = processorPrefix
 export const dnsProviderOutput = dnsProvider
 export const edgeTlsModeOutput = edgeTlsMode
@@ -1794,8 +1668,6 @@ export const bucketName = bucket.bucket
 export const objectPrefix = prefix
 export const loaderSqsQueueUrl = loaderQueue.url
 export const loaderSqsQueueArn = loaderQueue.arn
-export const clickhouseModeOutput = clickhouseMode
-export const clickhouseCloudServiceIdOutput = clickhouseCloudServiceId
 export const clickhouseUrlOutput = clickhouseUrl
 export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
@@ -1821,14 +1693,12 @@ export const loginEmailDkimTokens = managedLoginEmailIdentity
 export const loginEmailVerifiedForSending = managedLoginEmailIdentity
   ? managedLoginEmailIdentity.verifiedForSendingStatus
   : false
-export const bootstrapApiKeyOutput = pulumi.secret(bootstrapApiKey)
 export const ecrRepositoryUrl = repository.repositoryUrl
 export const serverImageUri = imageUri
 
 interface UserDataArgs {
   bucketName: string
   adminEmails: string
-  bootstrapApiKey: string
   clickhouseDatabase: string
   clickhouseEventIndexTable: string
   clickhousePassword: string
@@ -1861,20 +1731,18 @@ interface UserDataArgs {
   emailFrom: string
   publicBaseUrl: string
   sessionSecure: boolean
+  sessionSameSite: string
   uploadPollIntervalMs: number
   writerFlushBytes: number
   writerFlushIntervalMs: number
   writerLanes: number
   writerQueueCapacity: number
   compactBatchReceipts: boolean
-  dataPlaneOrganizationId: string
-  dataPlaneSharedSecret: string
   processorPrefix: string
 }
 
 interface QueryUserDataArgs {
   bucketName: string
-  bootstrapApiKey: string
   clickhouseDatabase: string
   clickhousePassword: string
   clickhouseTable: string
@@ -1889,11 +1757,10 @@ interface QueryUserDataArgs {
   region: string
   databaseUrl: string
   appBaseUrl: string
-  dataPlaneOrganizationId: string
-  dataPlaneSharedSecret: string
   publicBaseUrl: string
   corsAllowedOrigins: string
   sessionSecure: boolean
+  sessionSameSite: string
 }
 
 function renderUserData (args: UserDataArgs): string {
@@ -1983,12 +1850,10 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e PORT=${args.port} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
-  -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
-  -e NANOTRACE_DATA_PLANE_ORGANIZATION_ID=${shellQuote(args.dataPlaneOrganizationId)} \\
-  -e NANOTRACE_DATA_PLANE_SHARED_SECRET=${shellQuote(args.dataPlaneSharedSecret)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
+  -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
   -e NANOTRACE_EMAIL_FROM=${shellQuote(args.emailFrom)} \\
   -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
   -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
@@ -2090,12 +1955,10 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -e PORT=${args.port} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
-  -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
-  -e NANOTRACE_DATA_PLANE_ORGANIZATION_ID=${shellQuote(args.dataPlaneOrganizationId)} \\
-  -e NANOTRACE_DATA_PLANE_SHARED_SECRET=${shellQuote(args.dataPlaneSharedSecret)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
+  -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
@@ -2132,6 +1995,35 @@ function requireConfigOrEnv (configKey: string, envKey: string): string {
   return value
 }
 
+function hashDirectory (directory: string): string {
+  const hash = createHash('sha256')
+  for (const file of listFiles(directory)) {
+    const relative = path.relative(repoRoot, file)
+    hash.update(relative)
+    hash.update('\0')
+    hash.update(readFileSync(file))
+    hash.update('\0')
+  }
+  return hash.digest('hex')
+}
+
+function listFiles (directory: string): string[] {
+  const entries = readdirSync(directory)
+    .filter(entry => entry !== 'dist' && entry !== 'node_modules')
+    .sort()
+  const files: string[] = []
+  for (const entry of entries) {
+    const absolute = path.join(directory, entry)
+    const stat = statSync(absolute)
+    if (stat.isDirectory()) {
+      files.push(...listFiles(absolute))
+    } else if (stat.isFile()) {
+      files.push(absolute)
+    }
+  }
+  return files
+}
+
 function normalizeDomainName (value: string): string {
   const normalized = value.trim().replace(/\.$/, '')
   if (!normalized || normalized.includes('/') || normalized.includes(':')) {
@@ -2160,50 +2052,10 @@ function cloudflareRecordName (recordName: string, zoneName: string): string {
   return recordName.slice(0, -suffix.length)
 }
 
-function normalizeClickhouseMode (value: string): 'shared-service' | 'dedicated-service' | 'external' {
-  const normalized = value.trim()
-  if (
-    normalized === 'shared-service' ||
-    normalized === 'dedicated-service' ||
-    normalized === 'external'
-  ) {
-    return normalized
-  }
-  throw new Error(
-    'NANOTRACE_CLICKHOUSE_MODE must be shared-service, dedicated-service, or external'
-  )
-}
-
-function clickhouseDatabaseName (organizationId: string): string {
-  const normalized = organizationId
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-  if (!normalized) {
-    return 'observatory'
-  }
-  return /^[a-z_]/.test(normalized)
-    ? normalized
-    : `org_${normalized}`
-}
-
 function numberEnv (key: string, fallback: number): number {
   const value = process.env[key]
   if (!value) {
     return fallback
-  }
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`${key} must be a positive number`)
-  }
-  return parsed
-}
-
-function optionalNumberEnv (key: string): number | undefined {
-  const value = process.env[key]
-  if (!value) {
-    return undefined
   }
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -2231,36 +2083,6 @@ function booleanEnv (key: string, fallback: boolean): boolean {
     default:
       throw new Error(`${key} must be a boolean`)
   }
-}
-
-function parseClickhouseIpAccess (
-  value: string
-): { source: string; description?: string }[] {
-  const entries = value
-    .split(',')
-    .map(entry => entry.trim())
-    .filter(Boolean)
-  if (entries.length === 0) {
-    throw new Error('ClickHouse Cloud IP access list must not be empty')
-  }
-  return entries.map(entry => {
-    const [source, description] = entry.split(':', 2)
-    if (!source) {
-      throw new Error(`Invalid ClickHouse Cloud IP access entry: ${entry}`)
-    }
-    return {
-      source,
-      description: description || `Nanotrace access ${source}`
-    }
-  })
-}
-
-function formatClickhouseIpAccess (
-  entries: { source: string; description?: string }[]
-): string {
-  return entries
-    .map(entry => `${entry.source}:${entry.description ?? ''}`)
-    .join(',')
 }
 
 function nonNegativeNumberEnv (key: string, fallback: number): number {

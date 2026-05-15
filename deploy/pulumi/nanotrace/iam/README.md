@@ -1,8 +1,8 @@
 # Nanotrace IAM Policies
 
 These policies support the Pulumi EC2/EBS/S3/SQS/ECR/RDS/KMS deployment in
-`deploy/pulumi/nanotrace`. ClickHouse Cloud service creation is handled by the
-ClickHouse Cloud API credentials, not AWS IAM.
+`deploy/pulumi/nanotrace`. ClickHouse Cloud is expected to exist before deploy;
+Pulumi only applies the Nanotrace schema to it.
 
 - `bootstrap.json`: for an administrator to create and attach the Nanotrace
   deploy identities and managed policies.
@@ -44,5 +44,5 @@ refresh:
 
 `deploy-storage.json` also includes Nanotrace-scoped KMS key and alias
 management. These permissions are needed only when the stack is configured with
-`createDataPlaneKmsKey=true`; otherwise the deployment can run with existing
-AWS-managed/default encryption or a provided `dataPlaneKmsKeyArn`.
+`createDataKmsKey=true`; otherwise the deployment can run with existing
+AWS-managed/default encryption or a provided `dataKmsKeyArn`.

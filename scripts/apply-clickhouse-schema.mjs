@@ -19,6 +19,7 @@ const hotDimensionsTable = identifier(
     "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
 );
 const schemaPath = path.resolve(root, process.env.CLICKHOUSE_SCHEMA_PATH || "deploy/clickhouse/schema.sql");
+const defaultTenantId = process.env.NANOTRACE_DEFAULT_TENANT_ID || "org_default";
 
 const eventTableToken = "__NANOTRACE_EVENTS_TABLE__";
 const facetsTableToken = "__NANOTRACE_EVENT_FACETS_TABLE__";
@@ -35,9 +36,17 @@ const schema = readFileSync(schemaPath, "utf8")
     .replaceAll(hotDimensionsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(hotDimensionsTable)}`);
 
 await query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(database)}`);
+const tenantMigrations = [
+    await renameTenantlessTable(database, facetsTable, ["tenant_id"], "tenant_id"),
+    await renameTenantlessTable(database, eventIndexTable, ["tenant_id"], "tenant_id"),
+    await renameTenantlessTable(database, hotDimensionsTable, ["tenant_id"], "tenant_id"),
+].filter(Boolean);
 await recreateLegacyFacetTable(database, facetsTable);
 for (const statement of splitStatements(schema)) {
     await query(statement);
+}
+for (const migration of tenantMigrations) {
+    await copyTenantlessRows(migration);
 }
 for (const statement of compatibilityAlters(database, table)) {
     await query(statement);
@@ -137,6 +146,70 @@ async function recreateLegacyFacetTable(database, table) {
     }
 
     await query(`DROP TABLE ${quoteIdentifier(database)}.${quoteIdentifier(table)}`);
+}
+
+async function renameTenantlessTable(database, table, requiredColumns, requiredSortingKeyFragment) {
+    const row = (
+        await queryText(
+            `SELECT engine, sorting_key FROM system.tables WHERE database = ${sqlString(database)} AND name = ${sqlString(table)} FORMAT TabSeparated`,
+        )
+    ).trim();
+    if (!row) {
+        return null;
+    }
+    const [engine, sortingKey = ""] = row.split("\t");
+    if (!engine) {
+        return null;
+    }
+    const missingColumns = [];
+    for (const column of requiredColumns) {
+        const count = Number(
+            (
+                await queryText(
+                    `SELECT count() FROM system.columns WHERE database = ${sqlString(database)} AND table = ${sqlString(table)} AND name = ${sqlString(column)} FORMAT TabSeparated`,
+                )
+            ).trim(),
+        );
+        if (count === 0) {
+            missingColumns.push(column);
+        }
+    }
+    const hasRequiredSortingKey = sortingKey
+        .split(",")
+        .map((part) => part.trim().replaceAll("`", "").replace(/^[()]+|[()]+$/g, ""))
+        .includes(requiredSortingKeyFragment);
+    if (missingColumns.length === 0 && hasRequiredSortingKey) {
+        return null;
+    }
+
+    const legacyTable = `${table}_legacy_${Date.now()}`;
+    await query(
+        `RENAME TABLE ${quoteIdentifier(database)}.${quoteIdentifier(table)} TO ${quoteIdentifier(database)}.${quoteIdentifier(legacyTable)}`,
+    );
+    return { database, table, legacyTable };
+}
+
+async function copyTenantlessRows({ database, table, legacyTable }) {
+    const target = `${quoteIdentifier(database)}.${quoteIdentifier(table)}`;
+    const source = `${quoteIdentifier(database)}.${quoteIdentifier(legacyTable)}`;
+    const tenant = sqlString(defaultTenantId);
+    if (table === facetsTable) {
+        await query(
+            `INSERT INTO ${target} (tenant_id, bucket_time, key, value, value_type, count, error_count)
+             SELECT ${tenant}, bucket_time, key, value, value_type, count, error_count FROM ${source}`,
+        );
+    } else if (table === eventIndexTable) {
+        await query(
+            `INSERT INTO ${target} (tenant_id, key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms)
+             SELECT ${tenant}, key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms FROM ${source}`,
+        );
+    } else if (table === hotDimensionsTable) {
+        await query(
+            `INSERT INTO ${target} (tenant_id, path, value_type, status, display_name, source, created_at, updated_at, created_by, error)
+             SELECT ${tenant}, path, value_type, status, display_name, source, created_at, updated_at, created_by, error FROM ${source}`,
+        );
+    }
+    await query(`DROP TABLE ${source}`);
 }
 
 function splitStatements(sql) {

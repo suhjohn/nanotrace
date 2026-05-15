@@ -1,12 +1,12 @@
 import { Link, Outlet, createRootRoute, useRouterState } from '@tanstack/react-router'
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-import { BarChart3, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle, UsersRound } from 'lucide-react'
+import { BarChart3, Columns3, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
 import { useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../lib/cn'
 import { AppShellProvider } from '../lib/app-shell'
-import { queryHeaders, selectedOrganizationId, setSelectedOrganizationId } from '../lib/nanotrace-api'
+import { nanotraceApiBaseUrl, queryHeaders } from '../lib/nanotrace-api'
 
 export const Route = createRootRoute({
   component: RootDocument,
@@ -39,7 +39,7 @@ function RootDocument() {
 }
 
 function AuthGate({ children }: { children: ReactNode }) {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const authQuery = useQuery({
     queryKey: ['auth', observatoryUrl, 'me'],
     queryFn: () => fetchAuthMe({ apiBaseUrl: observatoryUrl }),
@@ -82,7 +82,7 @@ function AuthErrorScreen({ error, onRetry }: { error: unknown; onRetry: () => vo
 }
 
 function SignInScreen() {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const queryClient = useQueryClient()
   const [loginEmail, setLoginEmail] = useState('')
   const [loginSent, setLoginSent] = useState(false)
@@ -144,8 +144,8 @@ function SignInScreen() {
 function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: state => state.location.pathname })
   const isDashboard = pathname.startsWith('/dashboard')
+  const isFacets = pathname.startsWith('/facets')
   const isApiKeys = pathname.startsWith('/settings/api-keys')
-  const isOrganizations = pathname.startsWith('/settings/organizations')
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
   return (
@@ -163,9 +163,9 @@ function AppShell({ children }: { children: ReactNode }) {
               <PanelLeftClose size={16} strokeWidth={1.8} />
             </button>
             <nav className="flex flex-1 flex-col gap-1">
-              <NavItem active={!isDashboard && !isApiKeys && !isOrganizations} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
+              <NavItem active={!isDashboard && !isFacets && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
               <NavItem active={isDashboard} label="Dashboard" to="/dashboard" icon={<BarChart3 size={17} strokeWidth={1.8} />} />
-              <NavItem active={isOrganizations} label="Organizations" to="/settings/organizations" icon={<UsersRound size={17} strokeWidth={1.8} />} />
+              <NavItem active={isFacets} label="Facets" to="/facets" icon={<Columns3 size={17} strokeWidth={1.8} />} />
               <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
             </nav>
             <AccountControl />
@@ -181,21 +181,12 @@ type AuthIdentity = {
   auth_type: 'api_key' | 'session'
   email?: string
   name?: string
-  organization_id: string
-  organization_name: string
   role: 'admin' | 'service' | 'viewer'
   subject: string
 }
 
-type OrganizationRecord = {
-  id: string
-  name: string
-  slug: string
-  plan: string
-}
-
 function AccountControl() {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const authQuery = useQuery({
@@ -204,15 +195,6 @@ function AccountControl() {
     retry: false
   })
   const currentUser = authQuery.data ?? null
-  const organizationsQuery = useQuery({
-    enabled: Boolean(currentUser),
-    queryKey: ['organizations', observatoryUrl, currentUser?.organization_id],
-    queryFn: () => fetchOrganizations({ apiBaseUrl: observatoryUrl }),
-    retry: false
-  })
-  const organizations = organizationsQuery.data?.organizations ?? []
-  const currentOrganizationId = selectedOrganizationId() || currentUser?.organization_id || ''
-  const currentOrganization = organizations.find(organization => organization.id === currentOrganizationId)
   const authLabel = currentUser?.email || currentUser?.name || currentUser?.subject || ''
   const accountInitial = identityInitial(authLabel || 'user')
 
@@ -235,7 +217,7 @@ function AccountControl() {
           'flex w-full items-center gap-2 border border-neutral-800 bg-black p-2 text-left text-[11px] font-medium text-neutral-400 hover:bg-white/[0.04] hover:text-white',
           open && 'border-neutral-700 text-white'
         )}
-        title={currentUser ? `${authLabel} (${currentUser.role}) in ${currentOrganization?.name || currentUser.organization_name}` : 'Sign in'}
+        title={currentUser ? `${authLabel} (${currentUser.role})` : 'Sign in'}
         type="button"
         onClick={() => {
           setOpen(value => !value)
@@ -245,7 +227,7 @@ function AccountControl() {
           {currentUser ? accountInitial : <UserCircle size={17} strokeWidth={1.8} />}
         </span>
         <span className="min-w-0">
-          <span className="block truncate text-[12px] text-neutral-200">{currentOrganization?.name || currentUser?.organization_name || 'Organization'}</span>
+          <span className="block truncate text-[12px] text-neutral-200">{authLabel || 'Account'}</span>
           <span className="block truncate text-[10px] text-neutral-600">{authLabel || 'Sign in'}</span>
         </span>
       </button>
@@ -256,25 +238,6 @@ function AccountControl() {
               <div className="truncate text-[12px] text-white">{authLabel}</div>
               <div className="text-[11px] text-neutral-600">{currentUser.role}</div>
             </div>
-            {organizations.length > 0 ? (
-              <label className="grid gap-1 px-2 text-[11px] text-neutral-500">
-                Organization
-                <select
-                  className="h-8 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none focus:border-neutral-600"
-                  value={currentOrganizationId}
-                  onChange={event => {
-                    setSelectedOrganizationId(event.target.value)
-                    void queryClient.invalidateQueries()
-                  }}
-                >
-                  {organizations.map(organization => (
-                    <option key={organization.id} value={organization.id}>
-                      {organization.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : null}
             <button
               className="inline-flex h-8 items-center gap-2 border border-neutral-800 bg-black px-2 text-left text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
               type="button"
@@ -288,19 +251,6 @@ function AccountControl() {
       ) : null}
     </div>
   )
-}
-
-async function fetchOrganizations({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ organizations: OrganizationRecord[] }> {
-  const response = await fetch(organizationsUrl(apiBaseUrl), {
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'GET'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new Error(text || response.statusText)
-  }
-  return (await response.json()) as { organizations: OrganizationRecord[] }
 }
 
 async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthIdentity> {
@@ -345,11 +295,6 @@ function authUrl(apiBaseUrl: string, path: string) {
   return base ? `${base}/auth${path}` : `/auth${path}`
 }
 
-function organizationsUrl(apiBaseUrl: string) {
-  const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/organizations` : '/organizations'
-}
-
 function identityInitial(label: string) {
   const trimmed = label.trim()
   return (trimmed[0] || '?').toUpperCase()
@@ -382,7 +327,7 @@ function NavItem({
   active: boolean
   icon: ReactNode
   label: string
-  to: '/' | '/dashboard' | '/settings/api-keys' | '/settings/organizations'
+  to: '/' | '/dashboard' | '/facets' | '/settings/api-keys'
 }) {
   return (
     <Link

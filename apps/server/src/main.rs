@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .map(Arc::new);
     let aws_config = aws_config::load_from_env().await;
-    let s3 = aws_sdk_s3::Client::new(&aws_config);
+    let s3 = s3_client(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let upload_processors = match cfg.s3_bucket.clone() {
         Some(bucket) => ProcessorRuntime::start(
@@ -105,6 +105,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.flush().await?;
 
     Ok(())
+}
+
+fn s3_client(config: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
+    let mut builder = aws_sdk_s3::config::Builder::from(config);
+    if env_bool("AWS_S3_FORCE_PATH_STYLE") || env_bool("AWS_S3_PATH_STYLE") {
+        builder.set_force_path_style(Some(true));
+    }
+    aws_sdk_s3::Client::from_conf(builder.build())
+}
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 async fn shutdown_signal() {

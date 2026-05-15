@@ -1,14 +1,27 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Check, Columns3, KeyRound, LogOut, PanelLeftOpen, Plus, Trash2, UserCircle, X } from 'lucide-react'
+import { Calendar as CalendarIcon, Check, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
+import { format } from 'date-fns'
+import type { DateRange } from 'react-day-picker'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { JsonObject, JsonValue } from '../lib/json'
 import { clamp, useCookieState, useIndexedDbState } from '../lib/hooks'
 import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
-import { queryHeaders, runtimeNanotraceApiKey } from '../lib/nanotrace-api'
+import { Calendar } from '../components/ui/calendar'
+import { Popover, PopoverContent, PopoverTrigger } from '../components/ui/popover'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
+import {
+  HTTPError,
+  errorMessage,
+  fetchFacets,
+  nanotraceApiBaseUrl,
+  queryHeaders,
+  runtimeNanotraceApiKey
+} from '../lib/nanotrace-api'
+import type { FacetListResponse, HotFacet } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/')({
   validateSearch: parseObservatorySearch,
@@ -116,19 +129,6 @@ type GroupOption = {
   removable?: boolean
   source?: string
   valueType?: string
-}
-
-type HotFacet = {
-  display_name: string
-  path: string
-  removable: boolean
-  source: string
-  status: string
-  value_type: string
-}
-
-type FacetListResponse = {
-  facets: HotFacet[]
 }
 
 type AuthIdentity = {
@@ -276,6 +276,73 @@ function dateTimeLocalInputToIso(value: string) {
   return Number.isFinite(time) ? new Date(time).toISOString() : undefined
 }
 
+function timePartFromLocalInput(value: string) {
+  const match = value.match(/T(\d{2}:\d{2})/)
+  return match?.[1] ?? '00:00'
+}
+
+function dateRangeFromLocalInputs(start: string, end: string): DateRange | undefined {
+  const from = localDateOnly(start)
+  const to = localDateOnly(end)
+  if (!from && !to) return undefined
+  return { from: from ?? to, to: to ?? from }
+}
+
+function localDateOnly(value: string) {
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) return undefined
+  const date = new Date(parsed)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+function localMonthOnly(value: string) {
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) return undefined
+  const date = new Date(parsed)
+  return new Date(date.getFullYear(), date.getMonth(), 1)
+}
+
+function combineLocalDateAndTime(date: Date, time: string) {
+  const [hours = '0', minutes = '0'] = time.split(':')
+  const next = new Date(date)
+  next.setHours(Number(hours) || 0, Number(minutes) || 0, 0, 0)
+  return formatDateTimeLocalInput(next)
+}
+
+function timePartsFromLocalTime(value: string) {
+  const [hourValue = '0', minuteValue = '0'] = value.split(':')
+  const hour24 = Number(hourValue) || 0
+  const minute = clamp(Number(minuteValue) || 0, 0, 59)
+  const period = hour24 >= 12 ? 'PM' : 'AM'
+  const hour12 = hour24 % 12 || 12
+  return {
+    hour: String(hour12).padStart(2, '0'),
+    minute: String(minute).padStart(2, '0'),
+    period
+  }
+}
+
+function localTimeFromParts(hour: string, minute: string, period: string) {
+  let hourNumber = clamp(Number(hour) || 12, 1, 12)
+  const minuteNumber = clamp(Number(minute) || 0, 0, 59)
+  if (period === 'PM' && hourNumber < 12) hourNumber += 12
+  if (period === 'AM' && hourNumber === 12) hourNumber = 0
+  return `${String(hourNumber).padStart(2, '0')}:${String(minuteNumber).padStart(2, '0')}`
+}
+
+function normalizeTimeSegment(value: string, min: number, max: number) {
+  const digits = value.replace(/\D/g, '')
+  if (!digits) return String(min).padStart(2, '0')
+  return String(clamp(Number(digits) || min, min, max)).padStart(2, '0')
+}
+
+function customRangeLabel(start: string, end: string) {
+  const startDate = new Date(start)
+  const endDate = new Date(end)
+  if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime())) return 'Custom'
+  return `${format(startDate, 'MMM d HH:mm')} - ${format(endDate, 'MMM d HH:mm')}`
+}
+
 function getJsonValueType(value: JsonValue) {
   if (value === null) return 'null'
   if (Array.isArray(value)) return 'array'
@@ -291,9 +358,8 @@ export function ObservatoryHome({
   routeSelection?: RouteSelection
   selectedEventId: string
 }) {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [runsWidth, setRunsWidth] = useCookieState({
     cookieName: 'observatory-ui-runs-width',
@@ -333,8 +399,6 @@ export function ObservatoryHome({
   const [highlightedEventIds, setHighlightedEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
-  const [facetDraft, setFacetDraft] = useState('')
-  const [facetValueType, setFacetValueType] = useState('string')
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
@@ -356,31 +420,6 @@ export function ObservatoryHome({
   const groupOptionsQuery = useQuery({
     queryKey: ['logs', observatoryUrl, 'group-options'],
     queryFn: () => fetchGroupOptions({ apiBaseUrl: observatoryUrl, limit: 120 })
-  })
-  const invalidateGroupOptions = () => queryClient.invalidateQueries({ queryKey: ['logs', observatoryUrl, 'group-options'] })
-  const addFacetMutation = useMutation({
-    mutationFn: () =>
-      putFacet({
-        apiBaseUrl: observatoryUrl,
-        path: facetDraft,
-        valueType: facetValueType
-      }),
-    onSuccess: async facet => {
-      setFacetDraft('')
-      setFacetValueType('string')
-      setManualGroupBy(facet.display_name || displayFacetPath(facet.path))
-      await invalidateGroupOptions()
-    }
-  })
-  const removeFacetMutation = useMutation({
-    mutationFn: (path: string) => deleteFacet({ apiBaseUrl: observatoryUrl, path }),
-    onSuccess: async (_facet, path) => {
-      if (facetKey(groupBy) === path) {
-        setManualGroupBy('')
-        void navigate({ search: {}, to: '/' })
-      }
-      await invalidateGroupOptions()
-    }
   })
   const groupOptions = groupOptionsQuery.data?.fields ?? []
   const activeFacetPaths = useMemo(() => {
@@ -404,10 +443,8 @@ export function ObservatoryHome({
         : groupOptions,
     [groupBy, groupOptions]
   )
-  const customGroupOptions = displayedGroupOptions.filter(option => option.removable)
   const selectedGroupOption = displayedGroupOptions.find(option => option.path === groupBy) ?? null
   const groupByLabel = selectedGroupOption ? groupOptionLabel(selectedGroupOption) : groupBy
-  const facetMutationError = errorMessage(addFacetMutation.error) || errorMessage(removeFacetMutation.error)
   const selectedGroupValue = routeSelection?.field === groupBy ? routeSelection.value : ''
   const selectedTimeRange = useMemo(
     () =>
@@ -566,7 +603,7 @@ export function ObservatoryHome({
         }
       : null
   const flamegraph = flamegraphQuery.data ?? emptyFlamegraph
-  const listError = errorMessage(groupOptionsQuery.error) || errorMessage(groupsQuery.error) || facetMutationError
+  const listError = errorMessage(groupOptionsQuery.error) || errorMessage(groupsQuery.error)
   const traceError =
     (!hasEventQuery && needsLatest ? errorMessage(latestQuery.error) : '') ||
     errorMessage(summaryQuery.error) ||
@@ -575,6 +612,9 @@ export function ObservatoryHome({
   const loadingList = groupOptionsQuery.isPending || (Boolean(groupBy) && groupsQuery.isPending)
   const emptyObservatory = !loadingList && !listError && groupOptions.length === 0
   const emptyGroup = !loadingList && !listError && Boolean(groupBy) && !groupSearch && groupOptions.length > 0 && traceList.length === 0
+  const emptyGroupLabel = selectedGroupOption?.removable
+    ? 'No indexed values. Manage or backfill this group on the Facets page.'
+    : 'No groups found.'
   const waitingForLatest = Boolean(needsLatest && latestQuery.isPending && !hasEventQuery)
   const waitingForSummary = Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.isPending)
   const loadingGraph =
@@ -673,6 +713,13 @@ export function ObservatoryHome({
     setCustomRangeEnd(value)
     setTimeRangeKey('custom')
     applyRangeFilter(resolveTimeRange({ customEnd: value, customStart: customRangeStart, key: 'custom' }))
+  }
+
+  function setCustomRange(start: string, end: string) {
+    setCustomRangeStart(start)
+    setCustomRangeEnd(end)
+    setTimeRangeKey('custom')
+    applyRangeFilter(resolveTimeRange({ customEnd: end, customStart: start, key: 'custom' }))
   }
 
   function applyEventFilter() {
@@ -807,7 +854,7 @@ export function ObservatoryHome({
   const inspectedEvent = eventPayloadQuery.data?.event ?? (eventPayloadQuery.isFetching ? null : selectedEvent)
   const inspectorPayload = inspectedEvent
     ? {
-        title: `${String(inspectedEvent.data.type || 'event')} event`,
+        title: `${eventName(inspectedEvent.data)} event`,
         value: inspectedEvent as unknown as JsonValue
       }
     : null
@@ -1031,23 +1078,26 @@ export function ObservatoryHome({
         </form>
         <label className="flex shrink-0 items-center gap-1.5">
           <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Group</span>
-          <select
-            aria-label="Group by"
-            className="h-7 w-[132px] min-w-0 border border-neutral-800 bg-black px-1.5 text-[11px] text-white outline-none focus:border-neutral-600"
+          <Select
             value={groupBy || noGroupValue}
-            onChange={event => {
-              setManualGroupBy(event.target.value)
+            onValueChange={value => {
+              setManualGroupBy(value)
               setFilter('')
               void navigate({ search: {}, to: '/' })
             }}
           >
-            <option value={noGroupValue}>No grouping</option>
-            {displayedGroupOptions.map(option => (
-              <option key={option.path} value={option.path}>
-                {groupOptionLabel(option)}
-              </option>
-            ))}
-          </select>
+            <SelectTrigger aria-label="Group by" className="w-[150px]">
+              <SelectValue placeholder="Group" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={noGroupValue}>No grouping</SelectItem>
+              {displayedGroupOptions.map(option => (
+                <SelectItem key={option.path} value={option.path}>
+                  {groupOptionLabel(option)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </label>
         <div className="ml-auto flex shrink-0 items-center justify-end gap-1.5">
           <div className="flex overflow-hidden border border-neutral-800 bg-black">
@@ -1064,40 +1114,13 @@ export function ObservatoryHome({
                 {option.label}
               </button>
             ))}
-            <button
-              className={cn(
-                'h-7 border-l border-neutral-800 px-1.5 text-[10px] text-neutral-400 hover:bg-white/[0.04] hover:text-white',
-                timeRangeKey === 'custom' && 'bg-neutral-800 text-white'
-              )}
-              type="button"
-              onClick={() => selectTimeRange('custom')}
-            >
-              Custom
-            </button>
+            <CustomTimeRangePicker
+              active={timeRangeKey === 'custom'}
+              end={customRangeEnd}
+              start={customRangeStart}
+              onApply={setCustomRange}
+            />
           </div>
-          {timeRangeKey === 'custom' ? (
-            <div className="flex items-center gap-1">
-              <input
-                aria-label="Custom range start"
-                className="h-7 w-[140px] border border-neutral-800 bg-black px-1.5 text-[10px] text-white outline-none"
-                type="datetime-local"
-                value={customRangeStart}
-                onChange={event => {
-                  setCustomStartRange(event.target.value)
-                }}
-              />
-              <span className="text-[11px] text-neutral-600">to</span>
-              <input
-                aria-label="Custom range end"
-                className="h-7 w-[140px] border border-neutral-800 bg-black px-1.5 text-[10px] text-white outline-none"
-                type="datetime-local"
-                value={customRangeEnd}
-                onChange={event => {
-                  setCustomEndRange(event.target.value)
-                }}
-              />
-            </div>
-          ) : null}
         </div>
       </header>
       {listError ? (
@@ -1115,8 +1138,9 @@ export function ObservatoryHome({
           <aside className={cn(panelClass, 'border-r border-neutral-800')} style={{ width: runsWidth, minWidth: runsWidth, maxWidth: runsWidth }}>
           <div className="grid gap-2 border-b border-neutral-800 bg-black/30 px-2 py-2">
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="truncate text-[12px] font-medium text-white">{groupByLabel || 'Groups'}</div>
+              <div className="min-w-0 truncate text-[12px] font-medium text-white">{groupByLabel || 'Groups'}</div>
+              <div className="shrink-0 text-[11px] text-neutral-600">
+                {loadingList ? 'loading' : `${traceList.length} values`}
               </div>
             </div>
             {traceList.length > 0 || filter ? (
@@ -1125,7 +1149,7 @@ export function ObservatoryHome({
                 className="h-7 w-full min-w-0 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
                 value={filter}
                 onChange={event => setFilter(event.target.value)}
-                placeholder="exact group value..."
+                placeholder={`exact ${groupByLabel || 'group'} value...`}
               />
             ) : null}
           </div>
@@ -1178,7 +1202,7 @@ export function ObservatoryHome({
                 </div>
               ) : null}
               {emptyObservatory ? <EmptyState label="No observations yet." /> : null}
-              {emptyGroup ? <EmptyState label="No groups found." /> : null}
+              {emptyGroup ? <EmptyState label={emptyGroupLabel} /> : null}
               {emptyFilter ? <EmptyState label="No exact group match." /> : null}
               {groupsQuery.hasNextPage || groupsQuery.isFetchingNextPage ? (
                 <div ref={groupLoadMoreRef} className="px-3 py-3 text-center text-[11px] text-neutral-600">
@@ -1448,7 +1472,7 @@ function mergeSpanRecords(events: TraceEvent[]) {
   const passthrough: TraceEvent[] = []
 
   for (const event of events) {
-    const type = stringField(event.data.type)
+    const type = stringField(event.data.event_type)
     const spanId = stringField(event.data.spanId)
     if (spanId && (type === 'span_start' || type === 'span_end')) {
       const span = spans.get(spanId) ?? {}
@@ -1612,88 +1636,194 @@ function identityInitial(label: string) {
   return (trimmed[0] || '?').toUpperCase()
 }
 
-function FacetMenu({
-  customGroupOptions,
-  facetDraft,
-  facetValueType,
-  mutating,
-  onAdd,
-  onFacetDraft,
-  onFacetValueType,
-  onRemove
+function CustomTimeRangePicker({
+  active,
+  end,
+  onApply,
+  start
 }: {
-  customGroupOptions: GroupOption[]
-  facetDraft: string
-  facetValueType: string
-  mutating: boolean
-  onAdd: () => void
-  onFacetDraft: (value: string) => void
-  onFacetValueType: (value: string) => void
-  onRemove: (path: string) => void
+  active: boolean
+  end: string
+  onApply: (start: string, end: string) => void
+  start: string
 }) {
+  const [open, setOpen] = useState(false)
+  const [draftStartDate, setDraftStartDate] = useState<Date | undefined>(() => localDateOnly(start))
+  const [draftEndDate, setDraftEndDate] = useState<Date | undefined>(() => localDateOnly(end))
+  const [draftStartMonth, setDraftStartMonth] = useState<Date>(() => localMonthOnly(start) ?? new Date())
+  const [draftEndMonth, setDraftEndMonth] = useState<Date>(() => localMonthOnly(end) ?? new Date())
+  const [draftStartTime, setDraftStartTime] = useState(() => timePartFromLocalInput(start))
+  const [draftEndTime, setDraftEndTime] = useState(() => timePartFromLocalInput(end))
+
+  useEffect(() => {
+    if (!open) return
+    const nextStartDate = localDateOnly(start)
+    const nextEndDate = localDateOnly(end)
+    setDraftStartDate(nextStartDate)
+    setDraftEndDate(nextEndDate)
+    setDraftStartMonth(localMonthOnly(start) ?? nextStartDate ?? new Date())
+    setDraftEndMonth(localMonthOnly(end) ?? nextEndDate ?? new Date())
+    setDraftStartTime(timePartFromLocalInput(start))
+    setDraftEndTime(timePartFromLocalInput(end))
+  }, [end, open, start])
+
+  const rangeLabel = customRangeLabel(start, end)
+  const canApply = Boolean(draftStartDate && draftEndDate && draftStartTime && draftEndTime)
+
+  function applyDraft() {
+    if (!draftStartDate || !draftEndDate) return
+    const nextStart = combineLocalDateAndTime(draftStartDate, draftStartTime)
+    const nextEnd = combineLocalDateAndTime(draftEndDate, draftEndTime)
+    onApply(nextStart, nextEnd)
+    setOpen(false)
+  }
+
   return (
-    <div className="grid gap-2 border-b border-neutral-800 pb-2">
-      <div className="flex items-center justify-between gap-2 px-2">
-        <div className="inline-flex items-center gap-1.5 text-[12px] text-white">
-          <Columns3 size={13} strokeWidth={1.8} />
-          Facets
-        </div>
-        <span className="text-[11px] text-neutral-600">{customGroupOptions.length} custom</span>
-      </div>
-      <div className="grid grid-cols-[1fr_76px_auto] gap-1.5">
-        <input
-          className="h-8 min-w-0 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
-          value={facetDraft}
-          onChange={event => onFacetDraft(event.target.value)}
-          placeholder="path.to.field"
-        />
-        <select
-          aria-label="Facet type"
-          className="h-8 border border-neutral-800 bg-black px-1.5 text-[12px] text-white outline-none focus:border-neutral-600"
-          value={facetValueType}
-          onChange={event => onFacetValueType(event.target.value)}
-        >
-          <option value="string">string</option>
-          <option value="low_cardinality_string">low card</option>
-          <option value="integer">int</option>
-          <option value="unsigned">uint</option>
-          <option value="float">float</option>
-          <option value="bool">bool</option>
-          <option value="datetime">date</option>
-        </select>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <button
-          aria-label="Add facet"
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white disabled:text-neutral-700"
-          disabled={!facetDraft.trim() || mutating}
-          title="Add facet"
+          className={cn(
+            'inline-flex h-7 items-center gap-1.5 border-l border-neutral-800 px-1.5 text-[10px] text-neutral-400 hover:bg-white/[0.04] hover:text-white',
+            active && 'bg-neutral-800 text-white'
+          )}
           type="button"
-          onClick={onAdd}
         >
-          <Plus size={14} strokeWidth={1.8} />
+          <CalendarIcon size={12} strokeWidth={1.8} />
+          <span>{active ? rangeLabel : 'Custom'}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-auto p-0">
+        <div className="inline-grid">
+          <div className="grid grid-cols-[276px_276px]">
+            <div className="w-[276px] border-r border-neutral-800">
+              <div className="border-b border-neutral-800 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.08em] text-neutral-500">From</div>
+                <div className="mt-0.5 truncate text-[12px] text-white">{draftStartDate ? format(draftStartDate, 'MMM d, yyyy') : 'Select date'}</div>
+              </div>
+              <Calendar
+                mode="single"
+                month={draftStartMonth}
+                selected={draftStartDate}
+                onMonthChange={setDraftStartMonth}
+                onSelect={setDraftStartDate}
+              />
+              <div className="border-t border-neutral-800 p-3">
+                <TimeField label="Time" value={draftStartTime} onChange={setDraftStartTime} />
+              </div>
+            </div>
+            <div className="w-[276px]">
+              <div className="border-b border-neutral-800 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.08em] text-neutral-500">To</div>
+                <div className="mt-0.5 truncate text-[12px] text-white">{draftEndDate ? format(draftEndDate, 'MMM d, yyyy') : 'Select date'}</div>
+              </div>
+              <Calendar
+                mode="single"
+                month={draftEndMonth}
+                selected={draftEndDate}
+                onMonthChange={setDraftEndMonth}
+                onSelect={setDraftEndDate}
+              />
+              <div className="border-t border-neutral-800 p-3">
+                <TimeField label="Time" value={draftEndTime} onChange={setDraftEndTime} />
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-1.5 border-t border-neutral-800 p-3">
+            <button
+              className="h-8 border border-neutral-800 bg-black px-3 text-[12px] text-neutral-400 hover:bg-white/[0.04] hover:text-white"
+              type="button"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </button>
+              <button
+                className="h-8 border border-neutral-700 bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700"
+                disabled={!canApply}
+                type="button"
+                onClick={applyDraft}
+              >
+                Apply
+              </button>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function TimeField({
+  label,
+  onChange,
+  value
+}: {
+  label: string
+  onChange: (value: string) => void
+  value: string
+}) {
+  const parts = timePartsFromLocalTime(value)
+  const [draftHour, setDraftHour] = useState(parts.hour)
+  const [draftMinute, setDraftMinute] = useState(parts.minute)
+
+  useEffect(() => {
+    setDraftHour(parts.hour)
+    setDraftMinute(parts.minute)
+  }, [parts.hour, parts.minute])
+
+  function update(next: Partial<typeof parts>) {
+    onChange(localTimeFromParts(next.hour ?? parts.hour, next.minute ?? parts.minute, next.period ?? parts.period))
+  }
+
+  function commitHour(value: string) {
+    const hour = normalizeTimeSegment(value, 1, 12)
+    setDraftHour(hour)
+    update({ hour })
+  }
+
+  function commitMinute(value: string) {
+    const minute = normalizeTimeSegment(value, 0, 59)
+    setDraftMinute(minute)
+    update({ minute })
+  }
+
+  return (
+    <div className="grid gap-1">
+      <span className="text-[11px] text-neutral-500">{label}</span>
+      <div className="grid grid-cols-[1fr_1fr_auto] border border-neutral-800 bg-black">
+        <input
+          aria-label={`${label} hour`}
+          className="h-8 min-w-0 border-r border-neutral-900 bg-transparent px-2 text-center text-[12px] text-white outline-none focus:bg-white/[0.04]"
+          inputMode="numeric"
+          maxLength={2}
+          placeholder="hh"
+          value={draftHour}
+          onChange={event => setDraftHour(event.target.value.replace(/\D/g, '').slice(0, 2))}
+          onBlur={event => commitHour(event.target.value)}
+          onKeyDown={event => {
+            if (event.key === 'Enter') commitHour(event.currentTarget.value)
+          }}
+        />
+        <input
+          aria-label={`${label} minute`}
+          className="h-8 min-w-0 border-r border-neutral-900 bg-transparent px-2 text-center text-[12px] text-white outline-none focus:bg-white/[0.04]"
+          inputMode="numeric"
+          maxLength={2}
+          placeholder="mm"
+          value={draftMinute}
+          onChange={event => setDraftMinute(event.target.value.replace(/\D/g, '').slice(0, 2))}
+          onBlur={event => commitMinute(event.target.value)}
+          onKeyDown={event => {
+            if (event.key === 'Enter') commitMinute(event.currentTarget.value)
+          }}
+        />
+        <button
+          aria-label={`${label} period`}
+          className="h-8 w-11 text-[12px] text-white hover:bg-white/[0.04]"
+          type="button"
+          onClick={() => update({ period: parts.period === 'AM' ? 'PM' : 'AM' })}
+        >
+          {parts.period}
         </button>
       </div>
-      {customGroupOptions.length > 0 ? (
-        <div className="max-h-32 overflow-y-auto border border-neutral-900 bg-black/40">
-          {customGroupOptions.map(option => (
-            <div
-              key={option.path}
-              className="flex h-8 items-center gap-2 border-b border-neutral-900 px-2 text-[11px] text-neutral-300 last:border-b-0"
-            >
-              <span className="min-w-0 flex-1 truncate">{groupOptionLabel(option)}</span>
-              <button
-                aria-label={`Remove ${groupOptionLabel(option)}`}
-                className="inline-flex h-5 w-5 shrink-0 items-center justify-center text-neutral-500 hover:text-white disabled:text-neutral-700"
-                disabled={mutating}
-                title={`Remove ${groupOptionLabel(option)}`}
-                type="button"
-                onClick={() => onRemove(facetKey(option.path))}
-              >
-                <Trash2 size={12} strokeWidth={1.8} />
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : null}
     </div>
   )
 }
@@ -3109,7 +3239,7 @@ function buildFlamegraph(events: TraceEvent[]): Flamegraph {
   const consumed = new Set<string>()
 
   for (const event of events) {
-    const type = stringField(event.data.type)
+    const type = stringField(event.data.event_type)
     if (type === 'span_start' || type === 'span_end') {
       const id = stringField(event.data.spanId) || event.id
       const current = spanCandidates.get(id)
@@ -4095,11 +4225,12 @@ async function fetchEvent({
     // Fall back to /query. Some local deployments do not have S3 reads configured.
   }
 
-  const response = await postQuery<FlamegraphEventRow>({
+  const response = await postQuery<EventRow>({
     apiBaseUrl,
     parameters: { event_id: eventId },
     query: [
-      eventMetadataSelect('e'),
+      'SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.data AS data',
+      ', e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id',
       `FROM ${eventsTable()} AS e`,
       'WHERE event_id = {event_id:String}',
       'ORDER BY timestamp ASC',
@@ -4108,7 +4239,7 @@ async function fetchEvent({
   })
   const row = response.data?.[0]
   if (!row) throw new HTTPError({ message: 'event not found', status: 404 })
-  return { event: rowToFlamegraphEvent(row) }
+  return { event: rowToTraceEvent(row) }
 }
 
 async function postQuery<T>({
@@ -4134,67 +4265,6 @@ async function postQuery<T>({
     })
   }
   return (await response.json()) as ClickHouseResponse<T>
-}
-
-async function fetchFacets({ apiBaseUrl }: { apiBaseUrl: string }): Promise<FacetListResponse> {
-  const response = await fetch(facetsUrl(apiBaseUrl), {
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'GET'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  return (await response.json()) as FacetListResponse
-}
-
-async function putFacet({
-  apiBaseUrl,
-  path,
-  valueType
-}: {
-  apiBaseUrl: string
-  path: string
-  valueType: string
-}): Promise<HotFacet> {
-  const response = await fetch(facetsUrl(apiBaseUrl), {
-    body: JSON.stringify({
-      path: path.trim(),
-      value_type: valueType
-    }),
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'POST'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  const body = (await response.json()) as { facet?: HotFacet }
-  if (!body.facet) throw new HTTPError({ message: 'facet response missing facet', status: 502 })
-  return body.facet
-}
-
-async function deleteFacet({
-  apiBaseUrl,
-  path
-}: {
-  apiBaseUrl: string
-  path: string
-}): Promise<HotFacet> {
-  const response = await fetch(`${facetsUrl(apiBaseUrl)}/${encodeURIComponent(path)}`, {
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'DELETE'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  const body = (await response.json()) as { facet?: HotFacet }
-  if (!body.facet) throw new HTTPError({ message: 'facet response missing facet', status: 502 })
-  return body.facet
 }
 
 async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthIdentity> {
@@ -4293,11 +4363,6 @@ async function revokeApiKey({
 function queryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/query` : '/query'
-}
-
-function facetsUrl(apiBaseUrl: string) {
-  const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/facets` : '/facets'
 }
 
 function eventUrl(apiBaseUrl: string, eventId: string) {
@@ -4482,8 +4547,6 @@ function nanotracePath(path: string) {
       return 'end_time'
     case 'durationMs':
       return 'duration_ms'
-    case 'type':
-      return 'event_type'
     default:
       return normalizedPayloadPath(path)
   }
@@ -4507,8 +4570,6 @@ function displayFacetPath(path: string) {
       return 'endedAt'
     case 'duration_ms':
       return 'durationMs'
-    case 'event_type':
-      return 'type'
     default:
       return path
   }
@@ -4671,8 +4732,7 @@ function rowToFlamegraphEvent(row: FlamegraphEventRow): TraceEvent {
       startedAt,
       start_time: startedAt,
       traceId,
-      trace_id: traceId,
-      type: row.event_type
+      trace_id: traceId
     }),
     ...(endedAt ? compactObject({ endedAt, end_time: endedAt }) : {}),
     ...(durationMs > 0 ? { durationMs, duration_ms: durationMs } : {})
@@ -4711,7 +4771,7 @@ function pageGroupSummary({
 
 function normalizeEventData(row: EventRow): JsonObject {
   const data = cleanJsonObject(row.data)
-  const eventType = stringField(data.event_type) || row.event_type || stringField(data.type)
+  const eventType = stringField(data.event_type) || row.event_type
   const traceId = stringField(data.trace_id) || row.trace_id || stringField(data.traceId)
   const spanId = stringField(data.span_id) || row.span_id || stringField(data.spanId)
   const parentSpanId = stringField(data.parent_span_id) || stringField(data.parentSpanId)
@@ -4721,7 +4781,7 @@ function normalizeEventData(row: EventRow): JsonObject {
 
   return {
     ...data,
-    ...(eventType ? { type: eventType, event_type: eventType } : {}),
+    ...(eventType ? { event_type: eventType } : {}),
     ...(row.signal ? { signal: row.signal } : {}),
     ...(traceId ? { traceId, trace_id: traceId } : {}),
     ...(spanId ? { spanId, span_id: spanId } : {}),
@@ -4769,20 +4829,6 @@ function compactObject(values: Record<string, string | undefined>): JsonObject {
 
 function sqlString(value: string) {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
-}
-
-class HTTPError extends Error {
-  status: number
-
-  constructor({ message, status }: { message: string; status: number }) {
-    super(`${status} ${message}`)
-    this.name = 'HTTPError'
-    this.status = status
-  }
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : error ? String(error) : ''
 }
 
 function formatDateTimeUs(value?: string) {
@@ -4913,7 +4959,7 @@ function pad2(value: number) {
 }
 
 function eventName(data: JsonObject) {
-  return stringField(data.name) || stringField(data.type) || 'event'
+  return stringField(data.name) || stringField(data.event_type) || stringField(data.type) || 'event'
 }
 
 function isErrorEvent(event: TraceEvent) {

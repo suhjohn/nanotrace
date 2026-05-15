@@ -3,7 +3,7 @@ import { Check, Code2, Grip, PanelLeftOpen, Save, Trash2, X } from 'lucide-react
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
-import { queryHeaders } from '../lib/nanotrace-api'
+import { nanotraceApiBaseUrl, queryHeaders } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/dashboard')({
   component: DashboardRoute
@@ -100,7 +100,7 @@ const dashboardGroupOptions = [
 ]
 
 function DashboardRoute() {
-  const observatoryUrl = import.meta.env.VITE_NANOTRACE_URL || ''
+  const observatoryUrl = nanotraceApiBaseUrl()
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [visualizations, setVisualizations] = useState<DashboardVisualization[]>([])
   const [selectedId, setSelectedId] = useState('')
@@ -1199,8 +1199,6 @@ function nanotracePath(path: string) {
       return 'span_id'
     case 'parentSpanId':
       return 'parent_span_id'
-    case 'type':
-      return 'event_type'
     default:
       return normalizedPayloadPath(path)
   }
@@ -1214,8 +1212,6 @@ function displayFacetPath(path: string) {
       return 'spanId'
     case 'parent_span_id':
       return 'parentSpanId'
-    case 'event_type':
-      return 'type'
     default:
       return path
   }
