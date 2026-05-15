@@ -12,13 +12,12 @@ const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../..'
 )
-loadEnvFile(process.env.NANOTRACE_ENV_FILE)
 
 const cfg = new pulumi.Config()
 const awsCfg = new pulumi.Config('aws')
+const usEast1 = new aws.Provider('useast1', { region: 'us-east-1' })
 
-const deploymentId =
-  cfg.get('deploymentId') ?? process.env.NANOTRACE_DEPLOYMENT_ID ?? 'dev'
+const deploymentId = cfg.get('deploymentId') ?? pulumi.getStack()
 const name = cfg.get('name') ?? `nanotrace-${deploymentId}`
 const prefix =
   cfg.get('objectPrefix') ??
@@ -26,14 +25,81 @@ const prefix =
   process.env.NANOTRACE_OBJECT_PREFIX ??
   'events'
 const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, '')
+const dataPlaneOrganizationId =
+  cfg.get('dataPlaneOrganizationId') ??
+  process.env.NANOTRACE_DATA_PLANE_ORGANIZATION_ID ??
+  ''
+const isDataPlaneOnly = dataPlaneOrganizationId.trim() !== ''
+const createLoginEmailResources = !isDataPlaneOnly
+const dataPlaneSharedSecret =
+  cfg.getSecret('dataPlaneSharedSecret') ??
+  pulumi.secret(process.env.NANOTRACE_DATA_PLANE_SHARED_SECRET ?? '')
+const processorPrefix =
+  cfg.get('processorPrefix') ??
+  process.env.PROCESSOR_PREFIX ??
+  (dataPlaneOrganizationId
+    ? `organizations/${dataPlaneOrganizationId}/processors`
+    : 'organizations/org_default/processors')
 const region = awsCfg.get('region') ?? process.env.AWS_REGION ?? 'us-west-1'
+const expectedAwsAccountId =
+  cfg.get('awsAccountId') ??
+  process.env.NANOTRACE_AWS_ACCOUNT_ID ??
+  ''
+if (expectedAwsAccountId) {
+  const caller = await aws.getCallerIdentity({})
+  if (caller.accountId !== expectedAwsAccountId) {
+    throw new Error(
+      `AWS account mismatch: active credentials are for ${caller.accountId}, expected ${expectedAwsAccountId}`
+    )
+  }
+}
 const port = cfg.getNumber('port') ?? 18473
-const clickhouseUrl = cfg.get('clickhouseUrl') ?? requireEnv('CLICKHOUSE_URL')
-const clickhouseUser =
-  cfg.get('clickhouseUser') ?? requireEnv('CLICKHOUSE_USER')
-const clickhousePassword =
-  cfg.getSecret('clickhousePassword') ??
-  pulumi.secret(requireEnv('CLICKHOUSE_PASSWORD'))
+const clickhouseMode = normalizeClickhouseMode(
+  process.env.NANOTRACE_CLICKHOUSE_MODE ??
+  (!process.env.CLICKHOUSE_URL &&
+  (process.env.CLICKHOUSE_CLOUD_API_KEY ?? process.env.CLICKHOUSE_CLOUD_API_KEY_ID) &&
+  (process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET) &&
+  process.env.CLICKHOUSE_CLOUD_ORG_ID
+    ? 'shared-service'
+    : 'external')
+)
+const createDefaultClickhouseCloudService =
+  clickhouseMode === 'dedicated-service' ||
+  (clickhouseMode === 'shared-service' && !isDataPlaneOnly)
+const clickhouseCloudOrgId = process.env.CLICKHOUSE_CLOUD_ORG_ID ?? ''
+const clickhouseCloudApiKey =
+  process.env.CLICKHOUSE_CLOUD_API_KEY ??
+  process.env.CLICKHOUSE_CLOUD_API_KEY_ID ??
+  ''
+const clickhouseCloudApiSecret =
+  ((process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET)
+    ? pulumi.secret(process.env.CLICKHOUSE_CLOUD_API_SECRET ?? process.env.CLICKHOUSE_CLOUD_API_KEY_SECRET!)
+    : undefined)
+const clickhouseCloudProvider =
+  process.env.CLICKHOUSE_CLOUD_PROVIDER ??
+  'aws'
+const clickhouseCloudRegion =
+  process.env.CLICKHOUSE_CLOUD_REGION ??
+  region
+const defaultClickhouseServiceName =
+  process.env.NANOTRACE_DEFAULT_CLICKHOUSE_SERVICE_NAME ??
+  (clickhouseMode === 'shared-service'
+    ? `${name}-default`
+    : `${name}-clickhouse`)
+const defaultClickhouseTier = process.env.NANOTRACE_DEFAULT_CLICKHOUSE_TIER
+const defaultClickhouseIdleScaling =
+  booleanEnv('NANOTRACE_DEFAULT_CLICKHOUSE_IDLE_SCALING', true)
+const defaultClickhouseIdleTimeoutMinutes =
+  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_IDLE_TIMEOUT_MINUTES', 15)
+const defaultClickhouseMinTotalMemoryGb =
+  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_MIN_TOTAL_MEMORY_GB', 24)
+const defaultClickhouseMaxTotalMemoryGb =
+  numberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_MAX_TOTAL_MEMORY_GB', 24)
+const defaultClickhouseNumReplicas = optionalNumberEnv('NANOTRACE_DEFAULT_CLICKHOUSE_NUM_REPLICAS')
+const defaultClickhouseIpAccess = parseClickhouseIpAccess(
+  process.env.NANOTRACE_DEFAULT_CLICKHOUSE_IP_ACCESS ??
+  '0.0.0.0/0'
+)
 const modalTokenId =
   cfg.getSecret('modalTokenId') ?? pulumi.secret(process.env.MODAL_TOKEN_ID ?? '')
 const modalTokenSecret =
@@ -43,25 +109,21 @@ const modalServerApiKey =
   cfg.getSecret('modalServerApiKey') ??
   pulumi.secret(process.env.MODAL_SERVER_API_KEY ?? '')
 const clickhouseDatabase =
-  cfg.get('clickhouseDatabase') ??
   process.env.CLICKHOUSE_DATABASE ??
-  'observatory'
-const clickhouseTable =
-  cfg.get('clickhouseTable') ?? process.env.CLICKHOUSE_TABLE ?? 'events'
+  (dataPlaneOrganizationId
+    ? clickhouseDatabaseName(dataPlaneOrganizationId)
+    : 'observatory')
+const clickhouseTable = process.env.CLICKHOUSE_TABLE ?? 'events'
 const clickhouseFacetsTable =
-  cfg.get('clickhouseFacetsTable') ??
   process.env.CLICKHOUSE_FACETS_TABLE ??
   'event_facets'
 const clickhouseEventIndexTable =
-  cfg.get('clickhouseEventIndexTable') ??
   process.env.CLICKHOUSE_EVENT_INDEX_TABLE ??
   'event_facet_index'
 const clickhouseHotDimensionsTable =
-  cfg.get('clickhouseHotDimensionsTable') ??
   process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE ??
   'hot_dimensions'
 const clickhouseMaxBytesToRead =
-  cfg.getNumber('clickhouseMaxBytesToRead') ??
   numberEnv('CLICKHOUSE_MAX_BYTES_TO_READ', 1_000_000_000_000)
 
 const instanceType = cfg.get('instanceType') ?? 'c7g.large'
@@ -81,8 +143,7 @@ const dataVolumeIops = cfg.getNumber('dataVolumeIops') ?? 3000
 const dataVolumeThroughput = cfg.getNumber('dataVolumeThroughput') ?? 250
 const localDataDir = cfg.get('dataDir') ?? '/data/events'
 const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 1024 * 1024
-const partMaxAgeSecs =
-  cfg.getNumber('partMaxAgeSecs') ?? numberEnv('NANOTRACE_PART_MAX_AGE_SECS', 1)
+const partMaxAgeSecs = cfg.getNumber('partMaxAgeSecs') ?? 1
 const uploadPollIntervalMs =
   cfg.getNumber('uploadPollIntervalMs') ??
   numberEnv('UPLOAD_POLL_INTERVAL_MS', 500)
@@ -110,6 +171,29 @@ const writerFlushBytes =
 const compactBatchReceipts =
   cfg.getBoolean('compactBatchReceipts') ??
   booleanEnv('NANOTRACE_COMPACT_BATCH_RECEIPTS', false)
+const postgresMode =
+  cfg.get('postgresMode') ??
+  process.env.NANOTRACE_POSTGRES_MODE ??
+  'managed'
+if (postgresMode !== 'managed' && postgresMode !== 'external') {
+  throw new Error('nanotrace:postgresMode must be managed or external')
+}
+const postgresPrivateConnect =
+  cfg.get('postgresPrivateConnect') ??
+  process.env.NANOTRACE_POSTGRES_PRIVATE_CONNECT ??
+  'none'
+if (postgresPrivateConnect !== 'none' && postgresPrivateConnect !== 'aws-privatelink') {
+  throw new Error('nanotrace:postgresPrivateConnect must be none or aws-privatelink')
+}
+const externalPostgresUrl =
+  cfg.getSecret('postgresUrl') ??
+  (process.env.NANOTRACE_POSTGRES_URL
+    ? pulumi.secret(process.env.NANOTRACE_POSTGRES_URL)
+    : undefined)
+const postgresPrivateLinkServiceName =
+  cfg.get('postgresPrivateLinkServiceName') ??
+  process.env.NANOTRACE_POSTGRES_PRIVATELINK_SERVICE_NAME ??
+  ''
 const databaseName = cfg.get('databaseName') ?? 'nanotrace'
 const databaseUsername = cfg.get('databaseUsername') ?? 'nanotrace'
 const databaseInstanceClass = cfg.get('databaseInstanceClass') ?? 'db.t4g.micro'
@@ -121,20 +205,49 @@ const databaseSkipFinalSnapshot =
   cfg.getBoolean('databaseSkipFinalSnapshot') ?? true
 const databaseDeletionProtection =
   cfg.getBoolean('databaseDeletionProtection') ?? false
-const emailFrom = cfg.get('emailFrom') ?? process.env.NANOTRACE_EMAIL_FROM ?? ''
 const allowedEmails =
   cfg.get('allowedEmails') ??
   process.env.NANOTRACE_ALLOWED_EMAILS ??
   ''
 const adminEmails =
   cfg.get('adminEmails') ?? process.env.NANOTRACE_ADMIN_EMAILS ?? ''
-const corsAllowedOrigins =
-  cfg.get('corsAllowedOrigins') ??
-  process.env.NANOTRACE_CORS_ALLOWED_ORIGINS ??
-  ''
 const domainName = normalizeDomainName(
   requireConfigOrEnv('domainName', 'NANOTRACE_DOMAIN_NAME')
 )
+const configuredEmailFrom = cfg.get('emailFrom') ?? process.env.NANOTRACE_EMAIL_FROM
+const emailFrom = configuredEmailFrom?.trim() || `login@mail.${domainName}`
+const loginEmailIdentityDomain = normalizeDomainName(domainFromEmail(emailFrom))
+const loginEmailMailFromDomain = normalizeDomainName(`bounce.${loginEmailIdentityDomain}`)
+const manageLoginEmailDns =
+  !isDataPlaneOnly &&
+  emailFrom.trim() !== '' &&
+  booleanEnv('NANOTRACE_MANAGE_LOGIN_EMAIL_DNS', cfg.getBoolean('manageLoginEmailDns') ?? true)
+const apiDomainName = normalizeDomainName(
+  cfg.get('apiDomainName') ??
+    process.env.NANOTRACE_API_DOMAIN_NAME ??
+    `api.${domainName}`
+)
+const publicDnsDomains = Array.from(new Set([domainName, apiDomainName]))
+const appBaseUrl =
+  cfg.get('appBaseUrl') ??
+  process.env.NANOTRACE_APP_BASE_URL ??
+  `https://${domainName}`
+const apiBaseUrl =
+  cfg.get('apiBaseUrl') ??
+  process.env.NANOTRACE_API_BASE_URL ??
+  `https://${apiDomainName}`
+const uiApiBaseUrl =
+  cfg.get('uiApiBaseUrl') ??
+  process.env.VITE_NANOTRACE_URL ??
+  apiBaseUrl
+const corsAllowedOrigins =
+  cfg.get('corsAllowedOrigins') ??
+  process.env.NANOTRACE_CORS_ALLOWED_ORIGINS ??
+  [
+    appBaseUrl,
+    'http://localhost:5174',
+    'http://127.0.0.1:5174'
+  ].join(',')
 const hostedZoneName = normalizeDomainName(
   cfg.get('hostedZoneName') ??
     process.env.NANOTRACE_HOSTED_ZONE_NAME ??
@@ -144,22 +257,36 @@ const dnsProvider =
   cfg.get('dnsProvider') ??
   process.env.NANOTRACE_DNS_PROVIDER ??
   (process.env.CLOUDFLARE_API_TOKEN ? 'cloudflare' : 'route53')
-if (dnsProvider !== 'route53' && dnsProvider !== 'cloudflare') {
-  throw new Error('nanotrace:dnsProvider must be route53 or cloudflare')
+if (dnsProvider !== 'cloudflare' && dnsProvider !== 'route53' && dnsProvider !== 'external') {
+  throw new Error('nanotrace:dnsProvider must be cloudflare, route53, or external')
 }
 const edgeTlsMode =
   cfg.get('edgeTlsMode') ??
   process.env.NANOTRACE_EDGE_TLS_MODE ??
-  (dnsProvider === 'cloudflare' ? 'cloudflare-flexible' : 'alb')
-if (edgeTlsMode !== 'alb' && edgeTlsMode !== 'cloudflare-flexible') {
-  throw new Error('nanotrace:edgeTlsMode must be alb or cloudflare-flexible')
+  (dnsProvider === 'route53'
+    ? 'alb'
+    : dnsProvider === 'cloudflare'
+      ? 'cloudflare-flexible'
+      : 'edge-flexible')
+if (edgeTlsMode !== 'alb' && edgeTlsMode !== 'cloudflare-flexible' && edgeTlsMode !== 'edge-flexible') {
+  throw new Error('nanotrace:edgeTlsMode must be alb, cloudflare-flexible, or edge-flexible')
+}
+if (dnsProvider === 'external' && edgeTlsMode === 'alb') {
+  throw new Error('nanotrace:edgeTlsMode=alb requires managed DNS for ACM validation; use edge-flexible with nanotrace:dnsProvider=external')
 }
 const hostedZoneIdOverride =
   cfg.get('hostedZoneId') ?? process.env.NANOTRACE_HOSTED_ZONE_ID
 const cloudflareZoneIdOverride =
   cfg.get('cloudflareZoneId') ?? process.env.CLOUDFLARE_ZONE_ID
+const usesEdgeFlexibleTls = edgeTlsMode === 'cloudflare-flexible' || edgeTlsMode === 'edge-flexible'
 const manageDns = edgeTlsMode === 'alb'
-const cloudflareProvider = manageDns && dnsProvider === 'cloudflare'
+const usesRoute53Dns = dnsProvider === 'route53' && (manageDns || manageLoginEmailDns || dnsProvider === 'route53')
+const usesCloudflareDns = dnsProvider === 'cloudflare' && (
+  manageDns ||
+  usesEdgeFlexibleTls ||
+  manageLoginEmailDns
+)
+const cloudflareProvider = usesCloudflareDns
   ? new cloudflare.Provider(`${name}-cloudflare`, {
     apiToken: requireConfigOrEnv('cloudflareApiToken', 'CLOUDFLARE_API_TOKEN')
   })
@@ -169,6 +296,7 @@ const sessionSecure =
   booleanEnv('NANOTRACE_SESSION_SECURE', true)
 const imageUriOverride = cfg.get('imageUri')
 const buildImage = cfg.getBoolean('buildImage') ?? !imageUriOverride
+const imageBuildId = cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest'
 const schemaHash = createHash('sha256')
   .update(
     readFileSync(path.join(repoRoot, 'deploy/clickhouse/schema.sql'), 'utf8')
@@ -182,24 +310,51 @@ const schemaScriptHash = createHash('sha256')
     )
   )
   .digest('hex')
+const clickhouseCloudScriptHash = createHash('sha256')
+  .update(
+    readFileSync(
+      path.join(repoRoot, 'scripts/clickhouse-cloud-service.mjs'),
+      'utf8'
+    )
+  )
+  .digest('hex')
 
 const tags = {
   Project: 'nanotrace',
   Deployment: deploymentId
 }
-const managedLoginEmailIdentity = emailFrom.trim()
+const managedLoginEmailIdentity = createLoginEmailResources && emailFrom.trim()
   ? new aws.sesv2.EmailIdentity(`${name}-login-email`, {
-    emailIdentity: emailFrom.trim(),
+    dkimSigningAttributes: {
+      nextSigningKeyLength: 'RSA_2048_BIT'
+    },
+    emailIdentity: loginEmailIdentityDomain,
     tags
   })
   : undefined
+const managedLoginEmailMailFrom = managedLoginEmailIdentity
+  ? new aws.sesv2.EmailIdentityMailFromAttributes(`${name}-login-email-mail-from`, {
+    behaviorOnMxFailure: 'REJECT_MESSAGE',
+    emailIdentity: managedLoginEmailIdentity.emailIdentity,
+    mailFromDomain: loginEmailMailFromDomain
+  })
+  : undefined
 
-const databasePassword =
-  cfg.getSecret('databasePassword') ??
-  new random.RandomPassword(`${name}-database-password`, {
-    length: 32,
-    special: false
-  }).result
+const databasePassword = isDataPlaneOnly
+  ? (postgresMode === 'managed'
+      ? (cfg.getSecret('databasePassword') ??
+        new random.RandomPassword(`${name}-database-password`, {
+          length: 32,
+          special: false
+        }).result)
+      : pulumi.secret(''))
+  : postgresMode === 'managed'
+    ? (cfg.getSecret('databasePassword') ??
+      new random.RandomPassword(`${name}-database-password`, {
+        length: 32,
+        special: false
+      }).result)
+    : pulumi.secret('')
 const generatedBootstrapApiKey = new random.RandomPassword(
   `${name}-bootstrap-api-key`,
   {
@@ -207,13 +362,141 @@ const generatedBootstrapApiKey = new random.RandomPassword(
     special: false
   }
 )
-const bootstrapApiKey =
-  cfg.getSecret('bootstrapApiKey') ??
+const bootstrapApiKey = cfg.getSecret('bootstrapApiKey') ??
   (process.env.NANOTRACE_BOOTSTRAP_API_KEY
     ? pulumi.secret(process.env.NANOTRACE_BOOTSTRAP_API_KEY)
     : pulumi.interpolate`ntak_${generatedBootstrapApiKey.result}`)
+const configuredDataPlaneKmsKeyArn =
+  cfg.get('dataPlaneKmsKeyArn') ??
+  process.env.NANOTRACE_DATA_PLANE_KMS_KEY_ARN ??
+  ''
+const createDataPlaneKmsKey =
+  cfg.getBoolean('createDataPlaneKmsKey') ??
+  booleanEnv('NANOTRACE_CREATE_DATA_PLANE_KMS_KEY', false)
 
 const azs = aws.getAvailabilityZonesOutput({ state: 'available' })
+
+if (createDefaultClickhouseCloudService) {
+  if (!clickhouseCloudOrgId || !clickhouseCloudApiKey || !clickhouseCloudApiSecret) {
+    throw new Error(
+      `NANOTRACE_CLICKHOUSE_MODE=${clickhouseMode} requires CLICKHOUSE_CLOUD_ORG_ID, CLICKHOUSE_CLOUD_API_KEY, and CLICKHOUSE_CLOUD_API_SECRET`
+    )
+  }
+}
+
+const defaultClickhousePassword = createDefaultClickhouseCloudService
+  ? new random.RandomPassword(`${name}-clickhouse-default-password`, {
+      length: 32,
+      special: true,
+      overrideSpecial: '_-'
+    }).result
+  : undefined
+
+const defaultClickhouseService = createDefaultClickhouseCloudService
+  ? new command.local.Command(
+      `${name}-clickhouse-default`,
+      {
+        create: 'node scripts/clickhouse-cloud-service.mjs create',
+        update: 'node scripts/clickhouse-cloud-service.mjs create',
+        delete: 'true',
+        dir: repoRoot,
+        environment: {
+          CLICKHOUSE_CLOUD_API_KEY: clickhouseCloudApiKey,
+          CLICKHOUSE_CLOUD_API_SECRET: clickhouseCloudApiSecret!,
+          CLICKHOUSE_CLOUD_ORG_ID: clickhouseCloudOrgId,
+          CLICKHOUSE_CLOUD_PROVIDER: clickhouseCloudProvider,
+          CLICKHOUSE_CLOUD_REGION: clickhouseCloudRegion,
+          CLICKHOUSE_CLOUD_SERVICE_NAME: defaultClickhouseServiceName,
+          CLICKHOUSE_CLOUD_PASSWORD: defaultClickhousePassword!,
+          CLICKHOUSE_CLOUD_IDLE_SCALING: String(defaultClickhouseIdleScaling),
+          CLICKHOUSE_CLOUD_IDLE_TIMEOUT_MINUTES: String(
+            defaultClickhouseIdleTimeoutMinutes
+          ),
+          CLICKHOUSE_CLOUD_IP_ACCESS: formatClickhouseIpAccess(
+            defaultClickhouseIpAccess
+          ),
+          CLICKHOUSE_CLOUD_TIER: defaultClickhouseTier ?? '',
+          CLICKHOUSE_CLOUD_MIN_TOTAL_MEMORY_GB:
+            defaultClickhouseTier === 'production'
+              ? String(defaultClickhouseMinTotalMemoryGb)
+              : '',
+          CLICKHOUSE_CLOUD_MAX_TOTAL_MEMORY_GB:
+            defaultClickhouseTier === 'production'
+              ? String(defaultClickhouseMaxTotalMemoryGb)
+              : '',
+          CLICKHOUSE_CLOUD_NUM_REPLICAS:
+            defaultClickhouseTier === 'production' &&
+            defaultClickhouseNumReplicas !== undefined
+              ? String(defaultClickhouseNumReplicas)
+              : '',
+          CLICKHOUSE_CLOUD_STATE_FILE: path.join(
+            '.nanotrace',
+            'clickhouse-cloud',
+            `${deploymentId}-${defaultClickhouseServiceName}.json`
+          )
+        },
+        triggers: [
+          clickhouseCloudScriptHash,
+          clickhouseCloudProvider,
+          clickhouseCloudRegion,
+          defaultClickhouseServiceName,
+          defaultClickhouseTier ?? '',
+          defaultClickhouseIdleScaling,
+          defaultClickhouseIdleTimeoutMinutes,
+          formatClickhouseIpAccess(defaultClickhouseIpAccess),
+          defaultClickhouseMinTotalMemoryGb,
+          defaultClickhouseMaxTotalMemoryGb,
+          defaultClickhouseNumReplicas ?? '',
+          defaultClickhousePassword!
+        ]
+      },
+      {
+        additionalSecretOutputs: ['stdout', 'stderr']
+      }
+    )
+  : undefined
+
+const defaultClickhouseServiceState = defaultClickhouseService?.stdout.apply(
+  value => JSON.parse(value) as ClickhouseCloudServiceState
+)
+const defaultClickhouseHttpsEndpoint =
+  defaultClickhouseServiceState?.apply(state => state.url)
+
+const clickhouseUrl =
+  defaultClickhouseHttpsEndpoint ??
+  requireEnv('CLICKHOUSE_URL')
+const clickhouseUser =
+  createDefaultClickhouseCloudService
+    ? 'default'
+    : requireEnv('CLICKHOUSE_USER')
+const clickhousePassword =
+  defaultClickhousePassword ??
+  pulumi.secret(requireEnv('CLICKHOUSE_PASSWORD'))
+const clickhouseCloudServiceId =
+  defaultClickhouseServiceState?.apply(state => state.id) ?? ''
+
+const managedDataPlaneKmsKey = createDataPlaneKmsKey
+  ? new aws.kms.Key(`${name}-data-key`, {
+      description: dataPlaneOrganizationId
+        ? `Nanotrace data-plane key for ${dataPlaneOrganizationId}`
+        : `Nanotrace data key for ${deploymentId}`,
+      deletionWindowInDays: cfg.getNumber('kmsDeletionWindowDays') ?? 7,
+      enableKeyRotation: true
+    })
+  : undefined
+
+const dataPlaneKmsKeyArn = configuredDataPlaneKmsKeyArn
+  ? pulumi.output(configuredDataPlaneKmsKeyArn)
+  : managedDataPlaneKmsKey?.arn
+
+if (managedDataPlaneKmsKey) {
+  new aws.kms.Alias(`${name}-data-key-alias`, {
+    name: dataPlaneOrganizationId
+      ? `alias/nanotrace/${dataPlaneOrganizationId}`
+      : `alias/nanotrace/${deploymentId}`,
+    targetKeyId: managedDataPlaneKmsKey.keyId
+  })
+}
 
 const vpc = new aws.ec2.Vpc(`${name}-vpc`, {
   cidrBlock: '10.42.0.0/16',
@@ -259,6 +542,23 @@ const bucket = new aws.s3.BucketV2(`${name}-events`, {
   tags
 })
 
+new aws.s3.BucketServerSideEncryptionConfigurationV2(`${name}-events-encryption`, {
+  bucket: bucket.id,
+  rules: [
+    {
+      applyServerSideEncryptionByDefault: dataPlaneKmsKeyArn
+        ? {
+            kmsMasterKeyId: dataPlaneKmsKeyArn,
+            sseAlgorithm: 'aws:kms'
+          }
+        : {
+            sseAlgorithm: 'AES256'
+          },
+      bucketKeyEnabled: dataPlaneKmsKeyArn ? true : undefined
+    }
+  ]
+})
+
 new aws.s3.BucketPublicAccessBlock(`${name}-events-public-access`, {
   bucket: bucket.id,
   blockPublicAcls: true,
@@ -273,6 +573,7 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
 })
 
 const loaderQueue = new aws.sqs.Queue(`${name}-loader-events`, {
+  kmsMasterKeyId: dataPlaneKmsKeyArn,
   messageRetentionSeconds: 345_600,
   visibilityTimeoutSeconds: 300,
   tags
@@ -326,11 +627,10 @@ const repository = new aws.ecr.Repository(`${name}-server`, {
   tags
 })
 
+const imageTag = cfg.get('imageTag') ?? imageBuildId
 const imageUri = imageUriOverride
   ? pulumi.output(imageUriOverride)
-  : pulumi.interpolate`${repository.repositoryUrl}:${
-      cfg.get('imageTag') ?? 'latest'
-    }`
+  : pulumi.interpolate`${repository.repositoryUrl}:${imageTag}`
 
 const imageBuild = buildImage
   ? new command.local.Command(
@@ -344,7 +644,7 @@ const imageBuild = buildImage
         )}":{"auth":"%s"}}}\n' "$ECR_AUTH" > .pulumi-docker/config.json && docker --config .pulumi-docker build --platform linux/${cpuArchitecture} -t ${imageUri} . && docker --config .pulumi-docker push ${imageUri}`,
         delete: `true`,
         dir: repoRoot,
-        triggers: [cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest']
+        triggers: [imageBuildId]
       },
       {
         dependsOn: [repository]
@@ -369,63 +669,85 @@ const role = new aws.iam.Role(`${name}-instance-role`, {
 const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
   role: role.id,
   policy: pulumi
-    .all([bucket.arn, repository.arn, loaderQueue.arn])
-    .apply(([bucketArn, repositoryArn, queueArn]) =>
-      JSON.stringify({
-        Version: '2012-10-17',
-        Statement: [
-          {
-            Sid: 'WriteEventObjects',
-            Effect: 'Allow',
-            Action: ['s3:PutObject', 's3:AbortMultipartUpload'],
-            Resource: `${bucketArn}/${normalizedPrefix}/*`
-          },
-          {
-            Sid: 'ReadEventObjects',
-            Effect: 'Allow',
-            Action: 's3:GetObject',
-            Resource: `${bucketArn}/${normalizedPrefix}/*`
-          },
-          {
-            Sid: 'ReadWriteProcessorObjects',
-            Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject'],
-            Resource: `${bucketArn}/processors/*`
-          },
-          {
-            Sid: 'ReadObjectNotifications',
-            Effect: 'Allow',
-            Action: [
-              'sqs:ReceiveMessage',
-              'sqs:DeleteMessage',
-              'sqs:GetQueueAttributes'
-            ],
-            Resource: queueArn
-          },
-          {
-            Sid: 'SendLoginEmail',
-            Effect: 'Allow',
-            Action: ['ses:SendEmail', 'ses:SendRawEmail'],
-            Resource: '*'
-          },
-          {
-            Sid: 'ReadEcrAuth',
-            Effect: 'Allow',
-            Action: 'ecr:GetAuthorizationToken',
-            Resource: '*'
-          },
-          {
-            Sid: 'PullServerImage',
-            Effect: 'Allow',
-            Action: [
-              'ecr:BatchCheckLayerAvailability',
-              'ecr:BatchGetImage',
-              'ecr:GetDownloadUrlForLayer'
-            ],
-            Resource: repositoryArn
-          }
-        ]
-      })
+    .all([
+      bucket.arn,
+      repository.arn,
+      loaderQueue.arn,
+      dataPlaneKmsKeyArn ?? pulumi.output('')
+    ])
+    .apply(([bucketArn, repositoryArn, queueArn, kmsKeyArn]) =>
+      JSON.stringify(
+        {
+          Version: '2012-10-17',
+          Statement: [
+            ...(kmsKeyArn
+              ? [
+                  {
+                    Sid: 'UseDataPlaneKmsKey',
+                    Effect: 'Allow',
+                    Action: [
+                      'kms:Decrypt',
+                      'kms:Encrypt',
+                      'kms:GenerateDataKey',
+                      'kms:DescribeKey'
+                    ],
+                    Resource: kmsKeyArn
+                  }
+                ]
+              : []),
+            {
+              Sid: 'WriteEventObjects',
+              Effect: 'Allow',
+              Action: ['s3:PutObject', 's3:AbortMultipartUpload'],
+              Resource: `${bucketArn}/${normalizedPrefix}/*`
+            },
+            {
+              Sid: 'ReadEventObjects',
+              Effect: 'Allow',
+              Action: 's3:GetObject',
+              Resource: `${bucketArn}/${normalizedPrefix}/*`
+            },
+            {
+              Sid: 'ReadWriteProcessorObjects',
+              Effect: 'Allow',
+              Action: ['s3:GetObject', 's3:PutObject'],
+              Resource: `${bucketArn}/${processorPrefix}/*`
+            },
+            {
+              Sid: 'ReadObjectNotifications',
+              Effect: 'Allow',
+              Action: [
+                'sqs:ReceiveMessage',
+                'sqs:DeleteMessage',
+                'sqs:GetQueueAttributes'
+              ],
+              Resource: queueArn
+            },
+            {
+              Sid: 'SendLoginEmail',
+              Effect: 'Allow',
+              Action: ['ses:SendEmail', 'ses:SendRawEmail'],
+              Resource: '*'
+            },
+            {
+              Sid: 'ReadEcrAuth',
+              Effect: 'Allow',
+              Action: 'ecr:GetAuthorizationToken',
+              Resource: '*'
+            },
+            {
+              Sid: 'PullServerImage',
+              Effect: 'Allow',
+              Action: [
+                'ecr:BatchCheckLayerAvailability',
+                'ecr:BatchGetImage',
+                'ecr:GetDownloadUrlForLayer'
+              ],
+              Resource: repositoryArn
+            }
+          ]
+        }
+      )
     )
 })
 
@@ -524,51 +846,103 @@ const instanceSg = new aws.ec2.SecurityGroup(`${name}-instance-sg`, {
   tags: { ...tags, Name: `${name}-instance-sg` }
 })
 
-const databaseSg = new aws.ec2.SecurityGroup(`${name}-postgres-sg`, {
-  vpcId: vpc.id,
-  ingress: [
-    {
-      protocol: 'tcp',
-      fromPort: 5432,
-      toPort: 5432,
-      securityGroups: [instanceSg.id]
-    }
-  ],
-  egress: [
-    {
-      protocol: '-1',
-      fromPort: 0,
-      toPort: 0,
-      cidrBlocks: ['0.0.0.0/0']
-    }
-  ],
-  tags: { ...tags, Name: `${name}-postgres-sg` }
-})
+const createManagedPostgres = postgresMode === 'managed'
+const createPostgresPrivateLink =
+  postgresMode === 'external' && postgresPrivateConnect === 'aws-privatelink'
+if (createPostgresPrivateLink && !postgresPrivateLinkServiceName.trim()) {
+  throw new Error('NANOTRACE_POSTGRES_PRIVATELINK_SERVICE_NAME is required for aws-privatelink')
+}
+if (postgresMode === 'external' && !externalPostgresUrl) {
+  throw new Error('NANOTRACE_POSTGRES_URL is required when NANOTRACE_POSTGRES_MODE=external')
+}
 
-const databaseSubnetGroup = new aws.rds.SubnetGroup(`${name}-postgres-subnets`, {
-  subnetIds: subnets.map(subnet => subnet.id),
-  tags
-})
+const databaseSg = !createManagedPostgres
+  ? undefined
+  : new aws.ec2.SecurityGroup(`${name}-postgres-sg`, {
+      vpcId: vpc.id,
+      ingress: [
+        {
+          protocol: 'tcp',
+          fromPort: 5432,
+          toPort: 5432,
+          securityGroups: [instanceSg.id]
+        }
+      ],
+      egress: [
+        {
+          protocol: '-1',
+          fromPort: 0,
+          toPort: 0,
+          cidrBlocks: ['0.0.0.0/0']
+        }
+      ],
+      tags: { ...tags, Name: `${name}-postgres-sg` }
+    })
 
-const database = new aws.rds.Instance(`${name}-postgres`, {
-  allocatedStorage: databaseAllocatedStorageGb,
-  autoMinorVersionUpgrade: true,
-  backupRetentionPeriod: databaseBackupRetentionDays,
-  dbName: databaseName,
-  dbSubnetGroupName: databaseSubnetGroup.name,
-  deletionProtection: databaseDeletionProtection,
-  engine: 'postgres',
-  identifier: `${name}-postgres`,
-  instanceClass: databaseInstanceClass,
-  multiAz: false,
-  password: databasePassword,
-  publiclyAccessible: false,
-  skipFinalSnapshot: databaseSkipFinalSnapshot,
-  storageEncrypted: true,
-  username: databaseUsername,
-  vpcSecurityGroupIds: [databaseSg.id],
-  tags
-})
+const postgresEndpointSg = !createPostgresPrivateLink
+  ? undefined
+  : new aws.ec2.SecurityGroup(`${name}-postgres-endpoint-sg`, {
+      vpcId: vpc.id,
+      ingress: [
+        {
+          protocol: 'tcp',
+          fromPort: 5432,
+          toPort: 5432,
+          securityGroups: [instanceSg.id]
+        }
+      ],
+      egress: [
+        {
+          protocol: '-1',
+          fromPort: 0,
+          toPort: 0,
+          cidrBlocks: ['0.0.0.0/0']
+        }
+      ],
+      tags: { ...tags, Name: `${name}-postgres-endpoint-sg` }
+    })
+
+const postgresPrivateLinkEndpoint = !createPostgresPrivateLink
+  ? undefined
+  : new aws.ec2.VpcEndpoint(`${name}-postgres-privatelink`, {
+      privateDnsEnabled: true,
+      securityGroupIds: [postgresEndpointSg!.id],
+      serviceName: postgresPrivateLinkServiceName,
+      subnetIds: subnets.map(subnet => subnet.id),
+      vpcEndpointType: 'Interface',
+      vpcId: vpc.id,
+      tags: { ...tags, Name: `${name}-postgres-privatelink` }
+    })
+
+const databaseSubnetGroup = !createManagedPostgres
+  ? undefined
+  : new aws.rds.SubnetGroup(`${name}-postgres-subnets`, {
+      subnetIds: subnets.map(subnet => subnet.id),
+      tags
+    })
+
+const database = !createManagedPostgres
+  ? undefined
+  : new aws.rds.Instance(`${name}-postgres`, {
+      allocatedStorage: databaseAllocatedStorageGb,
+      autoMinorVersionUpgrade: true,
+      backupRetentionPeriod: databaseBackupRetentionDays,
+      dbName: databaseName,
+      dbSubnetGroupName: databaseSubnetGroup!.name,
+      deletionProtection: databaseDeletionProtection,
+      engine: 'postgres',
+      identifier: `${name}-postgres`,
+      instanceClass: databaseInstanceClass,
+      kmsKeyId: dataPlaneKmsKeyArn,
+      multiAz: false,
+      password: databasePassword,
+      publiclyAccessible: false,
+      skipFinalSnapshot: databaseSkipFinalSnapshot,
+      storageEncrypted: true,
+      username: databaseUsername,
+      vpcSecurityGroupIds: [databaseSg!.id],
+      tags
+    })
 
 const lb = new aws.lb.LoadBalancer(`${name}-alb`, {
   loadBalancerType: 'application',
@@ -613,14 +987,14 @@ const queryTargetGroup = new aws.lb.TargetGroup(`${name}-query-tg`, {
   tags: { ...tags, Service: 'query' }
 })
 
-const hostedZone = manageDns && dnsProvider === 'route53' && !hostedZoneIdOverride
+const hostedZone = usesRoute53Dns && !hostedZoneIdOverride
   ? new aws.route53.Zone(`${name}-zone`, {
     name: hostedZoneName,
     tags
   })
   : undefined
 const hostedZoneId = hostedZoneIdOverride ?? hostedZone?.zoneId
-const cloudflareZone = manageDns && dnsProvider === 'cloudflare' && !cloudflareZoneIdOverride
+const cloudflareZone = usesCloudflareDns && !cloudflareZoneIdOverride
   ? cloudflare.getZoneOutput(
     { filter: { name: hostedZoneName } },
     { provider: cloudflareProvider }
@@ -628,18 +1002,380 @@ const cloudflareZone = manageDns && dnsProvider === 'cloudflare' && !cloudflareZ
   : undefined
 const cloudflareZoneId = cloudflareZoneIdOverride ?? cloudflareZone?.zoneId
 
+type ManualDnsRecord = {
+  name: string | pulumi.Output<string>
+  type: string | pulumi.Output<string>
+  value: string | pulumi.Output<string>
+  ttl?: number
+  priority?: number
+  proxied?: boolean
+  purpose: string
+}
+const manualDnsRecords: ManualDnsRecord[] = []
+
+type ClickhouseCloudServiceState = {
+  id: string
+  url: string
+}
+
+const uiBucket = new aws.s3.BucketV2(`${name}-ui`, {
+  forceDestroy: cfg.getBoolean('forceDestroyUiBucket') ?? false,
+  tags: { ...tags, Service: 'ui' }
+})
+
+new aws.s3.BucketPublicAccessBlock(`${name}-ui-public-access`, {
+  bucket: uiBucket.id,
+  blockPublicAcls: true,
+  blockPublicPolicy: true,
+  ignorePublicAcls: true,
+  restrictPublicBuckets: true
+})
+
+new aws.s3.BucketServerSideEncryptionConfigurationV2(`${name}-ui-encryption`, {
+  bucket: uiBucket.id,
+  rules: [
+    {
+      applyServerSideEncryptionByDefault: {
+        sseAlgorithm: 'AES256'
+      }
+    }
+  ]
+})
+
+const uiCertificate = dnsProvider === 'external'
+  ? undefined
+  : new aws.acm.Certificate(`${name}-ui-certificate`, {
+      domainName,
+      validationMethod: 'DNS',
+      tags
+    }, { provider: usEast1 })
+
+const uiCertificateDomainValidationOption =
+  uiCertificate?.domainValidationOptions.apply(options => {
+    return options?.[0] ?? {
+      domainName,
+      resourceRecordName: `_pending-validation.${domainName}`,
+      resourceRecordType: 'CNAME',
+      resourceRecordValue: 'pending-validation'
+    }
+  })
+
+const uiCertificateValidationRecordFqdn = !uiCertificateDomainValidationOption
+  ? undefined
+  : dnsProvider === 'cloudflare'
+    ? new cloudflare.Record(`${name}-ui-certificate-validation`, {
+        content: uiCertificateDomainValidationOption.resourceRecordValue,
+        name: uiCertificateDomainValidationOption.resourceRecordName,
+        proxied: false,
+        ttl: 1,
+        type: 'CNAME',
+        zoneId: cloudflareZoneId
+      }, { provider: cloudflareProvider }).name
+    : new aws.route53.Record(`${name}-ui-certificate-validation`, {
+        allowOverwrite: true,
+        name: uiCertificateDomainValidationOption.resourceRecordName,
+        records: [uiCertificateDomainValidationOption.resourceRecordValue],
+        ttl: 60,
+        type: uiCertificateDomainValidationOption.resourceRecordType,
+        zoneId: hostedZoneId!
+      }).fqdn
+
+const uiCertificateValidation = uiCertificate && uiCertificateValidationRecordFqdn
+  ? new aws.acm.CertificateValidation(`${name}-ui-certificate-validation`, {
+      certificateArn: uiCertificate.arn,
+      validationRecordFqdns: [uiCertificateValidationRecordFqdn]
+    }, { provider: usEast1 })
+  : undefined
+
+const uiOriginAccessControl = new aws.cloudfront.OriginAccessControl(`${name}-ui-oac`, {
+  description: `Private S3 access for ${domainName}`,
+  originAccessControlOriginType: 's3',
+  signingBehavior: 'always',
+  signingProtocol: 'sigv4'
+})
+
+const uiOriginId = `${name}-ui-origin`
+const uiDistribution = new aws.cloudfront.Distribution(`${name}-ui`, {
+  aliases: uiCertificateValidation ? [domainName] : [],
+  comment: `${name} UI`,
+  defaultCacheBehavior: {
+    allowedMethods: ['GET', 'HEAD', 'OPTIONS'],
+    cachedMethods: ['GET', 'HEAD'],
+    compress: true,
+    forwardedValues: {
+      cookies: { forward: 'none' },
+      queryString: false
+    },
+    maxTtl: 31_536_000,
+    minTtl: 0,
+    defaultTtl: 60,
+    targetOriginId: uiOriginId,
+    viewerProtocolPolicy: 'redirect-to-https'
+  },
+  customErrorResponses: [
+    {
+      errorCode: 403,
+      responseCode: 200,
+      responsePagePath: '/index.html',
+      errorCachingMinTtl: 0
+    },
+    {
+      errorCode: 404,
+      responseCode: 200,
+      responsePagePath: '/index.html',
+      errorCachingMinTtl: 0
+    }
+  ],
+  defaultRootObject: 'index.html',
+  enabled: true,
+  isIpv6Enabled: true,
+  origins: [
+    {
+      domainName: uiBucket.bucketRegionalDomainName,
+      originAccessControlId: uiOriginAccessControl.id,
+      originId: uiOriginId
+    }
+  ],
+  priceClass: cfg.get('uiCloudFrontPriceClass') ?? 'PriceClass_100',
+  restrictions: {
+    geoRestriction: {
+      restrictionType: 'none'
+    }
+  },
+  viewerCertificate: uiCertificateValidation
+    ? {
+        acmCertificateArn: uiCertificateValidation.certificateArn,
+        minimumProtocolVersion: 'TLSv1.2_2021',
+        sslSupportMethod: 'sni-only'
+      }
+    : {
+        cloudfrontDefaultCertificate: true
+      },
+  tags: { ...tags, Service: 'ui' }
+})
+
+new aws.s3.BucketPolicy(`${name}-ui-policy`, {
+  bucket: uiBucket.id,
+  policy: pulumi.all([uiBucket.arn, uiDistribution.arn]).apply(([bucketArn, distributionArn]) =>
+    JSON.stringify({
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Sid: 'AllowCloudFrontRead',
+          Effect: 'Allow',
+          Principal: { Service: 'cloudfront.amazonaws.com' },
+          Action: 's3:GetObject',
+          Resource: `${bucketArn}/*`,
+          Condition: {
+            StringEquals: {
+              'AWS:SourceArn': distributionArn
+            }
+          }
+        }
+      ]
+    })
+  )
+})
+
+if (dnsProvider === 'external') {
+  manualDnsRecords.push(
+    {
+      name: domainName,
+      purpose: 'Point the Nanotrace UI domain at the CloudFront distribution. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex.',
+      ttl: 60,
+      type: domainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
+      value: uiDistribution.domainName
+    },
+    {
+      name: apiDomainName,
+      purpose: 'Point the Nanotrace API domain at the application load balancer. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex.',
+      ttl: 60,
+      type: apiDomainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
+      value: lb.dnsName
+    }
+  )
+}
+
+if (dnsProvider === 'cloudflare' && usesEdgeFlexibleTls) {
+  new cloudflare.Record(`${name}-api-cloudflare-flexible-alias`, {
+    content: lb.dnsName,
+    name: cloudflareRecordName(apiDomainName, hostedZoneName),
+    proxied: true,
+    ttl: 1,
+    type: 'CNAME',
+    zoneId: cloudflareZoneId
+  }, { provider: cloudflareProvider })
+}
+
+if (dnsProvider === 'cloudflare' && uiCertificateValidation) {
+  new cloudflare.Record(`${name}-ui-alias`, {
+    content: uiDistribution.domainName,
+    name: cloudflareRecordName(domainName, hostedZoneName),
+    proxied: false,
+    ttl: 1,
+    type: 'CNAME',
+    zoneId: cloudflareZoneId
+  }, { provider: cloudflareProvider })
+} else if (dnsProvider === 'route53' && uiCertificateValidation) {
+  new aws.route53.Record(`${name}-ui-alias`, {
+    aliases: [
+      {
+        evaluateTargetHealth: false,
+        name: uiDistribution.domainName,
+        zoneId: uiDistribution.hostedZoneId
+      }
+    ],
+    name: domainName,
+    type: 'A',
+    zoneId: hostedZoneId!
+  })
+}
+
+if (manageLoginEmailDns && dnsProvider === 'cloudflare' && managedLoginEmailIdentity) {
+  for (const index of [0, 1, 2]) {
+    const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
+    )
+    const dkimTarget = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}.dkim.amazonses.com`
+    )
+    new cloudflare.Record(`${name}-login-email-dkim-${index}`, {
+      content: dkimTarget,
+      name: dkimName,
+      proxied: false,
+      ttl: 1,
+      type: 'CNAME',
+      zoneId: cloudflareZoneId
+    }, { provider: cloudflareProvider })
+  }
+
+  new cloudflare.Record(`${name}-login-email-mail-from-mx`, {
+    content: `feedback-smtp.${region}.amazonses.com`,
+    name: loginEmailMailFromDomain,
+    priority: 10,
+    proxied: false,
+    ttl: 1,
+    type: 'MX',
+    zoneId: cloudflareZoneId
+  }, { provider: cloudflareProvider, dependsOn: managedLoginEmailMailFrom ? [managedLoginEmailMailFrom] : [] })
+
+  new cloudflare.Record(`${name}-login-email-mail-from-spf`, {
+    content: 'v=spf1 include:amazonses.com -all',
+    name: loginEmailMailFromDomain,
+    proxied: false,
+    ttl: 1,
+    type: 'TXT',
+    zoneId: cloudflareZoneId
+  }, { provider: cloudflareProvider })
+
+  new cloudflare.Record(`${name}-login-email-dmarc`, {
+    content: 'v=DMARC1; p=none',
+    name: `_dmarc.${loginEmailIdentityDomain}`,
+    proxied: false,
+    ttl: 1,
+    type: 'TXT',
+    zoneId: cloudflareZoneId
+  }, { provider: cloudflareProvider })
+} else if (manageLoginEmailDns && dnsProvider === 'route53' && managedLoginEmailIdentity) {
+  for (const index of [0, 1, 2]) {
+    const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
+    )
+    const dkimTarget = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}.dkim.amazonses.com`
+    )
+    new aws.route53.Record(`${name}-login-email-dkim-${index}`, {
+      allowOverwrite: true,
+      name: dkimName,
+      records: [dkimTarget],
+      ttl: 60,
+      type: 'CNAME',
+      zoneId: hostedZoneId!
+    })
+  }
+
+  new aws.route53.Record(`${name}-login-email-mail-from-mx`, {
+    allowOverwrite: true,
+    name: loginEmailMailFromDomain,
+    records: [`10 feedback-smtp.${region}.amazonses.com`],
+    ttl: 60,
+    type: 'MX',
+    zoneId: hostedZoneId!
+  }, { dependsOn: managedLoginEmailMailFrom ? [managedLoginEmailMailFrom] : [] })
+
+  new aws.route53.Record(`${name}-login-email-mail-from-spf`, {
+    allowOverwrite: true,
+    name: loginEmailMailFromDomain,
+    records: ['v=spf1 include:amazonses.com -all'],
+    ttl: 60,
+    type: 'TXT',
+    zoneId: hostedZoneId!
+  })
+
+  new aws.route53.Record(`${name}-login-email-dmarc`, {
+    allowOverwrite: true,
+    name: `_dmarc.${loginEmailIdentityDomain}`,
+    records: ['v=DMARC1; p=none'],
+    ttl: 60,
+    type: 'TXT',
+    zoneId: hostedZoneId!
+  })
+} else if (manageLoginEmailDns && dnsProvider === 'external' && managedLoginEmailIdentity) {
+  for (const index of [0, 1, 2]) {
+    const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
+    )
+    const dkimTarget = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
+      `${tokens[index]}.dkim.amazonses.com`
+    )
+    manualDnsRecords.push({
+      name: dkimName,
+      purpose: 'Verify the SES domain identity for login email DKIM signing.',
+      ttl: 60,
+      type: 'CNAME',
+      value: dkimTarget
+    })
+  }
+
+  manualDnsRecords.push(
+    {
+      name: loginEmailMailFromDomain,
+      priority: 10,
+      purpose: 'Configure the SES custom MAIL FROM bounce domain for login email.',
+      ttl: 60,
+      type: 'MX',
+      value: `feedback-smtp.${region}.amazonses.com`
+    },
+    {
+      name: loginEmailMailFromDomain,
+      purpose: 'Allow SES to send login email for the custom MAIL FROM domain.',
+      ttl: 60,
+      type: 'TXT',
+      value: 'v=spf1 include:amazonses.com -all'
+    },
+    {
+      name: `_dmarc.${loginEmailIdentityDomain}`,
+      purpose: 'Publish a baseline DMARC policy for login email.',
+      ttl: 60,
+      type: 'TXT',
+      value: 'v=DMARC1; p=none'
+    }
+  )
+}
+
 let certificateValidation: aws.acm.CertificateValidation | undefined
+let certificateArn: pulumi.Output<string> | undefined
 if (edgeTlsMode === 'alb') {
   const certificate = new aws.acm.Certificate(`${name}-certificate`, {
-    domainName,
+    domainName: apiDomainName,
     validationMethod: 'DNS',
     tags
   })
   const certificateDomainValidationOption =
     certificate.domainValidationOptions.apply(options => {
       return options?.[0] ?? {
-        domainName,
-        resourceRecordName: `_pending-validation.${domainName}`,
+        domainName: apiDomainName,
+        resourceRecordName: `_pending-validation.${apiDomainName}`,
         resourceRecordType: 'CNAME',
         resourceRecordValue: 'pending-validation'
       }
@@ -676,18 +1412,19 @@ if (edgeTlsMode === 'alb') {
       validationRecordFqdns: [certificateValidationRecordFqdn]
     }
   )
+  certificateArn = certificateValidation.certificateArn
 
   if (dnsProvider === 'cloudflare') {
-    new cloudflare.Record(`${name}-alias`, {
+    new cloudflare.Record(`${name}-api-alias`, {
       content: lb.dnsName,
-      name: cloudflareRecordName(domainName, hostedZoneName),
+      name: cloudflareRecordName(apiDomainName, hostedZoneName),
       proxied: false,
       ttl: 1,
       type: 'CNAME',
       zoneId: cloudflareZoneId
     }, { provider: cloudflareProvider })
-  } else {
-    new aws.route53.Record(`${name}-alias`, {
+  } else if (dnsProvider === 'route53') {
+    new aws.route53.Record(`${name}-api-alias`, {
       aliases: [
         {
           evaluateTargetHealth: true,
@@ -695,7 +1432,7 @@ if (edgeTlsMode === 'alb') {
           zoneId: lb.zoneId
         }
       ],
-      name: domainName,
+      name: apiDomainName,
       type: 'A',
       zoneId: hostedZoneId!
     })
@@ -722,7 +1459,7 @@ const httpListener = new aws.lb.Listener(`${name}-http`, {
 
 const listener = edgeTlsMode === 'alb'
   ? new aws.lb.Listener(`${name}-https`, {
-    certificateArn: certificateValidation!.certificateArn,
+    certificateArn: certificateArn!,
     loadBalancerArn: lb.arn,
     port: 443,
     protocol: 'HTTPS',
@@ -734,8 +1471,10 @@ const listener = edgeTlsMode === 'alb'
 const publicBaseUrl =
   cfg.get('publicBaseUrl') ??
   process.env.NANOTRACE_PUBLIC_BASE_URL ??
-  `https://${domainName}`
-const databaseUrl = pulumi.interpolate`postgres://${databaseUsername}:${databasePassword}@${database.address}:5432/${databaseName}`
+  appBaseUrl
+const databaseUrl = database
+  ? pulumi.interpolate`postgres://${databaseUsername}:${databasePassword}@${database.address}:5432/${databaseName}`
+  : externalPostgresUrl ?? pulumi.output('')
 
 new aws.lb.ListenerRule(`${name}-query-route`, {
   listenerArn: listener.arn,
@@ -747,11 +1486,31 @@ new aws.lb.ListenerRule(`${name}-query-route`, {
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
 })
 
+new aws.lb.ListenerRule(`${name}-internal-query-route`, {
+  listenerArn: listener.arn,
+  priority: 11,
+  conditions: [
+    { pathPattern: { values: ['/internal/query'] } },
+    { httpRequestMethod: { values: ['POST'] } }
+  ],
+  actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
+})
+
 new aws.lb.ListenerRule(`${name}-event-read-route`, {
   listenerArn: listener.arn,
   priority: 20,
   conditions: [
     { pathPattern: { values: ['/events/*'] } },
+    { httpRequestMethod: { values: ['GET'] } }
+  ],
+  actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
+})
+
+new aws.lb.ListenerRule(`${name}-internal-event-read-route`, {
+  listenerArn: listener.arn,
+  priority: 21,
+  conditions: [
+    { pathPattern: { values: ['/internal/events/*'] } },
     { httpRequestMethod: { values: ['GET'] } }
   ],
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
@@ -780,6 +1539,8 @@ const userData = pulumi
   .all([
     bucket.bucket,
     imageUri,
+    imageBuildId,
+    clickhouseUrl,
     clickhousePassword,
     databaseUrl,
     bootstrapApiKey,
@@ -787,12 +1548,15 @@ const userData = pulumi
     modalTokenId,
     modalTokenSecret,
     modalServerApiKey,
+    dataPlaneSharedSecret,
     publicBaseUrl
   ])
   .apply(
     ([
       bucketName,
       resolvedImageUri,
+      resolvedImageBuildId,
+      resolvedClickhouseUrl,
       resolvedClickhousePassword,
       resolvedDatabaseUrl,
       resolvedBootstrapApiKey,
@@ -800,6 +1564,7 @@ const userData = pulumi
       resolvedModalTokenId,
       resolvedModalTokenSecret,
       resolvedModalServerApiKey,
+      resolvedDataPlaneSharedSecret,
       resolvedPublicBaseUrl
     ]) =>
       renderUserData({
@@ -812,10 +1577,11 @@ const userData = pulumi
         clickhouseFacetsTable,
         clickhouseHotDimensionsTable,
         clickhouseTable,
-        clickhouseUrl,
+        clickhouseUrl: resolvedClickhouseUrl,
         clickhouseUser,
         clickhouseMaxBytesToRead,
         imageUri: resolvedImageUri,
+        imageBuildId: resolvedImageBuildId,
         loaderQueueUrl,
         modalServerApiKey: resolvedModalServerApiKey,
         modalTokenId: resolvedModalTokenId,
@@ -836,33 +1602,41 @@ const userData = pulumi
         writerLanes,
         writerQueueCapacity,
         compactBatchReceipts,
+        dataPlaneOrganizationId,
+        dataPlaneSharedSecret: resolvedDataPlaneSharedSecret,
         databaseUrl: resolvedDatabaseUrl,
         allowedEmails,
+        appBaseUrl,
         corsAllowedOrigins,
         emailFrom,
+        processorPrefix,
         publicBaseUrl: resolvedPublicBaseUrl,
         sessionSecure
       })
   )
 
 const queryUserData = pulumi
-  .all([bucket.bucket, imageUri, clickhousePassword, databaseUrl, bootstrapApiKey, publicBaseUrl])
-  .apply(([bucketName, resolvedImageUri, resolvedClickhousePassword, resolvedDatabaseUrl, resolvedBootstrapApiKey, resolvedPublicBaseUrl]) =>
+  .all([bucket.bucket, imageUri, imageBuildId, clickhouseUrl, clickhousePassword, databaseUrl, bootstrapApiKey, dataPlaneSharedSecret, publicBaseUrl])
+  .apply(([bucketName, resolvedImageUri, resolvedImageBuildId, resolvedClickhouseUrl, resolvedClickhousePassword, resolvedDatabaseUrl, resolvedBootstrapApiKey, resolvedDataPlaneSharedSecret, resolvedPublicBaseUrl]) =>
     renderQueryUserData({
       bucketName,
       bootstrapApiKey: resolvedBootstrapApiKey,
       clickhouseDatabase,
       clickhousePassword: resolvedClickhousePassword,
       clickhouseTable,
-      clickhouseUrl,
+      clickhouseUrl: resolvedClickhouseUrl,
       clickhouseUser,
       clickhouseMaxBytesToRead,
       imageUri: resolvedImageUri,
+      imageBuildId: resolvedImageBuildId,
       maxRequestBytes,
       port,
       prefix,
       region,
       databaseUrl: resolvedDatabaseUrl,
+      appBaseUrl,
+      dataPlaneOrganizationId,
+      dataPlaneSharedSecret: resolvedDataPlaneSharedSecret,
       publicBaseUrl: resolvedPublicBaseUrl,
       corsAllowedOrigins,
       sessionSecure
@@ -889,7 +1663,8 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
           volumeSize: cfg.getNumber('rootVolumeSizeGb') ?? 16,
           volumeType: 'gp3',
           deleteOnTermination: 'true',
-          encrypted: 'true'
+          encrypted: 'true',
+          kmsKeyId: dataPlaneKmsKeyArn
         }
       },
       {
@@ -901,7 +1676,8 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
           throughput:
             dataVolumeType === 'gp3' ? dataVolumeThroughput : undefined,
           deleteOnTermination: 'true',
-          encrypted: 'true'
+          encrypted: 'true',
+          kmsKeyId: dataPlaneKmsKeyArn
         }
       }
     ],
@@ -936,7 +1712,8 @@ const queryLaunchTemplate = new aws.ec2.LaunchTemplate(
           volumeSize: cfg.getNumber('queryRootVolumeSizeGb') ?? 16,
           volumeType: 'gp3',
           deleteOnTermination: 'true',
-          encrypted: 'true'
+          encrypted: 'true',
+          kmsKeyId: dataPlaneKmsKeyArn
         }
       }
     ],
@@ -992,13 +1769,24 @@ const queryAsg = new aws.autoscaling.Group(`${name}-query-asg`, {
 
 export const albDnsName = lb.dnsName
 export const domainNameOutput = domainName
+export const apiDomainNameOutput = apiDomainName
+export const appBaseUrlOutput = appBaseUrl
+export const apiBaseUrlOutput = apiBaseUrl
+export const dataPlaneOrganizationIdOutput = dataPlaneOrganizationId
+export const dataPlaneKmsKeyArnOutput = dataPlaneKmsKeyArn ?? ''
+export const processorPrefixOutput = processorPrefix
 export const dnsProviderOutput = dnsProvider
 export const edgeTlsModeOutput = edgeTlsMode
 export const hostedZoneNameOutput = hostedZoneName
 export const hostedZoneNameServers = hostedZone
   ? hostedZone.nameServers
   : []
-export const ingestUrl = publicBaseUrl
+export const manualDnsRecordsOutput = manualDnsRecords
+export const uiBucketName = uiBucket.bucket
+export const uiCloudFrontDistributionId = uiDistribution.id
+export const uiCloudFrontDomainName = uiDistribution.domainName
+export const uiUrl = appBaseUrl
+export const ingestUrl = apiBaseUrl
 export const queryTargetGroupArn = queryTargetGroup.arn
 export const ingestAutoScalingGroupName = asg.name
 export const queryAutoScalingGroupName = queryAsg.name
@@ -1006,14 +1794,30 @@ export const bucketName = bucket.bucket
 export const objectPrefix = prefix
 export const loaderSqsQueueUrl = loaderQueue.url
 export const loaderSqsQueueArn = loaderQueue.arn
+export const clickhouseModeOutput = clickhouseMode
+export const clickhouseCloudServiceIdOutput = clickhouseCloudServiceId
+export const clickhouseUrlOutput = clickhouseUrl
+export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
 export const clickhouseTableOutput = clickhouseTable
 export const clickhouseEventIndexTableOutput = clickhouseEventIndexTable
 export const clickhouseHotDimensionsTableOutput = clickhouseHotDimensionsTable
-export const databaseEndpoint = database.address
+export const databaseEndpoint = database ? database.address : ''
+export const postgresModeOutput = postgresMode
+export const postgresPrivateConnectOutput = postgresPrivateConnect
+export const postgresPrivateLinkEndpointId = postgresPrivateLinkEndpoint
+  ? postgresPrivateLinkEndpoint.id
+  : ''
 export const loginEmailIdentity = managedLoginEmailIdentity
   ? managedLoginEmailIdentity.emailIdentity
   : ''
+export const loginEmailFrom = emailFrom
+export const loginEmailMailFromDomainOutput = managedLoginEmailMailFrom
+  ? managedLoginEmailMailFrom.mailFromDomain
+  : loginEmailMailFromDomain
+export const loginEmailDkimTokens = managedLoginEmailIdentity
+  ? managedLoginEmailIdentity.dkimSigningAttributes.tokens
+  : []
 export const loginEmailVerifiedForSending = managedLoginEmailIdentity
   ? managedLoginEmailIdentity.verifiedForSendingStatus
   : false
@@ -1035,6 +1839,7 @@ interface UserDataArgs {
   clickhouseUser: string
   clickhouseMaxBytesToRead: number
   imageUri: string
+  imageBuildId: string
   loaderQueueUrl: string
   modalServerApiKey: string
   modalTokenId: string
@@ -1051,6 +1856,7 @@ interface UserDataArgs {
   region: string
   databaseUrl: string
   allowedEmails: string
+  appBaseUrl: string
   corsAllowedOrigins: string
   emailFrom: string
   publicBaseUrl: string
@@ -1061,6 +1867,9 @@ interface UserDataArgs {
   writerLanes: number
   writerQueueCapacity: number
   compactBatchReceipts: boolean
+  dataPlaneOrganizationId: string
+  dataPlaneSharedSecret: string
+  processorPrefix: string
 }
 
 interface QueryUserDataArgs {
@@ -1073,11 +1882,15 @@ interface QueryUserDataArgs {
   clickhouseUser: string
   clickhouseMaxBytesToRead: number
   imageUri: string
+  imageBuildId: string
   maxRequestBytes: number
   port: number
   prefix: string
   region: string
   databaseUrl: string
+  appBaseUrl: string
+  dataPlaneOrganizationId: string
+  dataPlaneSharedSecret: string
   publicBaseUrl: string
   corsAllowedOrigins: string
   sessionSecure: boolean
@@ -1168,16 +1981,19 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -v ${shellQuote(args.localDataDir)}:${shellQuote(args.localDataDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e PORT=${args.port} \\
-  -e NANOTRACE_DATABASE_URL=${shellQuote(args.databaseUrl)} \\
+  -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
+  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
   -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
+  -e NANOTRACE_DATA_PLANE_ORGANIZATION_ID=${shellQuote(args.dataPlaneOrganizationId)} \\
+  -e NANOTRACE_DATA_PLANE_SHARED_SECRET=${shellQuote(args.dataPlaneSharedSecret)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
+  -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
   -e NANOTRACE_EMAIL_FROM=${shellQuote(args.emailFrom)} \\
   -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
   -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_DATA_DIR=${shellQuote(args.localDataDir)} \\
-  -e NANOTRACE_UI_DIR=${shellQuote('/usr/local/share/nanotrace/ui')} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e S3_PREFIX=${shellQuote(args.prefix)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
@@ -1205,12 +2021,15 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e MODAL_TOKEN_SECRET=${shellQuote(args.modalTokenSecret)} \\
   -e MODAL_SERVER_API_KEY=${shellQuote(args.modalServerApiKey)} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
+  -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
   -e PROCESSOR_BUILDER_CMD=${shellQuote('python3 /usr/local/bin/modal_processor_builder.py')} \\
   ${shellQuote(args.imageUri)}
 docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e AWS_REGION=${shellQuote(args.region)} \\
+  -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e LOADER_SQS_QUEUE_URL=${shellQuote(args.loaderQueueUrl)} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
+  -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
@@ -1269,9 +2088,13 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e PORT=${args.port} \\
-  -e NANOTRACE_DATABASE_URL=${shellQuote(args.databaseUrl)} \\
+  -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
+  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
   -e NANOTRACE_BOOTSTRAP_API_KEY=${shellQuote(args.bootstrapApiKey)} \\
+  -e NANOTRACE_DATA_PLANE_ORGANIZATION_ID=${shellQuote(args.dataPlaneOrganizationId)} \\
+  -e NANOTRACE_DATA_PLANE_SHARED_SECRET=${shellQuote(args.dataPlaneSharedSecret)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
+  -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
@@ -1317,6 +2140,15 @@ function normalizeDomainName (value: string): string {
   return normalized
 }
 
+function domainFromEmail (value: string): string {
+  const trimmed = value.trim()
+  const at = trimmed.lastIndexOf('@')
+  if (at <= 0 || at === trimmed.length - 1) {
+    throw new Error(`Invalid email sender: ${value}`)
+  }
+  return trimmed.slice(at + 1)
+}
+
 function cloudflareRecordName (recordName: string, zoneName: string): string {
   if (recordName === zoneName) {
     return '@'
@@ -1328,10 +2160,50 @@ function cloudflareRecordName (recordName: string, zoneName: string): string {
   return recordName.slice(0, -suffix.length)
 }
 
+function normalizeClickhouseMode (value: string): 'shared-service' | 'dedicated-service' | 'external' {
+  const normalized = value.trim()
+  if (
+    normalized === 'shared-service' ||
+    normalized === 'dedicated-service' ||
+    normalized === 'external'
+  ) {
+    return normalized
+  }
+  throw new Error(
+    'NANOTRACE_CLICKHOUSE_MODE must be shared-service, dedicated-service, or external'
+  )
+}
+
+function clickhouseDatabaseName (organizationId: string): string {
+  const normalized = organizationId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  if (!normalized) {
+    return 'observatory'
+  }
+  return /^[a-z_]/.test(normalized)
+    ? normalized
+    : `org_${normalized}`
+}
+
 function numberEnv (key: string, fallback: number): number {
   const value = process.env[key]
   if (!value) {
     return fallback
+  }
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${key} must be a positive number`)
+  }
+  return parsed
+}
+
+function optionalNumberEnv (key: string): number | undefined {
+  const value = process.env[key]
+  if (!value) {
+    return undefined
   }
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -1361,6 +2233,36 @@ function booleanEnv (key: string, fallback: boolean): boolean {
   }
 }
 
+function parseClickhouseIpAccess (
+  value: string
+): { source: string; description?: string }[] {
+  const entries = value
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(Boolean)
+  if (entries.length === 0) {
+    throw new Error('ClickHouse Cloud IP access list must not be empty')
+  }
+  return entries.map(entry => {
+    const [source, description] = entry.split(':', 2)
+    if (!source) {
+      throw new Error(`Invalid ClickHouse Cloud IP access entry: ${entry}`)
+    }
+    return {
+      source,
+      description: description || `Nanotrace access ${source}`
+    }
+  })
+}
+
+function formatClickhouseIpAccess (
+  entries: { source: string; description?: string }[]
+): string {
+  return entries
+    .map(entry => `${entry.source}:${entry.description ?? ''}`)
+    .join(',')
+}
+
 function nonNegativeNumberEnv (key: string, fallback: number): number {
   const value = process.env[key]
   if (!value) {
@@ -1371,48 +2273,4 @@ function nonNegativeNumberEnv (key: string, fallback: number): number {
     throw new Error(`${key} must be a non-negative number`)
   }
   return parsed
-}
-
-function loadEnvFile (file: string | undefined): void {
-  if (!file) {
-    return
-  }
-
-  const envPath = path.resolve(repoRoot, file)
-  try {
-    const text = readFileSync(envPath, 'utf8')
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith('#')) {
-        continue
-      }
-      const match = trimmed.match(
-        /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/
-      )
-      if (!match) {
-        continue
-      }
-      const [, key, rawValue] = match
-      if (process.env[key] !== undefined) {
-        continue
-      }
-      process.env[key] = parseEnvValue(rawValue)
-    }
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException
-    if (nodeError.code !== 'ENOENT') {
-      throw error
-    }
-  }
-}
-
-function parseEnvValue (value: string): string {
-  const trimmed = value.trim()
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1)
-  }
-  return trimmed
 }

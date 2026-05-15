@@ -12,14 +12,18 @@ const pulumiCwd = path.join(root, "deploy/pulumi/nanotrace");
 loadEnvFile(process.env.NANOTRACE_ENV_FILE);
 
 const outputs = await pulumiOutputs();
-const apiKey = process.env.NANOTRACE_API_KEY || requiredOutput(outputs, "bootstrapApiKeyOutput");
-const ingestUrl = trimTrailingSlash(requiredOutput(outputs, "ingestUrl"));
+const apiKey = process.env.NANOTRACE_E2E_API_KEY || requiredOutput(outputs, "bootstrapApiKeyOutput");
+const ingestUrl = trimTrailingSlash(
+    process.env.NANOTRACE_E2E_INGEST_URL || requiredOutput(outputs, "ingestUrl"),
+);
 const bucketName = requiredOutput(outputs, "bucketName");
 const waitMs = numberEnv("NANOTRACE_E2E_WAIT_MS", 180_000);
 const pollMs = numberEnv("NANOTRACE_E2E_POLL_MS", 5_000);
 const clickhouseWaitMs = numberEnv("NANOTRACE_E2E_CLICKHOUSE_WAIT_MS", 300_000);
 const eventId = process.env.NANOTRACE_E2E_EVENT_ID ?? `e2e-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-const processorName = process.env.NANOTRACE_E2E_PROCESSOR_NAME ?? "e2e-modal-test";
+const processorName =
+    process.env.NANOTRACE_E2E_PROCESSOR_NAME ??
+    `e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const timestamp = new Date().toISOString();
 
 console.log(`ingestUrl=${ingestUrl}`);
@@ -34,7 +38,7 @@ try {
     await putProcessor(ingestUrl, apiKey, processorName);
     processorRegistered = true;
     await waitForProcessorReady(ingestUrl, apiKey, processorName, clickhouseWaitMs, pollMs);
-    await sleep(numberEnv("NANOTRACE_E2E_PROCESSOR_HOTLOAD_WAIT_MS", 10_000));
+    await sleep(numberEnv("NANOTRACE_E2E_PROCESSOR_HOTLOAD_WAIT_MS", 45_000));
 
     const receipt = await postEvent(ingestUrl, apiKey, {
         event_id: eventId,
@@ -72,7 +76,7 @@ try {
     assert(row.tenant_id === undefined, `tenant_id should live in data, got ${row.tenant_id}`);
     assert(row.service === undefined, `service should live in data, got ${row.service}`);
     assert(row.event_type === undefined, `event_type should live in data, got ${row.event_type}`);
-    assert(row.data?.tenant_id === "e2e", `tenant_id mismatch: ${row.data?.tenant_id}`);
+    assert(row.data?.tenant_id === "org_default", `tenant_id mismatch: ${row.data?.tenant_id}`);
     assert(row.data?.service === "nanotrace-e2e", `service mismatch: ${row.data?.service}`);
     assert(row.data?.event_type === "pulumi_e2e", `event_type mismatch: ${row.data?.event_type}`);
     assert(row.data?.event_id === eventId, "data payload mismatch");

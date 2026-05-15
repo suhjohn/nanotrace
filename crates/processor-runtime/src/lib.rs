@@ -64,6 +64,7 @@ pub enum ProcessorError {
 #[derive(Clone)]
 pub struct ProcessorSyncConfig {
     pub bucket: String,
+    pub prefix: String,
     pub interval: Duration,
     pub root: PathBuf,
     pub stage: String,
@@ -208,7 +209,8 @@ async fn load_processors(
     s3: &S3Client,
     cfg: &ProcessorSyncConfig,
 ) -> Result<Vec<LoadedProcessor>, ProcessorError> {
-    let index = match get_json::<ProcessorIndex>(s3, &cfg.bucket, "processors/index.json").await {
+    let index_key = processor_key(&cfg.prefix, "index.json");
+    let index = match get_json::<ProcessorIndex>(s3, &cfg.bucket, &index_key).await {
         Ok(index) => index,
         Err(err) => {
             warn!(error = %err, "processor index unavailable; using identity processors");
@@ -222,7 +224,7 @@ async fn load_processors(
     names.dedup();
 
     for name in names {
-        let key = format!("processors/{name}/manifest.json");
+        let key = processor_key(&cfg.prefix, &format!("{name}/manifest.json"));
         let manifest = match get_json::<ProcessorManifest>(s3, &cfg.bucket, &key).await {
             Ok(manifest) => manifest,
             Err(err) => {
@@ -307,6 +309,15 @@ async fn load_processor(
 fn processor_path(root: &std::path::Path, stage: &str, name: &str, sha: &str) -> PathBuf {
     let short_sha = sha.get(..16).unwrap_or(sha);
     root.join(format!("{stage}-{name}-{short_sha}.so"))
+}
+
+fn processor_key(prefix: &str, key: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}/{key}")
+    }
 }
 
 async fn get_json<T>(s3: &S3Client, bucket: &str, key: &str) -> Result<T, ProcessorError>

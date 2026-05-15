@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
@@ -22,14 +21,11 @@ if (!Number.isInteger(target) || target < 0) {
 const wait = !args.includes("--no-wait");
 const strictWait = args.includes("--strict");
 const allowMixedLaunchTemplates = args.includes("--allow-mixed-launch-templates");
-const envFile = optionValue("--env") ?? process.env.NANOTRACE_ENV_FILE;
 const pollMs = numberOption("--poll-ms", numberEnv("NANOTRACE_SCALE_POLL_MS", 10_000));
 const waitMs = numberOption("--wait-ms", numberEnv("NANOTRACE_SCALE_WAIT_MS", 15 * 60_000));
 
-loadEnvFile(envFile);
-
 const region = requiredEnv("AWS_REGION");
-const deploymentId = process.env.NANOTRACE_DEPLOYMENT_ID ?? "prod";
+const deploymentId = currentPulumiStack();
 const baseName = process.env.NANOTRACE_NAME ?? `nanotrace-${deploymentId}`;
 const asgName = process.env.NANOTRACE_ASG_NAME ?? await findAutoScalingGroup(`${baseName}-asg`);
 const pulumiEnv = {
@@ -211,43 +207,19 @@ async function targetGroupHealth(group, instanceIds) {
         }));
 }
 
-function loadEnvFile(file) {
-    if (!file) {
-        return;
+function currentPulumiStack() {
+    const result = spawnSync("pulumi", ["stack", "--show-name"], {
+        cwd: pulumiCwd,
+        env: {
+            ...process.env,
+            PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? "",
+        },
+        encoding: "utf8",
+    });
+    if (result.status === 0 && result.stdout.trim()) {
+        return result.stdout.trim();
     }
-    const resolved = path.resolve(root, file);
-    let contents;
-    try {
-        contents = readFileSync(resolved, "utf8");
-    } catch (error) {
-        throw error;
-    }
-
-    for (const line of contents.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) {
-            continue;
-        }
-        const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-        if (!match) {
-            continue;
-        }
-        const [, key, rawValue] = match;
-        if (process.env[key] !== undefined) {
-            continue;
-        }
-        process.env[key] = unquote(rawValue.trim());
-    }
-}
-
-function unquote(value) {
-    if (
-        (value.startsWith("\"") && value.endsWith("\"")) ||
-        (value.startsWith("'") && value.endsWith("'"))
-    ) {
-        return value.slice(1, -1);
-    }
-    return value;
+    return "prod";
 }
 
 function requiredEnv(key) {
@@ -323,9 +295,11 @@ function run(command, commandArgs, options = {}) {
 }
 
 function usage() {
-    console.log(`Usage: node scripts/scale-pulumi-asg.mjs <capacity> [--no-wait] [--strict] [--env path/to/env-file] [--wait-ms 900000] [--poll-ms 10000]
+    console.log(`Usage: node scripts/scale-pulumi-asg.mjs <capacity> [--no-wait] [--strict] [--wait-ms 900000] [--poll-ms 10000]
 
 Examples:
+  infisical run -- npm run scale:up
+  op run -- npm run scale:up
   npm run scale:down
   npm run scale:up
   npm run scale:set -- 2

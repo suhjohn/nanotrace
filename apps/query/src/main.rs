@@ -5,6 +5,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -14,7 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use config::Config;
-use nanotrace_auth::{AuthError, AuthStore};
+use nanotrace_auth::{AuthError, AuthIdentity, AuthRole, AuthStore, AuthType};
 use read::{QueryRequest, ReadError, ReadStore};
 use tokio::net::TcpListener;
 use tower_http::{
@@ -61,11 +62,16 @@ async fn main() -> anyhow::Result<()> {
 
 fn router(state: AppState) -> Router {
     let limit = state.cfg.max_request_bytes;
+
     let router = Router::new()
+        .route("/internal/query", post(post_query))
+        .route("/internal/events/{event_id}", get(get_event))
         .route("/query", post(post_query))
         .route("/events/{event_id}", get(get_event))
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+        .route("/readyz", get(readyz));
+
+    let router = router
         .layer(RequestBodyLimitLayer::new(limit))
         .with_state(state.clone());
 
@@ -88,7 +94,13 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(allowed_origins))
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                axum::http::header::HeaderName::from_static("x-nanotrace-organization-id"),
+                axum::http::header::HeaderName::from_static("x-nanotrace-internal-organization-id"),
+                axum::http::header::HeaderName::from_static("x-nanotrace-internal-secret"),
+            ])
             .allow_credentials(true),
     )
 }
@@ -97,9 +109,22 @@ async fn post_query(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers).await?;
-    Ok(Json(state.read.query(request).await?))
+) -> Result<Response, ApiError> {
+    let identity = authorize(&state, &headers).await?;
+    require_scope(&identity, "query:read")?;
+    let body = serde_json::to_vec(&request).map_err(|err| ApiError::BadGateway(err.to_string()))?;
+    if let Some(response) = proxy_to_data_plane(
+        &state,
+        &identity,
+        Method::POST,
+        "/internal/query",
+        Some(body),
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    Ok(Json(state.read.query(request, &identity.tenant_id).await?).into_response())
 }
 
 async fn get_event(
@@ -107,9 +132,32 @@ async fn get_event(
     headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    authorize(&state, &headers).await?;
-    let bytes = state.read.event_bytes(&event_id).await?;
+    let identity = authorize(&state, &headers).await?;
+    require_scope(&identity, "query:read")?;
+    if let Some(response) = proxy_to_data_plane(
+        &state,
+        &identity,
+        Method::GET,
+        &format!("/internal/events/{}", event_id),
+        None,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    let bytes = state
+        .read
+        .event_bytes(&event_id, &identity.tenant_id)
+        .await?;
     Ok(([("content-type", "application/json")], bytes).into_response())
+}
+
+fn require_scope(identity: &AuthIdentity, scope: &str) -> Result<(), ApiError> {
+    if nanotrace_auth::has_scope(identity, scope) {
+        Ok(())
+    } else {
+        Err(ApiError::Auth(AuthError::Forbidden))
+    }
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -126,14 +174,135 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<serde_json::Value>
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    nanotrace_auth::authorize_headers(headers, state.auth.as_deref()).await?;
-    Ok(())
+async fn proxy_to_data_plane(
+    state: &AppState,
+    identity: &AuthIdentity,
+    method: Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Result<Option<Response>, ApiError> {
+    if state.cfg.data_plane_organization_id.is_some() || identity.subject == "internal:gateway" {
+        return Ok(None);
+    }
+    let base_url = state
+        .cfg
+        .shared_data_plane_query_url
+        .as_deref()
+        .unwrap_or("");
+    let internal_secret = state.cfg.shared_data_plane_secret.as_deref().unwrap_or("");
+    if base_url.is_empty() || is_local_data_plane_base(state, base_url) {
+        return Ok(None);
+    }
+    if internal_secret.is_empty() {
+        return Ok(None);
+    }
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let method = method
+        .as_str()
+        .parse::<reqwest::Method>()
+        .map_err(|err| ApiError::BadGateway(err.to_string()))?;
+    let mut request = reqwest::Client::new()
+        .request(method, url)
+        .header("x-nanotrace-internal-organization-id", &identity.tenant_id)
+        .header("x-nanotrace-internal-secret", internal_secret);
+    if let Some(body) = body {
+        request = request
+            .header("content-type", "application/json")
+            .body(body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ApiError::BadGateway(err.to_string()))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| ApiError::BadGateway(err.to_string()))?;
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(body))
+        .map(Some)
+        .map_err(|err| ApiError::BadGateway(err.to_string()))
+}
+
+fn is_local_data_plane_base(state: &AppState, base_url: &str) -> bool {
+    state
+        .cfg
+        .auth
+        .public_base_url
+        .as_deref()
+        .is_some_and(|public_base_url| {
+            public_base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+        })
+}
+
+async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthIdentity, ApiError> {
+    if let Some(identity) = authorize_internal(state, headers) {
+        return Ok(identity);
+    }
+    let identity = nanotrace_auth::authorize_headers(headers, state.auth.as_deref()).await?;
+    if state
+        .cfg
+        .data_plane_organization_id
+        .as_deref()
+        .is_some_and(|organization_id| organization_id != identity.tenant_id)
+    {
+        return Err(ApiError::Auth(AuthError::Forbidden));
+    }
+    Ok(identity)
+}
+
+fn authorize_internal(state: &AppState, headers: &HeaderMap) -> Option<AuthIdentity> {
+    let configured_secret = state.cfg.data_plane_shared_secret.as_deref()?;
+    let provided_secret = headers
+        .get("x-nanotrace-internal-secret")
+        .and_then(|value| value.to_str().ok())?;
+    if configured_secret != provided_secret {
+        return None;
+    }
+    let organization_id = headers
+        .get("x-nanotrace-internal-organization-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if state
+        .cfg
+        .data_plane_organization_id
+        .as_deref()
+        .is_some_and(|expected| expected != organization_id)
+    {
+        return None;
+    }
+    Some(AuthIdentity {
+        auth_type: AuthType::ApiKey,
+        subject: "internal:gateway".to_string(),
+        email: None,
+        name: Some("internal gateway".to_string()),
+        role: AuthRole::Service,
+        tenant_id: organization_id.to_string(),
+        organization_id: organization_id.to_string(),
+        organization_name: organization_id.to_string(),
+        scopes: vec!["query:read".to_string()],
+    })
 }
 
 #[derive(Debug)]
 enum ApiError {
     Unauthorized,
+    BadGateway(String),
     Unavailable(&'static str),
     Read(ReadError),
     Auth(AuthError),
@@ -149,6 +318,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::BadGateway(message) => (StatusCode::BAD_GATEWAY, message),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message.to_string()),
             Self::Read(ReadError::InvalidQuery(err)) => (StatusCode::BAD_REQUEST, err),
             Self::Read(ReadError::ClickHouseResponse { status, body }) => {

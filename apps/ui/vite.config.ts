@@ -1,9 +1,13 @@
 import tailwindcss from '@tailwindcss/vite'
 import viteReact from '@vitejs/plugin-react'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '')
+  const env = loadEnv(mode, repoRoot, '')
   const apiTarget = env.NANOTRACE_URL || env.TRACER_URL || 'http://localhost:18473'
   const apiToken = env.NANOTRACE_API_KEY || env.NANOTRACE_KEY
   const proxyTarget = {
@@ -21,6 +25,7 @@ export default defineConfig(({ mode }) => {
         '/facets': proxyTarget,
         '/auth': proxyTarget,
         '/api-keys': proxyTarget,
+        '/dashboards': proxyTarget,
         '/query': proxyTarget
       },
       strictPort: true

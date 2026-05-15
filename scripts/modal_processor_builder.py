@@ -19,15 +19,16 @@ TARGET = os.environ.get("PROCESSOR_TARGET", "aarch64-unknown-linux-gnu")
 def main() -> int:
     bucket = required_env("PROCESSOR_BUCKET")
     name = required_env("PROCESSOR_NAME")
+    prefix = os.environ.get("PROCESSOR_PREFIX", "processors").strip("/")
     s3 = boto3.client("s3")
 
     try:
-        manifest = get_json(s3, bucket, manifest_key(name))
+        manifest = get_json(s3, bucket, manifest_key(prefix, name))
         stages = sorted(set(manifest.get("stages") or []))
         if not stages:
             raise RuntimeError("processor manifest has no stages")
 
-        mark_manifest(s3, bucket, name, manifest, status="building", error=None)
+        mark_manifest(s3, bucket, prefix, name, manifest, status="building", error=None)
         artifacts = dict(manifest.get("artifacts") or {})
         configs = dict(manifest.get("configs") or {})
 
@@ -48,11 +49,13 @@ def main() -> int:
 
         try:
             for stage in stages:
-                source = get_text(s3, bucket, f"processors/{name}/{stage}/source.rs")
-                config = get_json(s3, bucket, f"processors/{name}/{stage}/config.json")
+                source = get_text(s3, bucket, processor_key(prefix, name, stage, "source.rs"))
+                config = get_json(s3, bucket, processor_key(prefix, name, stage, "config.json"))
                 configs[stage] = config
                 artifact = build_stage(sandbox, name, stage, source)
-                artifact_key = f"processors/{name}/{stage}/artifacts/{TARGET}/libprocessor.so"
+                artifact_key = processor_key(
+                    prefix, name, stage, f"artifacts/{TARGET}/libprocessor.so"
+                )
                 s3.put_object(Bucket=bucket, Key=artifact_key, Body=artifact)
                 artifacts[stage] = {
                     "key": artifact_key,
@@ -73,13 +76,13 @@ def main() -> int:
         manifest["artifacts"] = artifacts
         manifest["error"] = None
         manifest["updated_at"] = now()
-        put_json(s3, bucket, manifest_key(name), manifest)
+        put_json(s3, bucket, manifest_key(prefix, name), manifest)
         return 0
     except Exception as exc:
         error = f"{exc}\n{traceback.format_exc()}"
         try:
-            manifest = get_json(s3, bucket, manifest_key(name))
-            mark_manifest(s3, bucket, name, manifest, status="failed", error=error)
+            manifest = get_json(s3, bucket, manifest_key(prefix, name))
+            mark_manifest(s3, bucket, prefix, name, manifest, status="failed", error=error)
         except Exception:
             print(error, file=sys.stderr)
         return 1
@@ -266,8 +269,12 @@ def read_stream(stream) -> str:
     return str(data)
 
 
-def manifest_key(name: str) -> str:
-    return f"processors/{name}/manifest.json"
+def manifest_key(prefix: str, name: str) -> str:
+    return f"{prefix}/{name}/manifest.json"
+
+
+def processor_key(prefix: str, name: str, stage: str, key: str) -> str:
+    return f"{prefix}/{name}/{stage}/{key.lstrip('/')}"
 
 
 def get_text(s3, bucket: str, key: str) -> str:
@@ -291,11 +298,13 @@ def put_json(s3, bucket: str, key: str, value) -> None:
     )
 
 
-def mark_manifest(s3, bucket: str, name: str, manifest, status: str, error: str | None) -> None:
+def mark_manifest(
+    s3, bucket: str, prefix: str, name: str, manifest, status: str, error: str | None
+) -> None:
     manifest["status"] = status
     manifest["error"] = error
     manifest["updated_at"] = now()
-    put_json(s3, bucket, manifest_key(name), manifest)
+    put_json(s3, bucket, manifest_key(prefix, name), manifest)
 
 
 def now() -> str:

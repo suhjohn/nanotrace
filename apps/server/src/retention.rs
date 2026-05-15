@@ -135,15 +135,29 @@ mod tests {
             compact_batch_receipts: false,
             processor_poll_interval: Duration::from_secs(30),
             processor_builder_cmd: "true".to_string(),
+            processor_prefix: "organizations/org_default/processors".to_string(),
+            cloud_provider: "aws".to_string(),
+            region: "us-west-2".to_string(),
+            supported_regions: vec!["us-west-2".to_string()],
+            clickhouse_mode: "external".to_string(),
+            clickhouse_region: "us-west-2".to_string(),
+            clickhouse_service_id: None,
+            data_plane_kms_key_arn: None,
+            data_plane_organization_id: None,
+            data_plane_shared_secret: None,
+            shared_data_plane_ingest_url: None,
+            shared_data_plane_query_url: None,
+            shared_data_plane_secret: None,
             auth: test_auth_config(),
             email_from: None,
             cors_allowed_origins: Vec::new(),
+            app_base_url: None,
         }
     }
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
-            database_url: None,
+            postgres_url: None,
             bootstrap_api_key: None,
             public_base_url: None,
             session_cookie_name: "nanotrace_session".to_string(),

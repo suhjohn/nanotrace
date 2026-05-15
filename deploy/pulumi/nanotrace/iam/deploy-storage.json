@@ -111,6 +111,55 @@
         "ses:UntagResource"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "ReadKmsForPulumiRefresh",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:GetKeyRotationStatus",
+        "kms:ListAliases",
+        "kms:ListResourceTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateNanotraceKmsKeys",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateKey",
+        "kms:TagResource"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestTag/Project": "nanotrace" } }
+    },
+    {
+      "Sid": "ManageNanotraceKmsKeys",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CancelKeyDeletion",
+        "kms:DisableKey",
+        "kms:DisableKeyRotation",
+        "kms:EnableKey",
+        "kms:EnableKeyRotation",
+        "kms:ScheduleKeyDeletion",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:UpdateKeyDescription"
+      ],
+      "Resource": "arn:aws:kms:*:*:key/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "nanotrace" } }
+    },
+    {
+      "Sid": "ManageNanotraceKmsAliases",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateAlias",
+        "kms:DeleteAlias",
+        "kms:UpdateAlias"
+      ],
+      "Resource": "arn:aws:kms:*:*:alias/nanotrace/*"
     }
   ]
 }

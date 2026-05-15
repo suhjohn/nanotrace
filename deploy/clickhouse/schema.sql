@@ -238,6 +238,7 @@ ORDER BY
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_facets (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         key String CODEC (ZSTD (1)),
         value String CODEC (ZSTD (1)),
@@ -248,10 +249,11 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (bucket_time)
 ORDER BY
-    (key, bucket_time, value, value_type);
+    (tenant_id, key, bucket_time, value, value_type);
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_facet_index (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         key LowCardinality (String),
         value String CODEC (ZSTD (1)),
         value_type LowCardinality (String),
@@ -271,7 +273,7 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (key, value, timestamp, event_id);
+    (tenant_id, key, value, timestamp, event_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.hot_dimensions (

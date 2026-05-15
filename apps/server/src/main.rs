@@ -1,4 +1,5 @@
 mod config;
+mod dashboards;
 mod event;
 mod event_log;
 mod facets;
@@ -17,8 +18,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
 
 use crate::{
-    config::Config, event_log::EventLogWriter, facets::FacetStore, http::AppState,
-    processors::ProcessorStore, read::ReadStore,
+    config::Config, dashboards::DashboardStore, event_log::EventLogWriter, facets::FacetStore,
+    http::AppState, processors::ProcessorStore, read::ReadStore,
 };
 
 #[tokio::main]
@@ -40,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3.clone(),
             ProcessorSyncConfig {
                 bucket,
+                prefix: cfg.processor_prefix.clone(),
                 interval: cfg.processor_poll_interval,
                 root: std::path::PathBuf::from("/tmp/nanotrace-upload-processors"),
                 stage: "upload".to_string(),
@@ -50,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let writer = Arc::new(EventLogWriter::new(cfg.clone()).await?);
     let read_store = Arc::new(ReadStore::new(cfg.clone(), s3.clone()));
     let facet_store = Arc::new(FacetStore::connect(cfg.clone()).await?);
+    let dashboard_store = Arc::new(DashboardStore::connect(cfg.clone()).await?);
     let processor_store = Arc::new(ProcessorStore::new(cfg.clone(), s3));
 
     {
@@ -85,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = http::router(AppState {
         cfg: cfg.clone(),
         auth,
+        dashboards: dashboard_store.clone(),
         facets: facet_store.clone(),
         processors: processor_store.clone(),
         read: read_store.clone(),

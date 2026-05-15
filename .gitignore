@@ -6,6 +6,7 @@ apps/ui/node_modules/
 packages/*/dist/
 /.env
 /.nanotrace/
+/.pulumi-docker/
 **/.wrangler/
 *.log
 __pycache__/

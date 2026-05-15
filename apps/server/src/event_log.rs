@@ -152,9 +152,13 @@ impl EventLogWriter {
         })
     }
 
-    pub async fn append_bytes(&self, body: &[u8]) -> Result<WriteReceipts, EventLogError> {
+    pub async fn append_bytes(
+        &self,
+        body: &[u8],
+        tenant_id: &str,
+    ) -> Result<WriteReceipts, EventLogError> {
         let started_at = Instant::now();
-        let events = match event::prepare_events(body) {
+        let mut events = match event::prepare_events(body) {
             Ok(events) => events,
             Err(err) => {
                 self.metrics
@@ -163,6 +167,7 @@ impl EventLogWriter {
                 return Err(err.into());
             }
         };
+        events.stamp_tenant(tenant_id);
 
         let lane = self.next_lane.fetch_add(1, Ordering::Relaxed) as usize % self.lanes.len();
         let (tx, rx) = oneshot::channel();
@@ -677,6 +682,7 @@ mod tests {
                     "timestamp": "2026-05-10T12:34:56.789Z",
                     "data": {"tenant_id": "tenant-a", "event_type": "log"}
                 }"#,
+                "org_default",
             )
             .await
             .expect("append commits");
@@ -748,15 +754,29 @@ mod tests {
             compact_batch_receipts: false,
             processor_poll_interval: Duration::from_secs(30),
             processor_builder_cmd: "true".to_string(),
+            processor_prefix: "organizations/org_default/processors".to_string(),
+            cloud_provider: "aws".to_string(),
+            region: "us-west-2".to_string(),
+            supported_regions: vec!["us-west-2".to_string()],
+            clickhouse_mode: "external".to_string(),
+            clickhouse_region: "us-west-2".to_string(),
+            clickhouse_service_id: None,
+            data_plane_kms_key_arn: None,
+            data_plane_organization_id: None,
+            data_plane_shared_secret: None,
+            shared_data_plane_ingest_url: None,
+            shared_data_plane_query_url: None,
+            shared_data_plane_secret: None,
             auth: test_auth_config(),
             email_from: None,
             cors_allowed_origins: Vec::new(),
+            app_base_url: None,
         }
     }
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
-            database_url: None,
+            postgres_url: None,
             bootstrap_api_key: None,
             public_base_url: None,
             session_cookie_name: "nanotrace_session".to_string(),

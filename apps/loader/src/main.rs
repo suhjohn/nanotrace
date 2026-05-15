@@ -33,6 +33,7 @@ struct Config {
     visibility_timeout: i32,
     request_timeout: Duration,
     processor_bucket: Option<String>,
+    processor_prefix: String,
     processor_poll_interval: Duration,
     processor_dir: PathBuf,
 }
@@ -82,6 +83,7 @@ struct S3Object {
 
 #[derive(Debug, Serialize)]
 struct FacetRow {
+    tenant_id: String,
     bucket_time: String,
     key: String,
     value: String,
@@ -92,6 +94,7 @@ struct FacetRow {
 
 #[derive(Debug, Serialize)]
 struct EventFacetIndexRow {
+    tenant_id: String,
     key: String,
     value: String,
     value_type: String,
@@ -134,6 +137,7 @@ async fn main() -> Result<()> {
             s3.clone(),
             ProcessorSyncConfig {
                 bucket,
+                prefix: cfg.processor_prefix.clone(),
                 interval: cfg.processor_poll_interval,
                 root: cfg.processor_dir.clone(),
                 stage: "loader".to_string(),
@@ -200,6 +204,9 @@ impl Config {
             processor_bucket: optional("PROCESSOR_S3_BUCKET")
                 .or_else(|| optional("NANOTRACE_S3_BUCKET"))
                 .or_else(|| optional("S3_BUCKET")),
+            processor_prefix: env_or("PROCESSOR_PREFIX", "organizations/org_default/processors")
+                .trim_matches('/')
+                .to_string(),
             processor_poll_interval: Duration::from_secs(parse_env(
                 "PROCESSOR_POLL_INTERVAL_SECS",
                 30,
@@ -485,7 +492,7 @@ impl Loader {
 }
 
 fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut counts = BTreeMap::<(String, String, String, String), (u64, u64)>::new();
+    let mut counts = BTreeMap::<(String, String, String, String, String), (u64, u64)>::new();
     let mut out = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -497,16 +504,23 @@ fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
         };
         for facet in facet_rows(row) {
             let count = counts
-                .entry((facet.bucket_time, facet.key, facet.value, facet.value_type))
+                .entry((
+                    facet.tenant_id,
+                    facet.bucket_time,
+                    facet.key,
+                    facet.value,
+                    facet.value_type,
+                ))
                 .or_insert((0, 0));
             count.0 += facet.count;
             count.1 += facet.error_count;
         }
     }
-    for ((bucket_time, key, value, value_type), (count, error_count)) in counts {
+    for ((tenant_id, bucket_time, key, value, value_type), (count, error_count)) in counts {
         serde_json::to_writer(
             &mut out,
             &FacetRow {
+                tenant_id,
                 bucket_time,
                 key,
                 value,
@@ -532,6 +546,9 @@ fn facet_rows(row: &Map<String, Value>) -> Vec<FacetRow> {
         .and_then(|data| string_value(data.get("event_type")).into_non_empty())
         .unwrap_or_default();
     let context = FacetContext {
+        tenant_id: data
+            .map(|data| string_value(data.get("tenant_id")))
+            .unwrap_or_default(),
         bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
         error_count: if is_error_row(row) { 1 } else { 0 },
         signal: signal_for_event_type(&event_type).to_string(),
@@ -589,6 +606,7 @@ fn event_facet_index_rows(
     let event_type = string_value(data.get("event_type"));
     let signal = signal_for_event_type(&event_type).to_string();
     let context = EventIndexContext {
+        tenant_id: string_value(data.get("tenant_id")),
         timestamp: timestamp.clone(),
         bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
         event_id,
@@ -622,6 +640,7 @@ fn event_facet_index_rows(
 }
 
 struct EventIndexContext {
+    tenant_id: String,
     timestamp: String,
     bucket_time: String,
     event_id: String,
@@ -709,6 +728,7 @@ fn push_event_index_row(
         return;
     }
     rows.push(EventFacetIndexRow {
+        tenant_id: context.tenant_id.clone(),
         key: key.to_string(),
         value,
         value_type: value_type.to_string(),
@@ -728,6 +748,7 @@ fn push_event_index_row(
 }
 
 struct FacetContext {
+    tenant_id: String,
     bucket_time: String,
     error_count: u64,
     signal: String,
@@ -798,6 +819,7 @@ fn push_facet(
         return;
     }
     facets.push(FacetRow {
+        tenant_id: context.tenant_id.clone(),
         bucket_time: context.bucket_time.clone(),
         key: key.to_string(),
         value,

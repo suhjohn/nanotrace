@@ -72,6 +72,7 @@ pub struct HotDimension {
 struct BackfillChunk {
     chunk_id: i64,
     job_id: String,
+    organization_id: String,
     path: String,
     value_type: String,
     chunk_start: DateTime<Utc>,
@@ -108,11 +109,11 @@ pub enum FacetError {
 
 impl FacetStore {
     pub async fn connect(cfg: Arc<Config>) -> Result<Self, FacetError> {
-        let pg = match cfg.auth.database_url.clone() {
-            Some(database_url) => Some(
+        let pg = match cfg.auth.postgres_url.clone() {
+            Some(postgres_url) => Some(
                 PgPoolOptions::new()
                     .max_connections(4)
-                    .connect(&database_url)
+                    .connect(&postgres_url)
                     .await?,
             ),
             None => None,
@@ -127,10 +128,10 @@ impl FacetStore {
         })
     }
 
-    pub async fn list(&self) -> Result<Vec<HotDimension>, FacetError> {
+    pub async fn list(&self, organization_id: &str) -> Result<Vec<HotDimension>, FacetError> {
         self.ensure_table().await?;
         let mut facets = builtin_dimensions();
-        for custom in self.active_custom_dimensions().await? {
+        for custom in self.active_custom_dimensions(organization_id).await? {
             if !facets.iter().any(|facet| facet.path == custom.path) {
                 facets.push(custom);
             }
@@ -138,7 +139,11 @@ impl FacetStore {
         Ok(facets)
     }
 
-    pub async fn put(&self, request: PutFacetRequest) -> Result<HotDimension, FacetError> {
+    pub async fn put(
+        &self,
+        organization_id: &str,
+        request: PutFacetRequest,
+    ) -> Result<HotDimension, FacetError> {
         self.ensure_table().await?;
         let path = validate_path(&request.path)?;
         if builtin_dimensions().iter().any(|facet| facet.path == path) {
@@ -153,7 +158,7 @@ impl FacetStore {
             .unwrap_or(&path)
             .to_string();
 
-        let mut dimensions = self.active_custom_dimensions().await?;
+        let mut dimensions = self.active_custom_dimensions(organization_id).await?;
         dimensions.retain(|dimension| dimension.path != path);
         dimensions.push(HotDimension {
             path: path.clone(),
@@ -173,18 +178,22 @@ impl FacetStore {
             source: "user".to_string(),
             removable: true,
         };
-        self.insert_dimension(&facet).await?;
+        self.insert_dimension(organization_id, &facet).await?;
         Ok(facet)
     }
 
-    pub async fn delete(&self, path: &str) -> Result<HotDimension, FacetError> {
+    pub async fn delete(
+        &self,
+        organization_id: &str,
+        path: &str,
+    ) -> Result<HotDimension, FacetError> {
         self.ensure_table().await?;
         let path = validate_path(path)?;
         if builtin_dimensions().iter().any(|facet| facet.path == path) {
             return Err(FacetError::BuiltinFacet);
         }
 
-        let mut dimensions = self.active_custom_dimensions().await?;
+        let mut dimensions = self.active_custom_dimensions(organization_id).await?;
         dimensions.retain(|dimension| dimension.path != path);
         self.reconcile_data_type(&dimensions).await?;
 
@@ -196,15 +205,19 @@ impl FacetStore {
             source: "user".to_string(),
             removable: true,
         };
-        self.insert_dimension(&facet).await?;
+        self.insert_dimension(organization_id, &facet).await?;
         Ok(facet)
     }
 
-    pub async fn enqueue_backfill(&self, path: &str) -> Result<FacetBackfillResponse, FacetError> {
+    pub async fn enqueue_backfill(
+        &self,
+        organization_id: &str,
+        path: &str,
+    ) -> Result<FacetBackfillResponse, FacetError> {
         self.ensure_table().await?;
         self.ensure_control_plane().await?;
         let path = validate_path(path)?;
-        let dimensions = self.list().await?;
+        let dimensions = self.list(organization_id).await?;
         let Some(dimension) = dimensions.iter().find(|dimension| dimension.path == path) else {
             return Err(FacetError::InvalidPath);
         };
@@ -224,9 +237,10 @@ impl FacetStore {
                     if(events = 0, 0, toInt64(toUnixTimestamp64Milli(min_ts))) AS min_ms, \
                     if(events = 0, 0, toInt64(toUnixTimestamp64Milli(max_ts))) AS max_ms \
              FROM (SELECT count() AS events, uniqExact(value) AS values, min(timestamp) AS min_ts, max(timestamp) AS max_ts \
-                   FROM (SELECT timestamp, {} AS value FROM {}) WHERE value != '')",
+                   FROM (SELECT timestamp, {} AS value FROM {} WHERE tenant_id = {}) WHERE value != '')",
             value_expr,
-            self.events_table()
+            self.events_table(),
+            quote_literal(organization_id)
         );
         let response: ClickHouseResponse<Bounds> =
             serde_json::from_str(&self.clickhouse_query(&bounds_query).await?)?;
@@ -237,7 +251,7 @@ impl FacetStore {
             max_ms: 0,
         });
 
-        let job_id = backfill_job_id(&path);
+        let job_id = backfill_job_id(organization_id, &path);
         let chunks = backfill_chunks(bounds.min_ms, bounds.max_ms);
         let total_chunks = chunks.len() as i64;
         let status = if total_chunks == 0 {
@@ -250,10 +264,11 @@ impl FacetStore {
         let mut tx = pg.begin().await?;
         sqlx::query(
             "INSERT INTO nanotrace_facet_backfill_jobs
-             (job_id, path, value_type, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error)
-             VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, '')",
+             (job_id, organization_id, path, value_type, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, $8, '')",
         )
         .bind(&job_id)
+        .bind(organization_id)
         .bind(&path)
         .bind(index_value_type)
         .bind(status)
@@ -274,10 +289,11 @@ impl FacetStore {
         for (chunk_start, chunk_end) in chunks {
             sqlx::query(
                 "INSERT INTO nanotrace_facet_backfill_chunks
-                 (job_id, path, chunk_start, chunk_end, status)
-                 VALUES ($1, $2, $3, $4, 'queued')",
+                 (job_id, organization_id, path, chunk_start, chunk_end, status)
+                 VALUES ($1, $2, $3, $4, $5, 'queued')",
             )
             .bind(&job_id)
+            .bind(organization_id)
             .bind(&path)
             .bind(chunk_start)
             .bind(chunk_end)
@@ -286,17 +302,22 @@ impl FacetStore {
         }
         tx.commit().await?;
 
-        self.backfill_status(&job_id).await
+        self.backfill_status(organization_id, &job_id).await
     }
 
-    pub async fn backfill_status(&self, job_id: &str) -> Result<FacetBackfillResponse, FacetError> {
+    pub async fn backfill_status(
+        &self,
+        organization_id: &str,
+        job_id: &str,
+    ) -> Result<FacetBackfillResponse, FacetError> {
         self.ensure_control_plane().await?;
         let job_id = validate_job_id(job_id)?;
         let row = sqlx::query_as::<_, (String, String, String, i64, i64, i64, i64, i64, String)>(
             "SELECT job_id, path, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error
              FROM nanotrace_facet_backfill_jobs
-             WHERE job_id = $1",
+             WHERE organization_id = $1 AND job_id = $2",
         )
+        .bind(organization_id)
         .bind(job_id)
         .fetch_optional(self.pg_pool()?)
         .await?;
@@ -304,14 +325,19 @@ impl FacetStore {
             .ok_or(FacetError::InvalidPath)
     }
 
-    pub async fn backfill_list(&self) -> Result<Vec<FacetBackfillResponse>, FacetError> {
+    pub async fn backfill_list(
+        &self,
+        organization_id: &str,
+    ) -> Result<Vec<FacetBackfillResponse>, FacetError> {
         self.ensure_control_plane().await?;
         let rows = sqlx::query_as::<_, (String, String, String, i64, i64, i64, i64, i64, String)>(
             "SELECT job_id, path, status, total_chunks, completed_chunks, failed_chunks, indexed_events, values, error
              FROM nanotrace_facet_backfill_jobs
+             WHERE organization_id = $1
              ORDER BY updated_at DESC, created_at DESC
              LIMIT 100",
         )
+        .bind(organization_id)
         .fetch_all(self.pg_pool()?)
         .await?;
         Ok(rows.into_iter().map(backfill_response_from_row).collect())
@@ -357,6 +383,7 @@ impl FacetStore {
                 String,
                 String,
                 String,
+                String,
                 DateTime<Utc>,
                 DateTime<Utc>,
                 i32,
@@ -385,12 +412,21 @@ impl FacetStore {
              FROM next_chunk, nanotrace_facet_backfill_jobs j
              WHERE c.chunk_id = next_chunk.chunk_id
                AND j.job_id = c.job_id
-             RETURNING c.chunk_id, c.job_id, c.path, j.value_type, c.chunk_start, c.chunk_end, c.attempts",
+             RETURNING c.chunk_id, c.job_id, c.organization_id, c.path, j.value_type, c.chunk_start, c.chunk_end, c.attempts",
         )
         .bind(&self.worker_id)
         .fetch_optional(self.pg_pool()?)
         .await?;
-        let Some((chunk_id, job_id, path, value_type, chunk_start, chunk_end, attempts)) = row
+        let Some((
+            chunk_id,
+            job_id,
+            organization_id,
+            path,
+            value_type,
+            chunk_start,
+            chunk_end,
+            attempts,
+        )) = row
         else {
             return Ok(None);
         };
@@ -405,6 +441,7 @@ impl FacetStore {
         Ok(Some(BackfillChunk {
             chunk_id,
             job_id,
+            organization_id,
             path,
             value_type,
             chunk_start,
@@ -419,42 +456,46 @@ impl FacetStore {
         let (bucket_delete_start, bucket_delete_end) =
             clickhouse_minute_bucket_bounds(chunk.chunk_start, chunk.chunk_end);
         self.clickhouse_exec_sync_mutation(&format!(
-            "ALTER TABLE {} DELETE WHERE key = {} AND bucket_time >= {} AND bucket_time < {}",
+            "ALTER TABLE {} DELETE WHERE tenant_id = {} AND key = {} AND bucket_time >= {} AND bucket_time < {}",
             self.facets_table(),
+            quote_literal(&chunk.organization_id),
             quote_literal(&chunk.path),
             bucket_delete_start,
             bucket_delete_end
         ))
         .await?;
         self.clickhouse_exec_sync_mutation(&format!(
-            "ALTER TABLE {} DELETE WHERE key = {} AND timestamp >= {} AND timestamp < {}",
+            "ALTER TABLE {} DELETE WHERE tenant_id = {} AND key = {} AND timestamp >= {} AND timestamp < {}",
             self.event_index_table(),
+            quote_literal(&chunk.organization_id),
             quote_literal(&chunk.path),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
         ))
         .await?;
         self.clickhouse_exec(&format!(
-            "INSERT INTO {} (bucket_time, key, value, value_type, count, error_count) \
-             SELECT toStartOfMinute(timestamp) AS bucket_time, {} AS key, value, {} AS value_type, count() AS count, sum(error) AS error_count \
+            "INSERT INTO {} (tenant_id, bucket_time, key, value, value_type, count, error_count) \
+             SELECT {} AS tenant_id, toStartOfMinute(timestamp) AS bucket_time, {} AS key, value, {} AS value_type, count() AS count, sum(error) AS error_count \
              FROM (SELECT timestamp, {} AS value, if({}, 1, 0) AS error FROM {} \
-                   WHERE timestamp >= {} AND timestamp < {}) \
+                   WHERE tenant_id = {} AND timestamp >= {} AND timestamp < {}) \
              WHERE value != '' \
              GROUP BY bucket_time, value",
             self.facets_table(),
+            quote_literal(&chunk.organization_id),
             quote_literal(&chunk.path),
             quote_literal(&chunk.value_type),
             value_expr,
             error_expr,
             self.events_table(),
+            quote_literal(&chunk.organization_id),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
         ))
         .await?;
         self.clickhouse_exec(&format!(
             "INSERT INTO {} \
-             (key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms) \
-             SELECT {}, value, {}, timestamp, toStartOfMinute(timestamp), event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms \
+             (tenant_id, key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms) \
+             SELECT {}, {}, value, {}, timestamp, toStartOfMinute(timestamp), event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms \
              FROM (SELECT timestamp, event_id, {} AS value, \
                     ifNull(toString(data.event_type), '') AS event_type, \
                     multiIf( \
@@ -469,13 +510,15 @@ impl FacetStore {
                     parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')) AS start_time, \
                     parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')) AS end_time, \
                     toFloat64OrZero(ifNull(toString(data.duration_ms), '0')) AS duration_ms \
-                   FROM {} WHERE timestamp >= {} AND timestamp < {}) \
+                   FROM {} WHERE tenant_id = {} AND timestamp >= {} AND timestamp < {}) \
              WHERE value != ''",
             self.event_index_table(),
+            quote_literal(&chunk.organization_id),
             quote_literal(&chunk.path),
             quote_literal(&chunk.value_type),
             value_expr,
             self.events_table(),
+            quote_literal(&chunk.organization_id),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
         ))
@@ -486,8 +529,9 @@ impl FacetStore {
             rows: u64,
         }
         let query = format!(
-            "SELECT count() AS rows FROM {} WHERE key = {} AND timestamp >= {} AND timestamp < {}",
+            "SELECT count() AS rows FROM {} WHERE tenant_id = {} AND key = {} AND timestamp >= {} AND timestamp < {}",
             self.event_index_table(),
+            quote_literal(&chunk.organization_id),
             quote_literal(&chunk.path),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
@@ -569,7 +613,7 @@ impl FacetStore {
             "running"
         };
         let values = if status == "completed" {
-            self.count_backfill_values(&path).await? as i64
+            self.count_backfill_values(&job_id, &path).await? as i64
         } else {
             0
         };
@@ -598,14 +642,21 @@ impl FacetStore {
         Ok(())
     }
 
-    async fn count_backfill_values(&self, path: &str) -> Result<u64, FacetError> {
+    async fn count_backfill_values(&self, job_id: &str, path: &str) -> Result<u64, FacetError> {
+        let organization_id = sqlx::query_scalar::<_, String>(
+            "SELECT organization_id FROM nanotrace_facet_backfill_jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(self.pg_pool()?)
+        .await?;
         #[derive(Deserialize)]
         struct ValueCount {
             values: u64,
         }
         let query = format!(
-            "SELECT uniqExact(value) AS values FROM {} WHERE key = {}",
+            "SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {}",
             self.event_index_table(),
+            quote_literal(&organization_id),
             quote_literal(path)
         );
         let response: ClickHouseResponse<ValueCount> =
@@ -613,22 +664,31 @@ impl FacetStore {
         Ok(response.data.first().map(|row| row.values).unwrap_or(0))
     }
 
-    async fn active_custom_dimensions(&self) -> Result<Vec<HotDimension>, FacetError> {
+    async fn active_custom_dimensions(
+        &self,
+        organization_id: &str,
+    ) -> Result<Vec<HotDimension>, FacetError> {
         let query = format!(
             "SELECT path, value_type, status, display_name, source, toBool(1) AS removable \
              FROM (SELECT path, value_type, status, display_name, source, updated_at \
-                   FROM {} ORDER BY updated_at DESC LIMIT 1 BY path) \
+                   FROM {} WHERE organization_id = {} ORDER BY updated_at DESC LIMIT 1 BY path) \
              WHERE status = 'active' AND source = 'user' \
              ORDER BY path ASC",
-            self.hot_dimensions_table()
+            self.hot_dimensions_table(),
+            quote_literal(organization_id)
         );
         let response: ClickHouseResponse<HotDimension> =
             serde_json::from_str(&self.clickhouse_query(&query).await?)?;
         Ok(response.data)
     }
 
-    async fn insert_dimension(&self, dimension: &HotDimension) -> Result<(), FacetError> {
+    async fn insert_dimension(
+        &self,
+        organization_id: &str,
+        dimension: &HotDimension,
+    ) -> Result<(), FacetError> {
         let body = serde_json::json!({
+            "organization_id": organization_id,
             "path": dimension.path,
             "value_type": dimension.value_type,
             "status": dimension.status,
@@ -666,6 +726,7 @@ impl FacetStore {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS nanotrace_facet_backfill_jobs (
                 job_id text PRIMARY KEY,
+                organization_id text NOT NULL DEFAULT 'org_default',
                 path text NOT NULL,
                 value_type text NOT NULL,
                 status text NOT NULL,
@@ -685,6 +746,7 @@ impl FacetStore {
             "CREATE TABLE IF NOT EXISTS nanotrace_facet_backfill_chunks (
                 chunk_id bigserial PRIMARY KEY,
                 job_id text NOT NULL REFERENCES nanotrace_facet_backfill_jobs(job_id) ON DELETE CASCADE,
+                organization_id text NOT NULL DEFAULT 'org_default',
                 path text NOT NULL,
                 chunk_start timestamptz NOT NULL,
                 chunk_end timestamptz NOT NULL,
@@ -712,6 +774,7 @@ impl FacetStore {
     async fn create_table(&self) -> Result<(), FacetError> {
         let hot_dimensions = format!(
             "CREATE TABLE IF NOT EXISTS {} (\
+             organization_id String DEFAULT 'org_default', \
              path String, \
              value_type LowCardinality(String), \
              status LowCardinality(String), \
@@ -721,10 +784,11 @@ impl FacetStore {
              updated_at DateTime64(3, 'UTC') DEFAULT now64(3), \
              created_by String DEFAULT '', \
              error String DEFAULT ''\
-             ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY path",
+             ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (organization_id, path)",
             self.hot_dimensions_table()
         );
-        self.clickhouse_exec(&hot_dimensions).await
+        self.clickhouse_exec(&hot_dimensions).await?;
+        Ok(())
     }
 
     async fn reconcile_data_type(&self, custom: &[HotDimension]) -> Result<(), FacetError> {
@@ -1088,7 +1152,7 @@ fn backfill_chunks(min_ms: i64, max_ms: i64) -> Vec<(DateTime<Utc>, DateTime<Utc
     chunks
 }
 
-fn backfill_job_id(path: &str) -> String {
+fn backfill_job_id(organization_id: &str, path: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let timestamp = chrono::Utc::now()
         .timestamp_nanos_opt()
@@ -1098,7 +1162,7 @@ fn backfill_job_id(path: &str) -> String {
         "bf_{:x}_{:x}_{:x}",
         timestamp,
         std::process::id(),
-        sequence ^ stable_path_hash(path)
+        sequence ^ stable_path_hash(&format!("{organization_id}:{path}"))
     )
 }
 

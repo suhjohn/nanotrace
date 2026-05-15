@@ -44,8 +44,9 @@ cargo test --all-features
 
 ## AWS Quickstart
 
-Set AWS credentials and an API key in the environment, or put them in an env
-file and point `NANOTRACE_ENV_FILE` at that file:
+Deploy commands read only the process environment. Inject variables before
+running them with your shell, password manager, or secret manager, for example
+`infisical run --`, `op run --`, or `set -a && source .env && set +a`.
 
 ```text
 AWS_REGION=us-west-1
@@ -55,7 +56,6 @@ NANOTRACE_API_KEY=ntak_...
 NANOTRACE_EMAIL_FROM=nanotrace@example.com
 NANOTRACE_ALLOWED_EMAILS=alice@company.com,*@company.com,/^.+@engineering\\.company\\.com$/
 NANOTRACE_ADMIN_EMAILS=alice@company.com
-NANOTRACE_DEPLOYMENT_ID=prod
 ```
 
 Browser login uses one-time email links sent through AWS SES. The sender in
@@ -63,12 +63,14 @@ Browser login uses one-time email links sent through AWS SES. The sender in
 region; if the account is still in the SES sandbox, recipients must be verified
 too.
 
-When using an env file, run commands with `NANOTRACE_ENV_FILE=path/to/env-file`.
-
 Deploy the ingest service:
 
 ```sh
 npm run deploy:up
+# or
+infisical run -- npm run deploy:up
+# or
+op run -- npm run deploy:up
 ```
 
 Run the deploy-aware E2E after `deploy:up`. It reads Pulumi outputs, posts
@@ -118,7 +120,8 @@ Destroy AWS resources:
 npm run deploy:destroy
 ```
 
-Resource names use `nanotrace-<NANOTRACE_DEPLOYMENT_ID>`.
+Resource names use `nanotrace-<Pulumi stack name>` unless overridden with
+Pulumi config `nanotrace:name` or `nanotrace:deploymentId`.
 
 ## UDP Client
 

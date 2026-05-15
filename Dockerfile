@@ -1,13 +1,5 @@
-ARG TARGETPLATFORM
-ARG TARGETARCH
-FROM --platform=$TARGETPLATFORM node:24-bookworm-slim AS ui-builder
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY apps/ui/package.json apps/ui/package.json
-RUN npm ci --workspace apps/ui --include-workspace-root
-COPY apps/ui apps/ui
-RUN npm --workspace apps/ui run build
-
+ARG TARGETPLATFORM=linux/arm64
+ARG TARGETARCH=arm64
 FROM --platform=$TARGETPLATFORM rust:1-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /app
@@ -41,7 +33,6 @@ RUN apt-get update \
 COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-server /usr/local/bin/nanotrace-server
 COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-loader /usr/local/bin/nanotrace-loader
 COPY --from=builder /app/target-${TARGETARCH}/release/nanotrace-query /usr/local/bin/nanotrace-query
-COPY --from=ui-builder /app/apps/ui/dist /usr/local/share/nanotrace/ui
 COPY scripts/modal_processor_builder.py /usr/local/bin/modal_processor_builder.py
 ENV PORT=18473
 EXPOSE 18473

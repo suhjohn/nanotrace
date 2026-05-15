@@ -12,11 +12,18 @@ pub struct Config {
     pub clickhouse_password: Option<String>,
     pub clickhouse_database: String,
     pub clickhouse_table: String,
+    pub clickhouse_facets_table: String,
+    pub clickhouse_event_index_table: String,
+    pub clickhouse_hot_dimensions_table: String,
     pub clickhouse_max_result_rows: u64,
     pub clickhouse_max_execution_secs: u64,
     pub clickhouse_max_bytes_to_read: u64,
     pub max_request_bytes: usize,
     pub request_timeout: Duration,
+    pub data_plane_organization_id: Option<String>,
+    pub data_plane_shared_secret: Option<String>,
+    pub shared_data_plane_query_url: Option<String>,
+    pub shared_data_plane_secret: Option<String>,
     pub auth: AuthConfig,
     pub cors_allowed_origins: Vec<String>,
 }
@@ -41,8 +48,29 @@ impl Config {
             .unwrap_or_else(|_| "events".to_string())
             .trim()
             .to_string();
+        let clickhouse_facets_table = env::var("CLICKHOUSE_FACETS_TABLE")
+            .unwrap_or_else(|_| "event_facets".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_event_index_table = env::var("CLICKHOUSE_EVENT_INDEX_TABLE")
+            .unwrap_or_else(|_| "event_facet_index".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_hot_dimensions_table = env::var("CLICKHOUSE_HOT_DIMENSIONS_TABLE")
+            .unwrap_or_else(|_| "hot_dimensions".to_string())
+            .trim()
+            .to_string();
         ensure_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         ensure_identifier("CLICKHOUSE_TABLE", &clickhouse_table)?;
+        ensure_identifier("CLICKHOUSE_FACETS_TABLE", &clickhouse_facets_table)?;
+        ensure_identifier(
+            "CLICKHOUSE_EVENT_INDEX_TABLE",
+            &clickhouse_event_index_table,
+        )?;
+        ensure_identifier(
+            "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
+            &clickhouse_hot_dimensions_table,
+        )?;
 
         let clickhouse_max_result_rows = parse_env("CLICKHOUSE_MAX_RESULT_ROWS", 100_000)?;
         let clickhouse_max_execution_secs = parse_env("CLICKHOUSE_MAX_EXECUTION_SECS", 30)?;
@@ -68,8 +96,7 @@ impl Config {
         let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 10 * 60)?;
         ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
         let auth = AuthConfig {
-            database_url: optional_string("NANOTRACE_DATABASE_URL")
-                .or_else(|| optional_string("DATABASE_URL")),
+            postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
             bootstrap_api_key: optional_string("NANOTRACE_BOOTSTRAP_API_KEY"),
             public_base_url,
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
@@ -93,11 +120,18 @@ impl Config {
             clickhouse_password: optional_string("CLICKHOUSE_PASSWORD"),
             clickhouse_database,
             clickhouse_table,
+            clickhouse_facets_table,
+            clickhouse_event_index_table,
+            clickhouse_hot_dimensions_table,
             clickhouse_max_result_rows,
             clickhouse_max_execution_secs,
             clickhouse_max_bytes_to_read,
             max_request_bytes: parse_env("MAX_REQUEST_BYTES", 16 * 1024 * 1024)?,
             request_timeout: Duration::from_secs(request_timeout_secs),
+            data_plane_organization_id: optional_string("NANOTRACE_DATA_PLANE_ORGANIZATION_ID"),
+            data_plane_shared_secret: optional_string("NANOTRACE_DATA_PLANE_SHARED_SECRET"),
+            shared_data_plane_query_url: optional_string("NANOTRACE_SHARED_DATA_PLANE_QUERY_URL"),
+            shared_data_plane_secret: optional_string("NANOTRACE_SHARED_DATA_PLANE_SECRET"),
             auth,
             cors_allowed_origins: parse_list_env("NANOTRACE_CORS_ALLOWED_ORIGINS"),
         })

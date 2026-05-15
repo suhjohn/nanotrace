@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -15,7 +15,7 @@ pub struct ReadStore {
     s3: S3Client,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct QueryRequest {
     pub query: String,
     #[serde(default)]
@@ -57,18 +57,25 @@ impl ReadStore {
         }
     }
 
-    pub async fn query(&self, request: QueryRequest) -> Result<Value, ReadError> {
+    pub async fn query(&self, request: QueryRequest, tenant_id: &str) -> Result<Value, ReadError> {
         let query = checked_select_query(&request.query)?;
-        let text = self.clickhouse_query(&query, &request.parameters).await?;
+        validate_query_sources(&query, &self.allowed_table_names())?;
+        let query = self.scope_query(&query);
+        let mut parameters = request.parameters;
+        parameters.insert(
+            "__nanotrace_tenant_id".to_string(),
+            Value::String(tenant_id.to_string()),
+        );
+        let text = self.clickhouse_query(&query, &parameters).await?;
         serde_json::from_str(&text).map_err(ReadError::InvalidStoredEvent)
     }
 
-    pub async fn event_bytes(&self, event_id: &str) -> Result<Bytes, ReadError> {
+    pub async fn event_bytes(&self, event_id: &str, tenant_id: &str) -> Result<Bytes, ReadError> {
         if event_id.trim().is_empty() {
             return Err(ReadError::InvalidQuery("event_id is required".to_string()));
         }
 
-        let pointer = self.event_pointer(event_id).await?;
+        let pointer = self.event_pointer(event_id, tenant_id).await?;
         let bucket = self
             .cfg
             .s3_bucket
@@ -101,11 +108,19 @@ impl ReadStore {
         Ok(bytes)
     }
 
-    async fn event_pointer(&self, event_id: &str) -> Result<EventPointer, ReadError> {
+    async fn event_pointer(
+        &self,
+        event_id: &str,
+        tenant_id: &str,
+    ) -> Result<EventPointer, ReadError> {
         let mut parameters = serde_json::Map::new();
         parameters.insert("event_id".to_string(), Value::String(event_id.to_string()));
+        parameters.insert(
+            "__nanotrace_tenant_id".to_string(),
+            Value::String(tenant_id.to_string()),
+        );
         let query = format!(
-            "SELECT source_file, source_offset, source_length FROM {} WHERE event_id = {{event_id:String}} ORDER BY timestamp ASC, source_file ASC, source_offset ASC LIMIT 1",
+            "SELECT source_file, source_offset, source_length FROM {} WHERE tenant_id = {{__nanotrace_tenant_id:String}} AND event_id = {{event_id:String}} ORDER BY timestamp ASC, source_file ASC, source_offset ASC LIMIT 1",
             self.table_name()
         );
         let text = self.clickhouse_query(&query, &parameters).await?;
@@ -190,6 +205,43 @@ impl ReadStore {
             self.cfg.clickhouse_database, self.cfg.clickhouse_table
         )
     }
+
+    fn scope_query(&self, query: &str) -> String {
+        let mut scoped = query.to_string();
+        for table in self.allowed_table_names().iter() {
+            let scoped_table = format!(
+                "(SELECT * FROM {table} WHERE tenant_id = {{__nanotrace_tenant_id:String}})"
+            );
+            for keyword in ["FROM", "JOIN"] {
+                scoped = scoped.replace(
+                    &format!("{keyword} {table}"),
+                    &format!("{keyword} {scoped_table}"),
+                );
+                scoped = scoped.replace(
+                    &format!("{} {table}", keyword.to_ascii_lowercase()),
+                    &format!("{} {scoped_table}", keyword.to_ascii_lowercase()),
+                );
+            }
+        }
+        scoped
+    }
+
+    fn allowed_table_names(&self) -> Vec<String> {
+        [
+            self.cfg.clickhouse_table.as_str(),
+            self.cfg.clickhouse_facets_table.as_str(),
+            self.cfg.clickhouse_event_index_table.as_str(),
+            self.cfg.clickhouse_hot_dimensions_table.as_str(),
+        ]
+        .into_iter()
+        .flat_map(|table| {
+            [
+                table.to_string(),
+                format!("{}.{}", self.cfg.clickhouse_database, table),
+            ]
+        })
+        .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,8 +285,97 @@ fn checked_select_query(query: &str) -> Result<String, ReadError> {
             )));
         }
     }
+    if query.contains('`') || query.contains('"') {
+        return Err(ReadError::InvalidQuery(
+            "query must not include quoted identifiers".to_string(),
+        ));
+    }
 
     Ok(query)
+}
+
+fn validate_query_sources(query: &str, allowed_tables: &[String]) -> Result<(), ReadError> {
+    let code = sql_code(query);
+    let bytes = code.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some((keyword_start, keyword)) = next_source_keyword(&code[index..]) else {
+            break;
+        };
+        index += keyword_start + keyword.len();
+        loop {
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] == b'(' {
+                break;
+            }
+            let source_start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric()
+                    || bytes[index] == b'_'
+                    || bytes[index] == b'.')
+            {
+                index += 1;
+            }
+            let source = code[source_start..index].trim();
+            if source.is_empty() {
+                break;
+            }
+            if !allowed_tables
+                .iter()
+                .any(|allowed| source.eq_ignore_ascii_case(allowed))
+            {
+                return Err(ReadError::InvalidQuery(format!(
+                    "query source is not allowed: {source}"
+                )));
+            }
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] != b',' {
+                break;
+            }
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn next_source_keyword(value: &str) -> Option<(usize, &'static str)> {
+    let from = find_keyword(value, "FROM");
+    let join = find_keyword(value, "JOIN");
+    match (from, join) {
+        (Some(from), Some(join)) if from <= join => Some((from, "FROM")),
+        (Some(_), Some(join)) => Some((join, "JOIN")),
+        (Some(from), None) => Some((from, "FROM")),
+        (None, Some(join)) => Some((join, "JOIN")),
+        (None, None) => None,
+    }
+}
+
+fn find_keyword(value: &str, keyword: &str) -> Option<usize> {
+    let upper = value.to_ascii_uppercase();
+    let mut offset = 0;
+    while let Some(index) = upper[offset..].find(keyword) {
+        let absolute = offset + index;
+        let before = absolute
+            .checked_sub(1)
+            .and_then(|idx| upper.as_bytes().get(idx))
+            .copied();
+        let after = upper.as_bytes().get(absolute + keyword.len()).copied();
+        let before_boundary = before.is_none_or(|ch| !is_identifier_byte(ch));
+        let after_boundary = after.is_none_or(|ch| !is_identifier_byte(ch));
+        if before_boundary && after_boundary {
+            return Some(absolute);
+        }
+        offset = absolute + keyword.len();
+    }
+    None
+}
+
+fn is_identifier_byte(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || value == b'_'
 }
 
 fn trim_single_statement(query: &str) -> Result<String, ReadError> {
@@ -367,7 +508,7 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadError, checked_select_query, validate_parameter_name};
+    use super::{ReadError, checked_select_query, validate_parameter_name, validate_query_sources};
 
     #[test]
     fn accepts_select_and_with_queries() {
@@ -412,5 +553,27 @@ mod tests {
         assert!(validate_parameter_name("_from").is_ok());
         assert!(validate_parameter_name("1bad").is_err());
         assert!(validate_parameter_name("bad-name").is_err());
+    }
+
+    #[test]
+    fn rejects_unapproved_query_sources() {
+        let allowed = vec![
+            "events".to_string(),
+            "observatory.events".to_string(),
+            "observatory.event_facets".to_string(),
+        ];
+        assert!(validate_query_sources("SELECT * FROM observatory.events", &allowed).is_ok());
+        assert!(
+            validate_query_sources(
+                "SELECT * FROM observatory.events JOIN system.tables ON 1",
+                &allowed
+            )
+            .is_err()
+        );
+        assert!(validate_query_sources("SELECT * FROM numbers(10)", &allowed).is_err());
+        assert!(
+            validate_query_sources("SELECT * FROM observatory.events, system.tables", &allowed)
+                .is_err()
+        );
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const pulumiCwd = path.join(root, "deploy/pulumi/nanotrace");
@@ -12,27 +12,29 @@ if (args.includes("--help") || args.includes("-h")) {
     process.exit(0);
 }
 
-const envFile = optionValue("--env") ?? process.env.NANOTRACE_ENV_FILE;
 const buildId = optionValue("--build-id") ?? `deploy-${timestamp()}`;
 const skipRoll = args.includes("--no-roll");
-const peakCapacity = numberOption("--peak", numberEnv("NANOTRACE_ROLL_PEAK_CAPACITY", 2));
-const finalCapacity = numberOption("--final", numberEnv("NANOTRACE_ROLL_FINAL_CAPACITY", 1));
+const refreshWaitMs = numberOption("--wait-ms", numberEnv("NANOTRACE_ROLL_WAIT_MS", 20 * 60_000));
+const refreshPollMs = numberOption("--poll-ms", numberEnv("NANOTRACE_ROLL_POLL_MS", 15_000));
 const node24 = process.env.NANOTRACE_NODE24_BIN ?? path.join(process.env.HOME ?? "", ".nvm/versions/node/v24.12.0/bin");
-
-loadEnvFile(envFile);
 
 const deployEnv = {
     ...process.env,
     PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? "",
     PATH: node24 ? `${node24}:${process.env.PATH ?? ""}` : process.env.PATH,
 };
+const region = requiredEnv("AWS_REGION");
+const deploymentId = currentPulumiStack();
+const baseName = process.env.NANOTRACE_NAME ?? `nanotrace-${deploymentId}`;
 
-if (envFile) {
-    console.log(`env=${envFile}`);
-}
 console.log(`imageBuildId=${buildId}`);
 
 await run("pulumi", ["config", "set", "imageBuildId", buildId], {
+    cwd: pulumiCwd,
+    env: deployEnv,
+    inherit: true,
+});
+await run("pulumi", ["config", "set", "imageTag", buildId], {
     cwd: pulumiCwd,
     env: deployEnv,
     inherit: true,
@@ -44,71 +46,99 @@ await run("pulumi", ["up", "--yes"], {
 });
 
 if (!skipRoll) {
-    if (peakCapacity < finalCapacity) {
-        throw new Error(`--peak (${peakCapacity}) must be >= --final (${finalCapacity})`);
+    const groups = [
+        await findAutoScalingGroup(`${baseName}-asg`),
+        await findAutoScalingGroup(`${baseName}-query-asg`),
+    ];
+    for (const group of groups) {
+        await startInstanceRefresh(group);
     }
-    await run(process.execPath, scaleArgs(peakCapacity, envFile, { allowMixedLaunchTemplates: true }), {
-        cwd: root,
-        env: deployEnv,
-        inherit: true,
-    });
-    await run(process.execPath, scaleArgs(finalCapacity, envFile), {
-        cwd: root,
-        env: deployEnv,
-        inherit: true,
-    });
+    await Promise.all(groups.map((group) => waitForInstanceRefresh(group, refreshWaitMs, refreshPollMs)));
 }
 
 console.log("deploy roll complete");
 
-function loadEnvFile(file) {
-    if (!file) {
-        return;
+function currentPulumiStack() {
+    const result = spawnSync("pulumi", ["stack", "--show-name"], {
+        cwd: pulumiCwd,
+        env: deployEnv,
+        encoding: "utf8",
+    });
+    if (result.status === 0 && result.stdout.trim()) {
+        return result.stdout.trim();
     }
-    const resolved = path.resolve(root, file);
-    let contents;
-    try {
-        contents = readFileSync(resolved, "utf8");
-    } catch (error) {
-        throw error;
-    }
-
-    for (const line of contents.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) {
-            continue;
-        }
-        const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-        if (!match) {
-            continue;
-        }
-        const [, key, rawValue] = match;
-        if (process.env[key] !== undefined) {
-            continue;
-        }
-        process.env[key] = unquote(rawValue.trim());
-    }
+    return "prod";
 }
 
-function scaleArgs(capacity, envFile, options = {}) {
-    const args = ["scripts/scale-pulumi-asg.mjs", String(capacity)];
-    if (envFile) {
-        args.push("--env", envFile);
+async function findAutoScalingGroup(namePrefix) {
+    const result = await run("aws", [
+        "autoscaling",
+        "describe-auto-scaling-groups",
+        "--region",
+        region,
+        "--query",
+        `AutoScalingGroups[?starts_with(AutoScalingGroupName, \`${namePrefix}\`)].AutoScalingGroupName`,
+        "--output",
+        "json",
+    ]);
+    const names = JSON.parse(result.stdout);
+    if (names.length !== 1) {
+        throw new Error(`expected one ASG starting with ${namePrefix}, found ${names.length}: ${names.join(", ")}`);
     }
-    if (options.allowMixedLaunchTemplates) {
-        args.push("--allow-mixed-launch-templates");
-    }
-    return args;
+    return names[0];
 }
 
-function unquote(value) {
-    if (
-        (value.startsWith("\"") && value.endsWith("\"")) ||
-        (value.startsWith("'") && value.endsWith("'"))
-    ) {
-        return value.slice(1, -1);
+async function startInstanceRefresh(group) {
+    const result = await run("aws", [
+        "autoscaling",
+        "start-instance-refresh",
+        "--region",
+        region,
+        "--auto-scaling-group-name",
+        group,
+        "--preferences",
+        "{\"MinHealthyPercentage\":100,\"InstanceWarmup\":120,\"SkipMatching\":false}",
+        "--query",
+        "InstanceRefreshId",
+        "--output",
+        "text",
+    ]);
+    console.log(`refresh started: ${group} id=${result.stdout.trim()}`);
+}
+
+async function waitForInstanceRefresh(group, timeoutMs, intervalMs) {
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = "";
+    while (Date.now() < deadline) {
+        const result = await run("aws", [
+            "autoscaling",
+            "describe-instance-refreshes",
+            "--region",
+            region,
+            "--auto-scaling-group-name",
+            group,
+            "--max-records",
+            "1",
+            "--query",
+            "InstanceRefreshes[0]",
+            "--output",
+            "json",
+        ]);
+        const refresh = JSON.parse(result.stdout);
+        if (!refresh) {
+            throw new Error(`no instance refresh found for ${group}`);
+        }
+        lastStatus = `${group} status=${refresh.Status} percent=${refresh.PercentageComplete ?? 0}`;
+        console.log(lastStatus);
+        if (refresh.Status === "Successful") {
+            return;
+        }
+        if (["Failed", "Cancelled", "RollbackFailed", "RollbackSuccessful"].includes(refresh.Status)) {
+            throw new Error(`instance refresh did not succeed: ${lastStatus} reason=${refresh.StatusReason ?? ""}`);
+        }
+        await sleep(intervalMs);
     }
-    return value;
+    throw new Error(`timed out waiting for instance refresh; last status: ${lastStatus}`);
 }
 
 function numberEnv(key, fallback) {
@@ -133,6 +163,14 @@ function numberOption(name, fallback) {
         throw new Error(`${name} must be a positive number`);
     }
     return parsed;
+}
+
+function requiredEnv(key) {
+    const value = process.env[key];
+    if (!value) {
+        throw new Error(`${key} is required`);
+    }
+    return value;
 }
 
 function optionValue(name) {
@@ -181,11 +219,13 @@ function run(command, commandArgs, options = {}) {
 }
 
 function usage() {
-    console.log(`Usage: node scripts/deploy-roll-pulumi.mjs [--env path/to/env-file] [--build-id deploy-...] [--peak 2] [--final 1] [--no-roll]
+    console.log(`Usage: node scripts/deploy-roll-pulumi.mjs [--build-id deploy-...] [--wait-ms 1200000] [--poll-ms 15000] [--no-roll]
 
 Examples:
   npm run deploy:roll
-  npm run deploy:roll -- --peak 2 --final 1
+  infisical run -- npm run deploy:roll
+  op run -- npm run deploy:roll
+  npm run deploy:roll -- --wait-ms 1200000
   npm run deploy:roll -- --no-roll
 `);
 }

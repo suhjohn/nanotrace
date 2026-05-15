@@ -54,6 +54,10 @@
         "rds:DescribeDBInstances",
         "rds:DescribeDBSubnetGroups",
         "route53:GetHostedZone",
+        "kms:DescribeKey",
+        "kms:GetKeyRotationStatus",
+        "kms:ListAliases",
+        "kms:ListResourceTags",
         "route53:ListHostedZones",
         "route53:ListHostedZonesByName",
         "route53:ListResourceRecordSets",
@@ -225,6 +229,25 @@
         "arn:aws:iam::*:role/nanotrace-*-instance-role-*",
         "arn:aws:iam::*:instance-profile/nanotrace-*-instance-profile-*"
       ]
+    },
+    {
+      "Sid": "DeleteNanotraceKmsAliases",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DeleteAlias"
+      ],
+      "Resource": "arn:aws:kms:*:*:alias/nanotrace/*"
+    },
+    {
+      "Sid": "ScheduleNanotraceKmsDeletion",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DisableKey",
+        "kms:ScheduleKeyDeletion",
+        "kms:UntagResource"
+      ],
+      "Resource": "arn:aws:kms:*:*:key/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "nanotrace" } }
     },
     {
       "Sid": "ReadCallerAndAccount",

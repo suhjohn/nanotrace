@@ -8,9 +8,10 @@
   ],
   "scripts": {
     "build": "npm --workspaces run build",
-    "deploy:preview": "pulumi -C deploy/pulumi/nanotrace preview",
-    "deploy:up": "pulumi -C deploy/pulumi/nanotrace up",
-    "deploy:destroy": "pulumi -C deploy/pulumi/nanotrace destroy",
+    "deploy:preview": "node scripts/pulumi-nanotrace.mjs preview",
+    "deploy:up": "node scripts/pulumi-nanotrace.mjs up",
+    "deploy:destroy": "node scripts/pulumi-nanotrace.mjs destroy",
+    "provision:data-plane": "node scripts/provision-data-plane.mjs",
     "deploy:roll": "node scripts/deploy-roll-pulumi.mjs",
     "backfill:facets": "node scripts/backfill-clickhouse-facets.mjs",
     "e2e:pulumi": "node scripts/e2e-pulumi.mjs",

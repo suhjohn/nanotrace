@@ -8,6 +8,7 @@ import type { JsonObject, JsonValue } from '../lib/json'
 import { clamp, useCookieState, useIndexedDbState } from '../lib/hooks'
 import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
+import { queryHeaders, runtimeNanotraceApiKey } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/')({
   validateSearch: parseObservatorySearch,
@@ -4313,33 +4314,6 @@ function authUrl(apiBaseUrl: string, path: string) {
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/api-keys` : '/api-keys'
-}
-
-function queryHeaders() {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = runtimeNanotraceApiKey()
-  if (token) headers.Authorization = `Bearer ${token}`
-  return headers
-}
-
-function runtimeNanotraceApiKey() {
-  const configured = import.meta.env.VITE_NANOTRACE_API_KEY
-  if (configured) return configured
-  if (typeof window === 'undefined') return ''
-
-  const params = new URLSearchParams(window.location.search)
-  const urlKey = params.get('nanotrace_api_key') || params.get('api_key') || ''
-  if (urlKey) {
-    window.localStorage.setItem('nanotrace.api_key', urlKey)
-    params.delete('nanotrace_api_key')
-    params.delete('api_key')
-    const search = params.toString()
-    const nextUrl = `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`
-    window.history.replaceState(window.history.state, '', nextUrl)
-    return urlKey
-  }
-
-  return window.localStorage.getItem('nanotrace.api_key') || ''
 }
 
 function eventsTable() {

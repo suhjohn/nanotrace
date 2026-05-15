@@ -10,12 +10,24 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiKeysRouteImport } from './routes/api-keys'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as FieldValueRouteImport } from './routes/$field/$value'
+import { Route as OrganizationsRouteImport } from './routes/organizations'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiKeysRoute = ApiKeysRouteImport.update({
+  id: '/settings/api-keys',
+  path: '/settings/api-keys',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OrganizationsRoute = OrganizationsRouteImport.update({
+  id: '/settings/organizations',
+  path: '/settings/organizations',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DashboardRoute = DashboardRouteImport.update({
@@ -31,30 +43,38 @@ const FieldValueRoute = FieldValueRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organizations': typeof OrganizationsRoute
   '/dashboard': typeof DashboardRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/dashboard' | '/$field/$value'
+  fullPaths: '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/dashboard' | '/$field/$value'
-  id: '__root__' | '/' | '/dashboard' | '/$field/$value'
+  to: '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
+  id: '__root__' | '/' | '/settings/api-keys' | '/settings/organizations' | '/dashboard' | '/$field/$value'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ApiKeysRoute: typeof ApiKeysRoute
+  OrganizationsRoute: typeof OrganizationsRoute
   DashboardRoute: typeof DashboardRoute
   FieldValueRoute: typeof FieldValueRoute
 }
@@ -66,6 +86,20 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/api-keys': {
+      id: '/settings/api-keys'
+      path: '/settings/api-keys'
+      fullPath: '/settings/api-keys'
+      preLoaderRoute: typeof ApiKeysRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/organizations': {
+      id: '/settings/organizations'
+      path: '/settings/organizations'
+      fullPath: '/settings/organizations'
+      preLoaderRoute: typeof OrganizationsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/dashboard': {
@@ -87,6 +121,8 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ApiKeysRoute: ApiKeysRoute,
+  OrganizationsRoute: OrganizationsRoute,
   DashboardRoute: DashboardRoute,
   FieldValueRoute: FieldValueRoute,
 }

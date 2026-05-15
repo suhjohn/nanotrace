@@ -40,6 +40,19 @@ impl PreparedEvents {
     pub fn len(&self) -> usize {
         self.events.len()
     }
+
+    pub fn stamp_tenant(&mut self, organization_id: &str) {
+        for event in &mut self.events {
+            event.data.insert(
+                "tenant_id".to_string(),
+                Value::String(organization_id.to_string()),
+            );
+            event.data.insert(
+                "organization_id".to_string(),
+                Value::String(organization_id.to_string()),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

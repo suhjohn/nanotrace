@@ -61,6 +61,7 @@ impl ProcessorStore {
 
     pub async fn put(
         &self,
+        organization_id: &str,
         name: &str,
         request: PutProcessorRequest,
     ) -> Result<ProcessorManifest, ProcessorStoreError> {
@@ -80,13 +81,13 @@ impl ProcessorStore {
             configs.insert(stage.to_string(), stage_request.config.clone());
             self.put_bytes(
                 bucket,
-                &format!("processors/{name}/{stage}/source.rs"),
+                &processor_key(organization_id, &format!("{name}/{stage}/source.rs")),
                 code.as_bytes().to_vec(),
             )
             .await?;
             self.put_json(
                 bucket,
-                &format!("processors/{name}/{stage}/config.json"),
+                &processor_key(organization_id, &format!("{name}/{stage}/config.json")),
                 &stage_request.config,
             )
             .await?;
@@ -104,21 +105,24 @@ impl ProcessorStore {
             error: None,
             updated_at: Some(Utc::now().to_rfc3339()),
         };
-        self.put_json(bucket, &manifest_key(name), &manifest)
+        self.put_json(bucket, &manifest_key(organization_id, name), &manifest)
             .await?;
-        self.upsert_index(bucket, name).await?;
-        self.spawn_builder(name)?;
+        self.upsert_index(bucket, organization_id, name).await?;
+        self.spawn_builder(organization_id, name)?;
 
         Ok(manifest)
     }
 
-    pub async fn list(&self) -> Result<Vec<ProcessorManifest>, ProcessorStoreError> {
+    pub async fn list(
+        &self,
+        organization_id: &str,
+    ) -> Result<Vec<ProcessorManifest>, ProcessorStoreError> {
         let bucket = self.bucket()?;
-        let index = self.get_index(bucket).await?;
+        let index = self.get_index(bucket, organization_id).await?;
         let mut processors = Vec::new();
         for name in index.processors {
             if let Ok(manifest) = self
-                .get_json::<ProcessorManifest>(bucket, &manifest_key(&name))
+                .get_json::<ProcessorManifest>(bucket, &manifest_key(organization_id, &name))
                 .await
             {
                 if manifest.status != "deleted" {
@@ -129,13 +133,21 @@ impl ProcessorStore {
         Ok(processors)
     }
 
-    pub async fn delete(&self, name: &str) -> Result<ProcessorManifest, ProcessorStoreError> {
+    pub async fn delete(
+        &self,
+        organization_id: &str,
+        name: &str,
+    ) -> Result<ProcessorManifest, ProcessorStoreError> {
         validate_name(name)?;
         let bucket = self.bucket()?;
-        let mut index = self.get_index(bucket).await?;
+        let mut index = self.get_index(bucket, organization_id).await?;
         index.processors.retain(|candidate| candidate != name);
-        self.put_json(bucket, "processors/index.json", &index)
-            .await?;
+        self.put_json(
+            bucket,
+            &processor_key(organization_id, "index.json"),
+            &index,
+        )
+        .await?;
 
         let manifest = ProcessorManifest {
             name: name.to_string(),
@@ -149,7 +161,7 @@ impl ProcessorStore {
             error: None,
             updated_at: Some(Utc::now().to_rfc3339()),
         };
-        self.put_json(bucket, &manifest_key(name), &manifest)
+        self.put_json(bucket, &manifest_key(organization_id, name), &manifest)
             .await?;
         Ok(manifest)
     }
@@ -161,19 +173,33 @@ impl ProcessorStore {
             .ok_or(ProcessorStoreError::S3NotConfigured)
     }
 
-    async fn upsert_index(&self, bucket: &str, name: &str) -> Result<(), ProcessorStoreError> {
-        let mut index = self.get_index(bucket).await?;
+    async fn upsert_index(
+        &self,
+        bucket: &str,
+        organization_id: &str,
+        name: &str,
+    ) -> Result<(), ProcessorStoreError> {
+        let mut index = self.get_index(bucket, organization_id).await?;
         if !index.processors.iter().any(|candidate| candidate == name) {
             index.processors.push(name.to_string());
         }
         index.processors.sort();
         index.processors.dedup();
-        self.put_json(bucket, "processors/index.json", &index).await
+        self.put_json(
+            bucket,
+            &processor_key(organization_id, "index.json"),
+            &index,
+        )
+        .await
     }
 
-    async fn get_index(&self, bucket: &str) -> Result<ProcessorIndex, ProcessorStoreError> {
+    async fn get_index(
+        &self,
+        bucket: &str,
+        organization_id: &str,
+    ) -> Result<ProcessorIndex, ProcessorStoreError> {
         match self
-            .get_json::<ProcessorIndex>(bucket, "processors/index.json")
+            .get_json::<ProcessorIndex>(bucket, &processor_key(organization_id, "index.json"))
             .await
         {
             Ok(index) => Ok(index),
@@ -232,7 +258,7 @@ impl ProcessorStore {
         Ok(())
     }
 
-    fn spawn_builder(&self, name: &str) -> Result<(), ProcessorStoreError> {
+    fn spawn_builder(&self, organization_id: &str, name: &str) -> Result<(), ProcessorStoreError> {
         let Some(bucket) = self.cfg.s3_bucket.clone() else {
             return Err(ProcessorStoreError::S3NotConfigured);
         };
@@ -248,6 +274,8 @@ impl ProcessorStore {
         command
             .args(parts)
             .env("PROCESSOR_BUCKET", bucket)
+            .env("PROCESSOR_ORGANIZATION_ID", organization_id)
+            .env("PROCESSOR_PREFIX", processor_prefix(organization_id))
             .env("PROCESSOR_NAME", name)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -295,8 +323,23 @@ impl PutProcessorRequest {
     }
 }
 
-fn manifest_key(name: &str) -> String {
-    format!("processors/{name}/manifest.json")
+fn manifest_key(organization_id: &str, name: &str) -> String {
+    processor_key(organization_id, &format!("{name}/manifest.json"))
+}
+
+fn processor_key(organization_id: &str, key: &str) -> String {
+    format!(
+        "{}/{}",
+        processor_prefix(organization_id),
+        key.trim_start_matches('/')
+    )
+}
+
+fn processor_prefix(organization_id: &str) -> String {
+    format!(
+        "organizations/{}/processors",
+        organization_id.trim_matches('/')
+    )
 }
 
 fn validate_name(name: &str) -> Result<(), ProcessorStoreError> {

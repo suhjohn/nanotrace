@@ -1,13 +1,13 @@
 use std::{env, path::PathBuf, time::Duration};
 
-use nanotrace_auth::AuthConfig;
+use nanotrace_auth::{AuthConfig, DEFAULT_ORGANIZATION_ID};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
-    pub ui_dir: PathBuf,
+    pub ui_dir: Option<PathBuf>,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
     pub clickhouse_url: Option<String>,
@@ -35,9 +35,23 @@ pub struct Config {
     pub compact_batch_receipts: bool,
     pub processor_poll_interval: Duration,
     pub processor_builder_cmd: String,
+    pub processor_prefix: String,
+    pub cloud_provider: String,
+    pub region: String,
+    pub supported_regions: Vec<String>,
+    pub clickhouse_mode: String,
+    pub clickhouse_region: String,
+    pub clickhouse_service_id: Option<String>,
+    pub data_plane_kms_key_arn: Option<String>,
+    pub data_plane_organization_id: Option<String>,
+    pub data_plane_shared_secret: Option<String>,
+    pub shared_data_plane_ingest_url: Option<String>,
+    pub shared_data_plane_query_url: Option<String>,
+    pub shared_data_plane_secret: Option<String>,
     pub auth: AuthConfig,
     pub email_from: Option<String>,
     pub cors_allowed_origins: Vec<String>,
+    pub app_base_url: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -56,10 +70,7 @@ impl Config {
         let data_dir = PathBuf::from(
             env::var("NANOTRACE_DATA_DIR").unwrap_or_else(|_| "/data/events".to_string()),
         );
-        let ui_dir = PathBuf::from(
-            env::var("NANOTRACE_UI_DIR")
-                .unwrap_or_else(|_| "/usr/local/share/nanotrace/ui".to_string()),
-        );
+        let ui_dir = optional_string("NANOTRACE_UI_DIR").map(PathBuf::from);
         let s3_bucket = env::var("NANOTRACE_S3_BUCKET")
             .or_else(|_| env::var("S3_BUCKET"))
             .ok()
@@ -114,7 +125,47 @@ impl Config {
             .unwrap_or_else(|_| "python3 /usr/local/bin/modal_processor_builder.py".to_string())
             .trim()
             .to_string();
+        let processor_prefix = env::var("PROCESSOR_PREFIX")
+            .unwrap_or_else(|_| format!("organizations/{DEFAULT_ORGANIZATION_ID}/processors"))
+            .trim()
+            .trim_matches('/')
+            .to_string();
+        let cloud_provider = env::var("NANOTRACE_DATA_PLANE_PROVIDER")
+            .or_else(|_| env::var("CLICKHOUSE_CLOUD_PROVIDER"))
+            .unwrap_or_else(|_| "aws".to_string())
+            .trim()
+            .to_string();
+        let region = env::var("NANOTRACE_DATA_PLANE_REGION")
+            .or_else(|_| env::var("AWS_REGION"))
+            .unwrap_or_else(|_| "us-west-2".to_string())
+            .trim()
+            .to_string();
+        let supported_regions = {
+            let configured = parse_list_env("NANOTRACE_SUPPORTED_REGIONS");
+            if configured.is_empty() {
+                vec![region.clone()]
+            } else {
+                configured
+            }
+        };
+        let clickhouse_mode = env::var("NANOTRACE_CLICKHOUSE_MODE")
+            .unwrap_or_else(|_| "external".to_string())
+            .trim()
+            .to_string();
+        let clickhouse_region = env::var("CLICKHOUSE_CLOUD_REGION")
+            .unwrap_or_else(|_| region.clone())
+            .trim()
+            .to_string();
+        let clickhouse_service_id = optional_string("CLICKHOUSE_CLOUD_SERVICE_ID");
+        let data_plane_kms_key_arn = optional_string("NANOTRACE_DATA_PLANE_KMS_KEY_ARN");
+        let data_plane_organization_id = optional_string("NANOTRACE_DATA_PLANE_ORGANIZATION_ID");
+        let data_plane_shared_secret = optional_string("NANOTRACE_DATA_PLANE_SHARED_SECRET");
+        let shared_data_plane_ingest_url =
+            optional_string("NANOTRACE_SHARED_DATA_PLANE_INGEST_URL");
+        let shared_data_plane_query_url = optional_string("NANOTRACE_SHARED_DATA_PLANE_QUERY_URL");
+        let shared_data_plane_secret = optional_string("NANOTRACE_SHARED_DATA_PLANE_SECRET");
         let public_base_url = optional_string("NANOTRACE_PUBLIC_BASE_URL");
+        let app_base_url = optional_string("NANOTRACE_APP_BASE_URL");
         let session_secure = optional_bool_env("NANOTRACE_SESSION_SECURE")?.unwrap_or_else(|| {
             public_base_url
                 .as_deref()
@@ -123,8 +174,7 @@ impl Config {
         let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
         let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 10 * 60)?;
         let auth = AuthConfig {
-            database_url: optional_string("NANOTRACE_DATABASE_URL")
-                .or_else(|| optional_string("DATABASE_URL")),
+            postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
             bootstrap_api_key: optional_string("NANOTRACE_BOOTSTRAP_API_KEY"),
             public_base_url,
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
@@ -201,9 +251,23 @@ impl Config {
             compact_batch_receipts,
             processor_poll_interval: Duration::from_secs(processor_poll_interval_secs),
             processor_builder_cmd,
+            processor_prefix,
+            cloud_provider,
+            region,
+            supported_regions,
+            clickhouse_mode,
+            clickhouse_region,
+            clickhouse_service_id,
+            data_plane_kms_key_arn,
+            data_plane_organization_id,
+            data_plane_shared_secret,
+            shared_data_plane_ingest_url,
+            shared_data_plane_query_url,
+            shared_data_plane_secret,
             auth,
             email_from: optional_string("NANOTRACE_EMAIL_FROM"),
             cors_allowed_origins,
+            app_base_url,
         })
     }
 }
