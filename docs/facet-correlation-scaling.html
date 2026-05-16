@@ -310,10 +310,10 @@
             A facet table is optimized for browsing, grouping, and drilling into a selected dimension.
             It usually has two pieces:
           </p>
-          <pre>event_facets
+          <pre>field_counts_5m
   tenant_id, key, value, bucket_time, count, error_count
 
-event_facet_index
+field_index
   tenant_id, key, value, timestamp, event_id, metadata...</pre>
           <p>
             The summary table makes top groups cheap. The membership table makes "open this group" cheap.
@@ -554,7 +554,7 @@ event_facet_index
         </div>
         <div class="card">
           <h3>Group-By Wants Time Buckets Or Time First</h3>
-          <pre>event_facets:
+          <pre>field_counts_5m:
 ORDER BY (tenant_id, key, bucket_time, value)</pre>
           <p>
             This makes "top values in this time range" cheap because the query scans aggregated buckets instead of event membership rows.
@@ -654,13 +654,13 @@ ORDER BY (tenant_id, key, bucket_time, value)</pre>
           <tr>
             <td>Default facets</td>
             <td><code>service</code>, <code>environment</code>, <code>event_type</code>, <code>signal</code>, <code>name</code>, <code>http.route</code>, <code>http.method</code>, <code>http.status_code</code>, <code>severity_text</code>, <code>metric_name</code></td>
-            <td><code>event_facets</code> + <code>event_facet_index</code></td>
+            <td><code>field_counts_5m</code> + <code>field_index</code></td>
             <td>Appear in group menu and sidebar by default.</td>
           </tr>
           <tr>
             <td>Intentional high-cardinality facets</td>
             <td><code>user_id</code>, <code>account_id</code>, <code>session_id</code>, selected customer fields</td>
-            <td><code>event_facets</code> + <code>event_facet_index</code>, only when active</td>
+            <td><code>field_counts_5m</code> + <code>field_index</code>, only when active</td>
             <td>Can be enabled as hot dimensions. Backfill old data when enabled.</td>
           </tr>
           <tr>

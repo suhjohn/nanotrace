@@ -186,30 +186,46 @@ struct Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoadProfile {
+    Atlas,
     Fixture,
     Realistic,
     Llm,
     Trace,
     Metrics,
     Logs,
+    Product,
+    Agent,
+    Processor,
 }
 
 impl LoadProfile {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Atlas => "atlas",
             Self::Fixture => "fixture",
             Self::Realistic => "realistic",
             Self::Llm => "llm",
             Self::Trace => "trace",
             Self::Metrics => "metrics",
             Self::Logs => "logs",
+            Self::Product => "product",
+            Self::Agent => "agent",
+            Self::Processor => "processor",
         }
     }
 
     fn is_realistic(self) -> bool {
         matches!(
             self,
-            Self::Realistic | Self::Llm | Self::Trace | Self::Metrics | Self::Logs
+            Self::Atlas
+                | Self::Realistic
+                | Self::Llm
+                | Self::Trace
+                | Self::Metrics
+                | Self::Logs
+                | Self::Product
+                | Self::Agent
+                | Self::Processor
         )
     }
 }
@@ -233,6 +249,9 @@ struct Fixtures {
     log_variations: Vec<Fixture>,
     metric_fixtures: Vec<Fixture>,
     trace_fixtures: Vec<Fixture>,
+    product_fixtures: Vec<Fixture>,
+    agent_fixtures: Vec<Fixture>,
+    processor_fixtures: Vec<Fixture>,
     rest: Vec<Fixture>,
 }
 
@@ -604,7 +623,7 @@ async fn post_batch(context: Arc<LoadContext>, batch_size: u64) -> RequestResult
 
         let response = context
             .client
-            .post(format!("{}/events", context.config.ingest_url))
+            .post(format!("{}/v1/events", context.config.ingest_url))
             .header(AUTHORIZATION, format!("Bearer {}", context.config.api_key))
             .header(CONTENT_TYPE, "application/json")
             .body(body)
@@ -733,6 +752,49 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
         let index = seq as usize % fixtures.trace_fixtures.len();
         return &fixtures.trace_fixtures[index];
     }
+    if profile == LoadProfile::Product {
+        let index = seq as usize % fixtures.product_fixtures.len();
+        return &fixtures.product_fixtures[index];
+    }
+    if profile == LoadProfile::Agent {
+        let index = seq as usize % fixtures.agent_fixtures.len();
+        return &fixtures.agent_fixtures[index];
+    }
+    if profile == LoadProfile::Processor {
+        let index = seq as usize % fixtures.processor_fixtures.len();
+        return &fixtures.processor_fixtures[index];
+    }
+    if profile == LoadProfile::Atlas {
+        let bucket = seq % 100;
+        if bucket < (log_ratio * 100.0).round() as u64 {
+            if fixtures.log_variations.is_empty() {
+                return &fixtures.log;
+            }
+            let index = seq as usize % (fixtures.log_variations.len() + 1);
+            if index == 0 {
+                return &fixtures.log;
+            }
+            return &fixtures.log_variations[index - 1];
+        }
+        if bucket < 48 {
+            let index = seq as usize % fixtures.product_fixtures.len();
+            return &fixtures.product_fixtures[index];
+        }
+        if bucket < 78 {
+            let index = seq as usize % fixtures.agent_fixtures.len();
+            return &fixtures.agent_fixtures[index];
+        }
+        if bucket < 92 {
+            let index = seq as usize % fixtures.metric_fixtures.len();
+            return &fixtures.metric_fixtures[index];
+        }
+        if bucket < 98 {
+            let index = seq as usize % fixtures.trace_fixtures.len();
+            return &fixtures.trace_fixtures[index];
+        }
+        let index = seq as usize % fixtures.processor_fixtures.len();
+        return &fixtures.processor_fixtures[index];
+    }
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
         if profile.is_realistic() && !fixtures.log_variations.is_empty() {
             let index = seq as usize % (fixtures.log_variations.len() + 1);
@@ -761,25 +823,66 @@ fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, St
                 observed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             )
         }
-        LoadProfile::Fixture
+        LoadProfile::Atlas
         | LoadProfile::Realistic
         | LoadProfile::Trace
         | LoadProfile::Metrics
-        | LoadProfile::Logs => {
+        | LoadProfile::Logs
+        | LoadProfile::Product
+        | LoadProfile::Agent
+        | LoadProfile::Processor => {
+            let timestamp = historical_loadtest_timestamp(run_id, seq);
+            let mut rng = TinyRng::new(seed_for(run_id, "observed-timestamp", seq));
+            let observed = timestamp + ChronoDuration::milliseconds(rng.range(1, 500) as i64);
+            (
+                timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                observed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+        }
+        LoadProfile::Fixture => {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             (now.clone(), now)
         }
     }
 }
 
+fn historical_loadtest_timestamp(run_id: &str, seq: u64) -> DateTime<Utc> {
+    const WINDOW_DAYS: i64 = 60;
+    const EVENTS_PER_SYNTHETIC_TRACE: u64 = 24;
+
+    let now = Utc::now();
+    let group = seq / EVENTS_PER_SYNTHETIC_TRACE;
+    let within_group = seq % EVENTS_PER_SYNTHETIC_TRACE;
+    let mut rng = TinyRng::new(seed_for(run_id, "timestamp-group", group));
+    let day = weighted_history_day(&mut rng, WINDOW_DAYS as u64);
+    let hour = weighted_business_hour(&mut rng);
+    let minute = rng.range(0, 59);
+    let second = rng.range(0, 59);
+    let date = (now - ChronoDuration::days(day as i64)).date_naive();
+    let base = DateTime::<Utc>::from_naive_utc_and_offset(
+        date.and_hms_opt(hour as u32, minute as u32, second as u32)
+            .expect("generated timestamp components are valid"),
+        Utc,
+    );
+    let base = if base > now {
+        base - ChronoDuration::days(1)
+    } else {
+        base
+    };
+    let jitter = TinyRng::new(seed_for(run_id, "timestamp-jitter", seq)).range(0, 20);
+
+    base + ChronoDuration::milliseconds((within_group * 50 + jitter) as i64)
+}
+
 fn realistic_llm_timestamp(run_id: &str, seq: u64) -> DateTime<Utc> {
-    const WINDOW_DAYS: i64 = 7;
+    const WINDOW_DAYS: u64 = 60;
+
     let window_end = Utc::now();
-    let window_start = window_end - ChronoDuration::days(WINDOW_DAYS);
+    let window_start = window_end - ChronoDuration::days(WINDOW_DAYS as i64);
     let mut rng = TinyRng::new(seed_for(run_id, "llm-timestamp", seq));
 
     let (day, hour) = loop {
-        let day = rng.range(0, (WINDOW_DAYS - 1) as u64) as i64;
+        let day = weighted_history_day(&mut rng, WINDOW_DAYS) as i64;
         let hour = rng.range(0, 23);
         let candidate = window_start + ChronoDuration::days(day);
         let weight = llm_traffic_weight(candidate, hour);
@@ -794,6 +897,41 @@ fn realistic_llm_timestamp(run_id: &str, seq: u64) -> DateTime<Utc> {
         + ChronoDuration::minutes(rng.range(0, 59) as i64)
         + ChronoDuration::seconds(rng.range(0, 59) as i64)
         + ChronoDuration::milliseconds(rng.range(0, 999) as i64)
+}
+
+fn weighted_history_day(rng: &mut TinyRng, window_days: u64) -> u64 {
+    loop {
+        let day = rng.range(0, window_days.saturating_sub(1));
+        let age_factor = 1.0 - ((day as f64 / window_days.max(1) as f64) * 0.35);
+        let weekday_factor = match day % 7 {
+            5 | 6 => 0.55,
+            _ => 1.0,
+        };
+        let weight = (100.0 * age_factor * weekday_factor)
+            .round()
+            .clamp(10.0, 100.0) as u64;
+        if rng.range(1, 100) <= weight {
+            return day;
+        }
+    }
+}
+
+fn weighted_business_hour(rng: &mut TinyRng) -> u64 {
+    loop {
+        let hour = rng.range(0, 23);
+        let weight = match hour {
+            0..=5 => 8,
+            6..=8 => 45,
+            9..=11 => 95,
+            12..=13 => 72,
+            14..=17 => 100,
+            18..=20 => 58,
+            _ => 24,
+        };
+        if rng.range(1, 100) <= weight {
+            return hour;
+        }
+    }
 }
 
 fn llm_traffic_weight(day: DateTime<Utc>, hour: u64) -> u64 {
@@ -835,6 +973,339 @@ fn randomize_realistic_data(
         deep_trace,
     );
     apply_realistic_object(data, "", &scenario, &mut rng);
+    enrich_realistic_data(data, fixture_name, &scenario, &mut rng);
+}
+
+fn enrich_realistic_data(
+    data: &mut Map<String, Value>,
+    fixture_name: &str,
+    scenario: &Scenario,
+    rng: &mut TinyRng,
+) {
+    let event_type = data
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or(fixture_name)
+        .to_owned();
+    let plan = rng.choose_str(&["free", "free", "pro", "pro", "enterprise"]);
+    let previous_plan = match plan {
+        "free" => "trial",
+        "pro" => "free",
+        "enterprise" => "pro",
+        _ => "free",
+    };
+    let risk_tier = rng.choose_str(&["low", "low", "medium", "medium", "high"]);
+    let lifecycle = rng.choose_str(&["new", "activated", "retained", "at_risk", "churned"]);
+    let symbol = rng.choose_str(&["AAPL", "NVDA", "TSLA", "COIN", "HOOD", "BTC-USD", "ETH-USD"]);
+    let order_side = rng.choose_str(&["buy", "sell"]);
+    let order_status = match event_type.as_str() {
+        "order.submitted" => "submitted",
+        "order.filled" => "filled",
+        "order.cancelled" => "cancelled",
+        _ => rng.choose_str(&["submitted", "filled", "cancelled", "rejected"]),
+    };
+    let amount = round(rng.float_range(9.0, 2_500.0), 2);
+    let quantity = round(rng.float_range(0.01, 250.0), 4);
+    let price = round(rng.float_range(4.0, 950.0), 2);
+    let order_id = format!(
+        "ord_{}",
+        stable_hex(&scenario.run_id, "order", rng.range(0, 1_000_000), 12)
+    );
+    let request_id = format!(
+        "req_{}",
+        stable_hex(&scenario.run_id, "request", rng.range(0, 1_000_000), 16)
+    );
+    let conversation_id = format!(
+        "conv_{}",
+        stable_hex(
+            &scenario.run_id,
+            "conversation",
+            rng.range(0, 1_000_000),
+            12
+        )
+    );
+
+    data.insert("request_id".to_owned(), Value::String(request_id));
+    data.insert(
+        "user_id".to_owned(),
+        Value::String(scenario.user_id.clone()),
+    );
+    data.insert(
+        "session_id".to_owned(),
+        Value::String(scenario.session_id.clone()),
+    );
+    data.insert(
+        "account_id".to_owned(),
+        Value::String(scenario.account_id.clone()),
+    );
+    data.insert(
+        "account".to_owned(),
+        json!({
+            "id": scenario.account_id,
+            "plan": plan,
+            "previous_plan": previous_plan,
+            "risk_tier": risk_tier,
+            "lifecycle": lifecycle,
+            "region": rng.choose_str(&["us-east", "us-west", "eu-west", "ap-south"]),
+            "segment": rng.choose_str(&["retail", "active_trader", "advisor", "institutional"])
+        }),
+    );
+
+    match event_type.as_str() {
+        "checkout.started" | "checkout.completed" | "subscription.renewed" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("billing".to_owned()));
+            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("revenue".to_owned(), number_value(amount));
+            data.insert(
+                "credits_used".to_owned(),
+                number_value(round(amount * 12.0, 2)),
+            );
+            data.insert(
+                "checkout".to_owned(),
+                json!({
+                    "id": format!("chk_{}", stable_hex(&scenario.run_id, "checkout", rng.range(0, 1_000_000), 12)),
+                    "currency": "USD",
+                    "amount": amount,
+                    "payment_method": rng.choose_str(&["card", "ach", "wire", "apple_pay"]),
+                    "plan_before": previous_plan,
+                    "plan_after": plan
+                }),
+            );
+        }
+        "order.submitted" | "order.filled" | "order.cancelled" | "order.rejected" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("trading".to_owned()));
+            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert(
+                "revenue".to_owned(),
+                number_value(round(amount * 0.0025, 4)),
+            );
+            data.insert(
+                "order".to_owned(),
+                json!({
+                    "id": order_id,
+                    "symbol": symbol,
+                    "asset_class": if symbol.ends_with("-USD") { "crypto" } else { "equity" },
+                    "side": order_side,
+                    "status": order_status,
+                    "quantity": quantity,
+                    "price": price,
+                    "notional": round(quantity * price, 2),
+                    "venue": rng.choose_str(&["nasdaq", "nyse", "arca", "crypto-router"])
+                }),
+            );
+        }
+        "account.plan_changed" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("billing".to_owned()));
+            data.insert(
+                "name".to_owned(),
+                Value::String("account.plan_changed".to_owned()),
+            );
+            data.insert(
+                "change".to_owned(),
+                json!({
+                    "field": "account.plan",
+                    "from": previous_plan,
+                    "to": plan,
+                    "reason": rng.choose_str(&["self_serve_upgrade", "sales_upgrade", "trial_expired", "admin_change"])
+                }),
+            );
+        }
+        "account.risk_tier_changed" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("risk".to_owned()));
+            data.insert(
+                "name".to_owned(),
+                Value::String("account.risk_tier_changed".to_owned()),
+            );
+            data.insert(
+                "change".to_owned(),
+                json!({
+                    "field": "account.risk_tier",
+                    "from": rng.choose_str(&["low", "medium", "high"]),
+                    "to": risk_tier,
+                    "reason": rng.choose_str(&["kyc_review", "velocity_rule", "manual_review", "model_score"])
+                }),
+            );
+        }
+        "span_start" | "span_end" => {
+            data.insert("signal".to_owned(), Value::String("trace".to_owned()));
+            data.insert("name".to_owned(), Value::String(scenario.span_name()));
+            data.insert("duration_ms".to_owned(), Value::from(scenario.duration_ms));
+            data.insert(
+                "trace_id".to_owned(),
+                Value::String(scenario.trace_id.clone()),
+            );
+            data.insert(
+                "span_id".to_owned(),
+                Value::String(scenario.span_id.clone()),
+            );
+            data.insert(
+                "parent_span_id".to_owned(),
+                Value::String(scenario.parent_span_id.clone()),
+            );
+        }
+        "agent.request" | "agent.decision" => {
+            data.insert("signal".to_owned(), Value::String("trace".to_owned()));
+            data.insert(
+                "service".to_owned(),
+                Value::String("atlas-agent".to_owned()),
+            );
+            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("conversation_id".to_owned(), Value::String(conversation_id));
+            data.insert(
+                "thread_id".to_owned(),
+                Value::String(scenario.thread_id.clone()),
+            );
+            data.insert("duration_ms".to_owned(), Value::from(scenario.duration_ms));
+            data.insert(
+                "agent".to_owned(),
+                json!({
+                    "type": rng.choose_str(&["support", "trading_assistant", "risk_reviewer", "portfolio_coach"]),
+                    "workflow_state": rng.choose_str(&["classified", "planned", "tool_wait", "responding", "escalated"]),
+                    "intent": rng.choose_str(&["portfolio_question", "trade_help", "billing_support", "risk_review"]),
+                    "decision": rng.choose_str(&["answer", "retrieve", "call_tool", "escalate", "refuse"])
+                }),
+            );
+        }
+        "llm.call" => {
+            let input_tokens = rng.range(400, 42_000);
+            let output_tokens = rng.range(80, 8_000);
+            let total_tokens = input_tokens + output_tokens;
+            data.insert("signal".to_owned(), Value::String("trace".to_owned()));
+            data.insert(
+                "service".to_owned(),
+                Value::String("llm-gateway".to_owned()),
+            );
+            data.insert("name".to_owned(), Value::String("llm.call".to_owned()));
+            data.insert("model".to_owned(), Value::String(scenario.model.to_owned()));
+            data.insert("input_tokens".to_owned(), Value::from(input_tokens));
+            data.insert("output_tokens".to_owned(), Value::from(output_tokens));
+            data.insert("total_tokens".to_owned(), Value::from(total_tokens));
+            data.insert(
+                "cost_usd".to_owned(),
+                number_value(round(total_tokens as f64 * 0.0000025, 5)),
+            );
+            data.insert(
+                "duration_ms".to_owned(),
+                Value::from(scenario.duration_ms.max(500)),
+            );
+            data.insert(
+                "llm".to_owned(),
+                json!({
+                    "provider": rng.choose_str(&["openai", "anthropic", "google"]),
+                    "model": scenario.model,
+                    "finish_reason": scenario.finish_reason,
+                    "cached_input_tokens": rng.range(0, input_tokens / 2),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                }),
+            );
+        }
+        "tool.call" => {
+            data.insert("signal".to_owned(), Value::String("trace".to_owned()));
+            data.insert(
+                "service".to_owned(),
+                Value::String("tool-runner".to_owned()),
+            );
+            data.insert("name".to_owned(), Value::String("tool.call".to_owned()));
+            data.insert("duration_ms".to_owned(), Value::from(scenario.duration_ms));
+            data.insert(
+                "credits_used".to_owned(),
+                number_value(round(rng.float_range(0.1, 18.0), 2)),
+            );
+            data.insert(
+                "tool".to_owned(),
+                json!({
+                    "name": rng.choose_str(&["get_positions", "submit_order", "search_knowledge_base", "create_support_ticket", "run_risk_check"]),
+                    "status": if scenario.is_error { "error" } else { "ok" },
+                    "attempt": rng.range(1, 3),
+                    "result_count": rng.range(0, 50)
+                }),
+            );
+        }
+        "retrieval.step" => {
+            data.insert("signal".to_owned(), Value::String("trace".to_owned()));
+            data.insert("service".to_owned(), Value::String("retrieval".to_owned()));
+            data.insert(
+                "name".to_owned(),
+                Value::String("retrieval.step".to_owned()),
+            );
+            data.insert("duration_ms".to_owned(), Value::from(rng.range(20, 1_200)));
+            data.insert(
+                "retrieval".to_owned(),
+                json!({
+                    "index": rng.choose_str(&["support_articles", "trade_docs", "risk_policies", "portfolio_notes"]),
+                    "query_type": rng.choose_str(&["hybrid", "vector", "keyword"]),
+                    "top_k": rng.range(3, 30),
+                    "hit_count": rng.range(0, 30),
+                    "max_score": round(rng.float_range(0.15, 0.98), 4)
+                }),
+            );
+        }
+        "eval.score" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("evals".to_owned()));
+            data.insert("name".to_owned(), Value::String("eval.score".to_owned()));
+            data.insert(
+                "eval_score".to_owned(),
+                number_value(round(rng.float_range(0.0, 1.0), 4)),
+            );
+            data.insert(
+                "eval".to_owned(),
+                json!({
+                    "name": rng.choose_str(&["answer_groundedness", "tool_correctness", "latency_budget", "policy_compliance"]),
+                    "score": round(rng.float_range(0.0, 1.0), 4),
+                    "passed": !scenario.is_error
+                }),
+            );
+        }
+        "safety.event" => {
+            data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
+            data.insert("service".to_owned(), Value::String("safety".to_owned()));
+            data.insert("name".to_owned(), Value::String("safety.event".to_owned()));
+            data.insert(
+                "is_error".to_owned(),
+                Value::from(if scenario.is_error { 1 } else { 0 }),
+            );
+            data.insert(
+                "safety".to_owned(),
+                json!({
+                    "policy": rng.choose_str(&["trading_advice", "privacy", "fraud", "prompt_injection"]),
+                    "action": rng.choose_str(&["allow", "warn", "block", "escalate"]),
+                    "severity": rng.choose_str(&["low", "medium", "high"])
+                }),
+            );
+        }
+        "processor.run" | "processor.backfill_slice" | "processor.report_materialized" => {
+            data.insert("signal".to_owned(), Value::String("pipeline".to_owned()));
+            data.insert("service".to_owned(), Value::String("processor".to_owned()));
+            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("duration_ms".to_owned(), Value::from(rng.range(50, 30_000)));
+            data.insert(
+                "rows_scanned".to_owned(),
+                Value::from(rng.range(10_000, 2_000_000_000)),
+            );
+            data.insert(
+                "rows_written".to_owned(),
+                Value::from(rng.range(1_000, 50_000_000)),
+            );
+            data.insert(
+                "processor".to_owned(),
+                json!({
+                    "id": format!("proc_{}", rng.range(1, 32)),
+                    "kind": rng.choose_str(&["definition_backfill", "report_refresh", "rollup_builder", "field_indexer"]),
+                    "status": if scenario.is_error { "failed" } else { rng.choose_str(&["completed", "completed", "running"]) },
+                    "definition_id": format!("def_{}", rng.choose_str(&["service", "account_plan", "duration_ms", "llm_tokens"])),
+                    "slice_seconds": rng.choose_str(&["60", "300", "900"])
+                }),
+            );
+        }
+        _ => {}
+    }
 }
 
 fn apply_llm_loadtest_data(
@@ -1448,10 +1919,14 @@ fn number_like(current: &Value, value: f64) -> Value {
     if current.as_i64().is_some() || current.as_u64().is_some() {
         Value::from(value.round() as u64)
     } else {
-        serde_json::Number::from_f64(round(value, 3))
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::from(0))
+        number_value(round(value, 3))
     }
+}
+
+fn number_value(value: f64) -> Value {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or_else(|| Value::from(0))
 }
 
 fn seed_for(run_id: &str, fixture_name: &str, seq: u64) -> u64 {
@@ -1567,7 +2042,7 @@ fn print_step(stats: &StepStats) {
 
 fn load_fixtures(root: &Path) -> Result<Fixtures> {
     let events_dir = root.join("fixtures/events");
-    let names = [
+    let base_names = [
         "log",
         "log_variation_code_success",
         "log_variation_excalidraw",
@@ -1580,6 +2055,31 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         "span_end",
         "span_start",
     ];
+    let mut names = base_names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let mut discovered = fs::read_dir(&events_dir)
+        .with_context(|| format!("read {}", events_dir.display()))?
+        .map(|entry| {
+            let entry = entry?;
+            Ok(entry.path())
+        })
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("read {}", events_dir.display()))?;
+    discovered.sort();
+    for path in discovered {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !names.iter().any(|name| name == stem) {
+            names.push(stem.to_owned());
+        }
+    }
+
     let mut loaded = Vec::new();
     for name in names {
         let path = events_dir.join(format!("{name}.json"));
@@ -1587,7 +2087,7 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
             &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
         )
         .with_context(|| format!("parse {}", path.display()))?;
-        validate_fixture(name, &body)?;
+        validate_fixture(&name, &body)?;
         loaded.push(Fixture {
             name: name.to_owned(),
             body,
@@ -1612,7 +2112,22 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         .collect::<Vec<_>>();
     let trace_fixtures = loaded
         .iter()
-        .filter(|fixture| fixture.name == "span_start" || fixture.name == "span_end")
+        .filter(|fixture| is_trace_fixture(&fixture.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let product_fixtures = loaded
+        .iter()
+        .filter(|fixture| is_product_fixture(&fixture.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let agent_fixtures = loaded
+        .iter()
+        .filter(|fixture| is_agent_fixture(&fixture.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let processor_fixtures = loaded
+        .iter()
+        .filter(|fixture| is_processor_fixture(&fixture.name))
         .cloned()
         .collect::<Vec<_>>();
     let log_variations = loaded
@@ -1628,13 +2143,45 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
     if trace_fixtures.is_empty() {
         bail!("expected at least one trace fixture");
     }
+    if product_fixtures.is_empty() {
+        bail!("expected at least one product fixture");
+    }
+    if agent_fixtures.is_empty() {
+        bail!("expected at least one agent fixture");
+    }
+    if processor_fixtures.is_empty() {
+        bail!("expected at least one processor fixture");
+    }
     Ok(Fixtures {
         log,
         log_variations,
         metric_fixtures,
         trace_fixtures,
+        product_fixtures,
+        agent_fixtures,
+        processor_fixtures,
         rest,
     })
+}
+
+fn is_product_fixture(name: &str) -> bool {
+    name.starts_with("product_") || name.starts_with("state_")
+}
+
+fn is_trace_fixture(name: &str) -> bool {
+    matches!(name, "span_start" | "span_end") || name.starts_with("span_")
+}
+
+fn is_agent_fixture(name: &str) -> bool {
+    name.starts_with("agent_")
+        || matches!(
+            name,
+            "llm_call" | "tool_call" | "retrieval_step" | "eval_score" | "safety_event"
+        )
+}
+
+fn is_processor_fixture(name: &str) -> bool {
+    name.starts_with("processor_")
 }
 
 fn validate_fixture(name: &str, fixture: &Value) -> Result<()> {
@@ -2024,6 +2571,13 @@ fn list_env(key: &str, fallback: &[u64]) -> Result<Vec<u64>> {
 
 fn load_profile_env() -> Result<LoadProfile> {
     match env::var("NANOTRACE_LOADTEST_PROFILE") {
+        Ok(value)
+            if value.eq_ignore_ascii_case("atlas")
+                || value.eq_ignore_ascii_case("mixed")
+                || value.eq_ignore_ascii_case("atlas_mixed") =>
+        {
+            Ok(LoadProfile::Atlas)
+        }
         Ok(value) if value.eq_ignore_ascii_case("realistic") => Ok(LoadProfile::Realistic),
         Ok(value)
             if value.eq_ignore_ascii_case("trace")
@@ -2048,6 +2602,29 @@ fn load_profile_env() -> Result<LoadProfile> {
             Ok(LoadProfile::Logs)
         }
         Ok(value)
+            if value.eq_ignore_ascii_case("product")
+                || value.eq_ignore_ascii_case("products")
+                || value.eq_ignore_ascii_case("analytics") =>
+        {
+            Ok(LoadProfile::Product)
+        }
+        Ok(value)
+            if value.eq_ignore_ascii_case("agent")
+                || value.eq_ignore_ascii_case("agents")
+                || value.eq_ignore_ascii_case("agentic")
+                || value.eq_ignore_ascii_case("agent_traces") =>
+        {
+            Ok(LoadProfile::Agent)
+        }
+        Ok(value)
+            if value.eq_ignore_ascii_case("processor")
+                || value.eq_ignore_ascii_case("processors")
+                || value.eq_ignore_ascii_case("pipeline")
+                || value.eq_ignore_ascii_case("pipelines") =>
+        {
+            Ok(LoadProfile::Processor)
+        }
+        Ok(value)
             if value.eq_ignore_ascii_case("llm")
                 || value.eq_ignore_ascii_case("realistic_llm")
                 || value.eq_ignore_ascii_case("llm_realistic") =>
@@ -2062,7 +2639,7 @@ fn load_profile_env() -> Result<LoadProfile> {
             Ok(LoadProfile::Fixture)
         }
         Ok(value) => bail!(
-            "NANOTRACE_LOADTEST_PROFILE must be llm, realistic, trace, metrics, logs, fixture, default, or static; got {value}"
+            "NANOTRACE_LOADTEST_PROFILE must be atlas, llm, realistic, trace, metrics, logs, product, agent, processor, fixture, default, or static; got {value}"
         ),
         Err(_) => Ok(LoadProfile::Fixture),
     }
@@ -2208,6 +2785,56 @@ mod tests {
                 .iter()
                 .all(|fixture| fixture.name == "span_start" || fixture.name == "span_end")
         );
+        assert!(
+            fixtures
+                .product_fixtures
+                .iter()
+                .any(|fixture| fixture.name == "product_checkout_completed")
+        );
+        assert!(
+            fixtures
+                .agent_fixtures
+                .iter()
+                .any(|fixture| fixture.name == "agent_request")
+        );
+        assert!(
+            fixtures
+                .processor_fixtures
+                .iter()
+                .any(|fixture| fixture.name == "processor_backfill_slice")
+        );
+    }
+
+    #[test]
+    fn new_profiles_select_their_fixture_families() {
+        let fixtures = load_fixtures(&repo_root()).expect("load fixtures");
+
+        assert!(is_product_fixture(
+            &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Product).name
+        ));
+        assert!(is_agent_fixture(
+            &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Agent).name
+        ));
+        assert!(is_processor_fixture(
+            &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Processor).name
+        ));
+        assert!(matches!(
+            choose_fixture(&fixtures, 50, 0.10, LoadProfile::Atlas)
+                .body
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("event_type"))
+                .and_then(Value::as_str),
+            Some(
+                "agent.request"
+                    | "agent.decision"
+                    | "llm.call"
+                    | "tool.call"
+                    | "retrieval.step"
+                    | "eval.score"
+                    | "safety.event"
+            )
+        ));
     }
 
     #[test]
@@ -2281,7 +2908,7 @@ mod tests {
             .with_timezone(&Utc);
         let now = Utc::now();
         assert!(timestamp <= now);
-        assert!(timestamp >= now - ChronoDuration::days(7) - ChronoDuration::seconds(1));
+        assert!(timestamp >= now - ChronoDuration::days(60) - ChronoDuration::seconds(1));
         assert!(observed > timestamp);
 
         let data = event["data"].as_object().expect("data object");
@@ -2509,6 +3136,63 @@ mod tests {
                             "start_time": "2026-05-08T01:23:45.000Z",
                             "end_time": "2026-05-08T01:23:45.123Z",
                             "duration_ms": 123
+                        }
+                    }),
+                }],
+                product_fixtures: vec![Fixture {
+                    name: "product_checkout_completed".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-product-checkout-completed",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "billing",
+                            "event_type": "checkout.completed",
+                            "signal": "analytics",
+                            "environment": "prod",
+                            "user_id": "user_fixture",
+                            "account": {
+                                "id": "acct_fixture",
+                                "plan": "pro"
+                            },
+                            "revenue": 49
+                        }
+                    }),
+                }],
+                agent_fixtures: vec![Fixture {
+                    name: "agent_request".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-agent-request",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "atlas-agent",
+                            "event_type": "agent.request",
+                            "signal": "trace",
+                            "environment": "prod",
+                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                            "span_id": "00f067aa0ba902b7",
+                            "parent_span_id": "",
+                            "duration_ms": 120
+                        }
+                    }),
+                }],
+                processor_fixtures: vec![Fixture {
+                    name: "processor_backfill_slice".to_owned(),
+                    body: json!({
+                        "event_id": "fixture-processor-backfill-slice",
+                        "timestamp": "2026-05-08T01:23:45.123Z",
+                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                        "data": {
+                            "tenant_id": "fixture",
+                            "service": "processor",
+                            "event_type": "processor.backfill_slice",
+                            "signal": "pipeline",
+                            "environment": "prod",
+                            "rows_scanned": 1000,
+                            "rows_written": 100
                         }
                     }),
                 }],

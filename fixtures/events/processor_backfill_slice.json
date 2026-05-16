@@ -1,0 +1,23 @@
+{
+  "event_id": "fixture-processor-backfill-slice",
+  "timestamp": "2026-05-08T01:23:45.823Z",
+  "observed_timestamp": "2026-05-08T01:23:45.830Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "processor",
+    "event_type": "processor.backfill_slice",
+    "signal": "pipeline",
+    "environment": "prod",
+    "name": "processor.backfill_slice",
+    "duration_ms": 3100,
+    "rows_scanned": 300000000,
+    "rows_written": 12000000,
+    "processor": {
+      "id": "proc_1",
+      "kind": "definition_backfill",
+      "status": "completed",
+      "definition_id": "def_account_plan",
+      "slice_seconds": "300"
+    }
+  }
+}

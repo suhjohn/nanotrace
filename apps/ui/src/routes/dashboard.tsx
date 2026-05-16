@@ -267,11 +267,12 @@ function DashboardRoute() {
 
   async function deleteSelected() {
     if (!selected || deleting) return
+    const deletedId = selected.id
     setDeleting(true)
     try {
       await dashboardApi.deleteVisualization(observatoryUrl, selected)
       setVisualizations(items => {
-        const remaining = items.filter(item => item.id !== selected.id)
+        const remaining = items.filter(item => item.id !== deletedId)
         setSelectedId(remaining[0]?.id ?? '')
         if (remaining.length === 0) setEditorOpen(false)
         return remaining
@@ -309,7 +310,6 @@ function DashboardRoute() {
               <PanelLeftOpen size={15} strokeWidth={1.8} />
             </button>
           ) : null}
-          <div className="truncate text-[13px] font-medium text-white">Dashboard</div>
         </div>
         <form
           className="flex min-w-[280px] flex-1 items-center gap-1.5"
@@ -817,7 +817,7 @@ function visualizationSrcDoc(visualization: DashboardVisualization, params: Dash
 }
 
 async function queryNanotrace(payload: QueryPayload) {
-  const response = await fetch('/query', {
+  const response = await fetch('/v1/query', {
     body: JSON.stringify({
       parameters: payload.parameters ?? {},
       query: payload.query
@@ -861,21 +861,7 @@ const dashboardApi = {
     const visualizations = Array.isArray(body.visualizations)
       ? body.visualizations.filter(isDashboardVisualization).map(normalizeDashboardVisualization)
       : []
-    if (visualizations.length > 0) return visualizations
-    return seedServerVisualizations(apiBaseUrl, id)
-  },
-
-  async resetVisualizations(apiBaseUrl: string, id: string) {
-    const response = await fetch(dashboardVisualizationsUrl(apiBaseUrl, id), {
-      credentials: 'include',
-      headers: queryHeaders(),
-      method: 'DELETE'
-    })
-    if (!response.ok) {
-      const text = await response.text()
-      throw new Error(text || response.statusText)
-    }
-    return seedServerVisualizations(apiBaseUrl, id)
+    return visualizations
   },
 
   async updateVisualization(apiBaseUrl: string, item: DashboardVisualization) {
@@ -900,14 +886,6 @@ const dashboardApi = {
 
 type DashboardVisualizationCreate = Omit<DashboardVisualization, 'updatedAt'>
 
-async function seedServerVisualizations(apiBaseUrl: string, id: string) {
-  const created: DashboardVisualization[] = []
-  for (const visualization of seedVisualizations(id)) {
-    created.push(await dashboardApi.createVisualization(apiBaseUrl, visualization))
-  }
-  return created
-}
-
 async function responseVisualization(response: Response) {
   if (!response.ok) {
     const text = await response.text()
@@ -924,60 +902,6 @@ function dashboardVisualizationsUrl(apiBaseUrl: string, id: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   const path = `/dashboards/${encodeURIComponent(id)}/visualizations`
   return base ? `${base}${path}` : path
-}
-
-function seedVisualizations(id: string): DashboardVisualization[] {
-  const now = new Date().toISOString()
-  return [
-    {
-      dashboardId: id,
-      height: 24,
-      id: crypto.randomUUID(),
-      parameterBindings: ['timeRange', 'filter'],
-      sourceCode: eventsOverTimeSource,
-      title: 'Events over time',
-      updatedAt: now,
-      width: 52,
-      x: 4,
-      y: 2
-    },
-    {
-      dashboardId: id,
-      height: 20,
-      id: crypto.randomUUID(),
-      parameterBindings: ['timeRange', 'filter'],
-      sourceCode: eventCountSource,
-      title: 'Event count',
-      updatedAt: now,
-      width: 36,
-      x: 60,
-      y: 2
-    },
-    {
-      dashboardId: id,
-      height: 26,
-      id: crypto.randomUUID(),
-      parameterBindings: ['timeRange', 'filter', 'groupBy'],
-      sourceCode: tokenUsageOverTimeSource,
-      title: 'Token usage over time',
-      updatedAt: now,
-      width: 72,
-      x: 4,
-      y: 30
-    },
-    {
-      dashboardId: id,
-      height: 26,
-      id: crypto.randomUUID(),
-      parameterBindings: ['timeRange', 'filter'],
-      sourceCode: recentEventsSource,
-      title: 'Recent events',
-      updatedAt: now,
-      width: 56,
-      x: 4,
-      y: 60
-    }
-  ]
 }
 
 function isDashboardVisualization(value: unknown): value is DashboardVisualization {
@@ -1326,346 +1250,3 @@ function delay<T>(value: T) {
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : error ? String(error) : ''
 }
-
-const eventCountSource = `import React from 'https://esm.sh/react@19.2.1';
-import { QueryClient, QueryClientProvider, useQuery } from 'https://esm.sh/@tanstack/react-query@5.100.10?deps=react@19.2.1';
-
-const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false, staleTime: 3000 } } });
-
-export default function EventCount(props) {
-  return React.createElement(QueryClientProvider, { client: queryClient },
-    React.createElement(EventCountBody, props)
-  );
-}
-
-function EventCountBody({ nanotrace, params }) {
-  const countQuery = useQuery({
-    queryKey: ['event-count', params.sql.where, params.sql.parameters],
-    queryFn: () => nanotrace.query({
-      parameters: params.sql.parameters,
-      query: 'SELECT count() AS count FROM observatory.events WHERE ' + params.sql.where
-    })
-  });
-  const count = Number(countQuery.data?.data?.[0]?.count || 0);
-
-  if (countQuery.error) return React.createElement('div', { style: styles.error }, String(countQuery.error.message || countQuery.error));
-  return React.createElement('div', { style: styles.root },
-    React.createElement('div', { style: styles.label }, params.timeRange ? 'Selected range' : 'All events'),
-    React.createElement('div', { style: styles.value }, countQuery.isLoading ? '...' : formatNumber(count))
-  );
-}
-
-function formatNumber(value) {
-  return Number(value || 0).toLocaleString();
-}
-
-const styles = {
-  root: { height: '100%', display: 'grid', placeContent: 'center', background: '#050505', padding: 12 },
-  label: { color: '#737373', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.8 },
-  value: { color: '#fff', fontSize: 48, fontWeight: 650, lineHeight: 1.05, marginTop: 8, fontVariantNumeric: 'tabular-nums' },
-  error: { color: '#fecaca', padding: 12, fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }
-};`
-
-const eventsOverTimeSource = `import React, { useEffect, useRef } from 'https://esm.sh/react@19.2.1';
-import { QueryClient, QueryClientProvider, useQuery } from 'https://esm.sh/@tanstack/react-query@5.100.10?deps=react@19.2.1';
-import Chart from 'https://esm.sh/chart.js@4/auto';
-import 'https://esm.sh/chartjs-adapter-date-fns@3';
-
-const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false, staleTime: 3000 } } });
-const EMPTY_ROWS = [];
-
-export default function EventsOverTime(props) {
-  return React.createElement(QueryClientProvider, { client: queryClient },
-    React.createElement(EventsOverTimeBody, props)
-  );
-}
-
-function EventsOverTimeBody({ nanotrace, params }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-  const eventsQuery = useQuery({
-    queryKey: ['events-over-time', params.sql.where, params.sql.parameters],
-    queryFn: () => nanotrace.query({
-      parameters: params.sql.parameters,
-      query: 'SELECT toStartOfMinute(timestamp) AS minute, count() AS events FROM observatory.events WHERE ' + params.sql.where + ' GROUP BY minute ORDER BY minute'
-    })
-  });
-  const rows = eventsQuery.data?.data || EMPTY_ROWS;
-
-  useEffect(() => {
-    if (!canvasRef.current || eventsQuery.isLoading || eventsQuery.error || rows.length === 0) {
-      chartRef.current?.destroy();
-      chartRef.current = null;
-      return;
-    }
-    chartRef.current?.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'bar',
-      data: {
-        datasets: [{
-          label: 'Events',
-          data: rows.map(row => ({ x: parseTime(row.minute), y: Number(row.events || 0) })),
-          backgroundColor: '#22d3ee',
-          borderRadius: 2,
-          maxBarThickness: 18
-        }]
-      },
-      options: {
-        animation: false,
-        maintainAspectRatio: false,
-        parsing: false,
-        responsive: true,
-        scales: {
-          x: { type: 'time', ticks: { color: '#737373', maxRotation: 0 }, grid: { color: '#1a1a1a' } },
-          y: { beginAtZero: true, ticks: { color: '#737373', precision: 0 }, grid: { color: '#1a1a1a' } }
-        },
-        plugins: { legend: { display: false }, tooltip: { intersect: false, mode: 'index' } }
-      }
-    });
-    return () => chartRef.current?.destroy();
-  }, [eventsQuery.error, eventsQuery.isLoading, rows]);
-
-  if (eventsQuery.error) return React.createElement('div', { style: styles.error }, String(eventsQuery.error.message || eventsQuery.error));
-  return React.createElement('div', { style: styles.root },
-    React.createElement('div', { style: styles.subtitle }, params.timeRange ? 'Selected range' : 'All events'),
-    React.createElement('div', { style: styles.chart },
-      eventsQuery.isLoading
-        ? React.createElement('div', { style: styles.state }, 'Loading...')
-        : rows.length === 0
-          ? React.createElement('div', { style: styles.state }, 'No events match this range')
-          : React.createElement('canvas', { ref: canvasRef })
-    )
-  );
-}
-
-function parseTime(value) {
-  if (value instanceof Date) return value;
-  const text = String(value || '');
-  return new Date(text.includes('T') ? text : text.replace(' ', 'T') + 'Z');
-}
-
-const styles = {
-  root: { height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', gap: 8, padding: 14, background: '#050505' },
-  subtitle: { color: '#737373', fontSize: 11 },
-  chart: { position: 'relative', minHeight: 0, width: '100%' },
-  state: { height: '100%', display: 'grid', placeContent: 'center', color: '#737373', fontSize: 12 },
-  error: { color: '#fecaca', padding: 12, fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }
-};`
-
-const tokenUsageOverTimeSource = `import React, { useEffect, useMemo, useRef } from 'https://esm.sh/react@19.2.1';
-import { QueryClient, QueryClientProvider, useQuery } from 'https://esm.sh/@tanstack/react-query@5.100.10?deps=react@19.2.1';
-import Chart from 'https://esm.sh/chart.js@4/auto';
-import 'https://esm.sh/chartjs-adapter-date-fns@3';
-
-const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false, staleTime: 3000 } } });
-const EMPTY_ROWS = [];
-const COLORS = ['#22d3ee', '#38bdf8', '#60a5fa', '#a78bfa', '#34d399', '#f59e0b', '#f472b6', '#fb7185'];
-
-export default function TokenUsageOverTime(props) {
-  return React.createElement(QueryClientProvider, { client: queryClient },
-    React.createElement(TokenUsageOverTimeBody, props)
-  );
-}
-
-function TokenUsageOverTimeBody({ nanotrace, params }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-  const tokenQuery = useQuery({
-    queryKey: ['token-usage-over-time', params.sql.where, params.sql.parameters, params.sql.groupByExpression],
-    queryFn: () => {
-      const groupSelect = params.sql.groupByExpression ? ', ' + params.sql.groupByExpression + ' AS group_value' : '';
-      const groupBy = params.sql.groupByExpression ? ', group_value' : '';
-      return nanotrace.query({
-        parameters: params.sql.parameters,
-        query: 'SELECT toStartOfMinute(timestamp) AS minute, ' +
-          'sum(toFloat64OrZero(ifNull(toString(data.llm.totalUsage.inputTokens), \\'0\\'))) AS input_tokens, ' +
-          'sum(toFloat64OrZero(ifNull(toString(data.llm.totalUsage.outputTokens), \\'0\\'))) AS output_tokens, ' +
-          'sum(toFloat64OrZero(ifNull(toString(data.llm.totalUsage.totalTokens), \\'0\\'))) AS total_tokens' +
-          groupSelect +
-          ' FROM observatory.events WHERE ' + params.sql.where +
-          ' AND toFloat64OrZero(ifNull(toString(data.llm.totalUsage.totalTokens), \\'0\\')) > 0' +
-          ' GROUP BY minute' + groupBy + ' ORDER BY minute'
-      });
-    }
-  });
-  const rows = tokenQuery.data?.data || EMPTY_ROWS;
-  const totals = useMemo(() => rows.reduce((acc, row) => ({
-    input: acc.input + Number(row.input_tokens || 0),
-    output: acc.output + Number(row.output_tokens || 0),
-    total: acc.total + Number(row.total_tokens || 0)
-  }), { input: 0, output: 0, total: 0 }), [rows]);
-  const datasets = useMemo(() => buildDatasets(rows, Boolean(params.sql.groupByExpression)), [params.sql.groupByExpression, rows]);
-
-  useEffect(() => {
-    if (!canvasRef.current || tokenQuery.isLoading || tokenQuery.error || datasets.length === 0) {
-      chartRef.current?.destroy();
-      chartRef.current = null;
-      return;
-    }
-    chartRef.current?.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'line',
-      data: { datasets },
-      options: {
-        animation: false,
-        maintainAspectRatio: false,
-        parsing: false,
-        responsive: true,
-        interaction: { intersect: false, mode: 'nearest' },
-        scales: {
-          x: { type: 'time', ticks: { color: '#737373', maxRotation: 0 }, grid: { color: '#1a1a1a' } },
-          y: { beginAtZero: true, ticks: { color: '#737373', callback: value => formatCompact(value) }, grid: { color: '#1a1a1a' } }
-        },
-        plugins: {
-          legend: { display: datasets.length > 1, labels: { color: '#d4d4d4', boxWidth: 10, boxHeight: 10, font: { size: 11 } } },
-          tooltip: { callbacks: { label: context => context.dataset.label + ': ' + formatNumber(context.parsed.y) } }
-        }
-      }
-    });
-    return () => chartRef.current?.destroy();
-  }, [datasets, tokenQuery.error, tokenQuery.isLoading]);
-
-  if (tokenQuery.error) return React.createElement('div', { style: styles.error }, String(tokenQuery.error.message || tokenQuery.error));
-  return React.createElement('div', { style: styles.root },
-    React.createElement('div', { style: styles.header },
-      React.createElement('div', { style: styles.subtitle }, params.sql.groupByLabel ? 'Grouped by ' + params.sql.groupByLabel : 'Total tokens'),
-      React.createElement('div', { style: styles.total }, tokenQuery.isLoading ? '...' : formatNumber(totals.total))
-    ),
-    React.createElement('div', { style: styles.stats },
-      React.createElement('div', { style: styles.stat },
-        React.createElement('span', { style: styles.statLabel }, 'Input'),
-        React.createElement('span', { style: styles.statValue }, tokenQuery.isLoading ? '...' : formatNumber(totals.input))
-      ),
-      React.createElement('div', { style: styles.stat },
-        React.createElement('span', { style: styles.statLabel }, 'Output'),
-        React.createElement('span', { style: styles.statValue }, tokenQuery.isLoading ? '...' : formatNumber(totals.output))
-      )
-    ),
-    React.createElement('div', { style: styles.chart },
-      tokenQuery.isLoading
-        ? React.createElement('div', { style: styles.state }, 'Loading...')
-        : rows.length === 0
-          ? React.createElement('div', { style: styles.state }, 'No token events match this range')
-          : React.createElement('canvas', { ref: canvasRef })
-    )
-  );
-}
-
-function buildDatasets(rows, grouped) {
-  const byGroup = new Map();
-  for (const row of rows) {
-    const label = grouped ? String(row.group_value || 'empty') : 'Total tokens';
-    if (!byGroup.has(label)) byGroup.set(label, []);
-    byGroup.get(label).push({ x: parseTime(row.minute), y: Number(row.total_tokens || 0) });
-  }
-  return Array.from(byGroup.entries()).map(([label, data], index) => {
-    const color = COLORS[index % COLORS.length];
-    return {
-      label,
-      data,
-      borderColor: color,
-      backgroundColor: color,
-      borderWidth: 2,
-      pointRadius: data.length <= 24 ? 2 : 0,
-      pointHoverRadius: 3,
-      tension: 0.25
-    };
-  });
-}
-
-function parseTime(value) {
-  if (value instanceof Date) return value;
-  const text = String(value || '');
-  return new Date(text.includes('T') ? text : text.replace(' ', 'T') + 'Z');
-}
-
-function formatNumber(value) {
-  return Math.round(Number(value || 0)).toLocaleString();
-}
-
-function formatCompact(value) {
-  return Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(value || 0));
-}
-
-const styles = {
-  root: { height: '100%', display: 'grid', gridTemplateRows: 'auto auto 1fr', gap: 10, padding: 14, background: '#050505' },
-  header: { display: 'flex', alignItems: 'start', justifyContent: 'space-between', gap: 12 },
-  subtitle: { color: '#737373', fontSize: 11, lineHeight: 1.3 },
-  total: { color: '#fff', fontSize: 26, lineHeight: 1, fontWeight: 700, fontVariantNumeric: 'tabular-nums' },
-  stats: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 },
-  stat: { border: '1px solid #262626', padding: '7px 9px', background: '#080808' },
-  statLabel: { display: 'block', color: '#737373', fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.8 },
-  statValue: { display: 'block', marginTop: 4, color: '#d4d4d4', fontSize: 13, fontVariantNumeric: 'tabular-nums' },
-  chart: { minHeight: 0, position: 'relative' },
-  state: { height: '100%', display: 'grid', placeContent: 'center', color: '#737373', fontSize: 12 },
-  error: { color: '#fecaca', padding: 12, fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }
-};`
-
-const recentEventsSource = `import React from 'https://esm.sh/react@19.2.1';
-import { QueryClient, QueryClientProvider, useQuery } from 'https://esm.sh/@tanstack/react-query@5.100.10?deps=react@19.2.1';
-
-const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false, staleTime: 3000 } } });
-const EMPTY_ROWS = [];
-
-export default function RecentEvents(props) {
-  return React.createElement(QueryClientProvider, { client: queryClient },
-    React.createElement(RecentEventsBody, props)
-  );
-}
-
-function RecentEventsBody({ nanotrace, params }) {
-  const eventsQuery = useQuery({
-    queryKey: ['recent-events', params.sql.where, params.sql.parameters],
-    queryFn: () => nanotrace.query({
-      parameters: params.sql.parameters,
-      query: 'SELECT timestamp, ifNull(toString(data.name), \\'\\') AS name, ifNull(toString(data.trace_id), trace_id) AS traceId FROM observatory.events WHERE ' + params.sql.where + ' ORDER BY timestamp DESC LIMIT 60'
-    })
-  });
-  const rows = eventsQuery.data?.data || EMPTY_ROWS;
-
-  if (eventsQuery.error) return React.createElement('div', { style: styles.error }, String(eventsQuery.error.message || eventsQuery.error));
-  return React.createElement('div', { style: styles.root },
-    eventsQuery.isLoading
-      ? React.createElement('div', { style: styles.state }, 'Loading...')
-      : rows.length === 0
-        ? React.createElement('div', { style: styles.state }, 'No events match this range')
-        : React.createElement('div', { style: styles.rows },
-            rows.map((row, index) => React.createElement('div', { key: index, style: styles.row },
-              React.createElement('span', { style: styles.time }, formatTime(row.timestamp)),
-              React.createElement('span', { style: styles.name, title: row.name || 'event' }, row.name || 'event'),
-              React.createElement('span', { style: styles.trace, title: row.traceId || '' }, row.traceId || '')
-            ))
-          )
-  );
-}
-
-function formatTime(value) {
-  const date = new Date(String(value || '').replace(' ', 'T') + 'Z');
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : String(value || '');
-}
-
-const styles = {
-  root: { height: '100%', minHeight: 0, background: '#050505' },
-  rows: { height: '100%', minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', scrollbarColor: '#737373 transparent', scrollbarWidth: 'thin' },
-  row: { display: 'grid', gridTemplateColumns: '82px minmax(0, 1fr) 124px', gap: 10, padding: '7px 12px', borderBottom: '1px solid #171717', color: '#d4d4d4', fontSize: 12, alignItems: 'center' },
-  time: { color: '#737373', fontFamily: 'monospace', fontSize: 11 },
-  name: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  trace: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#737373', fontFamily: 'monospace', fontSize: 11 },
-  state: { height: '100%', display: 'grid', placeContent: 'center', color: '#737373', fontSize: 12 },
-  error: { color: '#fecaca', padding: 12, fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }
-};`
-
-const sampleSourceCode = `import React from 'https://esm.sh/react@19.2.1';
-
-export default function Visualization() {
-  return React.createElement('div', {
-    style: {
-      height: '100%',
-      display: 'grid',
-      placeContent: 'center',
-      background: '#050505',
-      color: '#fafafa',
-      fontSize: 14
-    }
-  }, 'Edit this React module to create a visualization.');
-}`

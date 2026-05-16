@@ -1,0 +1,28 @@
+{
+  "event_id": "fixture-state-account-risk-tier-changed",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "risk",
+    "event_type": "account.risk_tier_changed",
+    "signal": "analytics",
+    "environment": "prod",
+    "request_id": "req_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "account.risk_tier_changed",
+    "account": {
+      "id": "acct_fixture",
+      "plan": "pro",
+      "risk_tier": "high",
+      "lifecycle": "at_risk"
+    },
+    "change": {
+      "field": "account.risk_tier",
+      "from": "medium",
+      "to": "high",
+      "reason": "velocity_rule"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Clipboard, KeyRound, PanelLeftOpen, Plus, Trash2, X } from 'lucide-react'
+import { Check, Clipboard, PanelLeftOpen, Plus, Trash2, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
@@ -101,37 +101,29 @@ function ApiKeysRoute() {
 
   return (
     <main className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-black text-[13px] text-neutral-100">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-950 px-3">
-        <div className="flex min-w-0 items-center gap-2">
-          {!sidebarOpen ? (
-            <button
-              aria-label="Expand navigation"
-              className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
-              title="Expand navigation"
-              type="button"
-              onClick={() => setSidebarOpen(true)}
-            >
-              <PanelLeftOpen size={15} strokeWidth={1.8} />
-            </button>
-          ) : null}
-          <KeyRound size={15} strokeWidth={1.8} className="shrink-0 text-neutral-500" />
-          <div className="truncate text-[13px] font-medium text-white">API keys</div>
-        </div>
-        <div className="ml-auto text-[11px] text-neutral-600">
-          {headerStatus}
-        </div>
-      </header>
-
       <section className="min-h-0 flex-1 overflow-auto bg-black">
-        <div className="mx-auto grid w-full max-w-5xl gap-4 px-4 py-4">
-          <section className="grid gap-3 border border-neutral-800 bg-neutral-950 p-3">
+        <div className="grid w-full min-w-0 content-start gap-4 p-2 sm:p-4">
+          <section className="grid content-start gap-3 border border-neutral-800 bg-neutral-950 p-3">
             <div className="flex min-w-0 items-center justify-between gap-3">
-              <div className="min-w-0">
-                <h1 className="truncate text-[13px] font-medium text-white">Create API key</h1>
-                <p className="mt-0.5 text-[11px] text-neutral-600">The secret is shown once after creation.</p>
+              <div className="flex min-w-0 items-start gap-2">
+                {!sidebarOpen ? (
+                  <button
+                    aria-label="Expand navigation"
+                    className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
+                    title="Expand navigation"
+                    type="button"
+                    onClick={() => setSidebarOpen(true)}
+                  >
+                    <PanelLeftOpen size={15} strokeWidth={1.8} />
+                  </button>
+                ) : null}
+                <div className="min-w-0">
+                  <h1 className="truncate text-[13px] font-medium text-white">Create API key</h1>
+                  <p className="mt-0.5 text-[11px] text-neutral-600">The secret is shown once after creation.</p>
+                </div>
               </div>
             </div>
-            <div className="grid gap-2 md:grid-cols-[minmax(180px,1fr)_140px_210px_auto]">
+            <div className="grid gap-2 lg:grid-cols-[minmax(180px,1fr)_140px_210px_auto]">
               <label className="grid gap-1 text-[11px] text-neutral-500">
                 Name
                 <input
@@ -164,7 +156,7 @@ function ApiKeysRoute() {
               </label>
               <div className="flex items-end">
                 <button
-                  className="inline-flex h-8 w-full items-center justify-center gap-1.5 border border-neutral-700 bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700 md:w-auto"
+                  className="inline-flex h-8 w-full items-center justify-center gap-1.5 border border-neutral-700 bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700 lg:w-auto"
                   disabled={!name.trim() || createMutation.isPending}
                   type="button"
                   onClick={() => createMutation.mutate()}
@@ -212,9 +204,12 @@ function ApiKeysRoute() {
 
           <section className="min-h-0 border border-neutral-800 bg-neutral-950">
             <div className="flex items-center justify-between gap-2 border-b border-neutral-800 px-3 py-2">
-              <h2 className="text-[13px] font-medium text-white">Keys</h2>
+              <div className="flex min-w-0 items-center gap-2">
+                <h2 className="text-[13px] font-medium text-white">Keys</h2>
+                <span className="text-[11px] text-neutral-600">{headerStatus}</span>
+              </div>
               <button
-                className="h-7 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
+                className="h-7 shrink-0 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
                 disabled={apiKeysQuery.isFetching}
                 type="button"
                 onClick={() => void apiKeysQuery.refetch()}

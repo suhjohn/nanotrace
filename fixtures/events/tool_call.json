@@ -1,0 +1,28 @@
+{
+  "event_id": "fixture-tool-call",
+  "timestamp": "2026-05-08T01:23:45.423Z",
+  "observed_timestamp": "2026-05-08T01:23:45.430Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "tool-runner",
+    "event_type": "tool.call",
+    "signal": "trace",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902c0",
+    "parent_span_id": "00f067aa0ba902b8",
+    "conversation_id": "conv_fixture",
+    "thread_id": "thread_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "tool.call",
+    "duration_ms": 245,
+    "credits_used": 1.5,
+    "tool": {
+      "name": "get_positions",
+      "status": "ok",
+      "attempt": 1,
+      "result_count": 12
+    }
+  }
+}

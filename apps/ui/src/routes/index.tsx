@@ -2,7 +2,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Calendar as CalendarIcon, Check, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
 import { format } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -16,12 +16,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import {
   HTTPError,
   errorMessage,
-  fetchFacets,
   nanotraceApiBaseUrl,
   queryHeaders,
   runtimeNanotraceApiKey
 } from '../lib/nanotrace-api'
-import type { FacetListResponse, HotFacet } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/')({
   validateSearch: parseObservatorySearch,
@@ -30,7 +28,20 @@ export const Route = createFileRoute('/')({
 
 function IndexRoute() {
   const search = Route.useSearch()
-  return <ObservatoryHome eventFilterSearchText={search.filter} selectedEventId={search.eventId ?? ''} />
+  const navigate = useNavigate()
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('groupBy') !== noGroupValue) return
+    void navigate({
+      replace: true,
+      search: (current: ObservatorySearch) => {
+        const { groupBy: _groupBy, ...next } = current
+        return next
+      },
+      to: '/'
+    } as never)
+  }, [navigate])
+  return <ObservatoryHome eventFilterSearchText={search.filter} searchGroupBy={search.groupBy} selectedEventId={search.eventId ?? ''} />
 }
 
 type LogGroupSummary = {
@@ -109,6 +120,8 @@ type DensityBucket = {
   start: string
 }
 
+type DensityYScale = 'linear' | 'sqrt' | 'log'
+
 type LogDensity = {
   bucketMs: number
   buckets: DensityBucket[]
@@ -166,9 +179,11 @@ export type RouteSelection = {
 export type ObservatorySearch = {
   eventId?: string
   filter?: string
+  groupBy?: string
 }
 
 type FlameKind = 'event' | 'run' | 'turn' | 'model' | 'tool'
+type EventSortDirection = 'asc' | 'desc'
 type GraphMode = 'flamegraph' | 'histogram'
 type GroupSortKey = 'count' | 'duration' | 'recent' | 'value'
 type TimeRangeKey = '15m' | '1h' | '6h' | '24h' | '7d' | 'custom'
@@ -246,6 +261,14 @@ export function parseObservatorySearch(search: Record<string, unknown>): Observa
   const parsed: ObservatorySearch = {}
   if (typeof search.eventId === 'string' && search.eventId) parsed.eventId = search.eventId
   if ('filter' in search && typeof search.filter === 'string') parsed.filter = search.filter
+  if (
+    'groupBy' in search &&
+    typeof search.groupBy === 'string' &&
+    search.groupBy &&
+    search.groupBy !== noGroupValue
+  ) {
+    parsed.groupBy = search.groupBy
+  }
   return parsed
 }
 
@@ -256,6 +279,10 @@ function parseStringArray(value: string) {
 
 function parseTimeRangeKey(value: string): TimeRangeKey {
   return value === 'custom' || timeRangeOptions.some(option => option.key === value) ? value as TimeRangeKey : '24h'
+}
+
+function parseEventSortDirection(value: string): EventSortDirection {
+  return value === 'asc' ? 'asc' : 'desc'
 }
 
 function formatDateTimeLocalInput(date: Date) {
@@ -354,10 +381,12 @@ function getJsonValueType(value: JsonValue) {
 export function ObservatoryHome({
   eventFilterSearchText,
   routeSelection,
+  searchGroupBy,
   selectedEventId
 }: {
   eventFilterSearchText?: string
   routeSelection?: RouteSelection
+  searchGroupBy?: string
   selectedEventId: string
 }) {
   const observatoryUrl = nanotraceApiBaseUrl()
@@ -380,6 +409,11 @@ export function ObservatoryHome({
     cookieName: 'observatory-ui-graph-mode',
     initialValue: 'flamegraph'
   })
+  const [eventSortDirection, setEventSortDirection] = useCookieState<EventSortDirection>({
+    cookieName: 'observatory-ui-event-sort-direction',
+    initialValue: 'desc',
+    parse: parseEventSortDirection
+  })
   const [timeRangeKey, setTimeRangeKey] = useCookieState<TimeRangeKey>({
     cookieName: 'observatory-ui-time-range',
     initialValue: '24h',
@@ -397,7 +431,6 @@ export function ObservatoryHome({
   })
   const centerRef = useRef<HTMLElement | null>(null)
   const [dragging, setDragging] = useState<null | 'runs' | 'inspector' | 'flamegraph'>(null)
-  const [manualGroupBy, setManualGroupBy] = useState('')
   const [highlightedEventIds, setHighlightedEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
@@ -434,9 +467,9 @@ export function ObservatoryHome({
   }, [groupOptions])
   const defaultGroupBy = groupOptions.find(option => option.path === 'traceId')?.path || groupOptions[0]?.path || ''
   const routeGroupBy = routeSelection?.field ?? ''
-  const groupingDisabled = manualGroupBy === noGroupValue
-  const manualGroupByValid = groupOptions.some(option => option.path === manualGroupBy)
-  const groupBy = groupingDisabled ? '' : manualGroupByValid ? manualGroupBy : routeGroupBy || defaultGroupBy
+  const requestedGroupBy = routeGroupBy || searchGroupBy || ''
+  const requestedGroupByValid = isKnownGroupOption(requestedGroupBy, groupOptions)
+  const groupBy = requestedGroupBy ? requestedGroupByValid ? requestedGroupBy : defaultGroupBy : ''
   const groupSortKey: GroupSortKey = isTraceLikeGroup(groupBy) ? 'recent' : 'count'
   const displayedGroupOptions = useMemo(
     () =>
@@ -523,10 +556,11 @@ export function ObservatoryHome({
     eventScopeKey,
     serializeEventFilter(eventFilterParams)
   ].join('\u0000')
-  const eventAnchorTimestamp =
-    eventAnchorOverride?.key === eventDataKey
-      ? eventAnchorOverride.timestamp
-      : eventFilterParams.createdBefore || latestCreatedAt || eventFilterParams.createdAfter || selectedTimeRange.createdBefore || ''
+  const eventAnchorTimestamp = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.timestamp : ''
+  const eventQueryFilterParams = useMemo(
+    () => eventAnchorTimestamp ? eventFilterWithoutTimeRange(eventFilterParams) : eventFilterParams,
+    [eventAnchorTimestamp, eventFilterParams]
+  )
   const summaryQuery = useQuery({
     enabled: Boolean(viewingGroupedEvents && hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
@@ -538,20 +572,33 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, eventAnchorTimestamp],
-    initialPageParam: { around: eventAnchorTimestamp } as EventPageParam,
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventQueryFilterParams, selectedTimeRange.key, eventAnchorTimestamp, eventSortDirection],
+    initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
         apiBaseUrl: observatoryUrl,
-        eventFilter: eventFilterParams,
+        eventFilter: eventQueryFilterParams,
         groupBy,
-        limit: 500,
+        limit: 100,
         pageParam,
-        selectedGroupValue
+        selectedGroupValue,
+        sortDirection: eventSortDirection,
+        timeRange: eventAnchorTimestamp ? undefined : selectedTimeRange
       }),
-    getNextPageParam: lastPage => lastPage.nextCursor ? { after: lastPage.nextCursor } : undefined,
-    getPreviousPageParam: firstPage => firstPage.prevCursor ? { before: firstPage.prevCursor } : undefined,
+    getNextPageParam: lastPage =>
+      lastPage.nextCursor
+        ? eventSortDirection === 'desc'
+          ? { before: lastPage.nextCursor }
+          : { after: lastPage.nextCursor }
+        : undefined,
+    getPreviousPageParam: firstPage =>
+      firstPage.prevCursor
+        ? eventSortDirection === 'desc'
+          ? { after: firstPage.prevCursor }
+          : { before: firstPage.prevCursor }
+        : undefined,
     placeholderData: keepPreviousData,
+    refetchInterval: !viewingGroupedEvents && timeRangeKey !== 'custom' ? 5000 : false,
     retry: false
   })
   const flamegraphQuery = useQuery({
@@ -614,9 +661,7 @@ export function ObservatoryHome({
   const loadingList = groupOptionsQuery.isPending || (Boolean(groupBy) && groupsQuery.isPending)
   const emptyObservatory = !loadingList && !listError && groupOptions.length === 0
   const emptyGroup = !loadingList && !listError && Boolean(groupBy) && !groupSearch && groupOptions.length > 0 && traceList.length === 0
-  const emptyGroupLabel = selectedGroupOption?.removable
-    ? 'No indexed values. Manage or backfill this group on the Facets page.'
-    : 'No groups found.'
+  const emptyGroupLabel = 'No groups found.'
   const waitingForLatest = Boolean(needsLatest && latestQuery.isPending && !hasEventQuery)
   const waitingForSummary = Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.isPending)
   const loadingGraph =
@@ -674,6 +719,7 @@ export function ObservatoryHome({
       ...(filter.facets?.length ? { facets: filter.facets } : {}),
       text: filter.text
     }
+    if (range.lookbackMinutes) return nextFilter
     if (range.createdAfter) nextFilter.createdAfter = range.createdAfter
     if (range.createdBefore) nextFilter.createdBefore = range.createdBefore
     return nextFilter
@@ -742,17 +788,24 @@ export function ObservatoryHome({
     commitEventFilter(nextFilter)
   }
 
-  useEffect(() => {
-    if (previousGroupKeyRef.current === eventScopeKey) {
+  function resetEventScope(nextEventScopeKey: string, { force = false }: { force?: boolean } = {}) {
+    if (!force && previousGroupKeyRef.current === nextEventScopeKey) {
       return
     }
 
-    previousGroupKeyRef.current = eventScopeKey
+    previousGroupKeyRef.current = nextEventScopeKey
     seededLatestGroupKeyRef.current = ''
     filterTouchedRef.current = false
     setEventFilterGroupKey('')
     setEventFilterDraft('')
     setEventFilterParams({ text: '' })
+    setEventAnchorOverride(null)
+    setHighlightedEventIds([])
+    setSelectedCanvasSpanId('')
+  }
+
+  useEffect(() => {
+    resetEventScope(eventScopeKey)
   }, [eventScopeKey])
 
   useEffect(() => {
@@ -784,9 +837,10 @@ export function ObservatoryHome({
       lastCreatedAt: latestCreatedAt,
       timeRange: selectedTimeRange
     })
+    const initialFilter = defaultFilter ?? (!viewingGroupedEvents && selectedTimeRange.lookbackMinutes ? { text: '' } : null)
     if (
       eventFilterSearchText !== undefined ||
-      !defaultFilter ||
+      !initialFilter ||
       filterTouchedRef.current ||
       seededLatestGroupKeyRef.current === eventScopeKey
     ) {
@@ -794,33 +848,17 @@ export function ObservatoryHome({
     }
 
     seededLatestGroupKeyRef.current = eventScopeKey
-    const defaultFilterText = eventFilterInputText(defaultFilter)
+    const defaultFilterText = eventFilterInputText(initialFilter)
     setEventFilterGroupKey(eventScopeKey)
     setEventFilterDraft(defaultFilterText)
-    setEventFilterParams(defaultFilter)
+    setEventFilterParams(initialFilter)
     setFilterSearch('')
-  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, selectedTimeRange])
-
-  useEffect(() => {
-    if (viewingGroupedEvents || timeRangeKey === 'custom' || !hasEventQuery) {
-      return
-    }
-
-    const interval = window.setInterval(() => {
-      const range = resolveTimeRange({
-        customEnd: customRangeEnd,
-        customStart: customRangeStart,
-        key: timeRangeKey
-      })
-      commitEventFilter(filterWithTimeRange(eventFilterParams, range), { syncUrl: false })
-    }, 5000)
-
-    return () => window.clearInterval(interval)
-  }, [customRangeEnd, customRangeStart, eventFilterParams, hasEventQuery, timeRangeKey, viewingGroupedEvents])
+  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, selectedTimeRange, viewingGroupedEvents])
 
   const filteredTraces = traceList
   const emptyFilter = !loadingList && !listError && Boolean(groupSearch) && traceList.length === 0
 
+  const eventTableFilterKey = eventFilterInputText(eventFilterParams)
   const eventTableScrollKey = useMemo(
     () =>
       [
@@ -828,11 +866,11 @@ export function ObservatoryHome({
         viewingGroupedEvents
           ? `/${encodeURIComponent(groupBy)}/${encodeURIComponent(selectedGroupValue)}`
           : '/events',
-        eventFilterParams.text,
-        eventFilterParams.createdAfter ?? '',
-        eventFilterParams.createdBefore ?? ''
+        eventTableFilterKey,
+        eventSortDirection,
+        eventAnchorTimestamp
       ].join('\u0000'),
-    [eventFilterParams.createdAfter, eventFilterParams.createdBefore, eventFilterParams.text, groupBy, selectedGroupValue, viewingGroupedEvents]
+    [eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
     if (!eventDetail) return selectedEventColumns
@@ -841,14 +879,8 @@ export function ObservatoryHome({
     return kept.length > 0 ? kept : [...defaultEventColumns].filter(path => available.has(path))
   }, [eventDetail, selectedEventColumns])
   const selectedEvent = allEvents.find(event => event.id === selectedEventId) ?? null
-  const pendingAnchoredEvent = Boolean(
-    selectedEventId &&
-    !selectedEvent &&
-    eventAnchorOverride?.key === eventDataKey &&
-    eventsQuery.isFetching
-  )
   const eventPayloadQuery = useQuery({
-    enabled: Boolean(selectedEventId && !pendingAnchoredEvent),
+    enabled: Boolean(selectedEventId),
     queryKey: ['logs', observatoryUrl, 'event', selectedEventId],
     queryFn: () => fetchEvent({ apiBaseUrl: observatoryUrl, eventId: selectedEventId }),
     retry: false
@@ -897,11 +929,7 @@ export function ObservatoryHome({
     setHighlightedEventIds(nextHighlightedEventIds)
     setSelectedCanvasSpanId(span.id)
     const anchorTimestamp = flamegraph.eventCreatedAt[nextEventId] || (Number.isFinite(span.startMs) ? new Date(span.startMs).toISOString() : '')
-    if (nextEventId && anchorTimestamp) {
-      setEventAnchorOverride({ key: eventDataKey, timestamp: anchorTimestamp })
-    } else {
-      setEventAnchorOverride(null)
-    }
+    setEventAnchorOverride(nextEventId && anchorTimestamp ? { key: eventDataKey, timestamp: anchorTimestamp } : null)
   }
 
   useEffect(() => {
@@ -912,19 +940,23 @@ export function ObservatoryHome({
     }
 
     if (!selectedEvent) {
-      if (pendingAnchoredEvent) {
-        return
-      }
-      setHighlightedEventIds([])
       if (eventPayloadQuery.error instanceof HTTPError && eventPayloadQuery.error.status === 404) {
+        setHighlightedEventIds([])
+        setSelectedCanvasSpanId('')
         setEventSearch('')
+      } else if (eventPayloadQuery.data?.event) {
+        setHighlightedEventIds([selectedEventId])
+        const anchorTimestamp = eventPayloadQuery.data.event.createdAt
+        if (anchorTimestamp && eventAnchorOverride?.timestamp !== anchorTimestamp) {
+          setEventAnchorOverride({ key: eventDataKey, timestamp: anchorTimestamp })
+        }
       }
       return
     }
 
     setHighlightedEventIds([selectedEventId])
     setSelectedCanvasSpanId(flamegraph.eventSpanIds[selectedEventId] ?? selectedEventId)
-  }, [eventPayloadQuery.error, flamegraph.eventSpanIds, pendingAnchoredEvent, selectedEvent, selectedEventId])
+  }, [eventPayloadQuery.data, eventPayloadQuery.error, flamegraph.eventSpanIds, selectedEvent, selectedEventId])
 
   useEffect(() => {
     document.body.style.cursor = dragging ? (dragging === 'flamegraph' ? 'row-resize' : 'col-resize') : ''
@@ -1083,9 +1115,12 @@ export function ObservatoryHome({
           <Select
             value={groupBy || noGroupValue}
             onValueChange={value => {
-              setManualGroupBy(value)
+              resetEventScope('all-events', { force: true })
               setFilter('')
-              void navigate({ search: {}, to: '/' })
+              void navigate({
+                search: value === noGroupValue ? {} : { groupBy: value },
+                to: '/'
+              })
             }}
           >
             <SelectTrigger aria-label="Group by" className="w-[150px]">
@@ -1156,7 +1191,7 @@ export function ObservatoryHome({
             ) : null}
           </div>
 
-	          <div ref={groupListRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 py-1.5">
+          <div ref={groupListRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 py-1.5">
             <div className="grid content-start gap-px">
               {filteredTraces.map(trace => (
                 <button
@@ -1169,6 +1204,7 @@ export function ObservatoryHome({
                   )}
                   type="button"
                   onClick={() => {
+                    resetEventScope(`${groupBy}\u0000${trace.value}`, { force: true })
                     void navigate({
                       to: '/$field/$value',
                       params: {
@@ -1324,12 +1360,14 @@ export function ObservatoryHome({
               selectedColumns={selectedEventColumnsForTrace}
               selectedEventAlign={eventAnchorOverride?.key === eventDataKey ? 'center' : 'auto'}
               selectedEventId={selectedEventId}
+              sortDirection={eventSortDirection}
               onLoadMore={() => {
                 void eventsQuery.fetchNextPage()
               }}
               onLoadPrevious={() => eventsQuery.fetchPreviousPage().then(() => undefined)}
               onInspect={selectEvent}
               onSetColumns={setSelectedEventColumns}
+              onToggleSortDirection={() => setEventSortDirection(current => current === 'desc' ? 'asc' : 'desc')}
               onToggleColumn={path =>
                 setSelectedEventColumns(current =>
                   current.includes(path) ? current.filter(value => value !== path) : [...current, path]
@@ -1591,6 +1629,15 @@ function previewGroupFields(fields: JsonObject | undefined) {
 
 function groupOptionLabel(option: GroupOption) {
   return option.displayName || displayFacetPath(option.path)
+}
+
+function isKnownGroupOption(path: string, options: GroupOption[]) {
+  if (!path) return false
+  const canonicalPath = facetKey(path)
+  return (
+    options.some(option => option.path === path || facetKey(option.path) === canonicalPath) ||
+    groupableFields.some(option => option === path || facetKey(option) === canonicalPath)
+  )
 }
 
 function isTraceLikeGroup(groupBy: string) {
@@ -1963,10 +2010,11 @@ function DensityHistogramCanvas({
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const [brush, setBrush] = useState<null | { fromX: number; toX: number }>(null)
+  const [yScale, setYScale] = useState<DensityYScale>('log')
   const fromMs = traceTimeMs(density.from)
   const toMs = traceTimeMs(density.to)
   const durationMs = Math.max(toMs - fromMs, 1)
-  const maxCount = Math.max(...density.buckets.map(bucket => bucket.count), 1)
+  const maxScaledCount = Math.max(...density.buckets.map(bucket => scaleDensityCount(bucket.count, yScale)), 1)
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -2000,8 +2048,8 @@ function DensityHistogramCanvas({
       const start = traceTimeMs(bucket.start)
       if (!Number.isFinite(start)) continue
       const x = padX + ((start - fromMs) / durationMs) * plotWidth
-      const height = Math.max(1, (bucket.count / maxCount) * plotHeight)
-      const errorHeight = Math.max(0, ((bucket.errorCount ?? 0) / maxCount) * plotHeight)
+      const height = Math.max(1, (scaleDensityCount(bucket.count, yScale) / maxScaledCount) * plotHeight)
+      const errorHeight = Math.max(0, (scaleDensityCount(bucket.errorCount ?? 0, yScale) / maxScaledCount) * plotHeight)
       ctx.fillStyle = 'rgba(212,212,212,0.58)'
       ctx.fillRect(x, padTop + plotHeight - height, Math.max(1, bucketWidth - 1), height)
       if (errorHeight > 0) {
@@ -2040,7 +2088,7 @@ function DensityHistogramCanvas({
       ctx.strokeStyle = 'rgba(255,255,255,0.8)'
       ctx.strokeRect(x0, padTop, Math.max(1, x1 - x0), plotHeight)
     }
-  }, [brush, density, durationMs, fromMs, maxCount, toMs])
+  }, [brush, density, durationMs, fromMs, maxScaledCount, toMs, yScale])
 
   function xToTimestamp(clientX: number) {
     const root = rootRef.current
@@ -2078,11 +2126,48 @@ function DensityHistogramCanvas({
       }}
     >
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
-      <div className="pointer-events-none absolute left-2 top-2 text-[11px] uppercase tracking-[0.08em] text-neutral-500">
-        Density {totalCount > 200000 ? '200k+' : totalCount}
+      <div className="absolute left-2 top-2 z-10 text-[11px] uppercase tracking-[0.08em] text-neutral-500">
+        Density {totalCount > 200000 ? '200k+' : totalCount} ·{' '}
+        <button
+          className="text-neutral-300 underline decoration-neutral-700 underline-offset-2 hover:text-white hover:decoration-neutral-300"
+          title="Cycle density y scale"
+          type="button"
+          onClick={event => {
+            event.stopPropagation()
+            setYScale(current => nextDensityYScale(current))
+          }}
+          onPointerDown={event => {
+            event.stopPropagation()
+          }}
+        >
+          {yScale}
+        </button>
       </div>
     </div>
   )
+}
+
+function scaleDensityCount(value: number, yScale: DensityYScale) {
+  const count = Math.max(0, Number(value) || 0)
+  switch (yScale) {
+    case 'linear':
+      return count
+    case 'sqrt':
+      return Math.sqrt(count)
+    case 'log':
+      return Math.log1p(count)
+  }
+}
+
+function nextDensityYScale(yScale: DensityYScale): DensityYScale {
+  switch (yScale) {
+    case 'log':
+      return 'linear'
+    case 'linear':
+      return 'sqrt'
+    case 'sqrt':
+      return 'log'
+  }
 }
 
 function FlamegraphCanvas({
@@ -2446,7 +2531,11 @@ function FlamegraphCanvas({
 
     if (Math.abs(deltaX) > 0) {
       preventDefault()
-      element.scrollLeft += deltaX
+      element.scrollLeft = clamp(
+        element.scrollLeft + deltaX,
+        0,
+        Math.max(element.scrollWidth - element.clientWidth, 0)
+      )
     }
   }
 
@@ -2502,7 +2591,9 @@ function FlamegraphCanvas({
     const onWheel = (event: WheelEvent) => {
       const handled = event.ctrlKey || Math.abs(event.deltaX) > 0
       if (handled) {
+        event.preventDefault()
         event.stopPropagation()
+        event.stopImmediatePropagation()
       }
       wheelTimeline({
         clientX: event.clientX,
@@ -2522,7 +2613,7 @@ function FlamegraphCanvas({
     <div
       ref={rootRef}
       className={cn('flex h-full flex-col', panning ? 'cursor-grabbing' : 'cursor-grab')}
-      style={{ overscrollBehavior: 'contain', touchAction: 'none' }}
+      style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none', touchAction: 'none' }}
     >
       <div>
         <div
@@ -2578,6 +2669,7 @@ function FlamegraphCanvas({
           'min-h-0 flex-1 overflow-auto bg-black',
           panning ? 'cursor-grabbing' : 'cursor-grab'
         )}
+        style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none' }}
         onPointerDown={event => {
           if (event.button !== 0 || (event.target as HTMLElement).closest('button')) return
           event.preventDefault()
@@ -2703,10 +2795,12 @@ function EventPanel({
   selectedColumns,
   selectedEventAlign,
   selectedEventId,
+  sortDirection,
   onInspect,
   onLoadMore,
   onLoadPrevious,
   onSetColumns,
+  onToggleSortDirection,
   onToggleColumn
 }: {
   anchorIndex: number
@@ -2724,10 +2818,12 @@ function EventPanel({
   selectedColumns: string[]
   selectedEventAlign: 'auto' | 'center'
   selectedEventId: string
+  sortDirection: EventSortDirection
   onInspect: (event: TraceEvent) => void
   onLoadMore: () => void
   onLoadPrevious: () => Promise<void>
   onSetColumns: (paths: string[]) => void
+  onToggleSortDirection: () => void
   onToggleColumn: (path: string) => void
 }) {
   const [columnsOpen, setColumnsOpen] = useState(false)
@@ -2740,7 +2836,11 @@ function EventPanel({
   const loadMoreEventCountRef = useRef(0)
   const loadPreviousEventCountRef = useRef(0)
   const anchoredScrollKeyRef = useRef('')
+  const currentScrollStateKeyRef = useRef(scrollStateKey)
   const selectedScrollKeyRef = useRef('')
+  const lastScrollTopRef = useRef(0)
+  const suppressScrollPaginationRef = useRef(false)
+  const userScrolledRef = useRef(false)
   const scrollSaveTimeoutRef = useRef<number | null>(null)
   const highlightedEventIdSet = new Set(highlightedEventIds)
   const selectedColumnSet = new Set(selectedColumns)
@@ -2759,6 +2859,15 @@ function EventPanel({
     overscan: 100
   })
 
+  function suppressScrollPaginationForProgrammaticScroll() {
+    suppressScrollPaginationRef.current = true
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        suppressScrollPaginationRef.current = false
+      })
+    })
+  }
+
   useEffect(() => {
     if (!selectedEventId) {
       selectedScrollKeyRef.current = ''
@@ -2773,14 +2882,16 @@ function EventPanel({
       return
     }
     selectedScrollKeyRef.current = key
+    suppressScrollPaginationForProgrammaticScroll()
     virtualizer.scrollToIndex(index, { align: selectedEventAlign })
   }, [events, scrollStateKey, selectedEventAlign, selectedEventId, virtualizer])
 
-  function loadMoreIfNeeded(element: HTMLElement | null) {
+  function loadMoreIfNeeded(element: HTMLElement | null, options: { fillOnly?: boolean } = {}) {
     if (!element || !hasMore || loadingMore || loadMoreEventCountRef.current === events.length) {
       return
     }
-    if (element.scrollHeight - element.scrollTop - element.clientHeight > 800) {
+    const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+    if (options.fillOnly ? element.scrollHeight > element.clientHeight + 1 : distanceFromBottom > 800) {
       return
     }
     loadMoreEventCountRef.current = events.length
@@ -2796,27 +2907,41 @@ function EventPanel({
     void onLoadPrevious().then(() => {
       requestAnimationFrame(() => {
         if (scrollRef.current) {
+          suppressScrollPaginationForProgrammaticScroll()
           scrollRef.current.scrollTop += scrollRef.current.scrollHeight - previousHeight
+          lastScrollTopRef.current = scrollRef.current.scrollTop
         }
       })
     })
   }
 
   useEffect(() => {
-    loadMoreIfNeeded(scrollRef.current)
+    loadMoreIfNeeded(scrollRef.current, { fillOnly: true })
   }, [events.length, hasMore, hasPrevious, loadingMore, loadingPrevious])
+
+  useEffect(() => {
+    if (currentScrollStateKeyRef.current === scrollStateKey) return
+    currentScrollStateKeyRef.current = scrollStateKey
+    lastScrollTopRef.current = 0
+    userScrolledRef.current = false
+  }, [scrollStateKey])
 
   useEffect(() => {
     const element = scrollRef.current
     if (!element) return
+    if (selectedEventAlign === 'center') return
+    if (userScrolledRef.current) return
+    suppressScrollPaginationForProgrammaticScroll()
     element.scrollTop = savedScrollTop
-  }, [savedScrollTop, scrollStateKey])
+    lastScrollTopRef.current = element.scrollTop
+  }, [savedScrollTop, scrollStateKey, selectedEventAlign])
 
   useEffect(() => {
     if (selectedEventId || anchoredScrollKeyRef.current === scrollStateKey || events.length === 0) {
       return
     }
     anchoredScrollKeyRef.current = scrollStateKey
+    suppressScrollPaginationForProgrammaticScroll()
     virtualizer.scrollToIndex(clamp(anchorIndex, 0, events.length - 1), { align: 'center' })
   }, [anchorIndex, events.length, scrollStateKey, selectedEventId, virtualizer])
 
@@ -2840,7 +2965,7 @@ function EventPanel({
   }, [columnsOpen])
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col bg-neutral-950">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-neutral-950">
       <div className="flex items-center gap-2 border-b border-neutral-800 px-2 py-1.5">
         <p className="text-[11px] uppercase tracking-[0.08em] text-neutral-500">Events</p>
         {loadingAnchor ? (
@@ -2897,23 +3022,47 @@ function EventPanel({
           )}
         </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-x-auto">
+      <div className="min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden">
         <div className="flex h-full min-w-[640px] flex-col">
           <div
             className="grid shrink-0 gap-3 border-b border-neutral-800 bg-neutral-950 px-3 py-2 text-[10px] uppercase tracking-[0.08em] text-neutral-500"
             style={{ gridTemplateColumns }}
           >
             {selectedColumns.map(path => (
-              <span key={path} className="truncate">{path}</span>
+              path === 'timestamp' ? (
+                <button
+                  key={path}
+                  aria-label={`Sort timestamp ${sortDirection === 'desc' ? 'ascending' : 'descending'}`}
+                  className="inline-flex min-w-0 items-center gap-1 text-left uppercase text-neutral-400 outline-none hover:text-white focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600"
+                  title={`Timestamp ${sortDirection === 'desc' ? 'descending' : 'ascending'}`}
+                  type="button"
+                  onClick={onToggleSortDirection}
+                >
+                  <span className="truncate">{path}</span>
+                  {sortDirection === 'desc' ? <ArrowDown size={11} strokeWidth={1.8} /> : <ArrowUp size={11} strokeWidth={1.8} />}
+                </button>
+              ) : (
+                <span key={path} className="truncate">{path}</span>
+              )
             ))}
           </div>
           <div
             ref={scrollRef}
             className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain"
             onScroll={event => {
-              loadPreviousIfNeeded(event.currentTarget)
-              loadMoreIfNeeded(event.currentTarget)
               const nextScrollTop = Math.round(event.currentTarget.scrollTop)
+              const previousScrollTop = lastScrollTopRef.current
+              const suppressPagination = suppressScrollPaginationRef.current
+              suppressScrollPaginationRef.current = false
+              lastScrollTopRef.current = nextScrollTop
+              if (!suppressPagination) {
+                userScrolledRef.current = true
+                if (nextScrollTop < previousScrollTop) {
+                  loadPreviousIfNeeded(event.currentTarget)
+                } else if (nextScrollTop > previousScrollTop) {
+                  loadMoreIfNeeded(event.currentTarget)
+                }
+              }
               if (scrollSaveTimeoutRef.current !== null) {
                 window.clearTimeout(scrollSaveTimeoutRef.current)
               }
@@ -2937,7 +3086,7 @@ function EventPanel({
                   <button
                     key={`${event.id}-${event.createdAt}`}
                     className={cn(
-                      'absolute left-0 top-0 grid w-full gap-3 border-b border-neutral-900 px-3 py-2 text-left text-[13px] leading-5 hover:bg-white/[0.03]',
+                      'absolute left-0 top-0 grid w-full gap-3 border-b border-neutral-900 px-3 py-2 text-left text-[13px] leading-5 outline-none hover:bg-white/[0.03] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600',
                       error && 'border-l-2 border-l-red-400 bg-red-950/25 ring-1 ring-inset ring-red-500/35 hover:bg-red-950/35',
                       highlightedEventIdSet.has(event.id) && 'bg-white/[0.05]',
                       event.id === selectedEventId && 'bg-white/[0.1] ring-1 ring-inset ring-white/40'
@@ -2950,7 +3099,10 @@ function EventPanel({
                       transform: `translateY(${virtualRow.start}px)`
                     }}
                     type="button"
-                    onClick={() => onInspect(event)}
+                    onClick={clickEvent => {
+                      clickEvent.currentTarget.blur()
+                      onInspect(event)
+                    }}
                   >
                     {selectedColumns.map(path => (
                       <span
@@ -3242,11 +3394,21 @@ function buildFlamegraph(events: TraceEvent[]): Flamegraph {
 
   for (const event of events) {
     const type = stringField(event.data.event_type)
-    if (type === 'span_start' || type === 'span_end') {
+    const boundedSpan =
+      type === 'span' ||
+      (Boolean(stringField(event.data.spanId)) &&
+        Boolean(stringField(event.data.startedAt)) &&
+        (Boolean(stringField(event.data.endedAt)) || typeof event.data.durationMs === 'number'))
+    if (type === 'span_start' || type === 'span_end' || boundedSpan) {
       const id = stringField(event.data.spanId) || event.id
       const current = spanCandidates.get(id)
       const nextStart = stringField(event.data.startedAt) || event.createdAt
-      const nextEnd = type === 'span_end' ? stringField(event.data.endedAt) || undefined : undefined
+      const explicitEnd = stringField(event.data.endedAt)
+      const durationMs = typeof event.data.durationMs === 'number' ? event.data.durationMs : Number.NaN
+      const nextEnd =
+        type === 'span_end' || boundedSpan
+          ? explicitEnd || (Number.isFinite(durationMs) && durationMs > 0 ? new Date(traceTimeMs(nextStart) + durationMs).toISOString() : undefined)
+          : undefined
       const payload = type === 'span_end' || !current ? event.data : current.payload
       spanCandidates.set(id, {
         eventIds: [...(current?.eventIds ?? []), event.id],
@@ -3452,9 +3614,11 @@ type FlamegraphEventRow = {
 }
 
 const defaultTableName = 'observatory.events'
-const defaultFacetsTableName = 'observatory.event_facets'
-const defaultEventIndexTableName = 'observatory.event_facet_index'
-const defaultFieldValuesTableName = 'observatory.field_values'
+const defaultFacetsTableName = 'observatory.field_counts_5m'
+const defaultEventIndexTableName = 'observatory.field_index'
+const defaultFieldValuesTableName = 'observatory.field_index'
+const defaultSpansTableName = 'observatory.spans'
+const defaultTraceSummariesTableName = 'observatory.trace_summaries'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -3484,90 +3648,18 @@ async function fetchGroupOptions({
   apiBaseUrl: string
   limit: number
 }): Promise<{ fields: GroupOption[] }> {
-  let facetsResponse: FacetListResponse
-  try {
-    facetsResponse = await fetchFacets({ apiBaseUrl })
-  } catch (error) {
-    if (error instanceof HTTPError && error.status === 404) {
-      return fetchLegacyGroupOptions({ apiBaseUrl, limit })
-    }
-    throw error
-  }
-  const facets = facetsResponse.facets.filter(facet => facet.status === 'active' && facet.lookup_enabled !== false).slice(0, limit)
-  const keys = facets.map(facet => facet.path)
-  const keyList = keys.map(key => `'${sqlString(key)}'`).join(', ')
-  const countResponse = keys.length
-    ? await postQuery<{
-        capped: boolean
-        cardinality: number
-        path: string
-      }>({
-        apiBaseUrl,
-        parameters: { limit },
-        query: [
-          'SELECT key AS path, uniqCombined64(value) AS cardinality, toBool(0) AS capped',
-          `FROM ${fieldValuesTable()}`,
-          `WHERE key IN (${keyList}) AND value != ''`,
-          'GROUP BY path',
-          'ORDER BY cardinality DESC, path ASC',
-          'LIMIT {limit:UInt64}'
-        ].join(' ')
-      })
-    : { data: [] }
-  const counts = new Map((countResponse.data ?? []).map(field => [field.path, field]))
-  const fields = facets.map(facet => {
-    const count = counts.get(facet.path)
-    return {
-      cardinality: Number(count?.cardinality) || 0,
-      capped: Boolean(count?.capped),
-      displayName: facet.display_name || displayFacetPath(facet.path),
-      path: facet.display_name || displayFacetPath(facet.path),
-      removable: Boolean(facet.removable),
-      source: facet.source,
-      lookupEnabled: facet.lookup_enabled,
-      aggregateEnabled: facet.aggregate_enabled,
-      valueType: facet.value_type
-    }
-  })
-  if (fields.length > 0) {
-    return { fields }
-  }
-  return {
-    fields: groupableFields.slice(0, limit).map(path => ({
-      cardinality: 0,
-      capped: false,
-      path
-    }))
-  }
-}
-
-async function fetchLegacyGroupOptions({
-  apiBaseUrl,
-  limit
-}: {
-  apiBaseUrl: string
-  limit: number
-}): Promise<{ fields: GroupOption[] }> {
   const response = await postQuery<{
     capped: boolean
     cardinality: number
     path: string
+    valueType: string
   }>({
     apiBaseUrl,
     parameters: { limit },
     query: [
-      'SELECT path, max(cardinality) AS cardinality, toBool(0) AS capped',
-      'FROM (',
-      'SELECT key AS path, uniqCombined64(value) AS cardinality',
+      'SELECT field_name AS path, uniqCombined64(value) AS cardinality, any(value_type) AS valueType, toBool(0) AS capped',
       `FROM ${fieldValuesTable()}`,
-      "WHERE key != ''",
-      'GROUP BY path',
-      'UNION ALL',
-      'SELECT key AS path, uniqCombined64(value) AS cardinality',
-      `FROM ${facetsTable()}`,
-      "WHERE key != ''",
-      'GROUP BY path',
-      ')',
+      "WHERE field_name != '' AND value != ''",
       'GROUP BY path',
       'ORDER BY cardinality DESC, path ASC',
       'LIMIT {limit:UInt64}'
@@ -3576,7 +3668,8 @@ async function fetchLegacyGroupOptions({
   const dynamicFields = (response.data ?? []).map(field => ({
     cardinality: Number(field.cardinality) || 0,
     capped: Boolean(field.capped),
-    path: displayFacetPath(field.path)
+    path: displayFacetPath(field.path),
+    valueType: field.valueType
   }))
   if (dynamicFields.length > 0) {
     return { fields: mergeGroupOptions(dynamicFields, limit) }
@@ -3607,6 +3700,17 @@ async function fetchGroups({
   sortKey: GroupSortKey
   timeRange: ResolvedTimeRange
 }): Promise<LogGroupPage> {
+  if (facetKey(groupBy) === 'trace_id') {
+    try {
+      const tracePage = await fetchTraceSummaryGroups({ apiBaseUrl, groupBy, limit, offset, search, sortKey, timeRange })
+      if (tracePage.groups.length > 0 || search) return tracePage
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
   const timeFilter = timeRangeWhereClause(timeRange, 'bucket_time')
   const exactFilter = search ? ' AND value = {group_value:String}' : ''
   const pageLimit = limit + 1
@@ -3638,7 +3742,7 @@ async function fetchGroups({
           ', count() AS count',
           ", countIf(endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
           `FROM ${eventIndexTable()}`,
-          `PREWHERE key = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
+          `PREWHERE field_name = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
           'GROUP BY value',
           'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
         ].join(' ')
@@ -3672,7 +3776,7 @@ async function fetchGroups({
         ', sum(count) AS count',
         ', sum(error_count) AS errorCount',
         `FROM ${facetsTable()}`,
-        `PREWHERE key = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
+        `PREWHERE field_name = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
         `WHERE value != ''${exactFilter}`,
         'GROUP BY value',
         groupOrderByClause({ groupBy, hasErrorCount: true, sortKey }),
@@ -3703,13 +3807,13 @@ async function fetchGroups({
       parameters: baseParameters,
       query: [
         'SELECT value',
-        ', min(first_seen) AS startedAt',
-        ', max(last_seen) AS endedAt',
-        ", dateDiff('millisecond', min(first_seen), max(last_seen)) AS durationMs",
-        ', toUInt64(0) AS count',
-        ', toUInt64(0) AS errorCount',
+        ', min(timestamp) AS startedAt',
+        ', max(timestamp) AS endedAt',
+        ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
+        ', count() AS count',
+        ', sum(toUInt64(is_error)) AS errorCount',
         `FROM ${fieldValuesTable()}`,
-        `PREWHERE key = {group_key:String}${valueTimeFilter ? ` AND ${valueTimeFilter}` : ''}`,
+        `PREWHERE field_name = {group_key:String}${valueTimeFilter ? ` AND ${valueTimeFilter}` : ''}`,
         `WHERE value != ''${exactFilter}`,
         'GROUP BY value',
         fieldValueOrderByClause(sortKey),
@@ -3742,7 +3846,7 @@ async function fetchGroups({
       ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs",
       ', sum(count) AS count',
       `FROM ${facetsTable()}`,
-      `PREWHERE key = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
+      `PREWHERE field_name = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
       `WHERE value != ''${exactFilter}`,
       'GROUP BY value',
       groupOrderByClause({ groupBy, hasErrorCount: false, sortKey }),
@@ -3753,10 +3857,96 @@ async function fetchGroups({
   return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
 }
 
+async function fetchTraceSummaryGroups({
+  apiBaseUrl,
+  groupBy,
+  limit,
+  offset,
+  search,
+  sortKey,
+  timeRange
+}: {
+  apiBaseUrl: string
+  groupBy: string
+  limit: number
+  offset: number
+  search: string
+  sortKey: GroupSortKey
+  timeRange: ResolvedTimeRange
+}): Promise<LogGroupPage> {
+  const timeFilter = timeRangeWhereClause(timeRange, 'bucket_time')
+  const pageLimit = limit + 1
+  const response = await postQuery<{
+    count: number
+    durationMs: number
+    endedAt: string
+    errorCount: number
+    rootName: string
+    rootService: string
+    startedAt: string
+    value: string
+  }>({
+    apiBaseUrl,
+    parameters: {
+      group_value: search,
+      limit: pageLimit,
+      offset,
+      ...timeRangeParameters(timeRange)
+    },
+    query: [
+      'SELECT trace_id AS value',
+      ', minMerge(trace_start_state) AS startedAt',
+      ', maxMerge(trace_end_state) AS endedAt',
+      ", dateDiff('millisecond', startedAt, endedAt) AS durationMs",
+      ', uniqCombined64Merge(span_count_state) AS count',
+      ', sumMerge(error_count_state) AS errorCount',
+      ', argMinMerge(root_service_state) AS rootService',
+      ', argMinMerge(root_name_state) AS rootName',
+      `FROM ${traceSummariesTable()}`,
+      timeFilter ? `PREWHERE ${timeFilter}` : '',
+      search ? 'WHERE trace_id = {group_value:String}' : '',
+      'GROUP BY trace_id',
+      traceSummaryOrderByClause(sortKey),
+      'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
+    ].join(' ')
+  })
+  const pageRows = (response.data ?? []).slice(0, limit)
+  return {
+    groups: pageRows.map(group => ({
+      count: Number(group.count) || 0,
+      durationMs: Number(group.durationMs) || 0,
+      endedAt: normalizeTimestamp(group.endedAt),
+      errorCount: Number(group.errorCount) || 0,
+      fields: compactObject({
+        rootName: group.rootName,
+        rootService: group.rootService
+      }),
+      groupBy,
+      startedAt: normalizeTimestamp(group.startedAt),
+      value: group.value
+    })),
+    nextOffset: (response.data ?? []).length > limit ? offset + limit : undefined
+  }
+}
+
+function traceSummaryOrderByClause(sortKey: GroupSortKey) {
+  switch (sortKey) {
+    case 'count':
+      return 'ORDER BY count DESC, errorCount DESC, endedAt DESC'
+    case 'duration':
+      return 'ORDER BY durationMs DESC, endedAt DESC'
+    case 'value':
+      return 'ORDER BY value ASC'
+    case 'recent':
+      return 'ORDER BY endedAt DESC, errorCount DESC, count DESC'
+  }
+}
+
 function fieldValueTimeRangeWhereClause(timeRange: ResolvedTimeRange) {
   const clauses = []
-  if (timeRange.from) clauses.push("last_seen >= {from:DateTime64(3, 'UTC')}")
-  if (timeRange.to) clauses.push("first_seen <= {to:DateTime64(3, 'UTC')}")
+  if (timeRange.createdAfter) clauses.push("timestamp >= {created_after:DateTime64(3, 'UTC')}")
+  if (timeRange.createdBefore) clauses.push("timestamp <= {created_before:DateTime64(3, 'UTC')}")
+  if (timeRange.lookbackMinutes) clauses.push('timestamp >= now64(3) - toIntervalMinute({lookback_minutes:UInt64})')
   return clauses.join(' AND ')
 }
 
@@ -3840,10 +4030,10 @@ async function fetchLatest({
       apiBaseUrl,
       parameters,
       query: [
-        'SELECT max(bucket_time) AS lastCreatedAt',
-        `FROM ${facetsTable()}`,
-        'PREWHERE key = {group_key:String}',
-        'WHERE value = {group_value:String}'
+      'SELECT max(bucket_time) AS lastCreatedAt',
+      `FROM ${facetsTable()}`,
+      'PREWHERE field_name = {group_key:String}',
+      'WHERE value = {group_value:String}'
       ].join(' ')
     })
     const lastCreatedAt = normalizeTimestamp(response.data?.[0]?.lastCreatedAt)
@@ -3860,7 +4050,7 @@ async function fetchLatest({
     query: [
       'SELECT max(timestamp) AS lastCreatedAt',
       `FROM ${eventIndexTable()}`,
-      'PREWHERE key = {group_key:String} AND value = {group_value:String}'
+      'PREWHERE field_name = {group_key:String} AND value = {group_value:String}'
     ].join(' ')
   })
   return { lastCreatedAt: normalizeTimestamp(response.data?.[0]?.lastCreatedAt) }
@@ -3920,7 +4110,7 @@ async function fetchSummaryFromIndex({
     query: [
       'SELECT count() AS count',
       `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
     ].join(' ')
   })
@@ -3934,7 +4124,9 @@ async function fetchEvents({
   groupBy,
   limit,
   pageParam,
-  selectedGroupValue
+  selectedGroupValue,
+  sortDirection,
+  timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
@@ -3942,10 +4134,12 @@ async function fetchEvents({
   limit: number
   pageParam: EventPageParam
   selectedGroupValue: string
+  sortDirection: EventSortDirection
+  timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
   if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
     try {
-      return await fetchEventsFromIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue })
+      return await fetchEventsFromIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue, sortDirection, timeRange })
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -3953,7 +4147,10 @@ async function fetchEvents({
     }
   }
 
-  const direction = pageParam.before ? 'before' : 'forward'
+  const queryOrder = sortDirection === 'desc'
+    ? pageParam.after ? 'ASC' : 'DESC'
+    : pageParam.before ? 'DESC' : 'ASC'
+  const tableOrder = sortDirection === 'desc' ? 'DESC' : 'ASC'
   const pageFilter = pageParam.before
     ? "e.timestamp < {cursor:DateTime64(3, 'UTC')}"
     : pageParam.after
@@ -3962,17 +4159,17 @@ async function fetchEvents({
         ? "e.timestamp <= {cursor:DateTime64(3, 'UTC')}"
         : ''
   const parameters = {
-    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
     limit,
     ...(pageParam.before || pageParam.after || pageParam.around
       ? { cursor: clickHouseDateTime64(pageParam.before || pageParam.after || pageParam.around || '') }
       : {})
   }
-  const order = direction === 'before' || pageParam.around ? 'DESC' : 'ASC'
   const filters = eventFilterClauses({
     eventFilter,
     groupBy,
     selectedGroupValue,
+    timeRange,
     prewhere: pageFilter ? [pageFilter] : []
   })
   const response = await postQuery<FlamegraphEventRow>({
@@ -3988,22 +4185,27 @@ async function fetchEvents({
       `FROM ${eventsTable()} AS e`,
       filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
       filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : '',
-      `ORDER BY e.timestamp ${order}, e.event_id ${order}`,
+      `ORDER BY e.timestamp ${queryOrder}, e.event_id ${queryOrder}`,
       'LIMIT {limit:UInt64}',
       ')',
       ')',
-      `ORDER BY e.timestamp ${order}, e.event_id ${order}`,
+      `ORDER BY e.timestamp ${queryOrder}, e.event_id ${queryOrder}`,
     ].join(' ')
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  if (order === 'DESC') events.reverse()
+  if (queryOrder !== tableOrder) events.reverse()
+  const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
 
   return {
     events,
     fields: orderLogFields(inferLogFields(events)),
     group: pageGroupSummary({ events, groupBy, selectedGroupValue }),
-    nextCursor: pageParam.after && events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
-    prevCursor: events.length >= limit ? events[0]?.createdAt : undefined
+    nextCursor: events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
+    prevCursor: loadedTowardTop
+      ? events.length >= limit ? events[0]?.createdAt : undefined
+      : pageParam.around
+        ? events[0]?.createdAt
+        : undefined
   }
 }
 
@@ -4013,7 +4215,9 @@ async function fetchEventsFromIndex({
   groupBy,
   limit,
   pageParam,
-  selectedGroupValue
+  selectedGroupValue,
+  sortDirection,
+  timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
@@ -4021,8 +4225,13 @@ async function fetchEventsFromIndex({
   limit: number
   pageParam: EventPageParam
   selectedGroupValue: string
+  sortDirection: EventSortDirection
+  timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  const direction = pageParam.before ? 'before' : 'forward'
+  const queryOrder = sortDirection === 'desc'
+    ? pageParam.after ? 'ASC' : 'DESC'
+    : pageParam.before ? 'DESC' : 'ASC'
+  const tableOrder = sortDirection === 'desc' ? 'DESC' : 'ASC'
   const cursorFilter = pageParam.before
     ? "i.timestamp < {cursor:DateTime64(3, 'UTC')}"
     : pageParam.after
@@ -4030,10 +4239,9 @@ async function fetchEventsFromIndex({
       : pageParam.around
         ? "i.timestamp <= {cursor:DateTime64(3, 'UTC')}"
         : ''
-  const order = direction === 'before' || pageParam.around ? 'DESC' : 'ASC'
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter })
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter, timeRange })
   const parameters = {
-    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
     limit,
     ...(pageParam.before || pageParam.after || pageParam.around
       ? { cursor: clickHouseDateTime64(pageParam.before || pageParam.after || pageParam.around || '') }
@@ -4047,21 +4255,26 @@ async function fetchEventsFromIndex({
       ', i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
       ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
       `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
-      `ORDER BY i.timestamp ${order}, i.event_id ${order}`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      eventIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
+      `ORDER BY i.timestamp ${queryOrder}, i.event_id ${queryOrder}`,
       'LIMIT {limit:UInt64}'
     ].join(' ')
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  if (order === 'DESC') events.reverse()
+  if (queryOrder !== tableOrder) events.reverse()
+  const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
 
   return {
     events,
     fields: orderLogFields(inferLogFields(events)),
     group: pageGroupSummary({ events, groupBy, selectedGroupValue }),
-    nextCursor: pageParam.after && events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
-    prevCursor: events.length >= limit ? events[0]?.createdAt : undefined
+    nextCursor: events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
+    prevCursor: loadedTowardTop
+      ? events.length >= limit ? events[0]?.createdAt : undefined
+      : pageParam.around
+        ? events[0]?.createdAt
+        : undefined
   }
 }
 
@@ -4078,6 +4291,16 @@ async function fetchFlamegraph({
   maxSpans: number
   selectedGroupValue: string
 }): Promise<LogFlamegraph> {
+  if (facetKey(groupBy) === 'trace_id' && selectedGroupValue) {
+    try {
+      return await fetchFlamegraphFromSpans({ apiBaseUrl, maxSpans, selectedTraceId: selectedGroupValue })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
   if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
     try {
       return await fetchFlamegraphFromIndex({ apiBaseUrl, eventFilter, groupBy, maxSpans, selectedGroupValue })
@@ -4118,6 +4341,51 @@ async function fetchFlamegraph({
   }
 }
 
+async function fetchFlamegraphFromSpans({
+  apiBaseUrl,
+  maxSpans,
+  selectedTraceId
+}: {
+  apiBaseUrl: string
+  maxSpans: number
+  selectedTraceId: string
+}): Promise<LogFlamegraph> {
+  const response = await postQuery<FlamegraphEventRow>({
+    apiBaseUrl,
+    parameters: {
+      limit: maxSpans,
+      trace_id: selectedTraceId
+    },
+    query: [
+      'SELECT event_id, start_time AS timestamp, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms',
+      'FROM (',
+      'SELECT if(length(arrayFlatten(groupArray(event_ids))) > 0, arrayFlatten(groupArray(event_ids))[1], span_id) AS event_id',
+      ', anyLast(event_type) AS event_type',
+      ', anyLast(signal) AS signal',
+      ', trace_id',
+      ', span_id',
+      ', anyLast(parent_span_id) AS parent_span_id',
+      ', anyLast(name) AS name',
+      ', min(start_time) AS start_time',
+      ', max(end_time) AS end_time',
+      ', ifNull(max(duration_ms), 0) AS duration_ms',
+      `FROM ${spansTable()}`,
+      'PREWHERE trace_id = {trace_id:String}',
+      'GROUP BY trace_id, span_id',
+      ')',
+      'ORDER BY start_time ASC, span_id ASC',
+      'LIMIT {limit:UInt64}'
+    ].join(' ')
+  })
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
+  const flamegraph = buildFlamegraph(events)
+  return {
+    ...flamegraph,
+    capped: events.length >= maxSpans,
+    spanCount: flamegraph.rows.reduce((count, row) => count + row.length, 0)
+  }
+}
+
 async function fetchFlamegraphFromIndex({
   apiBaseUrl,
   eventFilter,
@@ -4142,7 +4410,7 @@ async function fetchFlamegraphFromIndex({
       'SELECT i.event_id AS event_id, i.timestamp AS timestamp, i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
       ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
       `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
       'ORDER BY i.timestamp ASC, i.event_id ASC',
       'LIMIT {limit:UInt64}'
@@ -4251,7 +4519,7 @@ async function fetchDensityFromIndex({
     query: [
       'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, count() AS count',
       `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       indexWhere
     ].join(' ')
   })
@@ -4273,7 +4541,7 @@ async function fetchDensityFromIndex({
       'SELECT bucket, count() AS count',
       ", countIf(endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
       `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.key = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       indexWhere,
       'GROUP BY bucket',
       'ORDER BY bucket ASC'
@@ -4310,7 +4578,7 @@ async function fetchEvent({
       return { event: rowToTraceEvent(row) }
     }
   } catch {
-    // Fall back to /query. Some local deployments do not have S3 reads configured.
+    // Fall back to the read-only query endpoint when S3 reads are not configured.
   }
 
   const response = await postQuery<EventRow>({
@@ -4450,12 +4718,12 @@ async function revokeApiKey({
 
 function queryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/query` : '/query'
+  return base ? `${base}/v1/query` : '/v1/query'
 }
 
 function eventUrl(apiBaseUrl: string, eventId: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  const path = `/events/${encodeURIComponent(eventId)}`
+  const path = `/v1/events/${encodeURIComponent(eventId)}`
   return base ? `${base}${path}` : path
 }
 
@@ -4477,42 +4745,68 @@ function eventsTable() {
 }
 
 function facetsTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FACETS_TABLE || '').trim()
+  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_COUNTS_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
     return configured
   }
   const table = eventsTable()
   const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.event_facets` : 'event_facets'
+  const derived = database ? `${database}.field_counts_5m` : 'field_counts_5m'
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFacetsTableName
 }
 
 function eventIndexTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_EVENT_INDEX_TABLE || '').trim()
+  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_INDEX_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
     return configured
   }
   const table = eventsTable()
   const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.event_facet_index` : 'event_facet_index'
+  const derived = database ? `${database}.field_index` : 'field_index'
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultEventIndexTableName
 }
 
 function fieldValuesTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_VALUES_TABLE || '').trim()
+  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_INDEX_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
     return configured
   }
   const table = eventsTable()
   const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.field_values` : 'field_values'
+  const derived = database ? `${database}.field_index` : 'field_index'
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFieldValuesTableName
+}
+
+function spansTable() {
+  const configured = String(import.meta.env.VITE_NANOTRACE_SPANS_TABLE || '').trim()
+  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
+    return configured
+  }
+  const table = eventsTable()
+  const database = table.includes('.') ? table.split('.')[0] : ''
+  const derived = database ? `${database}.spans` : 'spans'
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
+    ? derived
+    : defaultSpansTableName
+}
+
+function traceSummariesTable() {
+  const configured = String(import.meta.env.VITE_NANOTRACE_TRACE_SUMMARIES_TABLE || '').trim()
+  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
+    return configured
+  }
+  const table = eventsTable()
+  const database = table.includes('.') ? table.split('.')[0] : ''
+  const derived = database ? `${database}.trace_summaries` : 'trace_summaries'
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
+    ? derived
+    : defaultTraceSummariesTableName
 }
 
 function eventMetadataSelect(alias: string) {
@@ -4547,10 +4841,7 @@ function resolveTimeRange({
   }
 
   const option = timeRangeOptions.find(item => item.key === key) ?? timeRangeOptions.find(item => item.key === '24h')!
-  const createdBefore = new Date()
   return {
-    createdAfter: new Date(createdBefore.getTime() - option.minutes * 60 * 1000).toISOString(),
-    createdBefore: createdBefore.toISOString(),
     key: option.key,
     lookbackMinutes: option.minutes
   }
@@ -4578,42 +4869,50 @@ function timeRangeParameters(range: ResolvedTimeRange): QueryParameters {
 function eventIndexPrewhere({
   eventFilter,
   includeAlias,
-  includeCursor = ''
+  includeCursor = '',
+  timeRange
 }: {
   eventFilter: ParsedEventFilter
   includeAlias: boolean
   includeCursor?: string
+  timeRange?: ResolvedTimeRange
 }) {
   const column = includeAlias ? 'i.timestamp' : 'timestamp'
+  const useTimeRange = !eventFilter.createdAfter && !eventFilter.createdBefore
   return [
     includeCursor,
     eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
-    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : ''
+    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : '',
+    useTimeRange && timeRange ? timeRangeWhereClause(timeRange, column) : ''
   ].filter(Boolean).join(' AND ')
 }
 
-function eventIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string) {
+function eventIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string, timeRange?: ResolvedTimeRange) {
   const column = `${alias}.timestamp`
+  const useTimeRange = !eventFilter.createdAfter && !eventFilter.createdBefore
   return [
     eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
-    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : ''
+    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : '',
+    useTimeRange && timeRange ? timeRangeWhereClause(timeRange, column) : ''
   ].filter(Boolean).join(' AND ')
 }
 
 function eventIndexFacetWhere({
   eventFilter,
-  outerAlias
+  outerAlias,
+  timeRange
 }: {
   eventFilter: ParsedEventFilter
   outerAlias: string
+  timeRange?: ResolvedTimeRange
 }) {
   const clauses = (eventFilter.facets ?? []).map((_filter, index) => {
       const alias = `f${index}`
-      const timePrewhere = eventIndexTimePrewhere(eventFilter, alias)
+      const timePrewhere = eventIndexTimePrewhere(eventFilter, alias, timeRange)
       return [
         `${outerAlias}.event_id IN (`,
         `SELECT ${alias}.event_id FROM ${eventIndexTable()} AS ${alias}`,
-        `PREWHERE ${alias}.key = {facet_filter_${index}_key:String} AND ${alias}.value = {facet_filter_${index}_value:String}${timePrewhere ? ` AND ${timePrewhere}` : ''}`,
+        `PREWHERE ${alias}.field_name = {facet_filter_${index}_key:String} AND ${alias}.value = {facet_filter_${index}_value:String}${timePrewhere ? ` AND ${timePrewhere}` : ''}`,
         ')'
       ].join(' ')
     })
@@ -4692,11 +4991,13 @@ function eventFilterClauses({
   eventFilter,
   groupBy,
   selectedGroupValue,
+  timeRange,
   prewhere = []
 }: {
   eventFilter: ParsedEventFilter
   groupBy: string
   selectedGroupValue?: string
+  timeRange?: ResolvedTimeRange
   prewhere?: string[]
 }) {
   const clauses = {
@@ -4714,6 +5015,9 @@ function eventFilterClauses({
   }
   if (eventFilter.createdAfter) clauses.prewhere.push("e.timestamp >= {created_after:DateTime64(3, 'UTC')}")
   if (eventFilter.createdBefore) clauses.prewhere.push("e.timestamp <= {created_before:DateTime64(3, 'UTC')}")
+  if (!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange) {
+    clauses.prewhere.push(timeRangeWhereClause(timeRange, 'e.timestamp'))
+  }
   for (const [index, filter] of (eventFilter.facets ?? []).entries()) {
     clauses.prewhere.push(`${eventValueExpression(filter.path)} = {facet_filter_${index}_value:String}`)
   }
@@ -4755,11 +5059,13 @@ function eventTextWhereClause(eventFilter: ParsedEventFilter) {
 function eventQueryParameters({
   eventFilter,
   groupBy,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   eventFilter: ParsedEventFilter
   groupBy: string
   selectedGroupValue: string
+  timeRange?: ResolvedTimeRange
 }): QueryParameters {
   const facetParameters = Object.fromEntries(
     (eventFilter.facets ?? []).flatMap((filter, index) => [
@@ -4770,6 +5076,7 @@ function eventQueryParameters({
   return {
     group_key: facetKey(groupBy),
     group_value: selectedGroupValue,
+    ...(!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange ? timeRangeParameters(timeRange) : {}),
     ...(eventFilter.createdAfter ? { created_after: clickHouseDateTime64(eventFilter.createdAfter) } : {}),
     ...(eventFilter.createdBefore ? { created_before: clickHouseDateTime64(eventFilter.createdBefore) } : {}),
     ...(eventFilter.text ? { event_filter: eventFilter.text } : {}),
@@ -5116,6 +5423,13 @@ function eventFilterInputText(filter: ParsedEventFilter) {
     ...(filter.facets ?? []).map(facet => `${facet.path}=${quoteFilterValue(facet.value)}`),
     filter.text
   ].filter(Boolean).join(' ')
+}
+
+function eventFilterWithoutTimeRange(filter: ParsedEventFilter): ParsedEventFilter {
+  return {
+    ...(filter.facets?.length ? { facets: filter.facets } : {}),
+    text: filter.text
+  }
 }
 
 function serializeEventFilter(filter: ParsedEventFilter) {

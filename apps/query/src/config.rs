@@ -12,10 +12,6 @@ pub struct Config {
     pub clickhouse_password: Option<String>,
     pub clickhouse_database: String,
     pub clickhouse_table: String,
-    pub clickhouse_facets_table: String,
-    pub clickhouse_event_index_table: String,
-    pub clickhouse_field_values_table: String,
-    pub clickhouse_hot_dimensions_table: String,
     pub clickhouse_max_result_rows: u64,
     pub clickhouse_max_execution_secs: u64,
     pub clickhouse_max_bytes_to_read: u64,
@@ -45,37 +41,8 @@ impl Config {
             .unwrap_or_else(|_| "events".to_string())
             .trim()
             .to_string();
-        let clickhouse_facets_table = env::var("CLICKHOUSE_FACETS_TABLE")
-            .unwrap_or_else(|_| "event_facets".to_string())
-            .trim()
-            .to_string();
-        let clickhouse_event_index_table = env::var("CLICKHOUSE_EVENT_INDEX_TABLE")
-            .unwrap_or_else(|_| "event_facet_index".to_string())
-            .trim()
-            .to_string();
-        let clickhouse_field_values_table = env::var("CLICKHOUSE_FIELD_VALUES_TABLE")
-            .unwrap_or_else(|_| "field_values".to_string())
-            .trim()
-            .to_string();
-        let clickhouse_hot_dimensions_table = env::var("CLICKHOUSE_HOT_DIMENSIONS_TABLE")
-            .unwrap_or_else(|_| "hot_dimensions".to_string())
-            .trim()
-            .to_string();
         ensure_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         ensure_identifier("CLICKHOUSE_TABLE", &clickhouse_table)?;
-        ensure_identifier("CLICKHOUSE_FACETS_TABLE", &clickhouse_facets_table)?;
-        ensure_identifier(
-            "CLICKHOUSE_EVENT_INDEX_TABLE",
-            &clickhouse_event_index_table,
-        )?;
-        ensure_identifier(
-            "CLICKHOUSE_FIELD_VALUES_TABLE",
-            &clickhouse_field_values_table,
-        )?;
-        ensure_identifier(
-            "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
-            &clickhouse_hot_dimensions_table,
-        )?;
 
         let clickhouse_max_result_rows = parse_env("CLICKHOUSE_MAX_RESULT_ROWS", 100_000)?;
         let clickhouse_max_execution_secs = parse_env("CLICKHOUSE_MAX_EXECUTION_SECS", 30)?;
@@ -126,10 +93,6 @@ impl Config {
             clickhouse_password: optional_string("CLICKHOUSE_PASSWORD"),
             clickhouse_database,
             clickhouse_table,
-            clickhouse_facets_table,
-            clickhouse_event_index_table,
-            clickhouse_field_values_table,
-            clickhouse_hot_dimensions_table,
             clickhouse_max_result_rows,
             clickhouse_max_execution_secs,
             clickhouse_max_bytes_to_read,

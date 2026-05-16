@@ -1,0 +1,29 @@
+{
+  "event_id": "fixture-state-account-plan-changed",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "billing",
+    "event_type": "account.plan_changed",
+    "signal": "analytics",
+    "environment": "prod",
+    "request_id": "req_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "account.plan_changed",
+    "account": {
+      "id": "acct_fixture",
+      "plan": "enterprise",
+      "previous_plan": "pro",
+      "risk_tier": "medium",
+      "lifecycle": "retained"
+    },
+    "change": {
+      "field": "account.plan",
+      "from": "pro",
+      "to": "enterprise",
+      "reason": "sales_upgrade"
+    }
+  }
+}

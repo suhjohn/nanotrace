@@ -1,0 +1,28 @@
+{
+  "event_id": "fixture-retrieval-step",
+  "timestamp": "2026-05-08T01:23:45.523Z",
+  "observed_timestamp": "2026-05-08T01:23:45.530Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "retrieval",
+    "event_type": "retrieval.step",
+    "signal": "trace",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902c1",
+    "parent_span_id": "00f067aa0ba902b8",
+    "conversation_id": "conv_fixture",
+    "thread_id": "thread_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "retrieval.step",
+    "duration_ms": 98,
+    "retrieval": {
+      "index": "support_articles",
+      "query_type": "hybrid",
+      "top_k": 10,
+      "hit_count": 7,
+      "max_score": 0.91
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "event_id": "fixture-product-order-filled",
+  "timestamp": "2026-05-08T01:23:45.123Z",
+  "observed_timestamp": "2026-05-08T01:23:45.130Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "trading",
+    "event_type": "order.filled",
+    "signal": "analytics",
+    "environment": "prod",
+    "request_id": "req_fixture",
+    "session_id": "sess_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "order.filled",
+    "account": {
+      "id": "acct_fixture",
+      "plan": "pro",
+      "risk_tier": "low",
+      "lifecycle": "retained",
+      "region": "us-west",
+      "segment": "retail"
+    },
+    "order": {
+      "id": "ord_fixture",
+      "symbol": "NVDA",
+      "asset_class": "equity",
+      "side": "buy",
+      "status": "filled",
+      "quantity": 10,
+      "price": 915.25,
+      "notional": 9152.5,
+      "venue": "nasdaq"
+    },
+    "revenue": 0.42
+  }
+}

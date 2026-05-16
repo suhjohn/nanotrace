@@ -919,6 +919,8 @@ fn default_scopes(role: AuthRole) -> Vec<String> {
             "ingest:write".to_string(),
             "query:read".to_string(),
             "dashboards:write".to_string(),
+            "definitions:write".to_string(),
+            "reports:write".to_string(),
             "api_keys:write".to_string(),
             "facets:write".to_string(),
             "processors:write".to_string(),

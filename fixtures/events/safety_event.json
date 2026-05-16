@@ -1,0 +1,26 @@
+{
+  "event_id": "fixture-safety-event",
+  "timestamp": "2026-05-08T01:23:45.723Z",
+  "observed_timestamp": "2026-05-08T01:23:45.730Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "safety",
+    "event_type": "safety.event",
+    "signal": "analytics",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902c3",
+    "parent_span_id": "00f067aa0ba902b7",
+    "conversation_id": "conv_fixture",
+    "thread_id": "thread_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "safety.event",
+    "is_error": 0,
+    "safety": {
+      "policy": "trading_advice",
+      "action": "allow",
+      "severity": "low"
+    }
+  }
+}

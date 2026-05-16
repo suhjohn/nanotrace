@@ -1,12 +1,18 @@
 import { Link, Outlet, createRootRoute, useRouterState } from '@tanstack/react-router'
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-import { BarChart3, Columns3, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
-import { useState } from 'react'
+import { BarChart3, ClipboardList, Cpu, Database, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../lib/cn'
 import { AppShellProvider } from '../lib/app-shell'
 import { nanotraceApiBaseUrl, queryHeaders } from '../lib/nanotrace-api'
+
+type SidebarMode = 'closed' | 'expanded'
+
+const SIDEBAR_COOKIE = 'nanotrace_sidebar'
+const SIDEBAR_CLOSED_WIDTH = 0
+const SIDEBAR_EXPANDED_WIDTH = 224
 
 export const Route = createRootRoute({
   component: RootDocument,
@@ -144,32 +150,120 @@ function SignInScreen() {
 function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: state => state.location.pathname })
   const isDashboard = pathname.startsWith('/dashboard')
-  const isFacets = pathname.startsWith('/facets')
+  const isSchema = pathname.startsWith('/schema')
+  const isProcessors = pathname.startsWith('/processors')
+  const isReports = pathname.startsWith('/reports')
   const isApiKeys = pathname.startsWith('/settings/api-keys')
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => readSidebarMode())
+  const [dragWidth, setDragWidth] = useState<number | null>(null)
+  const sidebarVisible = sidebarMode !== 'closed' || dragWidth !== null
+  const sidebarOpen = sidebarMode !== 'closed'
+  const sidebarExpanded = (dragWidth ?? sidebarWidth(sidebarMode)) >= 96
+  const setSidebarOpen = useCallback((next: boolean | ((value: boolean) => boolean)) => {
+    setSidebarMode(current => {
+      const currentOpen = current !== 'closed'
+      const nextOpen = typeof next === 'function' ? next(currentOpen) : next
+      return nextOpen ? 'expanded' : 'closed'
+    })
+  }, [])
+
+  useEffect(() => {
+    writeSidebarMode(sidebarMode)
+  }, [sidebarMode])
+
+  useEffect(() => {
+    function closeSidebarOnNarrowViewport() {
+      if (window.innerWidth <= 900) setSidebarMode('closed')
+    }
+
+    closeSidebarOnNarrowViewport()
+    window.addEventListener('resize', closeSidebarOnNarrowViewport)
+    return () => window.removeEventListener('resize', closeSidebarOnNarrowViewport)
+  }, [])
+
+  const beginSidebarDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    const startX = event.clientX
+    const startWidth = sidebarWidth(sidebarMode)
+    setDragWidth(startWidth)
+
+    function onPointerMove(moveEvent: PointerEvent) {
+      const width = Math.max(0, Math.min(SIDEBAR_EXPANDED_WIDTH, startWidth + moveEvent.clientX - startX))
+      setDragWidth(width)
+    }
+
+    function onPointerUp(upEvent: PointerEvent) {
+      const width = Math.max(0, Math.min(SIDEBAR_EXPANDED_WIDTH, startWidth + upEvent.clientX - startX))
+      setSidebarMode(snapSidebarMode(width))
+      setDragWidth(null)
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp)
+  }, [sidebarMode])
 
   return (
     <AppShellProvider value={{ sidebarOpen, setSidebarOpen }}>
       <div className="fixed inset-0 flex min-h-0 min-w-0 overflow-hidden bg-black text-neutral-100">
-        {sidebarOpen ? (
-          <aside className="relative z-50 flex w-56 shrink-0 flex-col border-r border-neutral-800 bg-neutral-950 p-2">
-            <button
-              aria-label="Collapse navigation"
-              className="mb-3 flex h-8 w-8 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
-              title="Collapse navigation"
-              type="button"
-              onClick={() => setSidebarOpen(false)}
-            >
-              <PanelLeftClose size={16} strokeWidth={1.8} />
-            </button>
-            <nav className="flex flex-1 flex-col gap-1">
-              <NavItem active={!isDashboard && !isFacets && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
-              <NavItem active={isDashboard} label="Dashboard" to="/dashboard" icon={<BarChart3 size={17} strokeWidth={1.8} />} />
-              <NavItem active={isFacets} label="Facets" to="/facets" icon={<Columns3 size={17} strokeWidth={1.8} />} />
-              <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
-            </nav>
-            <AccountControl />
+        {sidebarVisible ? (
+          <aside
+            className={cn(
+              'relative z-50 flex shrink-0 flex-col overflow-hidden border-r border-neutral-800 bg-neutral-950 max-[900px]:absolute max-[900px]:inset-y-0 max-[900px]:left-0 max-[900px]:shadow-2xl',
+              dragWidth === null && 'transition-[width] duration-150 ease-out',
+              'p-2'
+            )}
+            style={{ width: dragWidth ?? sidebarWidth(sidebarMode) }}
+          >
+            {sidebarExpanded ? (
+              <div className="mb-3 flex h-10 items-center justify-between gap-3">
+                <div className="min-w-0 truncate px-1 font-mono text-[15px] font-semibold tracking-tight text-white">
+                  Nanotrace
+                </div>
+                <button
+                  aria-label="Collapse navigation"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-500 hover:border-neutral-700 hover:text-neutral-200"
+                  title="Collapse navigation"
+                  type="button"
+                  onClick={() => setSidebarMode('closed')}
+                >
+                  <PanelLeftClose size={16} strokeWidth={1.8} />
+                </button>
+              </div>
+            ) : null}
+            {sidebarExpanded ? (
+              <>
+                <nav className="flex flex-1 flex-col gap-1">
+                  <NavItem active={!isDashboard && !isSchema && !isProcessors && !isReports && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isDashboard} label="Dashboard" to="/dashboard" icon={<BarChart3 size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isSchema} label="Schema" to="/schema" icon={<Database size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isReports} label="Reports" to="/reports" icon={<ClipboardList size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isProcessors} label="Processors" to="/processors" icon={<Cpu size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
+                </nav>
+                <AccountControl />
+              </>
+            ) : null}
+            <div
+              aria-label="Resize navigation"
+              className="absolute -right-1 top-0 h-full w-2 cursor-col-resize border-r border-transparent hover:border-neutral-600"
+              role="separator"
+              onPointerDown={beginSidebarDrag}
+            />
           </aside>
+        ) : null}
+        {sidebarMode === 'closed' && dragWidth === null ? (
+          <div
+            aria-label="Resize navigation"
+            className="h-full w-1 shrink-0 cursor-col-resize border-r border-transparent hover:border-neutral-700"
+            role="separator"
+            onPointerDown={beginSidebarDrag}
+          />
         ) : null}
         <section className="min-h-0 min-w-0 flex-1 overflow-hidden">{children}</section>
       </div>
@@ -185,7 +279,7 @@ type AuthIdentity = {
   subject: string
 }
 
-function AccountControl() {
+function AccountControl({ compact = false }: { compact?: boolean }) {
   const observatoryUrl = nanotraceApiBaseUrl()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -209,13 +303,15 @@ function AccountControl() {
   }
 
   return (
-    <div className="relative mt-auto">
+    <div className={cn('relative mt-auto', compact && 'mb-2')}>
       <button
         aria-expanded={open}
         aria-label={currentUser ? `Account: ${authLabel}` : 'Sign in'}
         className={cn(
-          'flex w-full items-center gap-2 border border-neutral-800 bg-black p-2 text-left text-[11px] font-medium text-neutral-400 hover:bg-white/[0.04] hover:text-white',
-          open && 'border-neutral-700 text-white'
+          compact
+            ? 'flex h-10 w-10 items-center justify-center rounded-lg bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white'
+            : 'flex w-full items-center gap-2 border border-neutral-800 bg-black p-2 text-left text-[11px] font-medium text-neutral-400 hover:bg-white/[0.04] hover:text-white',
+          open && (compact ? 'bg-white/[0.06] text-white' : 'border-neutral-700 text-white')
         )}
         title={currentUser ? `${authLabel} (${currentUser.role})` : 'Sign in'}
         type="button"
@@ -226,10 +322,12 @@ function AccountControl() {
         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-neutral-800 bg-neutral-950 text-[11px] text-neutral-300">
           {currentUser ? accountInitial : <UserCircle size={17} strokeWidth={1.8} />}
         </span>
-        <span className="min-w-0">
-          <span className="block truncate text-[12px] text-neutral-200">{authLabel || 'Account'}</span>
-          <span className="block truncate text-[10px] text-neutral-600">{authLabel || 'Sign in'}</span>
-        </span>
+        {!compact ? (
+          <span className="min-w-0">
+            <span className="block truncate text-[12px] text-neutral-200">{authLabel || 'Account'}</span>
+            <span className="block truncate text-[10px] text-neutral-600">{authLabel || 'Sign in'}</span>
+          </span>
+        ) : null}
       </button>
       {open && currentUser ? (
         <div className="absolute bottom-0 left-[calc(100%+8px)] z-50 w-[min(340px,calc(100vw-248px))] border border-neutral-800 bg-neutral-950 p-2 shadow-2xl shadow-black/60">
@@ -295,6 +393,29 @@ function authUrl(apiBaseUrl: string, path: string) {
   return base ? `${base}/auth${path}` : `/auth${path}`
 }
 
+function sidebarWidth(mode: SidebarMode) {
+  if (mode === 'expanded') return SIDEBAR_EXPANDED_WIDTH
+  return SIDEBAR_CLOSED_WIDTH
+}
+
+function snapSidebarMode(width: number): SidebarMode {
+  return width < SIDEBAR_EXPANDED_WIDTH / 2 ? 'closed' : 'expanded'
+}
+
+function readSidebarMode(): SidebarMode {
+  if (typeof document === 'undefined') return 'expanded'
+  const match = document.cookie
+    .split('; ')
+    .find(cookie => cookie.startsWith(`${SIDEBAR_COOKIE}=`))
+  const value = match ? decodeURIComponent(match.split('=').slice(1).join('=')) : ''
+  return value === 'closed' || value === 'expanded' ? value : 'expanded'
+}
+
+function writeSidebarMode(mode: SidebarMode) {
+  if (typeof document === 'undefined') return
+  document.cookie = `${SIDEBAR_COOKIE}=${encodeURIComponent(mode)}; Path=/; Max-Age=31536000; SameSite=Lax`
+}
+
 function identityInitial(label: string) {
   const trimmed = label.trim()
   return (trimmed[0] || '?').toUpperCase()
@@ -327,14 +448,14 @@ function NavItem({
   active: boolean
   icon: ReactNode
   label: string
-  to: '/' | '/dashboard' | '/facets' | '/settings/api-keys'
+  to: '/' | '/dashboard' | '/schema' | '/reports' | '/processors' | '/settings/api-keys'
 }) {
   return (
     <Link
       aria-label={label}
       className={cn(
-        'group relative flex h-9 items-center gap-2 border border-transparent px-2 text-[12px] text-neutral-500 hover:border-neutral-800 hover:bg-black hover:text-white',
-        active && 'border-neutral-700 bg-black text-white'
+        'group relative flex h-9 items-center gap-2 border-l-2 border-transparent px-2 text-[12px] text-neutral-500 hover:text-neutral-200',
+        active && 'border-neutral-500 text-white'
       )}
       title={label}
       to={to}

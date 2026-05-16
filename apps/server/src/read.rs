@@ -76,6 +76,18 @@ impl ReadStore {
             return Err(ReadError::InvalidQuery("event_id is required".to_string()));
         }
 
+        match self.event_bytes_from_s3(event_id, tenant_id).await {
+            Ok(bytes) => Ok(bytes),
+            Err(ReadError::NotFound) => Err(ReadError::NotFound),
+            Err(_) => self.event_bytes_from_clickhouse(event_id, tenant_id).await,
+        }
+    }
+
+    async fn event_bytes_from_s3(
+        &self,
+        event_id: &str,
+        tenant_id: &str,
+    ) -> Result<Bytes, ReadError> {
         let pointer = self.event_pointer(event_id, tenant_id).await?;
         let bucket = self
             .cfg
@@ -107,6 +119,34 @@ impl ReadStore {
 
         validate_event_bytes(event_id, &bytes)?;
         Ok(bytes)
+    }
+
+    async fn event_bytes_from_clickhouse(
+        &self,
+        event_id: &str,
+        tenant_id: &str,
+    ) -> Result<Bytes, ReadError> {
+        let mut parameters = serde_json::Map::new();
+        parameters.insert("event_id".to_string(), Value::String(event_id.to_string()));
+        parameters.insert(
+            "__nanotrace_tenant_id".to_string(),
+            Value::String(tenant_id.to_string()),
+        );
+        let query = format!(
+            "SELECT event_id, timestamp, observed_timestamp, ingested_timestamp, source_file, source_offset, source_length, data FROM {} WHERE tenant_id = {{__nanotrace_tenant_id:String}} AND event_id = {{event_id:String}} ORDER BY timestamp ASC LIMIT 1",
+            self.table_name()
+        );
+        let text = self.clickhouse_query(&query, &parameters).await?;
+        let response: ClickHouseResponse<Value> =
+            serde_json::from_str(&text).map_err(ReadError::InvalidStoredEvent)?;
+        let event = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or(ReadError::NotFound)?;
+        let bytes = serde_json::to_vec(&event).map_err(ReadError::InvalidStoredEvent)?;
+        validate_event_bytes(event_id, &bytes)?;
+        Ok(Bytes::from(bytes))
     }
 
     async fn event_pointer(
@@ -237,21 +277,35 @@ impl ReadStore {
     }
 
     fn allowed_table_names(&self) -> Vec<String> {
-        [
-            self.cfg.clickhouse_table.as_str(),
-            self.cfg.clickhouse_facets_table.as_str(),
-            self.cfg.clickhouse_event_index_table.as_str(),
-            self.cfg.clickhouse_field_values_table.as_str(),
-            self.cfg.clickhouse_hot_dimensions_table.as_str(),
-        ]
-        .into_iter()
-        .flat_map(|table| {
-            [
-                table.to_string(),
-                format!("{}.{}", self.cfg.clickhouse_database, table),
-            ]
-        })
-        .collect()
+        const ANALYTICS_TABLES: &[&str] = &[
+            "event_index",
+            "field_index",
+            "field_counts_5m",
+            "span_fragments",
+            "spans",
+            "trace_summaries",
+            "definitions",
+            "event_rollups_5m",
+            "event_measures",
+            "measure_rollups",
+            "entity_state_updates",
+            "report_results",
+            "sequence_report_results",
+            "cohort_memberships",
+            "definition_stats",
+            "pipeline_metrics",
+        ];
+
+        [self.cfg.clickhouse_table.as_str()]
+            .into_iter()
+            .chain(ANALYTICS_TABLES.iter().copied())
+            .flat_map(|table| {
+                [
+                    table.to_string(),
+                    format!("{}.{}", self.cfg.clickhouse_database, table),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -635,15 +689,15 @@ mod tests {
     fn normalizes_prewhere_for_wrapped_tables() {
         assert_eq!(
             normalize_prewhere(
-                "SELECT value FROM observatory.event_facets PREWHERE key = 'service' WHERE value != ''"
+                "SELECT value FROM observatory.field_index PREWHERE field_name = 'service' WHERE value != ''"
             ),
-            "SELECT value FROM observatory.event_facets WHERE key = 'service' AND value != ''"
+            "SELECT value FROM observatory.field_index WHERE field_name = 'service' AND value != ''"
         );
         assert_eq!(
             normalize_prewhere(
-                "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.event_facet_index PREWHERE key = 'service' WHERE value = 'api')"
+                "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.field_index PREWHERE field_name = 'service' WHERE value = 'api')"
             ),
-            "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.event_facet_index WHERE key = 'service' AND value = 'api')"
+            "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.field_index WHERE field_name = 'service' AND value = 'api')"
         );
     }
 
@@ -660,7 +714,7 @@ mod tests {
         let allowed = vec![
             "events".to_string(),
             "observatory.events".to_string(),
-            "observatory.event_facets".to_string(),
+            "observatory.field_index".to_string(),
         ];
         assert!(validate_query_sources("SELECT * FROM observatory.events", &allowed).is_ok());
         assert!(

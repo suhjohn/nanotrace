@@ -77,10 +77,12 @@ fn router(state: AppState) -> Router {
     let limit = state.cfg.max_request_bytes;
 
     let router = Router::new()
-        .route("/query", post(post_query))
-        .route("/events/{event_id}", get(get_event))
+        .route("/v1/query", post(post_query))
+        .route("/v1/events/{event_id}", get(get_event))
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz));
+        .route("/v1/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/v1/readyz", get(readyz));
 
     let router = router
         .layer(RequestBodyLimitLayer::new(limit))

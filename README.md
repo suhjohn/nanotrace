@@ -111,7 +111,7 @@ Useful knobs:
 
 ```sh
 NANOTRACE_LOADTEST_BATCH_SIZES=1,10,100
-NANOTRACE_LOADTEST_PROFILE=realistic
+NANOTRACE_LOADTEST_PROFILE=atlas
 NANOTRACE_LOADTEST_TOTAL_EVENTS=1000
 NANOTRACE_LOADTEST_STEP_SECONDS=30
 NANOTRACE_LOADTEST_MAX_RPS=2000
@@ -122,10 +122,15 @@ NANOTRACE_LOADTEST_CLICKHOUSE_POLL_MS=5000
 NANOTRACE_LOADTEST_GENERATORS=4
 ```
 
-`NANOTRACE_LOADTEST_PROFILE` can be `realistic` for mixed logs/metrics/traces,
-`trace` for pure span traffic, `metrics` for pure metric traffic, `logs` for
-pure log traffic, `llm` for LLM log traffic, or `fixture` for mostly static
-fixture replay.
+`NANOTRACE_LOADTEST_PROFILE` can be `atlas` for the broad Atlas Markets mix
+of product analytics, state transitions, agent traces, metrics, pipeline
+events, and the existing realistic LLM logs. It can also be `realistic` for
+mixed fixture replay, `product` for product/state analytics, `agent` for deep
+agent traces, `trace` for trace-shaped events, `processor` for pipeline events,
+`metrics` for pure metric traffic, `logs` for pure log traffic, `llm` for LLM
+log traffic, or `fixture` for mostly static fixture replay.
+Synthetic non-fixture profiles generate timestamps across a fixed 60-day
+history with weighted business-hour traffic and trace-local event spacing.
 Set `NANOTRACE_LOADTEST_TOTAL_EVENTS` when you want a fixed number of generated
 events instead of the normal timed RPS search.
 

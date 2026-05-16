@@ -350,7 +350,7 @@
       <li><strong>Stage.</strong> Accepted events are round-robin dispatched to one of <code>NANOTRACE_WRITER_LANES</code> (default 4) concurrent writer lanes, each backed by its own NDJSON part file on an XFS-formatted EBS volume. The writer flushes (fsyncs) at <code>NANOTRACE_WRITER_FLUSH_BYTES</code> (default 1 MiB) or <code>NANOTRACE_WRITER_FLUSH_INTERVAL_MS</code> (default 10 ms), whichever comes first. The HTTP 200 is returned after the event is committed to the lane queue. Parts rotate to <code>.ready</code> when they reach <code>NANOTRACE_PART_MAX_BYTES</code> (default 64 MiB) or <code>NANOTRACE_PART_MAX_AGE_SECS</code> (default 1 second).</li>
       <li><strong>Upload.</strong> The background uploader picks up <code>.ready</code> files, renames them to <code>.uploading</code>, optionally runs upload-stage processors, and PUTs them to object storage. The S3 key layout is Hive-partitioned: <code>&lt;prefix&gt;/dt=YYYY-MM-DD/hour=HH/host=&lt;hostname&gt;/lane=&lt;id&gt;/part-&lt;timestamp_ms&gt;.ndjson</code>. On success the local file transitions to <code>.done</code>; on failure it becomes <code>.failed</code>.</li>
       <li><strong>Notify.</strong> A bucket notification fans object creation events into the loader message queue.</li>
-      <li><strong>Load.</strong> The loader fetches each object, decodes lines, derives facet rows, and inserts via the ClickHouse HTTP <code>JSONEachRow</code> endpoint into <code>observatory.events</code>, <code>observatory.event_facets</code>, and <code>observatory.event_facet_index</code>.</li>
+      <li><strong>Load.</strong> The loader fetches each object, decodes lines, derives facet rows, and inserts via the ClickHouse HTTP <code>JSONEachRow</code> endpoint into <code>observatory.events</code>, <code>observatory.field_counts_5m</code>, and <code>observatory.field_index</code>.</li>
     </ol>
 
     <h3>Read path</h3>
@@ -385,17 +385,17 @@
         <td>Canonical event store. <code>ORDER BY (tenant_id, event_type, timestamp, trace_id, span_id)</code>; partitioned by day. Bloom-filter indexes on <code>trace_id</code>, <code>span_id</code>, <code>event_id</code>.</td>
       </tr>
       <tr>
-        <td><code>observatory.event_facets</code></td>
+        <td><code>observatory.field_counts_5m</code></td>
         <td>SummingMergeTree</td>
         <td>Pre-aggregated counts per <code>(tenant_id, key, value, bucket_time)</code> for fast facet listings.</td>
       </tr>
       <tr>
-        <td><code>observatory.event_facet_index</code></td>
+        <td><code>observatory.field_index</code></td>
         <td>MergeTree</td>
         <td>Facet &rarr; event lookup index. Lets the UI jump from a value chip to matching events without scanning <code>events</code>.</td>
       </tr>
       <tr>
-        <td><code>observatory.hot_dimensions</code></td>
+        <td><code>observatory.definitions</code></td>
         <td>ReplacingMergeTree</td>
         <td>Per-tenant configuration of which JSON paths are tracked for facets. Refreshed by the loader.</td>
       </tr>
@@ -443,7 +443,7 @@
     <h3>Query sandbox</h3>
     <ul>
       <li>Only <code>SELECT</code> / <code>WITH</code> statements allowed; DDL, DML, and multi-statement queries are rejected.</li>
-      <li>Table references are validated against a hard-coded whitelist (<code>events</code>, <code>event_facets</code>, <code>event_facet_index</code>, <code>hot_dimensions</code>). Access to <code>system.*</code> or other tables is blocked.</li>
+      <li>Table references are validated against a hard-coded whitelist (<code>events</code>, <code>field_counts_5m</code>, <code>field_index</code>, <code>definitions</code>). Access to <code>system.*</code> or other tables is blocked.</li>
       <li>User values are passed as ClickHouse query parameters, not interpolated into SQL. Parameter names are validated as identifiers; only scalar types are accepted.</li>
       <li>ClickHouse queries execute with <code>readonly=1</code>, <code>max_execution_time=30s</code>, <code>max_result_rows=100000</code>, and <code>max_bytes_to_read=1GB</code>.</li>
       <li>SQL comments are stripped before analysis to prevent obfuscation.</li>

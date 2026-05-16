@@ -1,0 +1,27 @@
+{
+  "event_id": "fixture-agent-decision",
+  "timestamp": "2026-05-08T01:23:45.223Z",
+  "observed_timestamp": "2026-05-08T01:23:45.230Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "atlas-agent",
+    "event_type": "agent.decision",
+    "signal": "trace",
+    "environment": "prod",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902b8",
+    "parent_span_id": "00f067aa0ba902b7",
+    "conversation_id": "conv_fixture",
+    "thread_id": "thread_fixture",
+    "user_id": "user_fixture",
+    "account_id": "acct_fixture",
+    "name": "agent.decision",
+    "duration_ms": 87,
+    "agent": {
+      "type": "trading_assistant",
+      "workflow_state": "tool_wait",
+      "intent": "trade_help",
+      "decision": "call_tool"
+    }
+  }
+}

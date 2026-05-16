@@ -17,7 +17,6 @@
     "dev:down": "docker compose -f docker-compose.dev.yml down",
     "dev:reset": "docker compose -f docker-compose.dev.yml down -v",
     "dev:logs": "docker compose -f docker-compose.dev.yml logs -f",
-    "backfill:facets": "node scripts/backfill-clickhouse-facets.mjs",
     "e2e:pulumi": "node scripts/e2e-pulumi.mjs",
     "loadtest:pulumi": "cargo run --release -p nanotrace-loadtest --",
     "loadtest:modal": "python3 scripts/modal_loadtest.py",

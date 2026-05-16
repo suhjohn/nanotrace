@@ -31,12 +31,14 @@ use crate::{
         CreateVisualizationRequest, DashboardError, DashboardStore,
         DashboardVisualizationsResponse, UpdateVisualizationRequest,
     },
-    event_log::{EventLogError, EventLogWriter, WriteReceipt},
-    facets::{
-        FacetBackfillListResponse, FacetError, FacetListResponse, FacetStore, PutFacetRequest,
+    definitions::{
+        BackfillRequest, CreateDefinitionRequest, DefinitionListResponse, DefinitionStore,
+        DefinitionStoreError,
     },
+    event_log::{EventLogError, EventLogWriter, WriteReceipt},
     processors::{ProcessorListResponse, ProcessorStore, ProcessorStoreError, PutProcessorRequest},
     read::{QueryRequest, ReadError, ReadStore},
+    reports::{CreateReportRequest, ReportListResponse, ReportStore, ReportStoreError},
 };
 
 #[derive(Clone)]
@@ -44,9 +46,10 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub auth: Option<Arc<AuthStore>>,
     pub dashboards: Arc<DashboardStore>,
-    pub facets: Arc<FacetStore>,
+    pub definitions: Arc<DefinitionStore>,
     pub processors: Arc<ProcessorStore>,
     pub read: Arc<ReadStore>,
+    pub reports: Arc<ReportStore>,
     pub ses: aws_sdk_sesv2::Client,
     pub writer: Arc<EventLogWriter>,
 }
@@ -55,19 +58,25 @@ pub fn router(state: AppState) -> Router {
     let limit = state.cfg.max_request_bytes;
 
     let router = Router::new()
-        .route("/events", post(post_events))
-        .route("/events/{event_id}", get(get_event))
-        .route("/facets", get(list_facets).post(put_facet))
-        .route("/facets/backfills", get(list_facet_backfills))
-        .route("/facets/backfills/{job_id}", get(get_facet_backfill))
-        .route("/facets/{path}/backfill", post(backfill_facet))
-        .route("/facets/{path}", delete(delete_facet))
-        .route("/processors", get(list_processors))
+        .route("/v1/events", post(post_events))
+        .route("/v1/events/{event_id}", get(get_event))
+        .route("/v1/processors", get(list_processors))
         .route(
-            "/processors/{name}",
+            "/v1/processors/{name}",
             put(put_processor).delete(delete_processor),
         )
-        .route("/query", post(post_query))
+        .route(
+            "/v1/definitions",
+            get(list_definitions).post(create_definition),
+        )
+        .route("/v1/definitions/{definition_id}", delete(delete_definition))
+        .route(
+            "/v1/definitions/{definition_id}/backfill",
+            post(backfill_definition),
+        )
+        .route("/v1/reports", get(list_reports).post(create_report))
+        .route("/v1/reports/{report_id}", delete(delete_report))
+        .route("/v1/query", post(post_query))
         .route(
             "/dashboards/{dashboard_id}/visualizations",
             get(list_dashboard_visualizations)
@@ -85,8 +94,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/healthz", get(healthz))
+        .route("/v1/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/readyz", get(readyz))
+        .route("/v1/readyz", get(readyz))
         .layer(RequestBodyLimitLayer::new(limit))
         .with_state(state.clone());
 
@@ -181,70 +192,6 @@ async fn list_processors(
     Ok(Json(ProcessorListResponse { processors }))
 }
 
-async fn list_facets(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<FacetListResponse>, ApiError> {
-    let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let facets = state.facets.list(&identity.tenant_id).await?;
-    Ok(Json(FacetListResponse { facets }))
-}
-
-async fn put_facet(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<PutFacetRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "facets:write").await?;
-    let facet = state.facets.put(&identity.tenant_id, request).await?;
-    Ok(Json(serde_json::json!({ "facet": facet })))
-}
-
-async fn delete_facet(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(path): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "facets:write").await?;
-    let facet = state.facets.delete(&identity.tenant_id, &path).await?;
-    Ok(Json(serde_json::json!({ "facet": facet })))
-}
-
-async fn backfill_facet(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(path): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "facets:write").await?;
-    let backfill = state
-        .facets
-        .enqueue_backfill(&identity.tenant_id, &path)
-        .await?;
-    Ok(Json(serde_json::json!({ "backfill": backfill })))
-}
-
-async fn list_facet_backfills(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<FacetBackfillListResponse>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "facets:write").await?;
-    let backfills = state.facets.backfill_list(&identity.tenant_id).await?;
-    Ok(Json(FacetBackfillListResponse { backfills }))
-}
-
-async fn get_facet_backfill(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(job_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "facets:write").await?;
-    let backfill = state
-        .facets
-        .backfill_status(&identity.tenant_id, &job_id)
-        .await?;
-    Ok(Json(serde_json::json!({ "backfill": backfill })))
-}
-
 async fn put_processor(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -267,6 +214,89 @@ async fn delete_processor(
     let identity = authorize_admin_scope(&state, &headers, "processors:write").await?;
     let manifest = state.processors.delete(&identity.tenant_id, &name).await?;
     Ok(Json(serde_json::json!({ "processor": manifest })))
+}
+
+async fn list_definitions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DefinitionListResponse>, ApiError> {
+    let identity = authorize_scope(&state, &headers, "query:read").await?;
+    let definitions = state.definitions.list(&identity.tenant_id).await?;
+    Ok(Json(DefinitionListResponse { definitions }))
+}
+
+async fn create_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDefinitionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
+    let response = state
+        .definitions
+        .create(&identity.tenant_id, request)
+        .await?;
+    Ok(Json(
+        serde_json::to_value(response).map_err(|err| ApiError::BadRequest(err.to_string()))?,
+    ))
+}
+
+async fn delete_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(definition_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
+    let definition = state
+        .definitions
+        .delete(&identity.tenant_id, &definition_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "definition": definition })))
+}
+
+async fn backfill_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(definition_id): Path<String>,
+    Json(request): Json<BackfillRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
+    let backfill = state
+        .definitions
+        .backfill(&identity.tenant_id, &definition_id, request)
+        .await?;
+    Ok(Json(serde_json::json!({ "backfill": backfill })))
+}
+
+async fn list_reports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ReportListResponse>, ApiError> {
+    let identity = authorize_scope(&state, &headers, "query:read").await?;
+    let reports = state.reports.list(&identity.tenant_id).await?;
+    Ok(Json(ReportListResponse { reports }))
+}
+
+async fn create_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateReportRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "reports:write").await?;
+    let report = state.reports.create(&identity.tenant_id, request).await?;
+    Ok(Json(serde_json::json!({ "report": report })))
+}
+
+async fn delete_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(report_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "reports:write").await?;
+    let report = state
+        .reports
+        .delete(&identity.tenant_id, &report_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "report": report })))
 }
 
 async fn list_dashboard_visualizations(
@@ -689,8 +719,9 @@ pub enum ApiError {
     Email(String),
     EventLog(crate::event_log::EventLogError),
     Processor(crate::processors::ProcessorStoreError),
-    Facet(crate::facets::FacetError),
+    Definition(crate::definitions::DefinitionStoreError),
     Dashboard(crate::dashboards::DashboardError),
+    Report(crate::reports::ReportStoreError),
     Read(crate::read::ReadError),
     Auth(AuthError),
 }
@@ -766,16 +797,21 @@ impl IntoResponse for ApiError {
                 "S3 bucket is not configured".to_string(),
             ),
             Self::Processor(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Self::Facet(err @ FacetError::InvalidPath)
-            | Self::Facet(err @ FacetError::InvalidValueType)
-            | Self::Facet(err @ FacetError::BuiltinFacet) => {
-                (StatusCode::BAD_REQUEST, err.to_string())
+            Self::Definition(
+                err @ (DefinitionStoreError::InvalidName
+                | DefinitionStoreError::InvalidKind
+                | DefinitionStoreError::InvalidMode
+                | DefinitionStoreError::InvalidPath
+                | DefinitionStoreError::InvalidConfig),
+            ) => (StatusCode::BAD_REQUEST, err.to_string()),
+            Self::Definition(DefinitionStoreError::NotFound) => {
+                (StatusCode::NOT_FOUND, "not_found".to_string())
             }
-            Self::Facet(FacetError::ClickHouseNotConfigured) => (
+            Self::Definition(DefinitionStoreError::ClickHouseNotConfigured) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ClickHouse is not configured".to_string(),
             ),
-            Self::Facet(FacetError::ClickHouseResponse { status, body }) => {
+            Self::Definition(DefinitionStoreError::ClickHouseResponse { status, body }) => {
                 let status = if status.is_client_error() {
                     StatusCode::BAD_REQUEST
                 } else {
@@ -783,7 +819,7 @@ impl IntoResponse for ApiError {
                 };
                 (status, body)
             }
-            Self::Facet(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Self::Definition(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Dashboard(
                 err @ (DashboardError::InvalidId
                 | DashboardError::InvalidDashboardId
@@ -799,6 +835,20 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, "not_found".to_string())
             }
             Self::Dashboard(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Self::Report(
+                err @ (ReportStoreError::InvalidId
+                | ReportStoreError::InvalidName
+                | ReportStoreError::InvalidKind
+                | ReportStoreError::InvalidConfig),
+            ) => (StatusCode::BAD_REQUEST, err.to_string()),
+            Self::Report(ReportStoreError::PostgresNotConfigured) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Postgres is not configured".to_string(),
+            ),
+            Self::Report(ReportStoreError::NotFound) => {
+                (StatusCode::NOT_FOUND, "not_found".to_string())
+            }
+            Self::Report(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Read(ReadError::InvalidQuery(err)) => (StatusCode::BAD_REQUEST, err),
             Self::Read(ReadError::ClickHouseResponse { status, body }) => {
                 let status = if status.is_client_error() {
@@ -837,15 +887,21 @@ impl From<crate::processors::ProcessorStoreError> for ApiError {
     }
 }
 
-impl From<crate::facets::FacetError> for ApiError {
-    fn from(value: crate::facets::FacetError) -> Self {
-        Self::Facet(value)
+impl From<crate::definitions::DefinitionStoreError> for ApiError {
+    fn from(value: crate::definitions::DefinitionStoreError) -> Self {
+        Self::Definition(value)
     }
 }
 
 impl From<crate::dashboards::DashboardError> for ApiError {
     fn from(value: crate::dashboards::DashboardError) -> Self {
         Self::Dashboard(value)
+    }
+}
+
+impl From<crate::reports::ReportStoreError> for ApiError {
+    fn from(value: crate::reports::ReportStoreError) -> Self {
+        Self::Report(value)
     }
 }
 

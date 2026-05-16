@@ -59,15 +59,6 @@ const clickhouseDatabase =
   process.env.CLICKHOUSE_DATABASE ??
   'observatory'
 const clickhouseTable = process.env.CLICKHOUSE_TABLE ?? 'events'
-const clickhouseFacetsTable =
-  process.env.CLICKHOUSE_FACETS_TABLE ??
-  'event_facets'
-const clickhouseEventIndexTable =
-  process.env.CLICKHOUSE_EVENT_INDEX_TABLE ??
-  'event_facet_index'
-const clickhouseHotDimensionsTable =
-  process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE ??
-  'hot_dimensions'
 const clickhouseMaxBytesToRead =
   numberEnv('CLICKHOUSE_MAX_BYTES_TO_READ', 1_000_000_000_000)
 
@@ -658,9 +649,6 @@ const clickHouseSchema = new command.local.Command(
       CLICKHOUSE_PASSWORD: clickhousePassword,
       CLICKHOUSE_DATABASE: clickhouseDatabase,
       CLICKHOUSE_TABLE: clickhouseTable,
-      CLICKHOUSE_FACETS_TABLE: clickhouseFacetsTable,
-      CLICKHOUSE_EVENT_INDEX_TABLE: clickhouseEventIndexTable,
-      CLICKHOUSE_HOT_DIMENSIONS_TABLE: clickhouseHotDimensionsTable,
       CLICKHOUSE_SCHEMA_PATH: 'deploy/clickhouse/schema.sql'
     },
     triggers: [
@@ -668,10 +656,7 @@ const clickHouseSchema = new command.local.Command(
       schemaScriptHash,
       clickhouseUrl,
       clickhouseDatabase,
-      clickhouseTable,
-      clickhouseFacetsTable,
-      clickhouseEventIndexTable,
-      clickhouseHotDimensionsTable
+      clickhouseTable
     ]
   },
   {
@@ -1383,7 +1368,7 @@ new aws.lb.ListenerRule(`${name}-query-route`, {
   listenerArn: listener.arn,
   priority: 10,
   conditions: [
-    { pathPattern: { values: ['/query'] } },
+    { pathPattern: { values: ['/v1/query'] } },
     { httpRequestMethod: { values: ['POST'] } }
   ],
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
@@ -1393,7 +1378,7 @@ new aws.lb.ListenerRule(`${name}-event-read-route`, {
   listenerArn: listener.arn,
   priority: 20,
   conditions: [
-    { pathPattern: { values: ['/events/*'] } },
+    { pathPattern: { values: ['/v1/events/*'] } },
     { httpRequestMethod: { values: ['GET'] } }
   ],
   actions: [{ type: 'forward', targetGroupArn: queryTargetGroup.arn }]
@@ -1450,10 +1435,7 @@ const userData = pulumi
       bucketName,
       adminEmails,
       clickhouseDatabase,
-      clickhouseEventIndexTable,
         clickhousePassword: resolvedClickhousePassword,
-        clickhouseFacetsTable,
-        clickhouseHotDimensionsTable,
         clickhouseTable,
         clickhouseUrl: resolvedClickhouseUrl,
         clickhouseUser,
@@ -1672,8 +1654,6 @@ export const clickhouseUrlOutput = clickhouseUrl
 export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
 export const clickhouseTableOutput = clickhouseTable
-export const clickhouseEventIndexTableOutput = clickhouseEventIndexTable
-export const clickhouseHotDimensionsTableOutput = clickhouseHotDimensionsTable
 export const databaseEndpoint = database ? database.address : ''
 export const postgresModeOutput = postgresMode
 export const postgresPrivateConnectOutput = postgresPrivateConnect
@@ -1700,10 +1680,7 @@ interface UserDataArgs {
   bucketName: string
   adminEmails: string
   clickhouseDatabase: string
-  clickhouseEventIndexTable: string
   clickhousePassword: string
-  clickhouseFacetsTable: string
-  clickhouseHotDimensionsTable: string
   clickhouseTable: string
   clickhouseUrl: string
   clickhouseUser: string
@@ -1866,7 +1843,6 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
-  -e CLICKHOUSE_HOT_DIMENSIONS_TABLE=${shellQuote(args.clickhouseHotDimensionsTable)} \\
   -e CLICKHOUSE_MAX_BYTES_TO_READ=${args.clickhouseMaxBytesToRead} \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
   -e MAX_EVENT_BYTES=${args.maxEventBytes} \\
@@ -1900,9 +1876,6 @@ docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
-  -e CLICKHOUSE_FACETS_TABLE=${shellQuote(args.clickhouseFacetsTable)} \\
-  -e CLICKHOUSE_EVENT_INDEX_TABLE=${shellQuote(args.clickhouseEventIndexTable)} \\
-  -e CLICKHOUSE_HOT_DIMENSIONS_TABLE=${shellQuote(args.clickhouseHotDimensionsTable)} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-loader
 `
