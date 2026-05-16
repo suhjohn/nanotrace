@@ -241,6 +241,7 @@ impl ReadStore {
             self.cfg.clickhouse_table.as_str(),
             self.cfg.clickhouse_facets_table.as_str(),
             self.cfg.clickhouse_event_index_table.as_str(),
+            self.cfg.clickhouse_field_values_table.as_str(),
             self.cfg.clickhouse_hot_dimensions_table.as_str(),
         ]
         .into_iter()

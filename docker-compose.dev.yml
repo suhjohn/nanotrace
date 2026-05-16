@@ -13,6 +13,7 @@ x-app-env: &app-env
   CLICKHOUSE_TABLE: events
   CLICKHOUSE_FACETS_TABLE: event_facets
   CLICKHOUSE_EVENT_INDEX_TABLE: event_facet_index
+  CLICKHOUSE_FIELD_VALUES_TABLE: field_values
   CLICKHOUSE_HOT_DIMENSIONS_TABLE: hot_dimensions
   NANOTRACE_POSTGRES_URL: postgres://nanotrace:nanotrace@postgres:5432/nanotrace
   NANOTRACE_DEV_BOOTSTRAP_API_KEY: ntak_dev
@@ -112,6 +113,7 @@ services:
       CLICKHOUSE_TABLE: events
       CLICKHOUSE_FACETS_TABLE: event_facets
       CLICKHOUSE_EVENT_INDEX_TABLE: event_facet_index
+      CLICKHOUSE_FIELD_VALUES_TABLE: field_values
       CLICKHOUSE_HOT_DIMENSIONS_TABLE: hot_dimensions
       CLICKHOUSE_SCHEMA_PATH: deploy/clickhouse/schema.sql
       NANOTRACE_DEFAULT_TENANT_ID: org_default

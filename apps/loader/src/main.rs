@@ -26,6 +26,7 @@ struct Config {
     clickhouse_table: String,
     clickhouse_facets_table: String,
     clickhouse_event_index_table: String,
+    clickhouse_field_values_table: String,
     clickhouse_hot_dimensions_table: String,
     hot_dimensions_refresh: Duration,
     poll_wait: u32,
@@ -45,13 +46,19 @@ struct Loader {
     processors: ProcessorRuntime,
     s3: S3Client,
     sqs: SqsClient,
-    hot_dimensions: Arc<RwLock<HotDimensionCache>>,
+    field_capabilities: Arc<RwLock<FieldCapabilityCache>>,
 }
 
 #[derive(Debug, Clone)]
-struct HotDimensionCache {
-    keys: Vec<String>,
+struct FieldCapabilityCache {
+    capabilities: FieldCapabilities,
     refreshed_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct FieldCapabilities {
+    lookup: Vec<String>,
+    aggregate: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,12 +116,24 @@ struct EventFacetIndexRow {
     name: String,
     start_time: Option<String>,
     end_time: Option<String>,
-    duration_ms: f64,
+    duration_ms: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HotDimensionPath {
+struct HotDimensionCapability {
     path: String,
+    lookup_enabled: u8,
+    aggregate_enabled: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct FieldValueRow {
+    tenant_id: String,
+    key: String,
+    value: String,
+    value_type: String,
+    first_seen: String,
+    last_seen: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,8 +170,8 @@ async fn main() -> Result<()> {
         processors,
         s3,
         sqs: SqsClient::new(&aws_config),
-        hot_dimensions: Arc::new(RwLock::new(HotDimensionCache {
-            keys: builtin_indexed_facet_keys(),
+        field_capabilities: Arc::new(RwLock::new(FieldCapabilityCache {
+            capabilities: builtin_field_capabilities(),
             refreshed_at: None,
         })),
     };
@@ -182,6 +201,7 @@ impl Config {
         let clickhouse_facets_table = env_or("CLICKHOUSE_FACETS_TABLE", "event_facets");
         let clickhouse_event_index_table =
             env_or("CLICKHOUSE_EVENT_INDEX_TABLE", "event_facet_index");
+        let clickhouse_field_values_table = env_or("CLICKHOUSE_FIELD_VALUES_TABLE", "field_values");
         let clickhouse_hot_dimensions_table =
             env_or("CLICKHOUSE_HOT_DIMENSIONS_TABLE", "hot_dimensions");
         validate_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
@@ -190,6 +210,10 @@ impl Config {
         validate_identifier(
             "CLICKHOUSE_EVENT_INDEX_TABLE",
             &clickhouse_event_index_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_FIELD_VALUES_TABLE",
+            &clickhouse_field_values_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
@@ -206,6 +230,7 @@ impl Config {
             clickhouse_table,
             clickhouse_facets_table,
             clickhouse_event_index_table,
+            clickhouse_field_values_table,
             clickhouse_hot_dimensions_table,
             hot_dimensions_refresh: Duration::from_secs(parse_env(
                 "LOADER_HOT_DIMENSIONS_REFRESH_SECS",
@@ -244,6 +269,13 @@ impl Config {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_event_index_table
+        )
+    }
+
+    fn field_values_table_name(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_field_values_table
         )
     }
 
@@ -362,14 +394,21 @@ impl Loader {
 
         self.insert_clickhouse(&self.cfg.table_name(), &processed)
             .await?;
-        let facets = facets_ndjson(&processed).context("generate event facets")?;
+        let capabilities = self.field_capabilities().await;
+        let field_values = field_values_ndjson(&processed, &capabilities.lookup)
+            .context("generate field values")?;
+        if !field_values.is_empty() {
+            self.insert_clickhouse(&self.cfg.field_values_table_name(), &field_values)
+                .await?;
+        }
+        let facets =
+            facets_ndjson(&processed, &capabilities.aggregate).context("generate event facets")?;
         if !facets.is_empty() {
             self.insert_clickhouse(&self.cfg.facets_table_name(), &facets)
                 .await?;
         }
-        let indexed_keys = self.indexed_facet_keys().await;
-        let event_index =
-            event_facet_index_ndjson(&processed, &indexed_keys).context("generate event index")?;
+        let event_index = event_facet_index_ndjson(&processed, &capabilities.lookup)
+            .context("generate event index")?;
         if !event_index.is_empty() {
             self.insert_clickhouse(&self.cfg.event_index_table_name(), &event_index)
                 .await?;
@@ -379,81 +418,81 @@ impl Loader {
             key,
             rows,
             bytes = processed.len(),
+            field_value_bytes = field_values.len(),
             facet_bytes = facets.len(),
             event_index_bytes = event_index.len(),
-            indexed_keys = indexed_keys.len(),
+            lookup_keys = capabilities.lookup.len(),
+            aggregate_keys = capabilities.aggregate.len(),
             "loaded event object"
         );
         Ok(())
     }
 
-    async fn indexed_facet_keys(&self) -> Vec<String> {
+    async fn field_capabilities(&self) -> FieldCapabilities {
         let now = Instant::now();
         {
-            let cache = self.hot_dimensions.read().await;
+            let cache = self.field_capabilities.read().await;
             if cache.refreshed_at.is_some_and(|refreshed| {
                 now.duration_since(refreshed) < self.cfg.hot_dimensions_refresh
-            }) && !cache.keys.is_empty()
-            {
-                return cache.keys.clone();
+            }) {
+                return cache.capabilities.clone();
             }
         }
 
-        let mut cache = self.hot_dimensions.write().await;
+        let mut cache = self.field_capabilities.write().await;
         if cache.refreshed_at.is_some_and(|refreshed| {
             now.duration_since(refreshed) < self.cfg.hot_dimensions_refresh
-        }) && !cache.keys.is_empty()
-        {
-            return cache.keys.clone();
+        }) {
+            return cache.capabilities.clone();
         }
 
-        match self.fetch_hot_dimension_keys().await {
-            Ok(keys) if !keys.is_empty() => {
-                cache.keys = keys;
+        match self.fetch_field_capabilities().await {
+            Ok(capabilities) => {
+                cache.capabilities = capabilities;
                 cache.refreshed_at = Some(now);
-            }
-            Ok(_) => {
-                cache.keys = builtin_indexed_facet_keys();
-                cache.refreshed_at = Some(now);
-                warn!("hot dimension registry was empty; using builtin index keys");
             }
             Err(err) => {
-                if cache.keys.is_empty() {
-                    cache.keys = builtin_indexed_facet_keys();
-                }
+                cache.capabilities = builtin_field_capabilities();
                 cache.refreshed_at = Some(now);
-                warn!(error = %err, "failed to refresh hot dimension registry; using cached index keys");
+                warn!(error = %err, "failed to refresh field capability registry; using builtin capabilities");
             }
         }
-        cache.keys.clone()
+        cache.capabilities.clone()
     }
 
-    async fn fetch_hot_dimension_keys(&self) -> Result<Vec<String>> {
-        let builtins = builtin_indexed_facet_keys();
+    async fn fetch_field_capabilities(&self) -> Result<FieldCapabilities> {
         let query = format!(
-            "SELECT path \
-             FROM (SELECT path, status, source, updated_at \
+            "SELECT path, lookup_enabled, aggregate_enabled \
+             FROM (SELECT path, status, source, lookup_enabled, aggregate_enabled, updated_at \
                    FROM {} ORDER BY updated_at DESC LIMIT 1 BY path) \
              WHERE status = 'active' AND source = 'user' \
              ORDER BY path ASC FORMAT JSON",
             self.cfg.hot_dimensions_table_name()
         );
-        let response: ClickHouseResponse<HotDimensionPath> =
+        let response: ClickHouseResponse<HotDimensionCapability> =
             serde_json::from_str(&self.clickhouse_query(&query).await?)
                 .context("parse hot dimension registry response")?;
 
-        let mut seen = BTreeSet::new();
-        let mut keys = Vec::new();
-        for key in builtins
-            .into_iter()
-            .chain(response.data.into_iter().map(|row| row.path))
-        {
-            let key = key.trim().to_string();
-            if is_valid_facet_path(&key) && seen.insert(key.clone()) {
-                keys.push(key);
+        let mut capabilities = builtin_field_capabilities();
+        let mut lookup_seen = capabilities.lookup.iter().cloned().collect::<BTreeSet<_>>();
+        let mut aggregate_seen = capabilities
+            .aggregate
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for row in response.data {
+            let key = row.path.trim().to_string();
+            if !is_valid_facet_path(&key) {
+                continue;
+            }
+            if row.lookup_enabled > 0 && lookup_seen.insert(key.clone()) {
+                capabilities.lookup.push(key.clone());
+            }
+            if row.aggregate_enabled > 0 && aggregate_seen.insert(key.clone()) {
+                capabilities.aggregate.push(key);
             }
         }
-        Ok(keys)
+        Ok(capabilities)
     }
 
     async fn insert_clickhouse(&self, table: &str, body: &[u8]) -> Result<()> {
@@ -506,7 +545,125 @@ impl Loader {
     }
 }
 
-fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
+fn field_values_ndjson(bytes: &[u8], value_keys: &[String]) -> Result<Vec<u8>> {
+    let mut values = BTreeMap::<(String, String, String, String), (String, String)>::new();
+    let mut out = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let row: Value =
+            serde_json::from_slice(line).context("parse event row for field values")?;
+        let Some(row) = row.as_object() else {
+            continue;
+        };
+        for value in field_value_rows(row, value_keys) {
+            let entry = values
+                .entry((value.tenant_id, value.key, value.value, value.value_type))
+                .or_insert((value.first_seen.clone(), value.last_seen.clone()));
+            if value.first_seen < entry.0 {
+                entry.0 = value.first_seen;
+            }
+            if value.last_seen > entry.1 {
+                entry.1 = value.last_seen;
+            }
+        }
+    }
+    for ((tenant_id, key, value, value_type), (first_seen, last_seen)) in values {
+        serde_json::to_writer(
+            &mut out,
+            &FieldValueRow {
+                tenant_id,
+                key,
+                value,
+                value_type,
+                first_seen,
+                last_seen,
+            },
+        )
+        .context("serialize field value row")?;
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+fn field_value_rows(row: &Map<String, Value>, value_keys: &[String]) -> Vec<FieldValueRow> {
+    let timestamp = string_value(row.get("timestamp"));
+    if timestamp.is_empty() {
+        return Vec::new();
+    }
+    let Some(data) = row.get("data").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let context = EventIndexContext::from_row(row, data, timestamp.clone());
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in value_keys {
+        if let Some(value) = indexed_value_for_key(row, data, &context, key) {
+            collect_field_values(&context, key, &value, &mut seen, &mut rows);
+        }
+    }
+    rows
+}
+
+fn collect_field_values(
+    context: &EventIndexContext,
+    key: &str,
+    value: &Value,
+    seen: &mut BTreeSet<String>,
+    rows: &mut Vec<FieldValueRow>,
+) {
+    match value {
+        Value::Null => {}
+        Value::Bool(value) => push_field_value_row(
+            context,
+            key,
+            if *value { "true" } else { "false" }.to_string(),
+            "bool",
+            seen,
+            rows,
+        ),
+        Value::Number(value) => {
+            push_field_value_row(context, key, value.to_string(), "number", seen, rows)
+        }
+        Value::String(value) => {
+            push_field_value_row(context, key, value.clone(), "string", seen, rows)
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_field_values(context, key, value, seen, rows);
+            }
+        }
+        Value::Object(_) => {}
+    }
+}
+
+fn push_field_value_row(
+    context: &EventIndexContext,
+    key: &str,
+    value: String,
+    value_type: &str,
+    seen: &mut BTreeSet<String>,
+    rows: &mut Vec<FieldValueRow>,
+) {
+    if key.is_empty() || value.is_empty() {
+        return;
+    }
+    let dedupe_key = format!("{key}\u{0}{value_type}\u{0}{value}");
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+    rows.push(FieldValueRow {
+        tenant_id: context.tenant_id.clone(),
+        key: key.to_string(),
+        value,
+        value_type: value_type.to_string(),
+        first_seen: context.timestamp.clone(),
+        last_seen: context.timestamp.clone(),
+    });
+}
+
+fn facets_ndjson(bytes: &[u8], aggregate_keys: &[String]) -> Result<Vec<u8>> {
     let mut counts = BTreeMap::<(String, String, String, String, String), (u64, u64)>::new();
     let mut out = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
@@ -517,7 +674,7 @@ fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
         let Some(row) = row.as_object() else {
             continue;
         };
-        for facet in facet_rows(row) {
+        for facet in facet_rows(row, aggregate_keys) {
             let count = counts
                 .entry((
                     facet.tenant_id,
@@ -550,40 +707,31 @@ fn facets_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn facet_rows(row: &Map<String, Value>) -> Vec<FacetRow> {
+fn facet_rows(row: &Map<String, Value>, aggregate_keys: &[String]) -> Vec<FacetRow> {
     let timestamp = string_value(row.get("timestamp"));
     if timestamp.is_empty() {
         return Vec::new();
     }
 
     let data = row.get("data").and_then(Value::as_object);
-    let event_type = data
-        .and_then(|data| string_value(data.get("event_type")).into_non_empty())
-        .unwrap_or_default();
     let context = FacetContext {
         tenant_id: data
             .map(|data| string_value(data.get("tenant_id")))
             .unwrap_or_default(),
-        bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
+        bucket_time: minute_bucket(&timestamp).unwrap_or_else(|| timestamp.clone()),
         error_count: if is_error_row(row) { 1 } else { 0 },
-        signal: signal_for_event_type(&event_type).to_string(),
     };
 
     let mut facets = Vec::new();
     let mut seen = BTreeSet::new();
     if let Some(data) = data {
-        for (key, value) in data {
-            collect_facets(&context, key, value, &mut seen, &mut facets);
+        let index_context = EventIndexContext::from_row(row, data, timestamp);
+        for key in aggregate_keys {
+            if let Some(value) = indexed_value_for_key(row, data, &index_context, key) {
+                collect_facets(&context, key, &value, &mut seen, &mut facets);
+            }
         }
     }
-    push_facet(
-        &context,
-        "signal",
-        context.signal.clone(),
-        "string",
-        &mut seen,
-        &mut facets,
-    );
     facets
 }
 
@@ -617,38 +765,13 @@ fn event_facet_index_rows(
         return Vec::new();
     };
 
-    let event_id = string_value(row.get("event_id"));
-    let event_type = string_value(data.get("event_type"));
-    let signal = signal_for_event_type(&event_type).to_string();
-    let context = EventIndexContext {
-        tenant_id: string_value(data.get("tenant_id")),
-        timestamp: timestamp.clone(),
-        bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
-        event_id,
-        event_type,
-        signal,
-        trace_id: string_value(data.get("trace_id")),
-        span_id: string_value(data.get("span_id")),
-        parent_span_id: string_value(data.get("parent_span_id")),
-        name: string_value(data.get("name")),
-        start_time: optional_time(data.get("start_time")),
-        end_time: optional_time(data.get("end_time")),
-        duration_ms: number_value(data.get("duration_ms")),
-    };
+    let context = EventIndexContext::from_row(row, data, timestamp);
 
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for key in indexed_keys {
-        if key == "signal" {
-            collect_event_index_facets(
-                &context,
-                key,
-                &Value::String(context.signal.clone()),
-                &mut seen,
-                &mut rows,
-            );
-        } else if let Some(value) = value_at_path(data, key) {
-            collect_event_index_facets(&context, key, value, &mut seen, &mut rows);
+        if let Some(value) = indexed_value_for_key(row, data, &context, key) {
+            collect_event_index_facets(&context, key, &value, &mut seen, &mut rows);
         }
     }
     rows
@@ -667,32 +790,79 @@ struct EventIndexContext {
     name: String,
     start_time: Option<String>,
     end_time: Option<String>,
-    duration_ms: f64,
+    duration_ms: Option<f64>,
 }
 
-fn builtin_indexed_facet_keys() -> Vec<String> {
-    [
+impl EventIndexContext {
+    fn from_row(row: &Map<String, Value>, data: &Map<String, Value>, timestamp: String) -> Self {
+        let event_id = string_value(row.get("event_id"));
+        let event_type = string_value(data.get("event_type"));
+        let signal = signal_for_event_type(&event_type).to_string();
+        Self {
+            tenant_id: string_value(data.get("tenant_id")),
+            timestamp: timestamp.clone(),
+            bucket_time: minute_bucket(&timestamp).unwrap_or(timestamp),
+            event_id,
+            event_type,
+            signal,
+            trace_id: string_value(data.get("trace_id")),
+            span_id: string_value(data.get("span_id")),
+            parent_span_id: string_value(data.get("parent_span_id")),
+            name: string_value(data.get("name")),
+            start_time: optional_time(data.get("start_time")),
+            end_time: optional_time(data.get("end_time")),
+            duration_ms: optional_number_value(data.get("duration_ms")),
+        }
+    }
+}
+
+fn builtin_field_capabilities() -> FieldCapabilities {
+    let aggregate = [
         "tenant_id",
         "service",
         "environment",
         "event_type",
+        "signal",
         "name",
-        "trace_id",
-        "span_id",
-        "parent_span_id",
-        "user_id",
-        "session_id",
-        "account_id",
         "http.route",
         "http.method",
         "http.status_code",
         "severity_text",
         "metric_name",
-        "signal",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    ];
+    let lookup_only = [
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "event_id",
+        "request_id",
+        "user_id",
+        "account_id",
+        "session_id",
+    ];
+    let mut lookup = BTreeSet::new();
+    for key in aggregate.into_iter().chain(lookup_only) {
+        lookup.insert(key.to_string());
+    }
+    FieldCapabilities {
+        lookup: lookup.into_iter().collect(),
+        aggregate: aggregate.into_iter().map(str::to_string).collect(),
+    }
+}
+
+fn indexed_value_for_key(
+    row: &Map<String, Value>,
+    data: &Map<String, Value>,
+    context: &EventIndexContext,
+    key: &str,
+) -> Option<Value> {
+    match key {
+        "event_id" => Some(Value::String(context.event_id.clone())),
+        "signal" => Some(Value::String(context.signal.clone())),
+        _ => value_at_path(data, key)
+            .cloned()
+            .or_else(|| row.get(key).cloned()),
+    }
 }
 
 fn collect_event_index_facets(
@@ -766,7 +936,6 @@ struct FacetContext {
     tenant_id: String,
     bucket_time: String,
     error_count: u64,
-    signal: String,
 }
 
 trait NonEmptyString {
@@ -884,6 +1053,14 @@ fn number_value(value: Option<&Value>) -> f64 {
         Some(Value::Number(value)) => value.as_f64().unwrap_or_default(),
         Some(Value::String(value)) => value.parse().unwrap_or_default(),
         _ => 0.0,
+    }
+}
+
+fn optional_number_value(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(value)) => value.as_f64(),
+        Some(Value::String(value)) => value.parse().ok(),
+        _ => None,
     }
 }
 
@@ -1079,8 +1256,16 @@ mod tests {
 
     #[test]
     fn generates_facets_for_nested_scalar_values() {
+        let aggregate_keys = [
+            "name".to_string(),
+            "http.status_code".to_string(),
+            "ok".to_string(),
+            "tags".to_string(),
+            "signal".to_string(),
+        ];
         let facets = facets_ndjson(
             br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","source_file":"events/part.ndjson","source_offset":42,"data":{"tenant_id":"tenant-a","event_type":"span","trace_id":"trace-1","span_id":"span-1","name":"GET /users","http":{"status_code":200},"ok":true,"tags":["api","api","prod"],"ignored":null}}"#,
+            &aggregate_keys,
         )
         .expect("generate facets");
         let rows = String::from_utf8(facets).expect("utf8");
@@ -1121,10 +1306,12 @@ mod tests {
 
     #[test]
     fn aggregates_facets_by_minute_key_and_value() {
+        let aggregate_keys = ["name".to_string()];
         let facets = facets_ndjson(
             br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:01.000Z","data":{"name":"GET /users","is_error":true}}
 {"event_id":"evt_2","timestamp":"2026-05-12T00:00:59.000Z","data":{"name":"GET /users"}}
 "#,
+            &aggregate_keys,
         )
         .expect("generate facets");
         let rows = String::from_utf8(facets).expect("utf8");

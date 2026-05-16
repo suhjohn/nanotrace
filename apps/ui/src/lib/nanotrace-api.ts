@@ -30,7 +30,9 @@ export function runtimeNanotraceApiKey() {
 }
 
 export type HotFacet = {
+  aggregate_enabled?: boolean
   display_name: string
+  lookup_enabled?: boolean
   path: string
   removable: boolean
   source: string
@@ -84,19 +86,25 @@ export async function fetchFacets({ apiBaseUrl }: { apiBaseUrl: string }): Promi
 }
 
 export async function putFacet({
+  aggregateEnabled,
   apiBaseUrl,
   displayName,
+  lookupEnabled,
   path,
   valueType
 }: {
+  aggregateEnabled?: boolean
   apiBaseUrl: string
   displayName?: string
+  lookupEnabled?: boolean
   path: string
   valueType: string
 }): Promise<HotFacet> {
   const response = await fetch(facetsUrl(apiBaseUrl), {
     body: JSON.stringify({
+      aggregate_enabled: aggregateEnabled,
       display_name: displayName?.trim() || undefined,
+      lookup_enabled: lookupEnabled,
       path: path.trim(),
       value_type: valueType
     }),

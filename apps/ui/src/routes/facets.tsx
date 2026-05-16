@@ -38,6 +38,8 @@ function FacetsRoute() {
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [path, setPath] = useState('')
   const [valueType, setValueType] = useState<FacetValueType>('string')
+  const [lookupEnabled, setLookupEnabled] = useState(true)
+  const [aggregateEnabled, setAggregateEnabled] = useState(false)
   const [detectedType, setDetectedType] = useState<TypeDetectionResult | null>(null)
 
   const facetsQuery = useQuery({
@@ -58,14 +60,32 @@ function FacetsRoute() {
   const addMutation = useMutation({
     mutationFn: () =>
       putFacet({
+        aggregateEnabled,
         apiBaseUrl: observatoryUrl,
+        lookupEnabled,
         path,
         valueType
       }),
     onSuccess: async () => {
       setPath('')
       setValueType('string')
+      setLookupEnabled(true)
+      setAggregateEnabled(false)
       setDetectedType(null)
+      await invalidateFacetQueries(queryClient, observatoryUrl)
+    }
+  })
+  const updateMutation = useMutation({
+    mutationFn: (facet: HotFacet) =>
+      putFacet({
+        aggregateEnabled: facet.aggregate_enabled !== false,
+        apiBaseUrl: observatoryUrl,
+        displayName: facet.display_name,
+        lookupEnabled: facet.lookup_enabled !== false,
+        path: facet.path,
+        valueType: facet.value_type
+      }),
+    onSuccess: async () => {
       await invalidateFacetQueries(queryClient, observatoryUrl)
     }
   })
@@ -101,7 +121,7 @@ function FacetsRoute() {
     }
     return latest
   }, [backfills])
-  const error = facetsQuery.error || addMutation.error || removeMutation.error || backfillMutation.error || detectTypeMutation.error
+  const error = facetsQuery.error || addMutation.error || updateMutation.error || removeMutation.error || backfillMutation.error || detectTypeMutation.error
   const backfillError = backfillsQuery.error
   const headerStatus = facetsQuery.error ? 'unavailable' : facetsQuery.isFetching ? 'loading' : `${activeFacets.length} active`
   const detectPath = path.trim()
@@ -183,9 +203,21 @@ function FacetsRoute() {
                 {detectTypeMutation.isPending ? <RefreshCw size={13} strokeWidth={1.8} /> : <WandSparkles size={13} strokeWidth={1.8} />}
               </button>
               <DetectionChip detectedType={detectedType} detecting={detectTypeMutation.isPending} />
+              <CapabilityCheckbox
+                checked={lookupEnabled}
+                label="Lookup"
+                title="Distinct values and click-through from grouped logs"
+                onChange={setLookupEnabled}
+              />
+              <CapabilityCheckbox
+                checked={aggregateEnabled}
+                label="Aggregate"
+                title="Rollups for counts and dashboard queries"
+                onChange={setAggregateEnabled}
+              />
               <button
                 className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap border border-neutral-700 bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700"
-                disabled={!path.trim() || addMutation.isPending}
+                disabled={!path.trim() || (!lookupEnabled && !aggregateEnabled) || addMutation.isPending}
                 type="button"
                 onClick={() => addMutation.mutate()}
               >
@@ -216,7 +248,9 @@ function FacetsRoute() {
               loading={facetsQuery.isLoading}
               removingPath={removeMutation.variables}
               onBackfill={facetPath => backfillMutation.mutate(facetPath)}
+              onCapabilityChange={facet => updateMutation.mutate(facet)}
               onRemove={facetPath => removeMutation.mutate(facetPath)}
+              updatingPath={updateMutation.variables?.path}
             />
           </section>
 
@@ -254,7 +288,9 @@ function FacetTable({
   loading,
   removingPath,
   onBackfill,
-  onRemove
+  onCapabilityChange,
+  onRemove,
+  updatingPath
 }: {
   backfillingPath?: string
   facets: HotFacet[]
@@ -262,16 +298,20 @@ function FacetTable({
   loading: boolean
   removingPath?: string
   onBackfill: (path: string) => void
+  onCapabilityChange: (facet: HotFacet) => void
   onRemove: (path: string) => void
+  updatingPath?: string
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[760px] border-collapse text-left text-[12px]">
+      <table className="w-full min-w-[920px] border-collapse text-left text-[12px]">
         <thead className="border-b border-neutral-800 text-[11px] uppercase text-neutral-600">
           <tr>
             <th className="px-3 py-2 font-medium">Path</th>
             <th className="px-3 py-2 font-medium">Type</th>
             <th className="px-3 py-2 font-medium">Source</th>
+            <th className="px-3 py-2 font-medium">Lookup</th>
+            <th className="px-3 py-2 font-medium">Aggregate</th>
             <th className="px-3 py-2 font-medium">Backfill</th>
             <th className="px-3 py-2 text-right font-medium">Actions</th>
           </tr>
@@ -285,6 +325,9 @@ function FacetTable({
               latestBackfill?.status === 'queued' ||
               latestBackfill?.status === 'running'
             const backfillCompleted = latestBackfill?.status === 'completed'
+            const updating = updatingPath === facet.path
+            const lookupEnabled = facet.lookup_enabled !== false
+            const aggregateEnabled = facet.aggregate_enabled !== false
             const backfillActionLabel = backfillInFlight
               ? latestBackfill?.status === 'queued'
                 ? 'Queued'
@@ -302,6 +345,34 @@ function FacetTable({
                   <span className={cn(facet.source === 'builtin' ? 'text-neutral-500' : 'text-emerald-300')}>
                     {facet.source}
                   </span>
+                </td>
+                <td className="px-3 py-2">
+                  <CapabilityControl
+                    checked={lookupEnabled}
+                    disabled={!facet.removable || updating}
+                    label="lookup"
+                    onChange={checked => {
+                      if (!checked && !aggregateEnabled) return
+                      onCapabilityChange({
+                        ...facet,
+                        lookup_enabled: checked
+                      })
+                    }}
+                  />
+                </td>
+                <td className="px-3 py-2">
+                  <CapabilityControl
+                    checked={aggregateEnabled}
+                    disabled={!facet.removable || updating}
+                    label="aggregate"
+                    onChange={checked => {
+                      if (!checked && !lookupEnabled) return
+                      onCapabilityChange({
+                        ...facet,
+                        aggregate_enabled: checked
+                      })
+                    }}
+                  />
                 </td>
                 <td className="px-3 py-2">
                   {!canBackfill ? (
@@ -324,7 +395,7 @@ function FacetTable({
                         aria-label={`${backfillActionLabel} ${facet.path}`}
                         className="inline-flex h-7 items-center justify-center gap-1.5 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white disabled:text-neutral-700"
                         disabled={backfillInFlight || backfillCompleted}
-                        title={`${backfillActionLabel} ${facet.path}`}
+                        title={`${backfillActionLabel} ${facet.path} lookup/aggregate data`}
                         type="button"
                         onClick={() => onBackfill(facet.path)}
                       >
@@ -373,6 +444,74 @@ function FacetTable({
         </tbody>
       </table>
     </div>
+  )
+}
+
+function CapabilityCheckbox({
+  checked,
+  label,
+  onChange,
+  title
+}: {
+  checked: boolean
+  label: string
+  onChange: (checked: boolean) => void
+  title: string
+}) {
+  return (
+    <label
+      className="inline-flex h-8 shrink-0 items-center gap-1.5 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300"
+      title={title}
+    >
+      <input
+        checked={checked}
+        className="h-3.5 w-3.5 accent-white"
+        type="checkbox"
+        onChange={event => onChange(event.target.checked)}
+      />
+      {label}
+    </label>
+  )
+}
+
+function CapabilityControl({
+  checked,
+  disabled,
+  label,
+  onChange
+}: {
+  checked: boolean
+  disabled: boolean
+  label: string
+  onChange: (checked: boolean) => void
+}) {
+  if (disabled) {
+    return <CapabilityPill enabled={checked} label={label} />
+  }
+  return (
+    <label className="inline-flex h-7 items-center gap-1.5 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300">
+      <input
+        checked={checked}
+        className="h-3.5 w-3.5 accent-white"
+        type="checkbox"
+        onChange={event => onChange(event.target.checked)}
+      />
+      {checked ? 'on' : 'off'}
+    </label>
+  )
+}
+
+function CapabilityPill({ enabled, label }: { enabled: boolean; label: string }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex h-6 items-center border px-2 text-[11px]',
+        enabled ? 'border-neutral-700 text-neutral-300' : 'border-neutral-900 text-neutral-600'
+      )}
+      title={`${label} ${enabled ? 'enabled' : 'disabled'}`}
+    >
+      {enabled ? 'on' : 'off'}
+    </span>
   )
 }
 

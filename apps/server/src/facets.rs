@@ -32,6 +32,10 @@ pub struct PutFacetRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub value_type: Option<String>,
+    #[serde(default = "default_true")]
+    pub lookup_enabled: bool,
+    #[serde(default = "default_true")]
+    pub aggregate_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +66,8 @@ pub struct HotDimension {
     pub path: String,
     pub value_type: String,
     pub status: String,
+    pub lookup_enabled: bool,
+    pub aggregate_enabled: bool,
     pub display_name: String,
     pub source: String,
     pub removable: bool,
@@ -161,6 +167,8 @@ impl FacetStore {
             path,
             value_type: value_type.to_string(),
             status: "active".to_string(),
+            lookup_enabled: request.lookup_enabled,
+            aggregate_enabled: request.aggregate_enabled,
             display_name,
             source: "user".to_string(),
             removable: true,
@@ -180,6 +188,8 @@ impl FacetStore {
             path,
             value_type: "string".to_string(),
             status: "disabled".to_string(),
+            lookup_enabled: false,
+            aggregate_enabled: false,
             display_name: String::new(),
             source: "user".to_string(),
             removable: true,
@@ -430,6 +440,15 @@ impl FacetStore {
     }
 
     async fn process_backfill_chunk(&self, chunk: &BackfillChunk) -> Result<(), FacetError> {
+        let dimensions = self.list(&chunk.organization_id).await?;
+        let Some(dimension) = dimensions
+            .iter()
+            .find(|dimension| dimension.path == chunk.path)
+        else {
+            return Err(FacetError::InvalidPath);
+        };
+        let lookup_enabled = dimension.lookup_enabled;
+        let aggregate_enabled = dimension.aggregate_enabled;
         let value_expr = facet_value_expression(&chunk.path);
         let error_expr = error_count_expression();
         let (bucket_delete_start, bucket_delete_end) =
@@ -452,7 +471,8 @@ impl FacetStore {
             clickhouse_datetime_literal(chunk.chunk_end)
         ))
         .await?;
-        self.clickhouse_exec(&format!(
+        if aggregate_enabled {
+            self.clickhouse_exec(&format!(
             "INSERT INTO {} (tenant_id, bucket_time, key, value, value_type, count, error_count) \
              SELECT {} AS tenant_id, toStartOfMinute(timestamp) AS bucket_time, {} AS key, value, {} AS value_type, count() AS count, sum(error) AS error_count \
              FROM (SELECT timestamp, {} AS value, if({}, 1, 0) AS error FROM {} \
@@ -469,9 +489,11 @@ impl FacetStore {
             quote_literal(&chunk.organization_id),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
-        ))
-        .await?;
-        self.clickhouse_exec(&format!(
+            ))
+            .await?;
+        }
+        if lookup_enabled {
+            self.clickhouse_exec(&format!(
             "INSERT INTO {} \
              (tenant_id, key, value, value_type, timestamp, bucket_time, event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms) \
              SELECT {}, {}, value, {}, timestamp, toStartOfMinute(timestamp), event_id, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms \
@@ -488,7 +510,7 @@ impl FacetStore {
                     ifNull(toString(data.parent_span_id), '') AS parent_span_id, ifNull(toString(data.name), '') AS name, \
                     parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')) AS start_time, \
                     parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')) AS end_time, \
-                    toFloat64OrZero(ifNull(toString(data.duration_ms), '0')) AS duration_ms \
+                    toFloat64OrNull(toString(data.duration_ms)) AS duration_ms \
                    FROM {} WHERE tenant_id = {} AND timestamp >= {} AND timestamp < {}) \
              WHERE value != ''",
             self.event_index_table(),
@@ -500,24 +522,59 @@ impl FacetStore {
             quote_literal(&chunk.organization_id),
             clickhouse_datetime_literal(chunk.chunk_start),
             clickhouse_datetime_literal(chunk.chunk_end)
-        ))
-        .await?;
+            ))
+            .await?;
+            self.clickhouse_exec(&format!(
+                "INSERT INTO {} (tenant_id, key, value, value_type, first_seen, last_seen) \
+                 SELECT {} AS tenant_id, {} AS key, value, {} AS value_type, min(timestamp) AS first_seen, max(timestamp) AS last_seen \
+                 FROM (SELECT timestamp, {} AS value FROM {} \
+                       WHERE tenant_id = {} AND timestamp >= {} AND timestamp < {}) \
+                 WHERE value != '' \
+                 GROUP BY value",
+                self.field_values_table(),
+                quote_literal(&chunk.organization_id),
+                quote_literal(&chunk.path),
+                quote_literal(&chunk.value_type),
+                value_expr,
+                self.events_table(),
+                quote_literal(&chunk.organization_id),
+                clickhouse_datetime_literal(chunk.chunk_start),
+                clickhouse_datetime_literal(chunk.chunk_end)
+            ))
+            .await?;
+        }
 
         #[derive(Deserialize)]
         struct ChunkRows {
             rows: u64,
         }
-        let query = format!(
-            "SELECT count() AS rows FROM {} WHERE tenant_id = {} AND key = {} AND timestamp >= {} AND timestamp < {}",
-            self.event_index_table(),
-            quote_literal(&chunk.organization_id),
-            quote_literal(&chunk.path),
-            clickhouse_datetime_literal(chunk.chunk_start),
-            clickhouse_datetime_literal(chunk.chunk_end)
-        );
-        let response: ClickHouseResponse<ChunkRows> =
-            serde_json::from_str(&self.clickhouse_query(&query).await?)?;
-        let rows = response.data.first().map(|row| row.rows).unwrap_or(0);
+        let rows = if lookup_enabled {
+            let query = format!(
+                "SELECT count() AS rows FROM {} WHERE tenant_id = {} AND key = {} AND timestamp >= {} AND timestamp < {}",
+                self.event_index_table(),
+                quote_literal(&chunk.organization_id),
+                quote_literal(&chunk.path),
+                clickhouse_datetime_literal(chunk.chunk_start),
+                clickhouse_datetime_literal(chunk.chunk_end)
+            );
+            let response: ClickHouseResponse<ChunkRows> =
+                serde_json::from_str(&self.clickhouse_query(&query).await?)?;
+            response.data.first().map(|row| row.rows).unwrap_or(0)
+        } else if aggregate_enabled {
+            let query = format!(
+                "SELECT ifNull(sum(count), 0) AS rows FROM {} WHERE tenant_id = {} AND key = {} AND bucket_time >= {} AND bucket_time < {}",
+                self.facets_table(),
+                quote_literal(&chunk.organization_id),
+                quote_literal(&chunk.path),
+                bucket_delete_start,
+                bucket_delete_end
+            );
+            let response: ClickHouseResponse<ChunkRows> =
+                serde_json::from_str(&self.clickhouse_query(&query).await?)?;
+            response.data.first().map(|row| row.rows).unwrap_or(0)
+        } else {
+            0
+        };
         sqlx::query(
             "UPDATE nanotrace_facet_backfill_chunks
              SET status = 'completed',
@@ -633,8 +690,21 @@ impl FacetStore {
             values: u64,
         }
         let query = format!(
-            "SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {}",
+            "SELECT max(values) AS values \
+             FROM (\
+               SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {} \
+               UNION ALL \
+               SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {} \
+               UNION ALL \
+               SELECT uniqExact(value) AS values FROM {} WHERE tenant_id = {} AND key = {}\
+             )",
+            self.field_values_table(),
+            quote_literal(&tenant_id),
+            quote_literal(path),
             self.event_index_table(),
+            quote_literal(&tenant_id),
+            quote_literal(path),
+            self.facets_table(),
             quote_literal(&tenant_id),
             quote_literal(path)
         );
@@ -648,8 +718,10 @@ impl FacetStore {
         tenant_id: &str,
     ) -> Result<Vec<HotDimension>, FacetError> {
         let query = format!(
-            "SELECT path, value_type, status, display_name, source, toBool(1) AS removable \
-             FROM (SELECT path, value_type, status, display_name, source, updated_at \
+            "SELECT path, value_type, status, toBool(lookup_enabled) AS lookup_enabled, \
+                    toBool(aggregate_enabled) AS aggregate_enabled, \
+                    display_name, source, toBool(1) AS removable \
+             FROM (SELECT path, value_type, status, lookup_enabled, aggregate_enabled, display_name, source, updated_at \
                    FROM {} WHERE tenant_id = {} ORDER BY updated_at DESC LIMIT 1 BY path) \
              WHERE status = 'active' AND source = 'user' \
              ORDER BY path ASC",
@@ -671,6 +743,8 @@ impl FacetStore {
             "path": dimension.path,
             "value_type": dimension.value_type,
             "status": dimension.status,
+            "lookup_enabled": dimension.lookup_enabled,
+            "aggregate_enabled": dimension.aggregate_enabled,
             "display_name": dimension.display_name,
             "source": dimension.source,
         });
@@ -757,6 +831,8 @@ impl FacetStore {
              path String, \
              value_type LowCardinality(String), \
              status LowCardinality(String), \
+             lookup_enabled UInt8 DEFAULT 1, \
+             aggregate_enabled UInt8 DEFAULT 1, \
              display_name String DEFAULT '', \
              source LowCardinality(String) DEFAULT 'user', \
              created_at DateTime64(3, 'UTC') DEFAULT now64(3), \
@@ -767,6 +843,13 @@ impl FacetStore {
             self.hot_dimensions_table()
         );
         self.clickhouse_exec(&hot_dimensions).await?;
+        for column in [
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lookup_enabled UInt8 DEFAULT 1",
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS aggregate_enabled UInt8 DEFAULT 1",
+        ] {
+            self.clickhouse_exec(&column.replace("{table}", &self.hot_dimensions_table()))
+                .await?;
+        }
         Ok(())
     }
 
@@ -851,6 +934,14 @@ impl FacetStore {
         )
     }
 
+    fn field_values_table(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.clickhouse_database),
+            quote_identifier(&self.cfg.clickhouse_field_values_table)
+        )
+    }
+
     fn hot_dimensions_table(&self) -> String {
         format!(
             "{}.{}",
@@ -862,34 +953,92 @@ impl FacetStore {
 
 fn builtin_dimensions() -> Vec<HotDimension> {
     [
-        ("trace_id", "string", "traceId"),
-        ("span_id", "string", "spanId"),
-        ("parent_span_id", "string", "parentSpanId"),
-        ("tenant_id", "low_cardinality_string", "tenant_id"),
-        ("service", "low_cardinality_string", "service"),
-        ("environment", "low_cardinality_string", "environment"),
-        ("event_type", "low_cardinality_string", "event_type"),
-        ("signal", "low_cardinality_string", "signal"),
-        ("name", "low_cardinality_string", "name"),
-        ("user_id", "string", "user_id"),
-        ("session_id", "string", "session_id"),
-        ("account_id", "string", "account_id"),
-        ("http.route", "low_cardinality_string", "http.route"),
-        ("http.method", "low_cardinality_string", "http.method"),
-        ("http.status_code", "integer", "http.status_code"),
-        ("severity_text", "low_cardinality_string", "severity_text"),
-        ("metric_name", "low_cardinality_string", "metric_name"),
+        ("trace_id", "string", "traceId", true, false),
+        ("span_id", "string", "spanId", true, false),
+        ("parent_span_id", "string", "parentSpanId", true, false),
+        ("event_id", "string", "eventId", true, false),
+        ("request_id", "string", "requestId", true, false),
+        (
+            "tenant_id",
+            "low_cardinality_string",
+            "tenant_id",
+            true,
+            true,
+        ),
+        ("service", "low_cardinality_string", "service", true, true),
+        (
+            "environment",
+            "low_cardinality_string",
+            "environment",
+            true,
+            true,
+        ),
+        (
+            "event_type",
+            "low_cardinality_string",
+            "event_type",
+            true,
+            true,
+        ),
+        ("signal", "low_cardinality_string", "signal", true, true),
+        ("name", "low_cardinality_string", "name", true, true),
+        ("user_id", "string", "user_id", true, false),
+        ("session_id", "string", "session_id", true, false),
+        ("account_id", "string", "account_id", true, false),
+        (
+            "http.route",
+            "low_cardinality_string",
+            "http.route",
+            true,
+            true,
+        ),
+        (
+            "http.method",
+            "low_cardinality_string",
+            "http.method",
+            true,
+            true,
+        ),
+        (
+            "http.status_code",
+            "integer",
+            "http.status_code",
+            true,
+            true,
+        ),
+        (
+            "severity_text",
+            "low_cardinality_string",
+            "severity_text",
+            true,
+            true,
+        ),
+        (
+            "metric_name",
+            "low_cardinality_string",
+            "metric_name",
+            true,
+            true,
+        ),
     ]
     .into_iter()
-    .map(|(path, value_type, display_name)| HotDimension {
-        path: path.to_string(),
-        value_type: value_type.to_string(),
-        status: "active".to_string(),
-        display_name: display_name.to_string(),
-        source: "builtin".to_string(),
-        removable: false,
-    })
+    .map(
+        |(path, value_type, display_name, lookup_enabled, aggregate_enabled)| HotDimension {
+            path: path.to_string(),
+            value_type: value_type.to_string(),
+            status: "active".to_string(),
+            lookup_enabled,
+            aggregate_enabled,
+            display_name: display_name.to_string(),
+            source: "builtin".to_string(),
+            removable: false,
+        },
+    )
     .collect()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn validate_path(path: &str) -> Result<String, FacetError> {

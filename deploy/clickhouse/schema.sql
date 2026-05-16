@@ -45,7 +45,7 @@ CREATE TABLE
             service.namespace LowCardinality (Nullable (String)),
             service.instance.id Nullable (String),
             service_version LowCardinality (Nullable (String)),
-            event_type LowCardinality (Nullable (String)),
+            event_type Nullable (String),
             environment LowCardinality (Nullable (String)),
             host.name LowCardinality (Nullable (String)),
             host.id Nullable (String),
@@ -208,7 +208,7 @@ CREATE TABLE
          * remain distinguishable from empty strings and zeroes.
          */
         tenant_id LowCardinality (String) MATERIALIZED ifNull (data.tenant_id, ''),
-        event_type LowCardinality (String) MATERIALIZED ifNull (data.event_type, ''),
+        event_type String MATERIALIZED ifNull (data.event_type, '') CODEC (ZSTD (1)),
         trace_id String MATERIALIZED ifNull (data.trace_id, '') CODEC (ZSTD (1)),
         span_id String MATERIALIZED ifNull (data.span_id, '') CODEC (ZSTD (1)),
 
@@ -228,9 +228,9 @@ CREATE TABLE
         /* The sort key is tenant/time first because product reads, facet
            backfills, retention, and event pages are tenant-scoped time scans.
            Event kind stays as metadata, not a storage-order dimension. */
-        INDEX idx_trace_id trace_id TYPE bloom_filter (0.01) GRANULARITY 1,
-        INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 1,
-        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 1
+        INDEX idx_trace_id trace_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4
     ) ENGINE = MergeTree
 PARTITION BY
     toYYYYMMDD (timestamp)
@@ -261,7 +261,7 @@ CREATE TABLE
         timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         event_id String CODEC (ZSTD (1)),
-        event_type LowCardinality (String),
+        event_type String CODEC (ZSTD (1)),
         signal LowCardinality (String),
         trace_id String CODEC (ZSTD (1)),
         span_id String CODEC (ZSTD (1)),
@@ -269,7 +269,7 @@ CREATE TABLE
         name String CODEC (ZSTD (1)),
         start_time Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
         end_time Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
-        duration_ms Float64 CODEC (ZSTD (1))
+        duration_ms Nullable (Float64) CODEC (ZSTD (1))
     ) ENGINE = MergeTree
 PARTITION BY
     toYYYYMMDD (timestamp)
@@ -277,11 +277,27 @@ ORDER BY
     (tenant_id, key, value, timestamp, event_id);
 
 CREATE TABLE
+    IF NOT EXISTS observatory.field_values (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        key LowCardinality (String),
+        value String CODEC (ZSTD (1)),
+        value_type LowCardinality (String),
+        first_seen DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        last_seen DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1))
+    ) ENGINE = ReplacingMergeTree (last_seen)
+PARTITION BY
+    cityHash64 (key) % 16
+ORDER BY
+    (tenant_id, key, value);
+
+CREATE TABLE
     IF NOT EXISTS observatory.hot_dimensions (
         tenant_id String DEFAULT 'org_default',
         path String CODEC (ZSTD (1)),
         value_type LowCardinality (String),
         status LowCardinality (String),
+        lookup_enabled UInt8 DEFAULT 1,
+        aggregate_enabled UInt8 DEFAULT 1,
         display_name String DEFAULT '',
         source LowCardinality (String) DEFAULT 'user',
         created_at DateTime64 (3, 'UTC') DEFAULT now64 (3),

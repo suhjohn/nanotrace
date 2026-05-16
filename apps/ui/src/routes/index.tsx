@@ -122,9 +122,11 @@ type LogFlamegraph = Flamegraph & {
 }
 
 type GroupOption = {
+  aggregateEnabled?: boolean
   cardinality: number
   capped: boolean
   displayName?: string
+  lookupEnabled?: boolean
   path: string
   removable?: boolean
   source?: string
@@ -3452,6 +3454,7 @@ type FlamegraphEventRow = {
 const defaultTableName = 'observatory.events'
 const defaultFacetsTableName = 'observatory.event_facets'
 const defaultEventIndexTableName = 'observatory.event_facet_index'
+const defaultFieldValuesTableName = 'observatory.field_values'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -3490,7 +3493,7 @@ async function fetchGroupOptions({
     }
     throw error
   }
-  const facets = facetsResponse.facets.filter(facet => facet.status === 'active').slice(0, limit)
+  const facets = facetsResponse.facets.filter(facet => facet.status === 'active' && facet.lookup_enabled !== false).slice(0, limit)
   const keys = facets.map(facet => facet.path)
   const keyList = keys.map(key => `'${sqlString(key)}'`).join(', ')
   const countResponse = keys.length
@@ -3502,13 +3505,11 @@ async function fetchGroupOptions({
         apiBaseUrl,
         parameters: { limit },
         query: [
-          'SELECT key AS path',
-          ', uniqCombined64(value) AS cardinality',
-          ', toBool(0) AS capped',
-          `FROM ${facetsTable()}`,
+          'SELECT key AS path, uniqCombined64(value) AS cardinality, toBool(0) AS capped',
+          `FROM ${fieldValuesTable()}`,
           `WHERE key IN (${keyList}) AND value != ''`,
           'GROUP BY path',
-          'ORDER BY sum(count) DESC, path ASC',
+          'ORDER BY cardinality DESC, path ASC',
           'LIMIT {limit:UInt64}'
         ].join(' ')
       })
@@ -3523,6 +3524,8 @@ async function fetchGroupOptions({
       path: facet.display_name || displayFacetPath(facet.path),
       removable: Boolean(facet.removable),
       source: facet.source,
+      lookupEnabled: facet.lookup_enabled,
+      aggregateEnabled: facet.aggregate_enabled,
       valueType: facet.value_type
     }
   })
@@ -3553,13 +3556,20 @@ async function fetchLegacyGroupOptions({
     apiBaseUrl,
     parameters: { limit },
     query: [
-      'SELECT key AS path',
-      ', uniqCombined64(value) AS cardinality',
-      ', toBool(0) AS capped',
+      'SELECT path, max(cardinality) AS cardinality, toBool(0) AS capped',
+      'FROM (',
+      'SELECT key AS path, uniqCombined64(value) AS cardinality',
+      `FROM ${fieldValuesTable()}`,
+      "WHERE key != ''",
+      'GROUP BY path',
+      'UNION ALL',
+      'SELECT key AS path, uniqCombined64(value) AS cardinality',
       `FROM ${facetsTable()}`,
       "WHERE key != ''",
       'GROUP BY path',
-      'ORDER BY sum(count) DESC, path ASC',
+      ')',
+      'GROUP BY path',
+      'ORDER BY cardinality DESC, path ASC',
       'LIMIT {limit:UInt64}'
     ].join(' ')
   })
@@ -3669,7 +3679,47 @@ async function fetchGroups({
         'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
       ].join(' ')
     })
-    return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
+    const rows = response.data ?? []
+    if (rows.length > 0) {
+      return groupPageFromResponse(rows, groupBy, limit, offset)
+    }
+  } catch (error) {
+    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+      throw error
+    }
+  }
+
+  try {
+    const valueTimeFilter = fieldValueTimeRangeWhereClause(timeRange)
+    const response = await postQuery<{
+      count: number
+      durationMs: number
+      endedAt: string
+      errorCount: number
+      startedAt: string
+      value: string
+    }>({
+      apiBaseUrl,
+      parameters: baseParameters,
+      query: [
+        'SELECT value',
+        ', min(first_seen) AS startedAt',
+        ', max(last_seen) AS endedAt',
+        ", dateDiff('millisecond', min(first_seen), max(last_seen)) AS durationMs",
+        ', toUInt64(0) AS count',
+        ', toUInt64(0) AS errorCount',
+        `FROM ${fieldValuesTable()}`,
+        `PREWHERE key = {group_key:String}${valueTimeFilter ? ` AND ${valueTimeFilter}` : ''}`,
+        `WHERE value != ''${exactFilter}`,
+        'GROUP BY value',
+        fieldValueOrderByClause(sortKey),
+        'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
+      ].join(' ')
+    })
+    const rows = response.data ?? []
+    if (rows.length > 0) {
+      return groupPageFromResponse(rows, groupBy, limit, offset)
+    }
   } catch (error) {
     if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
       throw error
@@ -3701,6 +3751,25 @@ async function fetchGroups({
   })
 
   return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
+}
+
+function fieldValueTimeRangeWhereClause(timeRange: ResolvedTimeRange) {
+  const clauses = []
+  if (timeRange.from) clauses.push("last_seen >= {from:DateTime64(3, 'UTC')}")
+  if (timeRange.to) clauses.push("first_seen <= {to:DateTime64(3, 'UTC')}")
+  return clauses.join(' AND ')
+}
+
+function fieldValueOrderByClause(sortKey: GroupSortKey) {
+  switch (sortKey) {
+    case 'value':
+      return 'ORDER BY value ASC'
+    case 'duration':
+      return 'ORDER BY durationMs DESC, endedAt DESC, value ASC'
+    case 'recent':
+    case 'count':
+      return 'ORDER BY endedAt DESC, value ASC'
+  }
 }
 
 function groupPageFromResponse(
@@ -3765,14 +3834,33 @@ async function fetchLatest({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogLatest> {
+  const parameters = { group_key: facetKey(groupBy), group_value: selectedGroupValue }
+  try {
+    const response = await postQuery<{ lastCreatedAt: string }>({
+      apiBaseUrl,
+      parameters,
+      query: [
+        'SELECT max(bucket_time) AS lastCreatedAt',
+        `FROM ${facetsTable()}`,
+        'PREWHERE key = {group_key:String}',
+        'WHERE value = {group_value:String}'
+      ].join(' ')
+    })
+    const lastCreatedAt = normalizeTimestamp(response.data?.[0]?.lastCreatedAt)
+    if (lastCreatedAt) return { lastCreatedAt }
+  } catch (error) {
+    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+      throw error
+    }
+  }
+
   const response = await postQuery<{ lastCreatedAt: string }>({
     apiBaseUrl,
-    parameters: { group_key: facetKey(groupBy), group_value: selectedGroupValue },
+    parameters,
     query: [
-      'SELECT max(bucket_time) AS lastCreatedAt',
-      `FROM ${facetsTable()}`,
-      'PREWHERE key = {group_key:String}',
-      'WHERE value = {group_value:String}'
+      'SELECT max(timestamp) AS lastCreatedAt',
+      `FROM ${eventIndexTable()}`,
+      'PREWHERE key = {group_key:String} AND value = {group_value:String}'
     ].join(' ')
   })
   return { lastCreatedAt: normalizeTimestamp(response.data?.[0]?.lastCreatedAt) }
@@ -4412,6 +4500,19 @@ function eventIndexTable() {
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultEventIndexTableName
+}
+
+function fieldValuesTable() {
+  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_VALUES_TABLE || '').trim()
+  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
+    return configured
+  }
+  const table = eventsTable()
+  const database = table.includes('.') ? table.split('.')[0] : ''
+  const derived = database ? `${database}.field_values` : 'field_values'
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
+    ? derived
+    : defaultFieldValuesTableName
 }
 
 function eventMetadataSelect(alias: string) {

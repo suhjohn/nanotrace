@@ -14,6 +14,10 @@ const eventIndexTable = identifier(
     process.env.CLICKHOUSE_EVENT_INDEX_TABLE || "event_facet_index",
     "CLICKHOUSE_EVENT_INDEX_TABLE",
 );
+const fieldValuesTable = identifier(
+    process.env.CLICKHOUSE_FIELD_VALUES_TABLE || "field_values",
+    "CLICKHOUSE_FIELD_VALUES_TABLE",
+);
 const hotDimensionsTable = identifier(
     process.env.CLICKHOUSE_HOT_DIMENSIONS_TABLE || "hot_dimensions",
     "CLICKHOUSE_HOT_DIMENSIONS_TABLE",
@@ -24,21 +28,25 @@ const defaultTenantId = process.env.NANOTRACE_DEFAULT_TENANT_ID || "org_default"
 const eventTableToken = "__NANOTRACE_EVENTS_TABLE__";
 const facetsTableToken = "__NANOTRACE_EVENT_FACETS_TABLE__";
 const eventIndexTableToken = "__NANOTRACE_EVENT_FACET_INDEX_TABLE__";
+const fieldValuesTableToken = "__NANOTRACE_FIELD_VALUES_TABLE__";
 const hotDimensionsTableToken = "__NANOTRACE_HOT_DIMENSIONS_TABLE__";
 const schema = readFileSync(schemaPath, "utf8")
     .replace(/\bobservatory\.hot_dimensions\b/g, hotDimensionsTableToken)
+    .replace(/\bobservatory\.field_values\b/g, fieldValuesTableToken)
     .replace(/\bobservatory\.event_facet_index\b/g, eventIndexTableToken)
     .replace(/\bobservatory\.event_facets\b/g, facetsTableToken)
     .replace(/\bobservatory\.events\b/g, eventTableToken)
     .replaceAll(eventTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(table)}`)
     .replaceAll(facetsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(facetsTable)}`)
     .replaceAll(eventIndexTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(eventIndexTable)}`)
+    .replaceAll(fieldValuesTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(fieldValuesTable)}`)
     .replaceAll(hotDimensionsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(hotDimensionsTable)}`);
 
 await query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(database)}`);
 const tenantMigrations = [
     await renameTenantlessTable(database, facetsTable, ["tenant_id"], "tenant_id"),
     await renameTenantlessTable(database, eventIndexTable, ["tenant_id"], "tenant_id"),
+    await renameTenantlessTable(database, fieldValuesTable, ["tenant_id"], "tenant_id"),
     await renameTenantlessTable(database, hotDimensionsTable, ["tenant_id"], "tenant_id"),
 ].filter(Boolean);
 await recreateLegacyFacetTable(database, facetsTable);
@@ -57,6 +65,9 @@ for (const statement of facetCompatibilityAlters(database, facetsTable)) {
 for (const statement of eventIndexCompatibilityAlters(database, eventIndexTable)) {
     await query(statement);
 }
+for (const statement of fieldValuesCompatibilityAlters(database, fieldValuesTable)) {
+    await query(statement);
+}
 for (const statement of hotDimensionsCompatibilityAlters(database, hotDimensionsTable)) {
     await query(statement);
 }
@@ -64,6 +75,7 @@ for (const statement of hotDimensionsCompatibilityAlters(database, hotDimensions
 console.log(`clickhouse_schema=${database}.${table}`);
 console.log(`clickhouse_facets_schema=${database}.${facetsTable}`);
 console.log(`clickhouse_event_index_schema=${database}.${eventIndexTable}`);
+console.log(`clickhouse_field_values_schema=${database}.${fieldValuesTable}`);
 console.log(`clickhouse_hot_dimensions_schema=${database}.${hotDimensionsTable}`);
 
 async function query(sql) {
@@ -234,7 +246,7 @@ function compatibilityAlters(database, table) {
         "service.namespace LowCardinality(Nullable(String)),",
         "service.instance.id Nullable(String),",
         "service_version LowCardinality(Nullable(String)),",
-        "event_type LowCardinality(Nullable(String)),",
+        "event_type Nullable(String),",
         "environment LowCardinality(Nullable(String)),",
         "host.name LowCardinality(Nullable(String)),",
         "host.id Nullable(String),",
@@ -358,7 +370,7 @@ function compatibilityAlters(database, table) {
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS data ${dataType}`,
         `ALTER TABLE ${target} MODIFY COLUMN data ${dataType}`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS tenant_id LowCardinality(String) MATERIALIZED ifNull(data.tenant_id, '')`,
-        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_type LowCardinality(String) MATERIALIZED ifNull(data.event_type, '')`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_type String MATERIALIZED ifNull(data.event_type, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS trace_id String MATERIALIZED ifNull(data.trace_id, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS span_id String MATERIALIZED ifNull(data.span_id, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS signal LowCardinality(String) MATERIALIZED multiIf(ifNull(data.event_type, '') IN ('span', 'span_start', 'span_end'), 'trace', ifNull(data.event_type, '') = 'metric', 'metric', ifNull(data.event_type, '') = 'log', 'log', ifNull(data.event_type, '') IN ('analytics', 'track', 'page', 'screen', 'identify', 'group', 'alias'), 'analytics', 'other')`,
@@ -367,13 +379,13 @@ function compatibilityAlters(database, table) {
         `ALTER TABLE ${target} MODIFY COLUMN observed_timestamp DateTime64(3, 'UTC') DEFAULT timestamp CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN ingested_timestamp DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN tenant_id LowCardinality(String) MATERIALIZED ifNull(data.tenant_id, '')`,
-        `ALTER TABLE ${target} MODIFY COLUMN event_type LowCardinality(String) MATERIALIZED ifNull(data.event_type, '')`,
+        `ALTER TABLE ${target} MODIFY COLUMN event_type String MATERIALIZED ifNull(data.event_type, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN trace_id String MATERIALIZED ifNull(data.trace_id, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN span_id String MATERIALIZED ifNull(data.span_id, '') CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} MODIFY COLUMN signal LowCardinality(String) MATERIALIZED multiIf(ifNull(data.event_type, '') IN ('span', 'span_start', 'span_end'), 'trace', ifNull(data.event_type, '') = 'metric', 'metric', ifNull(data.event_type, '') = 'log', 'log', ifNull(data.event_type, '') IN ('analytics', 'track', 'page', 'screen', 'identify', 'group', 'alias'), 'analytics', 'other')`,
-        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1`,
-        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 1`,
-        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 1`,
+        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 4`,
+        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 4`,
+        `ALTER TABLE ${target} ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 4`,
     ];
 }
 
@@ -403,7 +415,7 @@ function eventIndexCompatibilityAlters(database, table) {
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS timestamp DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS bucket_time DateTime64(3, 'UTC') DEFAULT timestamp CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_id String DEFAULT '' CODEC(ZSTD(1))`,
-        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_type LowCardinality(String) DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS event_type String DEFAULT '' CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS signal LowCardinality(String) DEFAULT ''`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS trace_id String DEFAULT '' CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS span_id String DEFAULT '' CODEC(ZSTD(1))`,
@@ -411,7 +423,19 @@ function eventIndexCompatibilityAlters(database, table) {
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS name String DEFAULT '' CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS start_time Nullable(DateTime64(3, 'UTC')) CODEC(Delta(8), ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS end_time Nullable(DateTime64(3, 'UTC')) CODEC(Delta(8), ZSTD(1))`,
-        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS duration_ms Float64 DEFAULT 0 CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS duration_ms Nullable(Float64) CODEC(ZSTD(1))`,
+    ];
+}
+
+function fieldValuesCompatibilityAlters(database, table) {
+    const target = `${quoteIdentifier(database)}.${quoteIdentifier(table)}`;
+    return [
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS tenant_id LowCardinality(String) DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS key LowCardinality(String) DEFAULT ''`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value String DEFAULT '' CODEC(ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS first_seen DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS last_seen DateTime64(3, 'UTC') DEFAULT first_seen CODEC(Delta(8), ZSTD(1))`,
     ];
 }
 
@@ -421,6 +445,8 @@ function hotDimensionsCompatibilityAlters(database, table) {
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS path String DEFAULT '' CODEC(ZSTD(1))`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS value_type LowCardinality(String) DEFAULT 'string'`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'active'`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS lookup_enabled UInt8 DEFAULT 1`,
+        `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS aggregate_enabled UInt8 DEFAULT 1`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS display_name String DEFAULT ''`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT 'user'`,
         `ALTER TABLE ${target} ADD COLUMN IF NOT EXISTS created_at DateTime64(3, 'UTC') DEFAULT now64(3)`,
