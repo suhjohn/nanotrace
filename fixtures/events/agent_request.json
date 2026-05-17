@@ -4,7 +4,7 @@
   "observed_timestamp": "2026-05-08T01:23:45.130Z",
   "data": {
     "tenant_id": "fixture",
-    "service": "atlas-agent",
+    "service": "codex-orchestrator",
     "event_type": "agent.request",
     "signal": "trace",
     "environment": "prod",
@@ -18,9 +18,9 @@
     "name": "agent.request",
     "duration_ms": 4200,
     "agent": {
-      "type": "trading_assistant",
+      "type": "coding",
       "workflow_state": "planned",
-      "intent": "portfolio_question",
+      "intent": "debug_failure",
       "decision": "retrieve"
     }
   }

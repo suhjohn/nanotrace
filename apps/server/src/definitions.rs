@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -588,7 +588,9 @@ struct ClickHouseResponse<T> {
 
 #[derive(Debug, Deserialize, Default)]
 struct BackfillStats {
+    #[serde(default, deserialize_with = "deserialize_u64_or_zero")]
     rows_matched: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_zero")]
     distinct_values: u64,
 }
 
@@ -897,4 +899,28 @@ fn clickhouse_datetime(value: &str) -> String {
                 .to_string()
         })
         .unwrap_or_else(|_| value.to_string())
+}
+
+fn deserialize_u64_or_zero<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackfillStats, ClickHouseResponse};
+
+    #[test]
+    fn backfill_stats_treats_null_distinct_values_as_zero() {
+        let response: ClickHouseResponse<BackfillStats> = serde_json::from_str(
+            r#"{"data":[{"rows_matched":0,"distinct_values":null}]}"#,
+        )
+        .expect("response should deserialize");
+
+        let stats = response.data.into_iter().next().expect("stats row");
+        assert_eq!(stats.rows_matched, 0);
+        assert_eq!(stats.distinct_values, 0);
+    }
 }

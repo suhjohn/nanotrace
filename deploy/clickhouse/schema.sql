@@ -741,6 +741,56 @@ GROUP BY
     value_type;
 
 /*
+ * event_density_1s: tenant-wide event counts over time.
+ *
+ * Concrete case:
+ *   The Logs screen opens with no grouping selected and needs a histogram for
+ *   the last 24h. At 10M events/sec that window contains 864B events, but the
+ *   chart still only needs a few hundred bars on screen.
+ *
+ * Without this table:
+ *   Each histogram refresh scans raw `events` to count rows into time buckets.
+ *   Even with only 700 displayed bars, the query still walks the full filtered
+ *   event set. For 24h at 10M/sec that is 864B rows per refresh.
+ *
+ * With this table:
+ *   Ingestion pre-aggregates one row per tenant per second. A 24h histogram
+ *   reads about 86,400 rows instead of 864B raw events, then merges those rows
+ *   into whatever display bucket size the UI needs. That keeps edge timestamps
+ *   accurate to within about a second instead of smearing whole minutes.
+ */
+CREATE TABLE
+    IF NOT EXISTS observatory.event_density_1s (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        count UInt64 CODEC (Delta, ZSTD (1)),
+        error_count UInt64 CODEC (Delta, ZSTD (1))
+    ) ENGINE = SummingMergeTree
+PARTITION BY
+    toYYYYMM (bucket_time)
+ORDER BY
+    (tenant_id, bucket_time);
+
+CREATE MATERIALIZED VIEW
+    IF NOT EXISTS observatory.mv_event_density_1s TO observatory.event_density_1s AS
+SELECT
+    tenant_id,
+    toStartOfInterval (timestamp, INTERVAL 1 SECOND) AS bucket_time,
+    count () AS count,
+    sum (
+        toUInt64 (
+            ifNull (data.is_error, 0) != 0
+            OR lower (ifNull (data.span_status_code, '')) = 'error'
+            OR endsWith (lower (event_type), '_error')
+        )
+    ) AS error_count
+FROM
+    observatory.events
+GROUP BY
+    tenant_id,
+    bucket_time;
+
+/*
  * definitions: registry for promoted schema.
  *
  * Concrete case:
@@ -898,7 +948,7 @@ ORDER BY
         dimension_value,
         timestamp,
         event_id,
-        definition_id
+        definition_version
     );
 
 ALTER TABLE observatory.event_measures

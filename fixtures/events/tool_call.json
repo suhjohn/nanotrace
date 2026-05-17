@@ -19,7 +19,7 @@
     "duration_ms": 245,
     "credits_used": 1.5,
     "tool": {
-      "name": "get_positions",
+      "name": "fs.read",
       "status": "ok",
       "attempt": 1,
       "result_count": 12

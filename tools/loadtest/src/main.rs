@@ -18,6 +18,7 @@ use tokio::{
     sync::mpsc,
     time::{Instant, sleep, sleep_until},
 };
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -187,6 +188,7 @@ struct Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoadProfile {
     Atlas,
+    Codex,
     Fixture,
     Realistic,
     Llm,
@@ -202,6 +204,7 @@ impl LoadProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::Atlas => "atlas",
+            Self::Codex => "codex",
             Self::Fixture => "fixture",
             Self::Realistic => "realistic",
             Self::Llm => "llm",
@@ -218,6 +221,7 @@ impl LoadProfile {
         matches!(
             self,
             Self::Atlas
+                | Self::Codex
                 | Self::Realistic
                 | Self::Llm
                 | Self::Trace
@@ -699,7 +703,7 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
 
     event.insert(
         "event_id".to_owned(),
-        Value::String(format!("{}-{seq}", context.config.run_id)),
+        Value::String(Uuid::now_v7().to_string()),
     );
     event.insert("timestamp".to_owned(), Value::String(timestamp));
     event.insert(
@@ -795,6 +799,9 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
         let index = seq as usize % fixtures.processor_fixtures.len();
         return &fixtures.processor_fixtures[index];
     }
+    if profile == LoadProfile::Codex {
+        return codex_fixture(fixtures, seq);
+    }
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
         if profile.is_realistic() && !fixtures.log_variations.is_empty() {
             let index = seq as usize % (fixtures.log_variations.len() + 1);
@@ -812,6 +819,163 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
     }
 }
 
+fn codex_fixture(fixtures: &Fixtures, seq: u64) -> &Fixture {
+    const EVENTS_PER_CODEX_TRACE: u64 = 24;
+
+    let group = seq / EVENTS_PER_CODEX_TRACE;
+    let slot = seq % EVENTS_PER_CODEX_TRACE;
+    let workflow = CodexWorkflow::for_group(group);
+
+    match slot {
+        0 => named_fixture_or_first(&fixtures.trace_fixtures, "span_start"),
+        1 => named_fixture_or_first(&fixtures.agent_fixtures, "agent_request"),
+        2 => workflow_log_fixture(fixtures, workflow),
+        3 | 16 => named_fixture_or_first(&fixtures.agent_fixtures, "retrieval_step"),
+        4 | 10 | 13 | 19 => named_fixture_or_first(&fixtures.agent_fixtures, "llm_call"),
+        5 => named_fixture_or_first(&fixtures.metric_fixtures, "metric_histogram"),
+        6 | 9 | 15 => named_fixture_or_first(&fixtures.agent_fixtures, "tool_call"),
+        7 | 12 | 17 | 21 => workflow_log_fixture(fixtures, workflow),
+        8 => named_fixture_or_first(&fixtures.metric_fixtures, "metric_counter"),
+        11 => named_fixture_or_first(&fixtures.agent_fixtures, "agent_decision"),
+        14 => named_fixture_or_first(&fixtures.metric_fixtures, "metric_runtime"),
+        18 => match group % 4 {
+            0 => named_fixture_or_first(&fixtures.agent_fixtures, "safety_event"),
+            1 => named_fixture_or_first(&fixtures.agent_fixtures, "eval_score"),
+            _ => named_fixture_or_first(&fixtures.metric_fixtures, "metric"),
+        },
+        20 => named_fixture_or_first(&fixtures.metric_fixtures, "metric"),
+        22 => match group % 6 {
+            0 => &fixtures.processor_fixtures[group as usize % fixtures.processor_fixtures.len()],
+            1 => named_fixture_or_first(&fixtures.agent_fixtures, "eval_score"),
+            2 => named_fixture_or_first(&fixtures.agent_fixtures, "safety_event"),
+            _ => workflow_log_fixture(fixtures, workflow),
+        },
+        23 => named_fixture_or_first(&fixtures.trace_fixtures, "span_end"),
+        _ => &fixtures.log,
+    }
+}
+
+fn workflow_log_fixture(fixtures: &Fixtures, workflow: CodexWorkflow) -> &Fixture {
+    let name = match workflow {
+        CodexWorkflow::CodeEdit | CodexWorkflow::DebugFailure | CodexWorkflow::ReviewFix => {
+            "log_variation_code_success"
+        }
+        CodexWorkflow::CanvasEdit => "log_variation_excalidraw",
+        CodexWorkflow::ImageGeneration => "log_variation_image_gen",
+        CodexWorkflow::DocsLookup => "log",
+    };
+    if name == "log" {
+        &fixtures.log
+    } else {
+        named_fixture_or_first(&fixtures.log_variations, name)
+    }
+}
+
+fn named_fixture_or_first<'a>(fixtures: &'a [Fixture], name: &str) -> &'a Fixture {
+    fixtures
+        .iter()
+        .find(|fixture| fixture.name == name)
+        .unwrap_or(&fixtures[0])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexWorkflow {
+    CodeEdit,
+    DebugFailure,
+    CanvasEdit,
+    DocsLookup,
+    ImageGeneration,
+    ReviewFix,
+}
+
+impl CodexWorkflow {
+    fn for_group(group: u64) -> Self {
+        match group % 10 {
+            0 | 1 | 2 => Self::CodeEdit,
+            3 | 4 => Self::DebugFailure,
+            5 => Self::CanvasEdit,
+            6 => Self::DocsLookup,
+            7 => Self::ImageGeneration,
+            _ => Self::ReviewFix,
+        }
+    }
+
+    fn conversation_mode(self) -> &'static str {
+        match self {
+            Self::CodeEdit | Self::DebugFailure | Self::ReviewFix => "coding",
+            Self::CanvasEdit => "canvas",
+            Self::DocsLookup => "research",
+            Self::ImageGeneration => "multimodal",
+        }
+    }
+
+    fn agent_type(self) -> &'static str {
+        match self {
+            Self::CanvasEdit => "canvas",
+            Self::DocsLookup => "research",
+            Self::ImageGeneration => "multimodal",
+            _ => "coding",
+        }
+    }
+
+    fn user_prompt(self) -> &'static str {
+        match self {
+            Self::CodeEdit => "Update the parser to handle the new schema and add a focused test.",
+            Self::DebugFailure => {
+                "Figure out why the deploy is failing after the ClickHouse upgrade and patch it."
+            }
+            Self::CanvasEdit => {
+                "Tighten the canvas layout and fix the overlapping labels in the visualization."
+            }
+            Self::DocsLookup => {
+                "Search the repo and docs for how tool execution and MCP requests are wired."
+            }
+            Self::ImageGeneration => {
+                "Generate a new hero image from the product screenshot and match the existing style."
+            }
+            Self::ReviewFix => "Address the PR review comments and explain the behavior change.",
+        }
+    }
+
+    fn system_prompt(self) -> &'static str {
+        match self {
+            Self::CanvasEdit => {
+                "You are Codex. Inspect the canvas code, keep edits scoped, and preserve interaction behavior."
+            }
+            Self::DocsLookup => {
+                "You are Codex. Read the repo first, ground answers in source, and avoid unsupported claims."
+            }
+            Self::ImageGeneration => {
+                "You are Codex. Use existing assets and tools, prefer concrete outputs, and keep revisions deterministic."
+            }
+            _ => {
+                "You are Codex, a coding agent. Read the repo, reason about the task, and make grounded code changes."
+            }
+        }
+    }
+
+    fn assistant_summary(self) -> &'static str {
+        match self {
+            Self::CodeEdit => "I inspected the relevant files and I am preparing a narrow patch.",
+            Self::DebugFailure => {
+                "I found the failure path and I am validating a schema-compatible fix."
+            }
+            Self::CanvasEdit => {
+                "I identified the layout collision and I am updating the visualization component."
+            }
+            Self::DocsLookup => {
+                "I gathered the relevant repo paths and I am tracing the execution flow."
+            }
+            Self::ImageGeneration => {
+                "I am iterating on the requested visual and checking the output against the existing UI."
+            }
+            Self::ReviewFix => {
+                "I reproduced the review concern and I am applying the requested fix."
+            }
+        }
+    }
+}
+
 fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, String) {
     match profile {
         LoadProfile::Llm => {
@@ -824,6 +988,7 @@ fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, St
             )
         }
         LoadProfile::Atlas
+        | LoadProfile::Codex
         | LoadProfile::Realistic
         | LoadProfile::Trace
         | LoadProfile::Metrics
@@ -987,42 +1152,9 @@ fn enrich_realistic_data(
         .and_then(Value::as_str)
         .unwrap_or(fixture_name)
         .to_owned();
-    let plan = rng.choose_str(&["free", "free", "pro", "pro", "enterprise"]);
-    let previous_plan = match plan {
-        "free" => "trial",
-        "pro" => "free",
-        "enterprise" => "pro",
-        _ => "free",
-    };
-    let risk_tier = rng.choose_str(&["low", "low", "medium", "medium", "high"]);
-    let lifecycle = rng.choose_str(&["new", "activated", "retained", "at_risk", "churned"]);
-    let symbol = rng.choose_str(&["AAPL", "NVDA", "TSLA", "COIN", "HOOD", "BTC-USD", "ETH-USD"]);
-    let order_side = rng.choose_str(&["buy", "sell"]);
-    let order_status = match event_type.as_str() {
-        "order.submitted" => "submitted",
-        "order.filled" => "filled",
-        "order.cancelled" => "cancelled",
-        _ => rng.choose_str(&["submitted", "filled", "cancelled", "rejected"]),
-    };
-    let amount = round(rng.float_range(9.0, 2_500.0), 2);
-    let quantity = round(rng.float_range(0.01, 250.0), 4);
-    let price = round(rng.float_range(4.0, 950.0), 2);
-    let order_id = format!(
-        "ord_{}",
-        stable_hex(&scenario.run_id, "order", rng.range(0, 1_000_000), 12)
-    );
     let request_id = format!(
         "req_{}",
         stable_hex(&scenario.run_id, "request", rng.range(0, 1_000_000), 16)
-    );
-    let conversation_id = format!(
-        "conv_{}",
-        stable_hex(
-            &scenario.run_id,
-            "conversation",
-            rng.range(0, 1_000_000),
-            12
-        )
     );
 
     data.insert("request_id".to_owned(), Value::String(request_id));
@@ -1039,23 +1171,70 @@ fn enrich_realistic_data(
         Value::String(scenario.account_id.clone()),
     );
     data.insert(
-        "account".to_owned(),
-        json!({
-            "id": scenario.account_id,
-            "plan": plan,
-            "previous_plan": previous_plan,
-            "risk_tier": risk_tier,
-            "lifecycle": lifecycle,
-            "region": rng.choose_str(&["us-east", "us-west", "eu-west", "ap-south"]),
-            "segment": rng.choose_str(&["retail", "active_trader", "advisor", "institutional"])
-        }),
+        "conversation_id".to_owned(),
+        Value::String(scenario.conversation_id.clone()),
+    );
+    data.insert(
+        "thread_id".to_owned(),
+        Value::String(scenario.thread_id.clone()),
     );
 
     match event_type.as_str() {
+        "log" => {
+            data.insert("signal".to_owned(), Value::String("log".to_owned()));
+            data.insert(
+                "service".to_owned(),
+                Value::String(scenario.service.to_owned()),
+            );
+            data.insert(
+                "conversationMode".to_owned(),
+                Value::String(scenario.workflow.conversation_mode().to_owned()),
+            );
+            data.insert(
+                "agentType".to_owned(),
+                Value::String(scenario.workflow.agent_type().to_owned()),
+            );
+            data.insert(
+                "agentPhase".to_owned(),
+                Value::String(log_agent_phase(scenario, rng).to_owned()),
+            );
+            data.insert(
+                "name".to_owned(),
+                Value::String(log_event_name(scenario, fixture_name).to_owned()),
+            );
+            data.insert(
+                "message".to_owned(),
+                Value::String(log_event_message(scenario, fixture_name, rng)),
+            );
+            data.insert("llm".to_owned(), codex_llm_log_payload(scenario, rng));
+            if fixture_name.contains("image_gen") {
+                data.insert(
+                    "asset".to_owned(),
+                    json!({
+                        "kind": "generated-image",
+                        "mime_type": "image/png",
+                        "width": 1536,
+                        "height": 1024
+                    }),
+                );
+            }
+            if fixture_name.contains("code_success") {
+                data.insert("tool".to_owned(), codex_tool_payload(scenario, rng, false));
+            }
+        }
         "checkout.started" | "checkout.completed" | "subscription.renewed" => {
             data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
             data.insert("service".to_owned(), Value::String("billing".to_owned()));
-            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("name".to_owned(), Value::String(event_type.clone()));
+            let plan = rng.choose_str(&["free", "free", "plus", "team", "team", "enterprise"]);
+            let previous_plan = match plan {
+                "free" => "trial",
+                "plus" => "free",
+                "team" => rng.choose_str(&["free", "plus"]),
+                "enterprise" => "team",
+                _ => "free",
+            };
+            let amount = round(rng.float_range(9.0, 499.0), 2);
             data.insert("revenue".to_owned(), number_value(amount));
             data.insert(
                 "credits_used".to_owned(),
@@ -1076,7 +1255,22 @@ fn enrich_realistic_data(
         "order.submitted" | "order.filled" | "order.cancelled" | "order.rejected" => {
             data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
             data.insert("service".to_owned(), Value::String("trading".to_owned()));
-            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("name".to_owned(), Value::String(event_type.clone()));
+            let amount = round(rng.float_range(9.0, 499.0), 2);
+            let symbol = rng.choose_str(&["AAPL", "NVDA", "MSFT", "META", "BTC-USD", "ETH-USD"]);
+            let order_side = rng.choose_str(&["buy", "sell"]);
+            let order_status = match event_type.as_str() {
+                "order.submitted" => "submitted",
+                "order.filled" => "filled",
+                "order.cancelled" => "cancelled",
+                _ => rng.choose_str(&["submitted", "filled", "cancelled", "rejected"]),
+            };
+            let quantity = round(rng.float_range(0.01, 250.0), 4);
+            let price = round(rng.float_range(4.0, 950.0), 2);
+            let order_id = format!(
+                "ord_{}",
+                stable_hex(&scenario.run_id, "order", rng.range(0, 1_000_000), 12)
+            );
             data.insert(
                 "revenue".to_owned(),
                 number_value(round(amount * 0.0025, 4)),
@@ -1099,6 +1293,14 @@ fn enrich_realistic_data(
         "account.plan_changed" => {
             data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
             data.insert("service".to_owned(), Value::String("billing".to_owned()));
+            let plan = rng.choose_str(&["free", "free", "plus", "team", "team", "enterprise"]);
+            let previous_plan = match plan {
+                "free" => "trial",
+                "plus" => "free",
+                "team" => rng.choose_str(&["free", "plus"]),
+                "enterprise" => "team",
+                _ => "free",
+            };
             data.insert(
                 "name".to_owned(),
                 Value::String("account.plan_changed".to_owned()),
@@ -1116,6 +1318,7 @@ fn enrich_realistic_data(
         "account.risk_tier_changed" => {
             data.insert("signal".to_owned(), Value::String("analytics".to_owned()));
             data.insert("service".to_owned(), Value::String("risk".to_owned()));
+            let risk_tier = rng.choose_str(&["low", "low", "medium", "medium", "high"]);
             data.insert(
                 "name".to_owned(),
                 Value::String("account.risk_tier_changed".to_owned()),
@@ -1151,22 +1354,17 @@ fn enrich_realistic_data(
             data.insert("signal".to_owned(), Value::String("trace".to_owned()));
             data.insert(
                 "service".to_owned(),
-                Value::String("atlas-agent".to_owned()),
+                Value::String("codex-orchestrator".to_owned()),
             );
-            data.insert("name".to_owned(), Value::String(event_type));
-            data.insert("conversation_id".to_owned(), Value::String(conversation_id));
-            data.insert(
-                "thread_id".to_owned(),
-                Value::String(scenario.thread_id.clone()),
-            );
+            data.insert("name".to_owned(), Value::String(event_type.clone()));
             data.insert("duration_ms".to_owned(), Value::from(scenario.duration_ms));
             data.insert(
                 "agent".to_owned(),
                 json!({
-                    "type": rng.choose_str(&["support", "trading_assistant", "risk_reviewer", "portfolio_coach"]),
-                    "workflow_state": rng.choose_str(&["classified", "planned", "tool_wait", "responding", "escalated"]),
-                    "intent": rng.choose_str(&["portfolio_question", "trade_help", "billing_support", "risk_review"]),
-                    "decision": rng.choose_str(&["answer", "retrieve", "call_tool", "escalate", "refuse"])
+                    "type": scenario.workflow.agent_type(),
+                    "workflow_state": rng.choose_str(&["classified", "planned", "tool_wait", "patching", "responding"]),
+                    "intent": workflow_intent(scenario.workflow),
+                    "decision": rng.choose_str(&["answer", "retrieve", "call_tool", "patch_files", "refuse"])
                 }),
             );
         }
@@ -1194,15 +1392,7 @@ fn enrich_realistic_data(
             );
             data.insert(
                 "llm".to_owned(),
-                json!({
-                    "provider": rng.choose_str(&["openai", "anthropic", "google"]),
-                    "model": scenario.model,
-                    "finish_reason": scenario.finish_reason,
-                    "cached_input_tokens": rng.range(0, input_tokens / 2),
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": total_tokens
-                }),
+                codex_llm_call_payload(scenario, input_tokens, output_tokens, total_tokens, rng),
             );
         }
         "tool.call" => {
@@ -1217,15 +1407,7 @@ fn enrich_realistic_data(
                 "credits_used".to_owned(),
                 number_value(round(rng.float_range(0.1, 18.0), 2)),
             );
-            data.insert(
-                "tool".to_owned(),
-                json!({
-                    "name": rng.choose_str(&["get_positions", "submit_order", "search_knowledge_base", "create_support_ticket", "run_risk_check"]),
-                    "status": if scenario.is_error { "error" } else { "ok" },
-                    "attempt": rng.range(1, 3),
-                    "result_count": rng.range(0, 50)
-                }),
-            );
+            data.insert("tool".to_owned(), codex_tool_payload(scenario, rng, true));
         }
         "retrieval.step" => {
             data.insert("signal".to_owned(), Value::String("trace".to_owned()));
@@ -1238,11 +1420,14 @@ fn enrich_realistic_data(
             data.insert(
                 "retrieval".to_owned(),
                 json!({
-                    "index": rng.choose_str(&["support_articles", "trade_docs", "risk_policies", "portfolio_notes"]),
+                    "index": scenario.retrieval_index,
                     "query_type": rng.choose_str(&["hybrid", "vector", "keyword"]),
+                    "query": retrieval_query(scenario.workflow, rng),
                     "top_k": rng.range(3, 30),
                     "hit_count": rng.range(0, 30),
-                    "max_score": round(rng.float_range(0.15, 0.98), 4)
+                    "max_score": round(rng.float_range(0.15, 0.98), 4),
+                    "reranked": rng.chance(72, 100),
+                    "namespace": rng.choose_str(&["workspace", "repo", "memory", "docs"])
                 }),
             );
         }
@@ -1257,7 +1442,7 @@ fn enrich_realistic_data(
             data.insert(
                 "eval".to_owned(),
                 json!({
-                    "name": rng.choose_str(&["answer_groundedness", "tool_correctness", "latency_budget", "policy_compliance"]),
+                    "name": rng.choose_str(&["answer_groundedness", "tool_correctness", "latency_budget", "policy_compliance", "patch_quality", "canvas_layout"]),
                     "score": round(rng.float_range(0.0, 1.0), 4),
                     "passed": !scenario.is_error
                 }),
@@ -1274,16 +1459,17 @@ fn enrich_realistic_data(
             data.insert(
                 "safety".to_owned(),
                 json!({
-                    "policy": rng.choose_str(&["trading_advice", "privacy", "fraud", "prompt_injection"]),
+                    "policy": rng.choose_str(&["prompt_injection", "secrets_exposure", "exfiltration", "unsafe_shell", "copyright"]),
                     "action": rng.choose_str(&["allow", "warn", "block", "escalate"]),
-                    "severity": rng.choose_str(&["low", "medium", "high"])
+                    "severity": rng.choose_str(&["low", "medium", "high"]),
+                    "surface": rng.choose_str(&["prompt", "tool_output", "file_read", "image_upload", "browser_result"])
                 }),
             );
         }
         "processor.run" | "processor.backfill_slice" | "processor.report_materialized" => {
             data.insert("signal".to_owned(), Value::String("pipeline".to_owned()));
             data.insert("service".to_owned(), Value::String("processor".to_owned()));
-            data.insert("name".to_owned(), Value::String(event_type));
+            data.insert("name".to_owned(), Value::String(event_type.clone()));
             data.insert("duration_ms".to_owned(), Value::from(rng.range(50, 30_000)));
             data.insert(
                 "rows_scanned".to_owned(),
@@ -1297,9 +1483,9 @@ fn enrich_realistic_data(
                 "processor".to_owned(),
                 json!({
                     "id": format!("proc_{}", rng.range(1, 32)),
-                    "kind": rng.choose_str(&["definition_backfill", "report_refresh", "rollup_builder", "field_indexer"]),
+                    "kind": rng.choose_str(&["session_rollup", "trace_summary", "token_rollup", "field_indexer", "conversation_compaction"]),
                     "status": if scenario.is_error { "failed" } else { rng.choose_str(&["completed", "completed", "running"]) },
-                    "definition_id": format!("def_{}", rng.choose_str(&["service", "account_plan", "duration_ms", "llm_tokens"])),
+                    "definition_id": format!("def_{}", rng.choose_str(&["service", "model", "duration_ms", "total_tokens", "tool_name"])),
                     "slice_seconds": rng.choose_str(&["60", "300", "900"])
                 }),
             );
@@ -1361,8 +1547,51 @@ fn apply_llm_loadtest_data(
         "finishReason".to_owned(),
         Value::String(finish_reason.to_owned()),
     );
-    llm.insert("messages".to_owned(), Value::Array(Vec::new()));
+    llm.insert(
+        "messages".to_owned(),
+        Value::Array(vec![
+            json!({
+                "role": "system",
+                "content": "You are Codex, a coding agent. Read the repo, reason about the task, and make grounded code changes."
+            }),
+            json!({
+                "role": "user",
+                "content": llm_profile_prompt(seq)
+            }),
+        ]),
+    );
+    llm.insert(
+        "request".to_owned(),
+        json!({
+            "endpoint": "/v1/chat/completions",
+            "stream": true,
+            "service_tier": rng.choose_str(&["priority", "default", "flex"]),
+            "parallel_tool_calls": rng.chance(35, 100),
+            "reasoning_effort": rng.choose_str(&["none", "low", "medium", "high"]),
+            "temperature": round(rng.float_range(0.0, 0.8), 2),
+            "max_output_tokens": rng.range(512, 8_192)
+        }),
+    );
+    llm.insert(
+        "response".to_owned(),
+        json!({
+            "provider_request_id": format!("oai_{}", stable_hex(run_id, "provider-request", seq, 16)),
+            "finish_reason": finish_reason,
+            "tool_call_count": if finish_reason == "tool-calls" { rng.range(1, 4) } else { 0 }
+        }),
+    );
     llm.insert("totalUsage".to_owned(), usage);
+}
+
+fn llm_profile_prompt(seq: u64) -> &'static str {
+    match seq % 6 {
+        0 => "Find the root cause of the flaky test and patch it.",
+        1 => "Inspect the UI route and explain why the histogram is hidden.",
+        2 => "Search the codebase for tool execution flow and summarize it.",
+        3 => "Update the canvas layout to avoid label overlap on mobile.",
+        4 => "Review the deploy failure after the ClickHouse schema change.",
+        _ => "Generate a screenshot-ready image that matches the product UI.",
+    }
 }
 
 fn llm_model(rng: &mut TinyRng) -> &'static str {
@@ -1438,19 +1667,26 @@ struct Scenario {
     environment: &'static str,
     method: &'static str,
     route: &'static str,
+    workflow: CodexWorkflow,
     status_code: u16,
     duration_ms: u64,
     is_error: bool,
     user_id: String,
     session_id: String,
     account_id: String,
+    conversation_id: String,
     trace_id: String,
     span_id: String,
     parent_span_id: String,
     run_id: String,
     thread_id: String,
     canvas_id: String,
+    workspace_id: String,
+    file_id: String,
     message_id: String,
+    tool_name: &'static str,
+    tool_sandbox: &'static str,
+    retrieval_index: &'static str,
     model: &'static str,
     finish_reason: &'static str,
     turn: u64,
@@ -1475,29 +1711,28 @@ impl Scenario {
         trace_depth: u64,
         deep_trace: bool,
     ) -> Self {
+        const EVENTS_PER_CODEX_TRACE: u64 = 24;
+
         let hierarchy = Hierarchy::new(run_id, seq, trace_depth, deep_trace);
-        let route = rng.choose_str(&[
-            "/checkout",
-            "/api/canvases/{canvas_id}",
-            "/api/canvas-events",
-            "/cart",
-            "/orders/{order_id}",
-            "/api/traces",
-            "/api/canvas/{document_id}",
-            "/v1/chat/completions",
-            "/health",
-        ]);
+        let trace_group = seq / EVENTS_PER_CODEX_TRACE;
+        let mut trace_rng = TinyRng::new(seed_for(run_id, "codex-trace", trace_group));
+        let workflow = CodexWorkflow::for_group(trace_group);
+        let route = route_for_workflow(workflow, &mut trace_rng);
         let method = match route {
-            "/health" => "GET",
-            "/v1/chat/completions" | "/checkout" | "/api/traces" | "/api/canvas-events" => "POST",
-            _ => rng.choose_str(&["GET", "POST", "PATCH"]),
+            "/healthz" => "GET",
+            "/v1/chat/completions"
+            | "/v1/responses"
+            | "/api/traces"
+            | "/api/canvas-events"
+            | "/api/tools/execute" => "POST",
+            _ => trace_rng.choose_str(&["GET", "POST", "PATCH"]),
         };
         let error_rate = match route {
-            "/checkout" => 3,
             "/api/canvases/{canvas_id}" | "/api/canvas/{document_id}" => 1,
             "/api/canvas-events" => 1,
-            "/v1/chat/completions" => 2,
-            "/health" => 1,
+            "/v1/chat/completions" | "/v1/responses" => 2,
+            "/api/tools/execute" => 3,
+            "/healthz" => 1,
             _ => 2,
         };
         let is_error = rng.chance(error_rate, 100);
@@ -1516,8 +1751,9 @@ impl Scenario {
             rng.range(250, 4_500)
         } else {
             match route {
-                "/health" => rng.range(3, 30),
-                "/v1/chat/completions" => rng.range(700, 9_000),
+                "/healthz" => rng.range(3, 30),
+                "/v1/chat/completions" | "/v1/responses" => rng.range(700, 9_000),
+                "/api/tools/execute" => rng.range(40, 2_400),
                 "/api/canvas/{document_id}" | "/api/canvases/{canvas_id}" => rng.range(80, 1_800),
                 _ => rng.range(20, 650),
             }
@@ -1533,27 +1769,78 @@ impl Scenario {
             rng,
         );
         let (start_time, end_time) = span_times(now, duration_ms, rng);
+        let tool_name = match workflow {
+            CodexWorkflow::CanvasEdit => {
+                trace_rng.choose_str(&["browser.open", "fs.write", "search.code"])
+            }
+            CodexWorkflow::DocsLookup => {
+                trace_rng.choose_str(&["search.code", "fs.read", "mcp.query"])
+            }
+            CodexWorkflow::ImageGeneration => {
+                trace_rng.choose_str(&["image.generate", "fs.read", "browser.open"])
+            }
+            _ => trace_rng.choose_str(&[
+                "shell.exec",
+                "fs.read",
+                "fs.write",
+                "git.status",
+                "search.code",
+                "mcp.query",
+            ]),
+        };
+        let tool_sandbox = match tool_name {
+            "image.generate" => "image",
+            "browser.open" => "browser",
+            "shell.exec" => "workspace-write",
+            _ => "default",
+        };
+        let retrieval_index = match workflow {
+            CodexWorkflow::DocsLookup => {
+                trace_rng.choose_str(&["openai-docs", "tool-docs", "conversation-memory"])
+            }
+            CodexWorkflow::CanvasEdit => {
+                trace_rng.choose_str(&["workspace-files", "repo-code", "conversation-memory"])
+            }
+            _ => trace_rng.choose_str(&[
+                "workspace-files",
+                "repo-code",
+                "conversation-memory",
+                "tool-docs",
+            ]),
+        };
 
         Self {
-            service: service_for_route(route, rng),
-            environment: rng.choose_str(&["prod", "prod", "prod", "staging", "canary"]),
+            service: service_for_route(route, &mut trace_rng),
+            environment: trace_rng.choose_str(&["prod", "prod", "prod", "staging", "canary"]),
             method,
             route,
+            workflow,
             status_code,
             duration_ms,
             is_error,
             user_id: hierarchy.user_id,
             session_id: hierarchy.session_id,
             account_id: hierarchy.account_id,
+            conversation_id: uuid_like(&mut trace_rng),
             trace_id: hierarchy.trace_id,
             span_id: hierarchy.span_id,
             parent_span_id: hierarchy.parent_span_id,
             run_id: uuid_like(rng),
-            thread_id: uuid_like(rng),
-            canvas_id: uuid_like(rng),
+            thread_id: uuid_like(&mut trace_rng),
+            canvas_id: uuid_like(&mut trace_rng),
+            workspace_id: uuid_like(&mut trace_rng),
+            file_id: uuid_like(&mut trace_rng),
             message_id: uuid_like(rng),
-            model: llm_model(rng),
-            finish_reason: rng.choose_str(&["stop", "tool-calls", "length", "content-filter"]),
+            tool_name,
+            tool_sandbox,
+            retrieval_index,
+            model: llm_model(&mut trace_rng),
+            finish_reason: trace_rng.choose_str(&[
+                "stop",
+                "tool-calls",
+                "length",
+                "content-filter",
+            ]),
             turn: rng.range(1, 80),
             start_time,
             end_time,
@@ -1584,6 +1871,250 @@ impl Scenario {
             )
         }
     }
+}
+
+fn route_for_workflow(workflow: CodexWorkflow, rng: &mut TinyRng) -> &'static str {
+    match workflow {
+        CodexWorkflow::CodeEdit | CodexWorkflow::DebugFailure | CodexWorkflow::ReviewFix => {
+            rng.choose_str(&["/v1/responses", "/api/workspaces/{workspace_id}/patch"])
+        }
+        CodexWorkflow::CanvasEdit => {
+            rng.choose_str(&["/api/canvases/{canvas_id}", "/api/canvas-events"])
+        }
+        CodexWorkflow::DocsLookup => rng.choose_str(&["/api/threads/{thread_id}", "/v1/responses"]),
+        CodexWorkflow::ImageGeneration => {
+            rng.choose_str(&["/v1/responses", "/api/files/{file_id}"])
+        }
+    }
+}
+
+fn workflow_intent(workflow: CodexWorkflow) -> &'static str {
+    match workflow {
+        CodexWorkflow::CodeEdit => "edit_code",
+        CodexWorkflow::DebugFailure => "debug_failure",
+        CodexWorkflow::CanvasEdit => "generate_ui",
+        CodexWorkflow::DocsLookup => "explain_repo",
+        CodexWorkflow::ImageGeneration => "generate_image",
+        CodexWorkflow::ReviewFix => "address_review",
+    }
+}
+
+fn log_agent_phase(scenario: &Scenario, rng: &mut TinyRng) -> &'static str {
+    match scenario.workflow {
+        CodexWorkflow::CodeEdit | CodexWorkflow::ReviewFix => {
+            rng.choose_str(&["planning", "patching", "verifying", "responding"])
+        }
+        CodexWorkflow::DebugFailure => {
+            rng.choose_str(&["investigating", "tool_wait", "patching", "responding"])
+        }
+        CodexWorkflow::CanvasEdit => {
+            rng.choose_str(&["planning", "editing", "previewing", "responding"])
+        }
+        CodexWorkflow::DocsLookup => rng.choose_str(&["searching", "reading", "summarizing"]),
+        CodexWorkflow::ImageGeneration => rng.choose_str(&["prompting", "rendering", "reviewing"]),
+    }
+}
+
+fn log_event_name(scenario: &Scenario, fixture_name: &str) -> &'static str {
+    match fixture_name {
+        "log_variation_code_success" => "patch.apply.completed",
+        "log_variation_excalidraw" => "canvas.snapshot.saved",
+        "log_variation_image_gen" => "image.generation.completed",
+        _ => {
+            if scenario.route == "/v1/responses" || scenario.route == "/v1/chat/completions" {
+                "response.stream.completed"
+            } else {
+                "agent.step.completed"
+            }
+        }
+    }
+}
+
+fn log_event_message(scenario: &Scenario, fixture_name: &str, rng: &mut TinyRng) -> String {
+    match fixture_name {
+        "log_variation_code_success" => format!(
+            "applied patch to {} and verified the focused test path",
+            rng.choose(&[
+                "loader schema",
+                "query builder",
+                "UI route",
+                "loadtest generator"
+            ])
+        ),
+        "log_variation_excalidraw" => {
+            "saved updated canvas layout after fixing overlap and spacing regressions".to_owned()
+        }
+        "log_variation_image_gen" => {
+            "completed image generation pass and attached a new bitmap artifact".to_owned()
+        }
+        _ => match scenario.workflow {
+            CodexWorkflow::DocsLookup => {
+                "retrieved the relevant repo and docs context for the current request".to_owned()
+            }
+            CodexWorkflow::DebugFailure => {
+                "captured the failure path and prepared a schema-compatible fix".to_owned()
+            }
+            _ => "response stream finished after tool-assisted generation".to_owned(),
+        },
+    }
+}
+
+fn codex_tool_payload(scenario: &Scenario, rng: &mut TinyRng, include_io: bool) -> Value {
+    let exit_code = if scenario.is_error {
+        rng.range(1, 2)
+    } else {
+        0
+    };
+    let mut payload = json!({
+        "name": scenario.tool_name,
+        "status": if scenario.is_error { "error" } else { "ok" },
+        "attempt": rng.range(1, 3),
+        "result_count": rng.range(0, 50),
+        "latency_class": rng.choose_str(&["fast", "medium", "slow"]),
+        "sandbox": scenario.tool_sandbox,
+        "workspace_id": scenario.workspace_id,
+        "arguments": tool_arguments(scenario),
+        "exit_code": exit_code
+    });
+    if include_io {
+        payload["bytes_read"] = Value::from(rng.range(256, 2_500_000));
+        payload["bytes_written"] = Value::from(rng.range(0, 400_000));
+    }
+    payload
+}
+
+fn tool_arguments(scenario: &Scenario) -> Value {
+    match scenario.tool_name {
+        "shell.exec" => json!({"cmd": "cargo test -p nanotrace-loadtest", "workdir": "/workspace"}),
+        "fs.read" => json!({"path": format!("apps/ui/src/routes/{}.tsx", scenario.file_id)}),
+        "fs.write" => json!({"path": format!("apps/server/src/{}.rs", scenario.file_id)}),
+        "git.status" => json!({}),
+        "search.code" => json!({"query": "fetchDensity histogram groupBy", "path": "/workspace"}),
+        "browser.open" => json!({"url": "http://localhost:3000"}),
+        "image.generate" => {
+            json!({"prompt": "Generate a product hero image matching the current UI"})
+        }
+        "mcp.query" => json!({"server": "openaiDeveloperDocs", "topic": "responses api"}),
+        _ => json!({}),
+    }
+}
+
+fn retrieval_query(workflow: CodexWorkflow, rng: &mut TinyRng) -> &'static str {
+    match workflow {
+        CodexWorkflow::CodeEdit => rng.choose_str(&[
+            "applyPatch helper",
+            "loader schema recreate",
+            "trace density query",
+        ]),
+        CodexWorkflow::DebugFailure => rng.choose_str(&[
+            "ClickHouse ORDER BY duplicate",
+            "Pulumi launch template refresh",
+            "SQS backlog drain",
+        ]),
+        CodexWorkflow::CanvasEdit => rng.choose_str(&[
+            "DensityHistogramCanvas",
+            "canvas overlap mobile",
+            "iframe visualization sizing",
+        ]),
+        CodexWorkflow::DocsLookup => rng.choose_str(&[
+            "tool execution flow",
+            "MCP query path",
+            "responses api reasoning effort",
+        ]),
+        CodexWorkflow::ImageGeneration => rng.choose_str(&[
+            "image generation asset pipeline",
+            "bitmap hero asset",
+            "product screenshot prompt",
+        ]),
+        CodexWorkflow::ReviewFix => rng.choose_str(&[
+            "requested changes failing tests",
+            "PR review comment",
+            "behavior regression summary",
+        ]),
+    }
+}
+
+fn codex_llm_call_payload(
+    scenario: &Scenario,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    rng: &mut TinyRng,
+) -> Value {
+    json!({
+        "provider": rng.choose_str(&["openai", "anthropic", "google"]),
+        "model": scenario.model,
+        "finish_reason": scenario.finish_reason,
+        "service_tier": rng.choose_str(&["priority", "default", "flex"]),
+        "stream": rng.chance(82, 100),
+        "parallel_tool_calls": rng.chance(35, 100),
+        "reasoning_effort": rng.choose_str(&["none", "low", "medium", "high"]),
+        "cached_input_tokens": rng.range(0, input_tokens / 2),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "provider_request_id": format!("req_{}", stable_hex(&scenario.run_id, "provider", scenario.turn, 18)),
+        "temperature": round(rng.float_range(0.0, 0.8), 2),
+        "max_output_tokens": rng.range(512, 8_192),
+        "tool_choice": if scenario.workflow == CodexWorkflow::DocsLookup { "auto" } else { rng.choose_str(&["auto", "required", "none"]) },
+        "messages": [
+            {
+                "role": "system",
+                "content": scenario.workflow.system_prompt()
+            },
+            {
+                "role": "user",
+                "content": scenario.workflow.user_prompt()
+            },
+            {
+                "role": "assistant",
+                "content": scenario.workflow.assistant_summary()
+            }
+        ],
+        "tools": [
+            {
+                "name": scenario.tool_name,
+                "type": "function"
+            }
+        ],
+        "response": {
+            "status": if scenario.is_error { "error" } else { "completed" },
+            "output_items": if scenario.finish_reason == "tool-calls" { rng.range(1, 4) } else { 1 }
+        }
+    })
+}
+
+fn codex_llm_log_payload(scenario: &Scenario, rng: &mut TinyRng) -> Value {
+    let usage = llm_total_usage(scenario.model, scenario.finish_reason, rng);
+    json!({
+        "provider": "openai",
+        "model": scenario.model,
+        "finishReason": scenario.finish_reason,
+        "messages": [
+            {
+                "role": "system",
+                "content": scenario.workflow.system_prompt()
+            },
+            {
+                "role": "user",
+                "content": scenario.workflow.user_prompt()
+            }
+        ],
+        "request": {
+            "endpoint": if scenario.route == "/v1/responses" { "/v1/responses" } else { "/v1/chat/completions" },
+            "stream": true,
+            "serviceTier": rng.choose_str(&["priority", "default", "flex"]),
+            "parallelToolCalls": rng.chance(35, 100),
+            "reasoningEffort": rng.choose_str(&["none", "low", "medium", "high"]),
+            "toolChoice": rng.choose_str(&["auto", "required", "none"])
+        },
+        "response": {
+            "providerRequestId": format!("oai_{}", stable_hex(&scenario.run_id, "log-provider", scenario.turn, 16)),
+            "status": if scenario.is_error { "error" } else { "completed" },
+            "finishReason": scenario.finish_reason
+        },
+        "totalUsage": usage
+    })
 }
 
 struct Hierarchy {
@@ -1739,7 +2270,7 @@ fn realistic_scalar_value(
             rng.choose(&["INFO", "DEBUG"]).to_string()
         }),
         "severity_number" => Value::from(if scenario.is_error { 17 } else { 9 }),
-        "name" if parent_key != "llm" => Value::String(scenario.span_name()),
+        "name" if parent_key.is_empty() => Value::String(scenario.span_name()),
         "message" => Value::String(scenario.log_message()),
         "metric_value" => number_like(current, scenario.metric_value),
         "value" if parent_key.contains("metric") => number_like(current, scenario.metric_value),
@@ -1793,12 +2324,12 @@ fn realistic_scalar_value(
                 .to_string(),
         ),
         "content" if current.is_string() => Value::String(llm_content(parent_key, scenario, rng)),
-        "title" => Value::String(
+        "title" if parent_key.is_empty() => Value::String(
             rng.choose(&[
-                "Checkout trace review",
-                "Canvas lesson draft",
-                "Latency investigation",
-                "Ingest smoke test",
+                "Patch review for loader schema",
+                "Canvas layout revision",
+                "Latency investigation for tool execution",
+                "Ingest smoke test for responses API",
             ])
             .to_string(),
         ),
@@ -1824,11 +2355,17 @@ fn metric_scenario(
         "metric_histogram" | "metric" => "http.server.duration",
         "metric_runtime" => "runtime.queue.depth",
         _ => match route {
-            "/v1/chat/completions" => {
-                rng.choose_str(&["llm.tokens", "llm.duration", "llm.requests"])
-            }
+            "/v1/chat/completions" | "/v1/responses" => rng.choose_str(&[
+                "llm.tokens",
+                "llm.duration",
+                "llm.requests",
+                "llm.stream_chunks",
+            ]),
             "/api/canvas/{document_id}" => {
                 rng.choose_str(&["canvas.tool.duration", "canvas.elements.changed"])
+            }
+            "/api/tools/execute" => {
+                rng.choose_str(&["tool.duration", "tool.requests", "tool.result_count"])
             }
             _ => rng.choose_str(&[
                 "http.server.duration",
@@ -1843,12 +2380,17 @@ fn metric_scenario(
         "http.server.duration" | "llm.duration" | "canvas.tool.duration" => {
             (metric_name, "histogram", "ms", duration_ms as f64)
         }
+        "tool.duration" => (metric_name, "histogram", "ms", duration_ms as f64),
         "http.server.requests" | "llm.requests" => {
             (metric_name, "counter", "1", rng.range(1, 20) as f64)
+        }
+        "tool.requests" | "llm.stream_chunks" => {
+            (metric_name, "counter", "1", rng.range(1, 80) as f64)
         }
         "runtime.queue.depth" | "canvas.elements.changed" => {
             (metric_name, "gauge", "1", queue_depth.max(1) as f64)
         }
+        "tool.result_count" => (metric_name, "gauge", "1", rng.range(0, 120) as f64),
         "process.memory.usage" => (metric_name, "gauge", "By", memory_bytes as f64),
         "llm.tokens" => (
             metric_name,
@@ -1866,12 +2408,17 @@ fn metric_scenario(
 
 fn service_for_route(route: &str, rng: &mut TinyRng) -> &'static str {
     match route {
-        "/checkout" | "/cart" | "/orders/{order_id}" => {
-            rng.choose_str(&["api", "checkout", "payments"])
+        "/v1/chat/completions" | "/v1/responses" => {
+            rng.choose_str(&["llm-gateway", "codex-orchestrator", "canvas-agent"])
         }
-        "/v1/chat/completions" => rng.choose_str(&["llm-gateway", "canvas-agent"]),
         "/api/canvas/{document_id}" | "/api/canvases/{canvas_id}" | "/api/canvas-events" => {
-            rng.choose_str(&["api", "canvas-agent"])
+            rng.choose_str(&["api", "canvas-agent", "document-sync"])
+        }
+        "/api/tools/execute" => rng.choose_str(&["tool-runner", "workspace-exec"]),
+        "/api/threads/{thread_id}" => rng.choose_str(&["conversation-store", "codex-orchestrator"]),
+        "/api/files/{file_id}" => rng.choose_str(&["workspace-files", "artifact-store"]),
+        "/api/workspaces/{workspace_id}/patch" => {
+            rng.choose_str(&["workspace-patcher", "tool-runner"])
         }
         "/api/traces" => rng.choose_str(&["api", "ingest"]),
         _ => rng.choose_str(&["api", "worker"]),
@@ -2572,9 +3119,14 @@ fn list_env(key: &str, fallback: &[u64]) -> Result<Vec<u64>> {
 fn load_profile_env() -> Result<LoadProfile> {
     match env::var("NANOTRACE_LOADTEST_PROFILE") {
         Ok(value)
-            if value.eq_ignore_ascii_case("atlas")
-                || value.eq_ignore_ascii_case("mixed")
-                || value.eq_ignore_ascii_case("atlas_mixed") =>
+            if value.eq_ignore_ascii_case("codex")
+                || value.eq_ignore_ascii_case("codex_mixed")
+                || value.eq_ignore_ascii_case("mixed") =>
+        {
+            Ok(LoadProfile::Codex)
+        }
+        Ok(value)
+            if value.eq_ignore_ascii_case("atlas") || value.eq_ignore_ascii_case("atlas_mixed") =>
         {
             Ok(LoadProfile::Atlas)
         }
@@ -2639,9 +3191,9 @@ fn load_profile_env() -> Result<LoadProfile> {
             Ok(LoadProfile::Fixture)
         }
         Ok(value) => bail!(
-            "NANOTRACE_LOADTEST_PROFILE must be atlas, llm, realistic, trace, metrics, logs, product, agent, processor, fixture, default, or static; got {value}"
+            "NANOTRACE_LOADTEST_PROFILE must be codex, atlas, llm, realistic, trace, metrics, logs, product, agent, processor, fixture, default, or static; got {value}"
         ),
-        Err(_) => Ok(LoadProfile::Fixture),
+        Err(_) => Ok(LoadProfile::Codex),
     }
 }
 
@@ -2687,10 +3239,7 @@ mod tests {
         let object = event.as_object().expect("event object");
 
         assert!(
-            object["event_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("test-run-")
+            Uuid::parse_str(object["event_id"].as_str().unwrap()).is_ok()
         );
         assert!(object.get("tenant_id").is_none());
         assert!(object.get("service").is_none());
@@ -2711,9 +3260,10 @@ mod tests {
         let first = make_event(&context, "test_mix").expect("first event");
         let second = make_event(&context, "test_mix").expect("second event");
 
-        assert_eq!(first["event_id"], "test-run-2");
+        assert!(Uuid::parse_str(first["event_id"].as_str().expect("first event id")).is_ok());
         assert_eq!(first["data"]["_loadtest"]["sequence"], 2);
-        assert_eq!(second["event_id"], "test-run-6");
+        assert!(Uuid::parse_str(second["event_id"].as_str().expect("second event id")).is_ok());
+        assert_ne!(first["event_id"], second["event_id"]);
         assert_eq!(second["data"]["_loadtest"]["sequence"], 6);
     }
 
@@ -2818,6 +3368,30 @@ mod tests {
         assert!(is_processor_fixture(
             &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Processor).name
         ));
+        assert_eq!(
+            choose_fixture(&fixtures, 4, 0.10, LoadProfile::Codex).name,
+            "llm_call"
+        );
+        assert_eq!(
+            choose_fixture(&fixtures, 6, 0.10, LoadProfile::Codex).name,
+            "tool_call"
+        );
+        assert_eq!(
+            choose_fixture(&fixtures, 1, 0.10, LoadProfile::Codex).name,
+            "agent_request"
+        );
+        assert_eq!(
+            choose_fixture(&fixtures, 23, 0.10, LoadProfile::Codex).name,
+            "span_end"
+        );
+        assert_eq!(
+            choose_fixture(&fixtures, 18, 0.10, LoadProfile::Codex).name,
+            "safety_event"
+        );
+        assert_eq!(
+            choose_fixture(&fixtures, 46, 0.10, LoadProfile::Codex).name,
+            "eval_score"
+        );
         assert!(matches!(
             choose_fixture(&fixtures, 50, 0.10, LoadProfile::Atlas)
                 .body
@@ -2925,7 +3499,9 @@ mod tests {
         let total = usage["totalTokens"].as_u64().unwrap();
 
         assert_eq!(data["event_type"], "log");
-        assert_eq!(llm["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(llm["messages"].as_array().unwrap().len(), 2);
+        assert!(llm["request"].is_object());
+        assert!(llm["response"].is_object());
         assert_eq!(
             usage["inputTokenDetails"]["cacheReadTokens"]
                 .as_u64()
@@ -2941,6 +3517,125 @@ mod tests {
         );
         assert_eq!(output, reasoning + text);
         assert_eq!(total, input + output);
+    }
+
+    #[test]
+    fn codex_profile_generates_correlated_workflow_events() {
+        let context = test_context_with_profile(LoadProfile::Codex);
+
+        let first = make_event(&context, "codex_mix").expect("first event");
+        let second = make_event(&context, "codex_mix").expect("second event");
+        let llm = (0..3)
+            .map(|_| make_event(&context, "codex_mix").expect("event"))
+            .last()
+            .expect("llm event");
+        let first_data = first["data"].as_object().expect("first data");
+        let second_data = second["data"].as_object().expect("second data");
+        let llm_data = llm["data"].as_object().expect("llm data");
+
+        assert_eq!(first_data["event_type"], "span_start");
+        assert_eq!(second_data["event_type"], "agent.request");
+        assert_eq!(first_data["trace_id"], second_data["trace_id"]);
+        assert_eq!(llm_data["event_type"], "llm.call");
+        assert_eq!(llm_data["trace_id"], first_data["trace_id"]);
+        assert!(llm_data["llm"]["messages"].is_array());
+        assert!(llm_data["llm"]["tools"].is_array());
+    }
+
+    #[test]
+    fn codex_profile_keeps_route_method_and_environment_consistent_within_trace() {
+        let context = test_context_with_profile(LoadProfile::Codex);
+        let events = (0..24)
+            .map(|_| make_event(&context, "codex_mix").expect("event"))
+            .collect::<Vec<_>>();
+
+        let trace_id = events[0]["data"]["trace_id"].clone();
+        let environment = events
+            .iter()
+            .find_map(|event| event["data"].get("environment").cloned())
+            .expect("environment present");
+        let route = events
+            .iter()
+            .find_map(|event| event["data"].get("http.route").cloned())
+            .expect("route present");
+        let method = events
+            .iter()
+            .find_map(|event| event["data"].get("http.method").cloned())
+            .expect("method present");
+
+        for event in &events {
+            let data = event["data"].as_object().expect("data object");
+            if let Some(value) = data.get("trace_id") {
+                assert_eq!(value, &trace_id);
+            }
+            if let Some(value) = data.get("environment") {
+                assert_eq!(value, &environment);
+            }
+            if let Some(value) = data.get("http.route") {
+                assert_eq!(value, &route);
+            }
+            if let Some(value) = data.get("http.method") {
+                assert_eq!(value, &method);
+            }
+        }
+    }
+
+    #[test]
+    fn realistic_mutation_does_not_overwrite_nested_tool_name_with_route_name() {
+        let context = test_context_with_profile(LoadProfile::Codex);
+        context.config.event_seq.store(2, Ordering::Relaxed);
+
+        let event = make_event(&context, "codex_mix").expect("event");
+        let tool_name = event["data"]["tool"]["name"]
+            .as_str()
+            .expect("tool name string");
+        assert!(!tool_name.contains("/api/"));
+        assert!(!tool_name.contains("/v1/"));
+    }
+
+    #[test]
+    fn bundled_codex_fixtures_preserve_shape_under_realistic_mutation() {
+        let fixtures = load_fixtures(&repo_root()).expect("load fixtures");
+        let names = [
+            "log",
+            "log_variation_code_success",
+            "log_variation_excalidraw",
+            "log_variation_image_gen",
+            "llm_call",
+            "tool_call",
+            "retrieval_step",
+            "agent_request",
+            "agent_decision",
+            "safety_event",
+            "eval_score",
+            "metric",
+            "metric_counter",
+            "metric_histogram",
+            "metric_runtime",
+            "span_start",
+            "span_end",
+        ];
+
+        for (index, name) in names.iter().enumerate() {
+            let fixture =
+                find_fixture(&fixtures, name).unwrap_or_else(|| panic!("missing fixture {name}"));
+            let original = fixture.body["data"]
+                .as_object()
+                .expect("fixture data object");
+            let mut mutated = original.clone();
+
+            randomize_realistic_data(
+                &mut mutated,
+                &fixture.name,
+                "test-run",
+                index as u64,
+                "2026-05-12T00:00:00.000Z",
+                96,
+                false,
+            );
+
+            assert_shape_preserved(original, &mutated, &format!("fixture {name}"));
+        }
     }
 
     #[test]
@@ -2983,6 +3678,73 @@ mod tests {
 
     fn test_context() -> LoadContext {
         test_context_with_profile(LoadProfile::Fixture)
+    }
+
+    fn find_fixture<'a>(fixtures: &'a Fixtures, name: &str) -> Option<&'a Fixture> {
+        fixtures
+            .log_variations
+            .iter()
+            .chain(fixtures.metric_fixtures.iter())
+            .chain(fixtures.trace_fixtures.iter())
+            .chain(fixtures.product_fixtures.iter())
+            .chain(fixtures.agent_fixtures.iter())
+            .chain(fixtures.processor_fixtures.iter())
+            .chain(fixtures.rest.iter())
+            .chain(std::iter::once(&fixtures.log))
+            .find(|fixture| fixture.name == name)
+    }
+
+    fn assert_shape_preserved(
+        original: &Map<String, Value>,
+        mutated: &Map<String, Value>,
+        context: &str,
+    ) {
+        for (key, original_value) in original {
+            let Some(mutated_value) = mutated.get(key) else {
+                panic!("missing key {key} in {context}");
+            };
+            assert_json_shape_preserved(original_value, mutated_value, &format!("{context}.{key}"));
+        }
+    }
+
+    fn assert_json_shape_preserved(original: &Value, mutated: &Value, path: &str) {
+        match (original, mutated) {
+            (Value::Object(original_map), Value::Object(mutated_map)) => {
+                assert_shape_preserved(original_map, mutated_map, path);
+            }
+            (Value::Array(original_items), Value::Array(mutated_items)) => {
+                assert_eq!(
+                    original_items.len(),
+                    mutated_items.len(),
+                    "array length mismatch at {path}"
+                );
+                for (index, (original_item, mutated_item)) in
+                    original_items.iter().zip(mutated_items.iter()).enumerate()
+                {
+                    assert_json_shape_preserved(
+                        original_item,
+                        mutated_item,
+                        &format!("{path}[{index}]"),
+                    );
+                }
+            }
+            _ => assert_eq!(
+                json_kind(original),
+                json_kind(mutated),
+                "type mismatch at {path}"
+            ),
+        }
+    }
+
+    fn json_kind(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
     }
 
     fn realistic_data_for_seq(seq: u64) -> Map<String, Value> {
@@ -3100,45 +3862,117 @@ mod tests {
                         }
                     }),
                 }],
-                metric_fixtures: vec![Fixture {
-                    name: "metric".to_owned(),
-                    body: json!({
-                        "event_id": "fixture-metric",
-                        "timestamp": "2026-05-08T01:23:45.123Z",
-                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
-                        "data": {
-                            "tenant_id": "fixture",
-                            "service": "api",
-                            "event_type": "metric",
-                            "metric_name": "http.server.duration",
-                            "metric_value": 231,
-                            "http.method": "POST",
-                            "http.route": "/checkout",
-                            "http.status_code": 200,
-                            "duration_ms": 231
-                        }
-                    }),
-                }],
-                trace_fixtures: vec![Fixture {
-                    name: "span_start".to_owned(),
-                    body: json!({
-                        "event_id": "fixture-span-start",
-                        "timestamp": "2026-05-08T01:23:45.123Z",
-                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
-                        "data": {
-                            "tenant_id": "fixture",
-                            "service": "api",
-                            "event_type": "span_start",
-                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-                            "span_id": "00f067aa0ba902b7",
-                            "parent_span_id": "",
-                            "name": "POST /checkout",
-                            "start_time": "2026-05-08T01:23:45.000Z",
-                            "end_time": "2026-05-08T01:23:45.123Z",
-                            "duration_ms": 123
-                        }
-                    }),
-                }],
+                metric_fixtures: vec![
+                    Fixture {
+                        name: "metric".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-metric",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "metric",
+                                "metric_name": "http.server.duration",
+                                "metric_value": 231,
+                                "http.method": "POST",
+                                "http.route": "/checkout",
+                                "http.status_code": 200,
+                                "duration_ms": 231
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "metric_counter".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-metric-counter",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "metric",
+                                "metric_name": "http.server.requests",
+                                "metric_type": "counter",
+                                "metric_value": 12
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "metric_histogram".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-metric-histogram",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "metric",
+                                "metric_name": "http.server.duration",
+                                "metric_type": "histogram",
+                                "metric_value": 231
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "metric_runtime".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-metric-runtime",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "metric",
+                                "metric_name": "runtime.queue.depth",
+                                "metric_type": "gauge",
+                                "metric_value": 4
+                            }
+                        }),
+                    },
+                ],
+                trace_fixtures: vec![
+                    Fixture {
+                        name: "span_start".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-span-start",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "span_start",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b7",
+                                "parent_span_id": "",
+                                "name": "POST /checkout",
+                                "start_time": "2026-05-08T01:23:45.000Z",
+                                "end_time": "2026-05-08T01:23:45.123Z",
+                                "duration_ms": 123
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "span_end".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-span-end",
+                            "timestamp": "2026-05-08T01:23:45.223Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.230Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "api",
+                                "event_type": "span_end",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b8",
+                                "parent_span_id": "00f067aa0ba902b7",
+                                "name": "POST /checkout",
+                                "start_time": "2026-05-08T01:23:45.000Z",
+                                "end_time": "2026-05-08T01:23:45.223Z",
+                                "duration_ms": 223
+                            }
+                        }),
+                    },
+                ],
                 product_fixtures: vec![Fixture {
                     name: "product_checkout_completed".to_owned(),
                     body: json!({
@@ -3160,25 +3994,130 @@ mod tests {
                         }
                     }),
                 }],
-                agent_fixtures: vec![Fixture {
-                    name: "agent_request".to_owned(),
-                    body: json!({
-                        "event_id": "fixture-agent-request",
-                        "timestamp": "2026-05-08T01:23:45.123Z",
-                        "observed_timestamp": "2026-05-08T01:23:45.130Z",
-                        "data": {
-                            "tenant_id": "fixture",
-                            "service": "atlas-agent",
-                            "event_type": "agent.request",
-                            "signal": "trace",
-                            "environment": "prod",
-                            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-                            "span_id": "00f067aa0ba902b7",
-                            "parent_span_id": "",
-                            "duration_ms": 120
-                        }
-                    }),
-                }],
+                agent_fixtures: vec![
+                    Fixture {
+                        name: "agent_request".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-agent-request",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "atlas-agent",
+                                "event_type": "agent.request",
+                                "signal": "trace",
+                                "environment": "prod",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b7",
+                                "parent_span_id": "",
+                                "duration_ms": 120
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "agent_decision".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-agent-decision",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "atlas-agent",
+                                "event_type": "agent.decision",
+                                "signal": "trace",
+                                "environment": "prod",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b7",
+                                "parent_span_id": "",
+                                "duration_ms": 120
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "llm_call".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-llm-call",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "llm-gateway",
+                                "event_type": "llm.call",
+                                "signal": "trace",
+                                "environment": "prod",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b8",
+                                "parent_span_id": "00f067aa0ba902b7"
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "tool_call".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-tool-call",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "tool-runner",
+                                "event_type": "tool.call",
+                                "signal": "trace",
+                                "environment": "prod",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b8",
+                                "parent_span_id": "00f067aa0ba902b7"
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "retrieval_step".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-retrieval-step",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "retrieval",
+                                "event_type": "retrieval.step",
+                                "signal": "trace",
+                                "environment": "prod",
+                                "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                "span_id": "00f067aa0ba902b8",
+                                "parent_span_id": "00f067aa0ba902b7"
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "safety_event".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-safety-event",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "safety",
+                                "event_type": "safety.event",
+                                "signal": "analytics",
+                                "environment": "prod"
+                            }
+                        }),
+                    },
+                    Fixture {
+                        name: "eval_score".to_owned(),
+                        body: json!({
+                            "event_id": "fixture-eval-score",
+                            "timestamp": "2026-05-08T01:23:45.123Z",
+                            "observed_timestamp": "2026-05-08T01:23:45.130Z",
+                            "data": {
+                                "tenant_id": "fixture",
+                                "service": "evals",
+                                "event_type": "eval.score",
+                                "signal": "analytics",
+                                "environment": "prod"
+                            }
+                        }),
+                    },
+                ],
                 processor_fixtures: vec![Fixture {
                     name: "processor_backfill_slice".to_owned(),
                     body: json!({

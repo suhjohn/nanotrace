@@ -122,13 +122,18 @@ NANOTRACE_LOADTEST_CLICKHOUSE_POLL_MS=5000
 NANOTRACE_LOADTEST_GENERATORS=4
 ```
 
-`NANOTRACE_LOADTEST_PROFILE` can be `atlas` for the broad Atlas Markets mix
-of product analytics, state transitions, agent traces, metrics, pipeline
-events, and the existing realistic LLM logs. It can also be `realistic` for
-mixed fixture replay, `product` for product/state analytics, `agent` for deep
-agent traces, `trace` for trace-shaped events, `processor` for pipeline events,
-`metrics` for pure metric traffic, `logs` for pure log traffic, `llm` for LLM
-log traffic, or `fixture` for mostly static fixture replay.
+`NANOTRACE_LOADTEST_PROFILE` defaults to `codex`, which produces a Codex-like
+mix of agent traces, LLM calls, tool calls, retrieval steps, runtime metrics,
+processor activity, and realistic logs over a 60-day history. The Codex profile
+emits correlated 24-event workflows rather than independent samples, so traces
+look like actual request lifecycles: span start/end, agent planning, retrieval,
+LLM requests with message and usage payloads, tool execution, evaluation,
+safety, runtime metrics, and terminal logs. It can also be `atlas` for the
+older Atlas Markets mix, `realistic` for generic mixed fixture replay,
+`product` for product/state analytics, `agent` for deep agent traces, `trace`
+for trace-shaped events, `processor` for pipeline events, `metrics` for pure
+metric traffic, `logs` for pure log traffic, `llm` for LLM log traffic, or
+`fixture` for mostly static fixture replay.
 Synthetic non-fixture profiles generate timestamps across a fixed 60-day
 history with weighted business-hour traffic and trace-local event spacing.
 Set `NANOTRACE_LOADTEST_TOTAL_EVENTS` when you want a fixed number of generated

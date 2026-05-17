@@ -18,7 +18,7 @@
     "name": "retrieval.step",
     "duration_ms": 98,
     "retrieval": {
-      "index": "support_articles",
+      "index": "repo-code",
       "query_type": "hybrid",
       "top_k": 10,
       "hit_count": 7,

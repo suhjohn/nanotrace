@@ -41,7 +41,16 @@ function IndexRoute() {
       to: '/'
     } as never)
   }, [navigate])
-  return <ObservatoryHome eventFilterSearchText={search.filter} searchGroupBy={search.groupBy} selectedEventId={search.eventId ?? ''} />
+  return (
+    <ObservatoryHome
+      eventFilterSearchText={search.filter}
+      searchCustomRangeEnd={search.rangeEnd}
+      searchCustomRangeStart={search.rangeStart}
+      searchGroupBy={search.groupBy}
+      searchTimeRange={search.timeRange}
+      selectedEventId={search.eventId ?? ''}
+    />
+  )
 }
 
 type LogGroupSummary = {
@@ -129,6 +138,13 @@ type LogDensity = {
   to: string
 }
 
+function hasRenderableDensity(density: LogDensity | null | undefined) {
+  if (!density || density.buckets.length === 0) return false
+  const fromMs = traceTimeMs(density.from)
+  const toMs = traceTimeMs(density.to)
+  return Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs
+}
+
 type LogFlamegraph = Flamegraph & {
   capped?: boolean
   spanCount?: number
@@ -180,6 +196,9 @@ export type ObservatorySearch = {
   eventId?: string
   filter?: string
   groupBy?: string
+  rangeEnd?: string
+  rangeStart?: string
+  timeRange?: TimeRangeKey
 }
 
 type FlameKind = 'event' | 'run' | 'turn' | 'model' | 'tool'
@@ -268,6 +287,15 @@ export function parseObservatorySearch(search: Record<string, unknown>): Observa
     search.groupBy !== noGroupValue
   ) {
     parsed.groupBy = search.groupBy
+  }
+  if ('timeRange' in search && typeof search.timeRange === 'string' && search.timeRange) {
+    parsed.timeRange = parseTimeRangeKey(search.timeRange)
+  }
+  if ('rangeStart' in search && typeof search.rangeStart === 'string' && search.rangeStart) {
+    parsed.rangeStart = search.rangeStart
+  }
+  if ('rangeEnd' in search && typeof search.rangeEnd === 'string' && search.rangeEnd) {
+    parsed.rangeEnd = search.rangeEnd
   }
   return parsed
 }
@@ -381,12 +409,18 @@ function getJsonValueType(value: JsonValue) {
 export function ObservatoryHome({
   eventFilterSearchText,
   routeSelection,
+  searchCustomRangeEnd,
+  searchCustomRangeStart,
   searchGroupBy,
+  searchTimeRange,
   selectedEventId
 }: {
   eventFilterSearchText?: string
   routeSelection?: RouteSelection
+  searchCustomRangeEnd?: string
+  searchCustomRangeStart?: string
   searchGroupBy?: string
+  searchTimeRange?: TimeRangeKey
   selectedEventId: string
 }) {
   const observatoryUrl = nanotraceApiBaseUrl()
@@ -481,20 +515,23 @@ export function ObservatoryHome({
   const selectedGroupOption = displayedGroupOptions.find(option => option.path === groupBy) ?? null
   const groupByLabel = selectedGroupOption ? groupOptionLabel(selectedGroupOption) : groupBy
   const selectedGroupValue = routeSelection?.field === groupBy ? routeSelection.value : ''
+  const effectiveTimeRangeKey = searchTimeRange ?? timeRangeKey
+  const effectiveCustomRangeStart = searchCustomRangeStart ?? customRangeStart
+  const effectiveCustomRangeEnd = searchCustomRangeEnd ?? customRangeEnd
   const selectedTimeRange = useMemo(
     () =>
       resolveTimeRange({
-        customEnd: customRangeEnd,
-        customStart: customRangeStart,
-        key: timeRangeKey
+        customEnd: effectiveCustomRangeEnd,
+        customStart: effectiveCustomRangeStart,
+        key: effectiveTimeRangeKey
       }),
-    [customRangeEnd, customRangeStart, timeRangeKey]
+    [effectiveCustomRangeEnd, effectiveCustomRangeStart, effectiveTimeRangeKey]
   )
   const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}` : ''
   const viewingGroupedEvents = Boolean(selectedGroupKey)
   const eventScopeKey = selectedGroupKey || 'all-events'
   const eventFilterReady = eventFilterGroupKey === eventScopeKey
-  const hasEventQuery = eventFilterReady
+  const hasEventQuery = viewingGroupedEvents ? eventFilterReady : true
   const groupSearch = filter.trim()
   const groupsQuery = useInfiniteQuery<LogGroupPage, Error, InfiniteData<LogGroupPage>, string[], number>({
     enabled: groupOptions.length > 0 && Boolean(groupBy),
@@ -562,7 +599,7 @@ export function ObservatoryHome({
     [eventAnchorTimestamp, eventFilterParams]
   )
   const summaryQuery = useQuery({
-    enabled: Boolean(viewingGroupedEvents && hasEventQuery),
+    enabled: Boolean(hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
     queryFn: () =>
       fetchSummary({ apiBaseUrl: observatoryUrl, eventFilter: eventFilterParams, groupBy, selectedGroupValue }),
@@ -598,7 +635,7 @@ export function ObservatoryHome({
           : { before: firstPage.prevCursor }
         : undefined,
     placeholderData: keepPreviousData,
-    refetchInterval: !viewingGroupedEvents && timeRangeKey !== 'custom' ? 5000 : false,
+    refetchInterval: !viewingGroupedEvents && effectiveTimeRangeKey !== 'custom' ? 5000 : false,
     retry: false
   })
   const flamegraphQuery = useQuery({
@@ -614,18 +651,19 @@ export function ObservatoryHome({
       }),
     retry: false
   })
-  const flamegraphDisabled = flamegraphDisabledBySummary || Boolean(flamegraphQuery.data?.capped)
+  const flamegraphDisabled = !viewingGroupedEvents || flamegraphDisabledBySummary || Boolean(flamegraphQuery.data?.capped)
   const graphMode = flamegraphDisabled ? 'histogram' : selectedGraphMode
   const densityQuery = useQuery({
-    enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
-    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams],
+    enabled: Boolean(hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
+    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange],
     queryFn: () =>
       fetchDensity({
         apiBaseUrl: observatoryUrl,
         buckets: 700,
         eventFilter: eventFilterParams,
         groupBy,
-        selectedGroupValue
+        selectedGroupValue,
+        timeRange: selectedTimeRange
       }),
     retry: false
   })
@@ -663,12 +701,12 @@ export function ObservatoryHome({
   const emptyGroup = !loadingList && !listError && Boolean(groupBy) && !groupSearch && groupOptions.length > 0 && traceList.length === 0
   const emptyGroupLabel = 'No groups found.'
   const waitingForLatest = Boolean(needsLatest && latestQuery.isPending && !hasEventQuery)
-  const waitingForSummary = Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.isPending)
+  const waitingForSummary = Boolean(hasEventQuery && summaryQuery.isPending)
   const loadingGraph =
     graphMode === 'histogram'
       ? densityQuery.isPending || densityQuery.isFetching
       : flamegraphQuery.isPending || flamegraphQuery.isFetching
-  const loadingDetail = viewingGroupedEvents && (waitingForLatest || waitingForSummary || loadingGraph)
+  const loadingDetail = hasEventQuery && (waitingForLatest || waitingForSummary || loadingGraph)
   const loadingTableDetail = hasEventQuery && (eventsQuery.isPending || eventsQuery.isFetching)
   const loadingAnchoredEvents = Boolean(
     eventAnchorOverride?.key === eventDataKey &&
@@ -700,6 +738,17 @@ export function ObservatoryHome({
       search: (current: ObservatorySearch) => ({
         ...current,
         filter: value || undefined
+      })
+    } as never)
+  }
+
+  function setTimeRangeSearch(key: TimeRangeKey, start?: string, end?: string) {
+    void navigate({
+      search: (current: ObservatorySearch) => ({
+        ...current,
+        rangeEnd: key === 'custom' ? end || undefined : undefined,
+        rangeStart: key === 'custom' ? start || undefined : undefined,
+        timeRange: key
       })
     } as never)
   }
@@ -746,7 +795,8 @@ export function ObservatoryHome({
 
   function selectTimeRange(key: TimeRangeKey) {
     setTimeRangeKey(key)
-    applyRangeFilter(resolveTimeRange({ customEnd: customRangeEnd, customStart: customRangeStart, key }), {
+    setTimeRangeSearch(key, key === 'custom' ? effectiveCustomRangeStart : undefined, key === 'custom' ? effectiveCustomRangeEnd : undefined)
+    applyRangeFilter(resolveTimeRange({ customEnd: effectiveCustomRangeEnd, customStart: effectiveCustomRangeStart, key }), {
       syncUrl: key === 'custom'
     })
   }
@@ -754,19 +804,22 @@ export function ObservatoryHome({
   function setCustomStartRange(value: string) {
     setCustomRangeStart(value)
     setTimeRangeKey('custom')
-    applyRangeFilter(resolveTimeRange({ customEnd: customRangeEnd, customStart: value, key: 'custom' }))
+    setTimeRangeSearch('custom', value, effectiveCustomRangeEnd)
+    applyRangeFilter(resolveTimeRange({ customEnd: effectiveCustomRangeEnd, customStart: value, key: 'custom' }))
   }
 
   function setCustomEndRange(value: string) {
     setCustomRangeEnd(value)
     setTimeRangeKey('custom')
-    applyRangeFilter(resolveTimeRange({ customEnd: value, customStart: customRangeStart, key: 'custom' }))
+    setTimeRangeSearch('custom', effectiveCustomRangeStart, value)
+    applyRangeFilter(resolveTimeRange({ customEnd: value, customStart: effectiveCustomRangeStart, key: 'custom' }))
   }
 
   function setCustomRange(start: string, end: string) {
     setCustomRangeStart(start)
     setCustomRangeEnd(end)
     setTimeRangeKey('custom')
+    setTimeRangeSearch('custom', start, end)
     applyRangeFilter(resolveTimeRange({ customEnd: end, customStart: start, key: 'custom' }))
   }
 
@@ -1143,7 +1196,7 @@ export function ObservatoryHome({
                 key={option.key}
                 className={cn(
                   'h-7 border-l border-neutral-800 px-1.5 text-[10px] text-neutral-400 first:border-l-0 hover:bg-white/[0.04] hover:text-white',
-                  timeRangeKey === option.key && 'bg-neutral-800 text-white'
+                  effectiveTimeRangeKey === option.key && 'bg-neutral-800 text-white'
                 )}
                 type="button"
                 onClick={() => selectTimeRange(option.key)}
@@ -1152,9 +1205,9 @@ export function ObservatoryHome({
               </button>
             ))}
             <CustomTimeRangePicker
-              active={timeRangeKey === 'custom'}
-              end={customRangeEnd}
-              start={customRangeStart}
+              active={effectiveTimeRangeKey === 'custom'}
+              end={effectiveCustomRangeEnd}
+              start={effectiveCustomRangeStart}
               onApply={setCustomRange}
             />
           </div>
@@ -1270,19 +1323,27 @@ export function ObservatoryHome({
             </div>
           </div>
 
-          {viewingGroupedEvents ? (
+          {hasEventQuery ? (
           <>
           <div className="overflow-hidden border-b border-neutral-800 bg-black" style={{ height: flamegraphHeight, minHeight: flamegraphHeight }}>
-            {loadingDetail ? <EmptyState label="Loading trace detail." /> : null}
-            {!loadingDetail && selectedGroupValue && graphMode === 'histogram' && densityQuery.data ? (
+            {loadingDetail ? <EmptyState label={viewingGroupedEvents ? 'Loading trace detail.' : 'Loading event histogram.'} /> : null}
+            {!loadingDetail && graphMode === 'histogram' && densityQuery.data && hasRenderableDensity(densityQuery.data) ? (
               <DensityHistogramCanvas
                 density={densityQuery.data}
                 totalCount={summaryQuery.data?.count ?? 0}
                 onSelectRange={applyTimeRange}
               />
             ) : null}
-            {!loadingDetail && selectedGroupValue && graphMode === 'histogram' && !densityQuery.data ? (
-              <EmptyState label="Loading density histogram." />
+            {!loadingDetail && graphMode === 'histogram' && !hasRenderableDensity(densityQuery.data) ? (
+              <EmptyState
+                label={
+                  densityQuery.data
+                    ? (summaryQuery.data?.count ?? 0) > 0
+                      ? 'No density data available for this range yet.'
+                      : 'No events in selected range.'
+                    : 'Loading density histogram.'
+                }
+              />
             ) : null}
             {!loadingDetail && selectedGroupValue && graphMode === 'flamegraph' && !traceDetail ? <EmptyState label="No events matched filter." /> : null}
             {!loadingDetail && graphMode === 'flamegraph' && traceDetail && flamegraph.rows.length === 0 ? (
@@ -1312,32 +1373,38 @@ export function ObservatoryHome({
           </>
           ) : null}
 
-          {viewingGroupedEvents ? (
+          {hasEventQuery ? (
             <div className="flex items-center gap-2 border-b border-neutral-800 bg-neutral-950 px-2 py-1.5">
-              <div className="inline-flex border border-neutral-800 bg-black">
-                <button
-                  className={cn(
-                    'h-6 px-2 text-[11px] text-neutral-500 hover:text-white disabled:cursor-not-allowed disabled:text-neutral-700',
-                    graphMode === 'flamegraph' && 'bg-neutral-800 text-white'
-                  )}
-                  disabled={flamegraphDisabled}
-                  type="button"
-                  onClick={() => setSelectedGraphMode('flamegraph')}
-                >
-                  Flamegraph
-                </button>
-                <button
-                  className={cn(
-                    'h-6 border-l border-neutral-800 px-2 text-[11px] text-neutral-500 hover:text-white',
-                    graphMode === 'histogram' && 'bg-neutral-800 text-white'
-                  )}
-                  type="button"
-                  onClick={() => setSelectedGraphMode('histogram')}
-                >
+              {viewingGroupedEvents ? (
+                <div className="inline-flex border border-neutral-800 bg-black">
+                  <button
+                    className={cn(
+                      'h-6 px-2 text-[11px] text-neutral-500 hover:text-white disabled:cursor-not-allowed disabled:text-neutral-700',
+                      graphMode === 'flamegraph' && 'bg-neutral-800 text-white'
+                    )}
+                    disabled={flamegraphDisabled}
+                    type="button"
+                    onClick={() => setSelectedGraphMode('flamegraph')}
+                  >
+                    Flamegraph
+                  </button>
+                  <button
+                    className={cn(
+                      'h-6 border-l border-neutral-800 px-2 text-[11px] text-neutral-500 hover:text-white',
+                      graphMode === 'histogram' && 'bg-neutral-800 text-white'
+                    )}
+                    type="button"
+                    onClick={() => setSelectedGraphMode('histogram')}
+                  >
+                    Histogram
+                  </button>
+                </div>
+              ) : (
+                <div className="inline-flex border border-neutral-800 bg-black px-2 py-1 text-[11px] text-white">
                   Histogram
-                </button>
-              </div>
-              {flamegraphDisabled ? (
+                </div>
+              )}
+              {viewingGroupedEvents && flamegraphDisabled ? (
                 <span className="truncate text-[11px] text-neutral-600">Flamegraph preview capped at 20k events.</span>
               ) : null}
             </div>
@@ -2007,19 +2074,42 @@ function DensityHistogramCanvas({
   totalCount: number
   onSelectRange: (range: { createdAfter: string; createdBefore: string }) => void
 }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const rootRef = useRef<HTMLDivElement | null>(null)
-  const [brush, setBrush] = useState<null | { fromX: number; toX: number }>(null)
-  const [yScale, setYScale] = useState<DensityYScale>('log')
-  const fromMs = traceTimeMs(density.from)
-  const toMs = traceTimeMs(density.to)
-  const durationMs = Math.max(toMs - fromMs, 1)
-  const maxScaledCount = Math.max(...density.buckets.map(bucket => scaleDensityCount(bucket.count, yScale)), 1)
+	const canvasRef = useRef<HTMLCanvasElement | null>(null)
+	const rootRef = useRef<HTMLDivElement | null>(null)
+	const [brush, setBrush] = useState<null | { fromX: number; toX: number }>(null)
+	const [yScale, setYScale] = useState<DensityYScale>('log')
+	const [sizeVersion, setSizeVersion] = useState(0)
+	const fromMs = traceTimeMs(density.from)
+	const toMs = traceTimeMs(density.to)
+  const validRange = Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs
+	const durationMs = Math.max(toMs - fromMs, 1)
+	const maxScaledCount = Math.max(...density.buckets.map(bucket => scaleDensityCount(bucket.count, yScale)), 1)
 
-  useEffect(() => {
-    const canvas = canvasRef.current
-    const root = rootRef.current
-    if (!canvas || !root) return
+	useEffect(() => {
+		const root = rootRef.current
+		if (!root) return
+
+		let frame = 0
+		const handleResize = () => {
+			if (frame) cancelAnimationFrame(frame)
+			frame = requestAnimationFrame(() => {
+				setSizeVersion(current => current + 1)
+			})
+		}
+
+		handleResize()
+		const observer = new ResizeObserver(handleResize)
+		observer.observe(root)
+		return () => {
+			if (frame) cancelAnimationFrame(frame)
+			observer.disconnect()
+		}
+	}, [])
+
+	useEffect(() => {
+		const canvas = canvasRef.current
+		const root = rootRef.current
+		if (!canvas || !root || !validRange) return
 
     const rect = root.getBoundingClientRect()
     const dpr = window.devicePixelRatio || 1
@@ -2088,11 +2178,11 @@ function DensityHistogramCanvas({
       ctx.strokeStyle = 'rgba(255,255,255,0.8)'
       ctx.strokeRect(x0, padTop, Math.max(1, x1 - x0), plotHeight)
     }
-  }, [brush, density, durationMs, fromMs, maxScaledCount, toMs, yScale])
+	}, [brush, density, durationMs, fromMs, maxScaledCount, sizeVersion, toMs, validRange, yScale])
 
   function xToTimestamp(clientX: number) {
     const root = rootRef.current
-    if (!root) return ''
+    if (!root || !validRange) return ''
     const rect = root.getBoundingClientRect()
     const padX = 18
     const ratio = clamp((clientX - rect.left - padX) / Math.max(1, rect.width - padX * 2), 0, 1)
@@ -3615,6 +3705,7 @@ type FlamegraphEventRow = {
 
 const defaultTableName = 'observatory.events'
 const defaultFacetsTableName = 'observatory.field_counts_5m'
+const defaultDensityRollupsTableName = 'observatory.event_density_1s'
 const defaultEventIndexTableName = 'observatory.field_index'
 const defaultFieldValuesTableName = 'observatory.field_index'
 const defaultSpansTableName = 'observatory.spans'
@@ -3739,8 +3830,8 @@ async function fetchGroups({
           ', min(timestamp) AS startedAt',
           ', max(timestamp) AS endedAt',
           ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
-          ', count() AS count',
-          ", countIf(endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
+          ', uniqExact(event_id) AS count',
+          ", uniqExactIf(event_id, endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
           `FROM ${eventIndexTable()}`,
           `PREWHERE field_name = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
           'GROUP BY value',
@@ -4067,6 +4158,17 @@ async function fetchSummary({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogSummary> {
+  if (canUseDensityRollup({ eventFilter, groupBy, selectedGroupValue })) {
+    try {
+      const rollupSummary = await fetchSummaryFromDensityRollup({ apiBaseUrl, eventFilter })
+      if (rollupSummary.count > 0) return rollupSummary
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
   if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
     try {
       return await fetchSummaryFromIndex({ apiBaseUrl, eventFilter, groupBy, selectedGroupValue })
@@ -4092,6 +4194,28 @@ async function fetchSummary({
   return { capped: false, count, limit: count }
 }
 
+async function fetchSummaryFromDensityRollup({
+  apiBaseUrl,
+  eventFilter
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+}): Promise<LogSummary> {
+  const response = await postQuery<{ count: number }>({
+    apiBaseUrl,
+    parameters: densityRollupParameters(eventFilter),
+    query: [
+      'SELECT sum(count) AS count',
+      `FROM ${densityRollupsTable()} AS d`,
+      densityRollupTimePrewhere(eventFilter)
+        ? `PREWHERE ${densityRollupTimePrewhere(eventFilter)}`
+        : ''
+    ].join(' ')
+  })
+  const count = Number(response.data?.[0]?.count) || 0
+  return { capped: false, count, limit: count }
+}
+
 async function fetchSummaryFromIndex({
   apiBaseUrl,
   eventFilter,
@@ -4108,7 +4232,7 @@ async function fetchSummaryFromIndex({
     apiBaseUrl,
     parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
     query: [
-      'SELECT count() AS count',
+      'SELECT uniqExact(i.event_id) AS count',
       `FROM ${eventIndexTable()} AS i`,
       `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
@@ -4252,11 +4376,12 @@ async function fetchEventsFromIndex({
     parameters,
     query: [
       'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
-      ', i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
-      ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
+      ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
+      ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
       `FROM ${eventIndexTable()} AS i`,
       `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       eventIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
+      'GROUP BY i.event_id, i.timestamp',
       `ORDER BY i.timestamp ${queryOrder}, i.event_id ${queryOrder}`,
       'LIMIT {limit:UInt64}'
     ].join(' ')
@@ -4407,11 +4532,13 @@ async function fetchFlamegraphFromIndex({
       limit: maxSpans
     },
     query: [
-      'SELECT i.event_id AS event_id, i.timestamp AS timestamp, i.event_type AS event_type, i.signal AS signal, i.trace_id AS trace_id, i.span_id AS span_id',
-      ', i.parent_span_id AS parent_span_id, i.name AS name, i.start_time AS start_time, i.end_time AS end_time, i.duration_ms AS duration_ms',
+      'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
+      ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
+      ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
       `FROM ${eventIndexTable()} AS i`,
       `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
+      'GROUP BY i.event_id, i.timestamp',
       'ORDER BY i.timestamp ASC, i.event_id ASC',
       'LIMIT {limit:UInt64}'
     ].join(' ')
@@ -4430,17 +4557,20 @@ async function fetchDensity({
   buckets,
   eventFilter,
   groupBy,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   apiBaseUrl: string
   buckets: number
   eventFilter: ParsedEventFilter
   groupBy: string
   selectedGroupValue: string
+  timeRange: ResolvedTimeRange
 }): Promise<LogDensity> {
-  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+  if (canUseDensityRollup({ eventFilter, groupBy, selectedGroupValue })) {
     try {
-      return await fetchDensityFromIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue })
+      const rollupDensity = await fetchDensityFromRollup({ apiBaseUrl, buckets, eventFilter, timeRange })
+      if (rollupDensity.buckets.length > 0) return rollupDensity
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -4448,8 +4578,18 @@ async function fetchDensity({
     }
   }
 
-  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue })
-  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
+  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+    try {
+      return await fetchDensityFromIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue, timeRange })
+    } catch (error) {
+      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
+        throw error
+      }
+    }
+  }
+
+  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange })
+  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue, timeRange })
   const range = await postQuery<{ count: number; from: string; to: string }>({
     apiBaseUrl,
     parameters,
@@ -4497,27 +4637,86 @@ async function fetchDensity({
   }
 }
 
+async function fetchDensityFromRollup({
+  apiBaseUrl,
+  buckets,
+  eventFilter,
+  timeRange
+}: {
+  apiBaseUrl: string
+  buckets: number
+  eventFilter: ParsedEventFilter
+  timeRange: ResolvedTimeRange
+}): Promise<LogDensity> {
+  const prewhere = densityRollupTimePrewhere(eventFilter, timeRange)
+  const parameters = densityRollupParameters(eventFilter, timeRange)
+  const range = await postQuery<{ count: number; from: string; to: string }>({
+    apiBaseUrl,
+    parameters,
+    query: [
+      'SELECT min(d.bucket_time) AS from, max(d.bucket_time) AS to, sum(d.count) AS count',
+      `FROM ${densityRollupsTable()} AS d`,
+      prewhere ? `PREWHERE ${prewhere}` : ''
+    ].join(' ')
+  })
+  const row = range.data?.[0]
+  const from = normalizeTimestamp(eventFilter.createdAfter || timeRange.createdAfter || row?.from)
+  const to = normalizeTimestamp(eventFilter.createdBefore || timeRange.createdBefore || row?.to)
+  const fromMs = Date.parse(from)
+  const toMs = Date.parse(to)
+  if (!Number(row?.count) || !Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+    return { bucketMs: 1, buckets: [], from: '', to: '' }
+  }
+
+  const bucketMs = Math.max(1_000, niceTimeInterval(Math.max(1_000, (toMs - fromMs) / buckets)))
+  const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
+    apiBaseUrl,
+    parameters: { ...parameters, bucket_ms: bucketMs },
+    query: [
+      'WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
+      'SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount',
+      `FROM ${densityRollupsTable()} AS d`,
+      prewhere ? `PREWHERE ${prewhere}` : '',
+      'GROUP BY bucket',
+      'ORDER BY bucket ASC'
+    ].join(' ')
+  })
+
+  return {
+    bucketMs,
+    buckets: (density.data ?? []).map(bucket => ({
+      count: Number(bucket.count) || 0,
+      errorCount: Number(bucket.errorCount) || 0,
+      start: new Date(Number(bucket.bucket)).toISOString()
+    })),
+    from,
+    to
+  }
+}
+
 async function fetchDensityFromIndex({
   apiBaseUrl,
   buckets,
   eventFilter,
   groupBy,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   apiBaseUrl: string
   buckets: number
   eventFilter: ParsedEventFilter
   groupBy: string
   selectedGroupValue: string
+  timeRange: ResolvedTimeRange
 }): Promise<LogDensity> {
-  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue })
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
-  const indexWhere = eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
+  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange })
+  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
+  const indexWhere = eventIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange })
   const range = await postQuery<{ count: number; from: string; to: string }>({
     apiBaseUrl,
     parameters,
     query: [
-      'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, count() AS count',
+      'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, uniqExact(i.event_id) AS count',
       `FROM ${eventIndexTable()} AS i`,
       `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       indexWhere
@@ -4538,8 +4737,8 @@ async function fetchDensityFromIndex({
     parameters: { ...parameters, bucket_ms: bucketMs },
     query: [
       'WITH intDiv(toUnixTimestamp64Milli(i.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
-      'SELECT bucket, count() AS count',
-      ", countIf(endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
+      'SELECT bucket, uniqExact(i.event_id) AS count',
+      ", uniqExactIf(i.event_id, endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
       `FROM ${eventIndexTable()} AS i`,
       `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
       indexWhere,
@@ -4755,6 +4954,19 @@ function facetsTable() {
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFacetsTableName
+}
+
+function densityRollupsTable() {
+  const configured = String(import.meta.env.VITE_NANOTRACE_EVENT_DENSITY_TABLE || '').trim()
+  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
+    return configured
+  }
+  const table = eventsTable()
+  const database = table.includes('.') ? table.split('.')[0] : ''
+  const derived = database ? `${database}.event_density_1s` : 'event_density_1s'
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
+    ? derived
+    : defaultDensityRollupsTableName
 }
 
 function eventIndexTable() {
@@ -5446,6 +5658,44 @@ function hasAppliedEventFilter(filter: ParsedEventFilter) {
 
 function canUseFacetIndex(filter: ParsedEventFilter) {
   return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed)
+}
+
+function canUseDensityRollup({
+  eventFilter,
+  groupBy,
+  selectedGroupValue
+}: {
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  selectedGroupValue: string
+}) {
+  return !groupBy && !selectedGroupValue && eventFilter.text === '' && !(eventFilter.facets?.length)
+}
+
+function densityRollupParameters(eventFilter: ParsedEventFilter, timeRange?: ResolvedTimeRange): QueryParameters {
+  return {
+    ...(!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange ? timeRangeParameters(timeRange) : {}),
+    ...(eventFilter.createdAfter ? { created_after: clickHouseDateTime64(eventFilter.createdAfter) } : {}),
+    ...(eventFilter.createdBefore ? { created_before: clickHouseDateTime64(eventFilter.createdBefore) } : {})
+  }
+}
+
+function densityRollupTimePrewhere(
+  eventFilter: ParsedEventFilter,
+  timeRange?: ResolvedTimeRange,
+  column = 'd.bucket_time'
+) {
+  return [
+    eventFilter.createdAfter
+      ? `${column} >= toStartOfInterval({created_after:DateTime64(3, 'UTC')}, INTERVAL 1 SECOND)`
+      : '',
+    eventFilter.createdBefore
+      ? `${column} <= toStartOfInterval({created_before:DateTime64(3, 'UTC')}, INTERVAL 1 SECOND)`
+      : '',
+    !eventFilter.createdAfter && !eventFilter.createdBefore && timeRange
+      ? timeRangeWhereClause(timeRange, column)
+      : ''
+  ].filter(Boolean).join(' AND ')
 }
 
 function parseEventFilter({

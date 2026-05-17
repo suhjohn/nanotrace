@@ -2,7 +2,7 @@
 
 This document defines the concrete event shapes we should use for fixture templates and loadtest generation.
 
-The fictional production tenant is **Atlas Markets**, a fintech company with trading, billing, support, and agentic AI workflows. The goal is not to mimic one vendor. The goal is to generate events that exercise Nanotrace as an analytics, observability, and agent-observability system.
+The primary example tenant is **Codex**, with coding, tool-use, canvas, retrieval, and agent-orchestration workflows. Some fixture families still include generic product/state examples so Nanotrace can exercise analytics read paths beyond pure agent telemetry.
 
 Assume the loadtest generator mutates these templates deterministically with `run_id + sequence`, but the field contract should stay stable.
 

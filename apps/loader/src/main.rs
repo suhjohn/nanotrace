@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, env, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_s3::Client as S3Client;
@@ -7,11 +13,13 @@ use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::{sync::RwLock, task::JoinSet};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_CLICKHOUSE_INSERT_MAX_ROWS: usize = 100_000;
 const DEFAULT_CLICKHOUSE_INSERT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_CLICKHOUSE_INSERT_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 struct Config {
@@ -28,14 +36,17 @@ struct Config {
     clickhouse_definitions_table: String,
     poll_wait: u32,
     max_messages: i32,
+    concurrency: usize,
     visibility_timeout: i32,
     request_timeout: Duration,
+    definitions_refresh_interval: Duration,
     processor_bucket: Option<String>,
     processor_prefix: String,
     processor_poll_interval: Duration,
     processor_dir: PathBuf,
     clickhouse_insert_max_rows: usize,
     clickhouse_insert_max_bytes: usize,
+    clickhouse_insert_concurrency: usize,
 }
 
 #[derive(Clone)]
@@ -45,6 +56,99 @@ struct Loader {
     processors: ProcessorRuntime,
     s3: S3Client,
     sqs: SqsClient,
+    definitions_cache: Arc<RwLock<CachedDefinitions>>,
+}
+
+#[derive(Clone)]
+struct CachedDefinitions {
+    definitions: ExtractionDefinitions,
+    fetched_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObjectRef {
+    bucket: String,
+    key: String,
+}
+
+#[derive(Debug)]
+struct PreparedObject {
+    object_ref: ObjectRef,
+    rows: usize,
+    raw: Vec<u8>,
+    derived: DerivedBuffers,
+    s3_ms: u64,
+    transform_ms: u64,
+    definitions_ms: u64,
+    derive_ms: u64,
+}
+
+#[derive(Default)]
+struct BatchBuffers {
+    rows: usize,
+    objects: usize,
+    raw: Vec<u8>,
+    field_index: Vec<u8>,
+    span_fragments: Vec<u8>,
+    event_measures: Vec<u8>,
+    entity_state_updates: Vec<u8>,
+    raw_bytes: usize,
+    field_index_bytes: usize,
+    span_fragment_bytes: usize,
+    event_measure_bytes: usize,
+    entity_state_update_bytes: usize,
+    s3_ms: u64,
+    transform_ms: u64,
+    definitions_ms: u64,
+    derive_ms: u64,
+}
+
+impl BatchBuffers {
+    fn from_prepared(prepared: &[PreparedObject]) -> Self {
+        let mut batch = Self::default();
+        for object in prepared {
+            batch.objects += 1;
+            batch.rows += object.rows;
+            batch.raw_bytes += object.raw.len();
+            batch.field_index_bytes += object.derived.field_index.len();
+            batch.span_fragment_bytes += object.derived.span_fragments.len();
+            batch.event_measure_bytes += object.derived.event_measures.len();
+            batch.entity_state_update_bytes += object.derived.entity_state_updates.len();
+            batch.s3_ms += object.s3_ms;
+            batch.transform_ms += object.transform_ms;
+            batch.definitions_ms += object.definitions_ms;
+            batch.derive_ms += object.derive_ms;
+
+            append_ndjson(&mut batch.raw, &object.raw);
+            append_ndjson(&mut batch.field_index, &object.derived.field_index);
+            append_ndjson(&mut batch.span_fragments, &object.derived.span_fragments);
+            append_ndjson(&mut batch.event_measures, &object.derived.event_measures);
+            append_ndjson(
+                &mut batch.entity_state_updates,
+                &object.derived.entity_state_updates,
+            );
+        }
+        batch
+    }
+}
+
+fn append_ndjson(dst: &mut Vec<u8>, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    dst.extend_from_slice(src);
+    if !src.ends_with(b"\n") {
+        dst.push(b'\n');
+    }
+}
+
+impl Default for CachedDefinitions {
+    fn default() -> Self {
+        Self {
+            definitions: ExtractionDefinitions::default(),
+            fetched_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,7 +420,7 @@ struct SpanFragmentRow {
     data: Value,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DerivedBuffers {
     rows: usize,
     field_index: Vec<u8>,
@@ -354,6 +458,7 @@ async fn main() -> Result<()> {
         processors,
         s3,
         sqs: SqsClient::new(&aws_config),
+        definitions_cache: Arc::new(RwLock::new(CachedDefinitions::default())),
     };
 
     info!("nanotrace loader starting");
@@ -372,6 +477,10 @@ fn env_bool(key: &str) -> bool {
     env::var(key)
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 impl Config {
@@ -426,8 +535,13 @@ impl Config {
             clickhouse_definitions_table,
             poll_wait: parse_env("LOADER_POLL_WAIT_SECS", 20)?,
             max_messages: parse_env("LOADER_MAX_MESSAGES", 10)?,
+            concurrency: parse_env("LOADER_CONCURRENCY", 4)?,
             visibility_timeout: parse_env("LOADER_VISIBILITY_TIMEOUT_SECS", 300)?,
             request_timeout: Duration::from_secs(parse_env("LOADER_REQUEST_TIMEOUT_SECS", 60)?),
+            definitions_refresh_interval: Duration::from_secs(parse_env(
+                "LOADER_DEFINITIONS_REFRESH_SECS",
+                60,
+            )?),
             processor_bucket: optional("PROCESSOR_S3_BUCKET")
                 .or_else(|| optional("NANOTRACE_S3_BUCKET"))
                 .or_else(|| optional("S3_BUCKET")),
@@ -446,6 +560,10 @@ impl Config {
             clickhouse_insert_max_bytes: parse_env(
                 "CLICKHOUSE_INSERT_MAX_BYTES",
                 DEFAULT_CLICKHOUSE_INSERT_MAX_BYTES,
+            )?,
+            clickhouse_insert_concurrency: parse_env(
+                "CLICKHOUSE_INSERT_CONCURRENCY",
+                DEFAULT_CLICKHOUSE_INSERT_CONCURRENCY,
             )?,
         })
     }
@@ -520,45 +638,142 @@ impl Loader {
             .await
             .context("receive SQS messages")?;
 
-        for message in output.messages() {
-            if let Err(err) = self.process_message(message).await {
-                error!(
-                    message_id = message.message_id().unwrap_or_default(),
-                    error = %err,
-                    "failed to process SQS message"
-                );
+        let messages: Vec<Message> = output.messages().to_vec();
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        self.process_message_batch(messages).await
+    }
+
+    async fn process_message_batch(&self, messages: Vec<Message>) -> Result<()> {
+        let mut objects = Vec::new();
+        for message in &messages {
+            let body = message
+                .body()
+                .ok_or_else(|| anyhow!("SQS message missing body"))?;
+            objects.extend(
+                parse_s3_records(body)?
+                    .into_iter()
+                    .map(|(bucket, key)| ObjectRef { bucket, key }),
+            );
+        }
+
+        let prepared = self.prepare_batch(objects).await?;
+        if prepared.is_empty() {
+            self.delete_messages(&messages).await?;
+            return Ok(());
+        }
+
+        let batch = BatchBuffers::from_prepared(&prepared);
+        let token_prefix = batch_token_prefix(&prepared);
+
+        let raw_insert_started = Instant::now();
+        self.insert_clickhouse(&self.cfg.table_name(), &batch.raw, &token_prefix, true)
+            .await?;
+        let raw_insert_ms = elapsed_ms(raw_insert_started);
+
+        let field_index_table = self.cfg.field_index_table_name();
+        let span_fragments_table = self.cfg.span_fragments_table_name();
+        let event_measures_table = self.cfg.event_measures_table_name();
+        let entity_state_updates_table = self.cfg.entity_state_updates_table_name();
+        let field_index_token_prefix = format!("{token_prefix}:field_index");
+        let span_fragments_token_prefix = format!("{token_prefix}:span_fragments");
+        let event_measures_token_prefix = format!("{token_prefix}:event_measures");
+        let entity_state_updates_token_prefix = format!("{token_prefix}:entity_state_updates");
+
+        let derived_insert_started = Instant::now();
+        tokio::try_join!(
+            self.insert_clickhouse(
+                &field_index_table,
+                &batch.field_index,
+                &field_index_token_prefix,
+                true,
+            ),
+            self.insert_clickhouse(
+                &span_fragments_table,
+                &batch.span_fragments,
+                &span_fragments_token_prefix,
+                true,
+            ),
+            self.insert_clickhouse(
+                &event_measures_table,
+                &batch.event_measures,
+                &event_measures_token_prefix,
+                true,
+            ),
+            self.insert_clickhouse(
+                &entity_state_updates_table,
+                &batch.entity_state_updates,
+                &entity_state_updates_token_prefix,
+                true,
+            ),
+        )?;
+        let derived_insert_ms = elapsed_ms(derived_insert_started);
+
+        self.delete_messages(&messages).await?;
+
+        info!(
+            objects = batch.objects,
+            rows = batch.rows,
+            bytes = batch.raw_bytes,
+            field_index_bytes = batch.field_index_bytes,
+            span_fragment_bytes = batch.span_fragment_bytes,
+            event_measure_bytes = batch.event_measure_bytes,
+            entity_state_update_bytes = batch.entity_state_update_bytes,
+            s3_ms = batch.s3_ms,
+            transform_ms = batch.transform_ms,
+            definitions_ms = batch.definitions_ms,
+            derive_ms = batch.derive_ms,
+            raw_insert_ms,
+            derived_insert_ms,
+            "loaded event object batch"
+        );
+
+        Ok(())
+    }
+
+    async fn prepare_batch(&self, objects: Vec<ObjectRef>) -> Result<Vec<PreparedObject>> {
+        let mut unique = BTreeSet::new();
+        let mut to_prepare = Vec::new();
+        for object_ref in objects {
+            if !unique.insert((object_ref.bucket.clone(), object_ref.key.clone())) {
+                continue;
+            }
+            to_prepare.push(object_ref);
+        }
+
+        let concurrency = self.cfg.concurrency.max(1);
+        let mut prepared = Vec::new();
+        for chunk in to_prepare.chunks(concurrency) {
+            let mut tasks = JoinSet::new();
+            for object in chunk.iter().cloned() {
+                let loader = self.clone();
+                tasks.spawn(async move { loader.prepare_object(object).await });
+            }
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(Some(object))) => prepared.push(object),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(err) => return Err(anyhow!("loader task failed: {err}")),
+                }
             }
         }
 
-        Ok(())
+        prepared.sort_by(|left, right| {
+            left.object_ref
+                .bucket
+                .cmp(&right.object_ref.bucket)
+                .then_with(|| left.object_ref.key.cmp(&right.object_ref.key))
+        });
+        Ok(prepared)
     }
 
-    async fn process_message(&self, message: &Message) -> Result<()> {
-        let body = message
-            .body()
-            .ok_or_else(|| anyhow!("SQS message missing body"))?;
-        let records = parse_s3_records(body)?;
-        for (bucket, key) in records {
-            self.process_object(&bucket, &key)
-                .await
-                .with_context(|| format!("process s3://{bucket}/{key}"))?;
-        }
-
-        let receipt = message
-            .receipt_handle()
-            .ok_or_else(|| anyhow!("SQS message missing receipt handle"))?;
-        self.sqs
-            .delete_message()
-            .queue_url(&self.cfg.sqs_queue_url)
-            .receipt_handle(receipt)
-            .send()
-            .await
-            .context("delete SQS message")?;
-
-        Ok(())
-    }
-
-    async fn process_object(&self, bucket: &str, key: &str) -> Result<()> {
+    async fn prepare_object(&self, object_ref: ObjectRef) -> Result<Option<PreparedObject>> {
+        let bucket = object_ref.bucket.as_str();
+        let key = object_ref.key.as_str();
+        let s3_started = Instant::now();
         let output = self
             .s3
             .get_object()
@@ -573,92 +788,93 @@ impl Loader {
             .await
             .context("read S3 object body")?
             .into_bytes();
+        let s3_ms = elapsed_ms(s3_started);
 
         if bytes.is_empty() {
             warn!(bucket, key, "skipping empty event object");
-            return Ok(());
+            return Ok(None);
         }
 
+        let transform_started = Instant::now();
         let processed = self
             .processors
             .transform_ndjson(&bytes)
             .context("transform event object")?;
+        let transform_ms = elapsed_ms(transform_started);
+        let rows = count_ndjson_rows(&processed);
 
-        if count_ndjson_rows(&processed) == 0 {
+        if rows == 0 {
             warn!(
                 bucket,
                 key,
                 bytes = processed.len(),
                 "skipping object without complete rows"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         let capabilities = builtin_field_capabilities();
-        let definitions = self.active_definitions().await.unwrap_or_else(|err| {
+        let definitions_started = Instant::now();
+        let definitions = self.cached_definitions().await.unwrap_or_else(|err| {
             warn!(error = %err, "failed to load dynamic definitions; continuing with built-ins");
             ExtractionDefinitions::default()
         });
+        let definitions_ms = elapsed_ms(definitions_started);
+        let derive_started = Instant::now();
         let derived = derived_buffers(&processed, &capabilities, &definitions)
             .context("derive event rows")?;
-        let token_prefix = insert_token_prefix(bucket, key);
+        let derive_ms = elapsed_ms(derive_started);
 
-        self.insert_clickhouse(&self.cfg.table_name(), &processed, &token_prefix, false)
-            .await?;
+        Ok(Some(PreparedObject {
+            object_ref,
+            rows,
+            raw: processed,
+            derived,
+            s3_ms,
+            transform_ms,
+            definitions_ms,
+            derive_ms,
+        }))
+    }
 
-        let field_index_table = self.cfg.field_index_table_name();
-        let span_fragments_table = self.cfg.span_fragments_table_name();
-        let event_measures_table = self.cfg.event_measures_table_name();
-        let entity_state_updates_table = self.cfg.entity_state_updates_table_name();
-        let field_index_token_prefix = format!("{token_prefix}:field_index");
-        let span_fragments_token_prefix = format!("{token_prefix}:span_fragments");
-        let event_measures_token_prefix = format!("{token_prefix}:event_measures");
-        let entity_state_updates_token_prefix = format!("{token_prefix}:entity_state_updates");
-
-        tokio::try_join!(
-            self.insert_clickhouse(
-                &field_index_table,
-                &derived.field_index,
-                &field_index_token_prefix,
-                true,
-            ),
-            self.insert_clickhouse(
-                &span_fragments_table,
-                &derived.span_fragments,
-                &span_fragments_token_prefix,
-                true,
-            ),
-            self.insert_clickhouse(
-                &event_measures_table,
-                &derived.event_measures,
-                &event_measures_token_prefix,
-                true,
-            ),
-            self.insert_clickhouse(
-                &entity_state_updates_table,
-                &derived.entity_state_updates,
-                &entity_state_updates_token_prefix,
-                true,
-            ),
-        )?;
-
-        info!(
-            bucket,
-            key,
-            rows = derived.rows,
-            bytes = processed.len(),
-            field_index_bytes = derived.field_index.len(),
-            span_fragment_bytes = derived.span_fragments.len(),
-            event_measure_bytes = derived.event_measures.len(),
-            entity_state_update_bytes = derived.entity_state_updates.len(),
-            lookup_keys = capabilities.lookup.len(),
-            aggregate_keys = capabilities.aggregate.len(),
-            dynamic_fields = definitions.fields.len(),
-            dynamic_measures = definitions.measures.len(),
-            dynamic_states = definitions.states.len(),
-            "loaded event object"
-        );
+    async fn delete_messages(&self, messages: &[Message]) -> Result<()> {
+        for message in messages {
+            let receipt = message
+                .receipt_handle()
+                .ok_or_else(|| anyhow!("SQS message missing receipt handle"))?;
+            self.sqs
+                .delete_message()
+                .queue_url(&self.cfg.sqs_queue_url)
+                .receipt_handle(receipt)
+                .send()
+                .await
+                .context("delete SQS message")?;
+        }
         Ok(())
+    }
+
+    async fn cached_definitions(&self) -> Result<ExtractionDefinitions> {
+        let now = Instant::now();
+        {
+            let cached = self.definitions_cache.read().await;
+            if cached.fetched_at.is_some_and(|fetched_at| {
+                now.duration_since(fetched_at) < self.cfg.definitions_refresh_interval
+            }) {
+                return Ok(cached.definitions.clone());
+            }
+        }
+
+        let mut cached = self.definitions_cache.write().await;
+        if cached.fetched_at.is_some_and(|fetched_at| {
+            now.duration_since(fetched_at) < self.cfg.definitions_refresh_interval
+        }) {
+            return Ok(cached.definitions.clone());
+        }
+
+        let definitions = self.active_definitions().await?;
+        cached.definitions = definitions.clone();
+        cached.fetched_at = Some(Instant::now());
+        Ok(definitions)
     }
 
     async fn active_definitions(&self) -> Result<ExtractionDefinitions> {
@@ -708,6 +924,8 @@ impl Loader {
             return Ok(());
         }
 
+        let insert_concurrency = self.cfg.clickhouse_insert_concurrency.max(1);
+        let mut tasks = JoinSet::new();
         for (chunk_index, chunk) in ndjson_chunks(
             body,
             self.cfg.clickhouse_insert_max_rows,
@@ -716,8 +934,29 @@ impl Loader {
         .into_iter()
         .enumerate()
         {
-            self.insert_clickhouse_chunk(table, chunk, token_prefix, chunk_index, async_insert)
-                .await?;
+            let loader = self.clone();
+            let table = table.to_string();
+            let token_prefix = token_prefix.to_string();
+            let chunk = chunk.to_vec();
+            tasks.spawn(async move {
+                loader
+                    .insert_clickhouse_chunk(
+                        &table,
+                        chunk,
+                        &token_prefix,
+                        chunk_index,
+                        async_insert,
+                    )
+                    .await
+            });
+
+            if tasks.len() >= insert_concurrency {
+                wait_for_insert_task(&mut tasks).await?;
+            }
+        }
+
+        while !tasks.is_empty() {
+            wait_for_insert_task(&mut tasks).await?;
         }
 
         Ok(())
@@ -726,7 +965,7 @@ impl Loader {
     async fn insert_clickhouse_chunk(
         &self,
         table: &str,
-        body: &[u8],
+        body: Vec<u8>,
         token_prefix: &str,
         chunk_index: usize,
         async_insert: bool,
@@ -743,14 +982,14 @@ impl Loader {
                 ("type_json_skip_duplicated_paths", "1"),
                 ("insert_deduplicate", "1"),
             ])
-            .body(body.to_vec());
+            .body(body);
 
         let dedupe_token = insert_deduplication_token(token_prefix, table, chunk_index);
         request = request.query(&[("insert_deduplication_token", dedupe_token.as_str())]);
         if async_insert {
             request = request.query(&[
                 ("async_insert", "1"),
-                ("wait_for_async_insert", "1"),
+                ("wait_for_async_insert", "0"),
                 ("async_insert_busy_timeout_ms", "1000"),
             ]);
         }
@@ -767,6 +1006,14 @@ impl Loader {
         }
 
         Ok(())
+    }
+}
+
+async fn wait_for_insert_task(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(err)) => Err(anyhow!("ClickHouse insert task failed: {err}")),
+        None => Ok(()),
     }
 }
 
@@ -1388,29 +1635,11 @@ impl EventIndexContext {
 }
 
 fn builtin_field_capabilities() -> FieldCapabilities {
-    let aggregate = [
-        "tenant_id",
-        "service",
-        "environment",
-        "event_type",
-        "signal",
-        "name",
-        "http.route",
-        "http.method",
-        "http.status_code",
-        "severity_text",
-        "metric_name",
-    ];
-    let lookup_only = [
-        "trace_id",
-        "span_id",
-        "parent_span_id",
-        "event_id",
-        "request_id",
-        "user_id",
-        "account_id",
-        "session_id",
-    ];
+    // Keep field_index schema-defined by default. Builtin event fields already
+    // live on `events`; high-cardinality lookups must be explicitly promoted so
+    // the loader does not multiply every ingest batch by default.
+    let aggregate: [&str; 0] = [];
+    let lookup_only: [&str; 0] = [];
     let mut lookup = BTreeSet::new();
     for key in aggregate.into_iter().chain(lookup_only) {
         lookup.insert(key.to_string());
@@ -1626,8 +1855,15 @@ fn ndjson_chunks(bytes: &[u8], max_rows: usize, max_bytes: usize) -> Vec<&[u8]> 
     chunks
 }
 
-fn insert_token_prefix(bucket: &str, key: &str) -> String {
-    format!("s3://{bucket}/{key}")
+fn batch_token_prefix(prepared: &[PreparedObject]) -> String {
+    let mut hasher = Sha256::new();
+    for object in prepared {
+        hasher.update(object.object_ref.bucket.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(object.object_ref.key.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("s3-batch:{:x}", hasher.finalize())
 }
 
 fn insert_deduplication_token(prefix: &str, table: &str, chunk_index: usize) -> String {
@@ -1761,26 +1997,14 @@ mod tests {
     }
 
     #[test]
-    fn generates_field_index_for_facet_and_lookup_modes() {
+    fn skips_builtin_field_index_without_schema_definitions() {
         let index = field_index_ndjson(
-            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","data":{"tenant_id":"tenant-a","event_type":"span_start","service":"api","trace_id":"trace-1","span_id":"span-1","name":"GET /users","http":{"route":"/users/:id","method":"GET"}}}"#,
+            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","data":{"tenant_id":"tenant-a","event_type":"span_start","service":"api","trace_id":"trace-1","span_id":"span-1","name":"GET /users","request_id":"req_1","http":{"route":"/users/:id","method":"GET"}}}"#,
             &builtin_field_capabilities(),
             &ExtractionDefinitions::default(),
         )
         .expect("generate field index");
-        let rows = String::from_utf8(index).expect("utf8");
-        let parsed: Vec<Value> = rows
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-
-        assert!(parsed.iter().any(|row| row["mode"] == "facet"
-            && row["field_name"] == "service"
-            && row["value"] == "api"));
-        assert!(parsed.iter().any(|row| row["mode"] == "lookup"
-            && row["field_name"] == "trace_id"
-            && row["value"] == "trace-1"));
-        assert!(!parsed.iter().any(|row| row["field_name"] == "ignored"));
+        assert!(index.is_empty());
     }
 
     #[test]

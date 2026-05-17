@@ -4,16 +4,16 @@
   "observed_timestamp": "2026-05-08T01:23:45.130Z",
   "data": {
     "tenant_id": "fixture",
-    "service": "api",
+    "service": "llm-gateway",
     "event_type": "metric",
     "signal": "metric",
     "environment": "prod",
-    "metric_name": "http.server.duration",
+    "metric_name": "llm.duration",
     "metric_type": "histogram",
-    "metric_value": 231,
+    "metric_value": 1810,
     "metric_unit": "ms",
-    "http.route": "/checkout",
+    "http.route": "/v1/responses",
     "bucket_counts": [12, 31, 4],
-    "explicit_bounds": [50, 100, 250]
+    "explicit_bounds": [250, 1000, 4000]
   }
 }

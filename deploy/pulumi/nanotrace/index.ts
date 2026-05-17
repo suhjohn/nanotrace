@@ -78,8 +78,20 @@ const dataVolumeType = cfg.get('dataVolumeType') ?? 'gp3'
 const dataVolumeIops = cfg.getNumber('dataVolumeIops') ?? 3000
 const dataVolumeThroughput = cfg.getNumber('dataVolumeThroughput') ?? 250
 const localDataDir = cfg.get('dataDir') ?? '/data/events'
-const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 1024 * 1024
-const partMaxAgeSecs = cfg.getNumber('partMaxAgeSecs') ?? 1
+const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 64 * 1024 * 1024
+const partMaxAgeSecs = cfg.getNumber('partMaxAgeSecs') ?? 5
+const loaderConcurrency = cfg.getNumber('loaderConcurrency') ?? 8
+const loaderDefinitionsRefreshSecs =
+  cfg.getNumber('loaderDefinitionsRefreshSecs') ?? 60
+const clickhouseInsertConcurrency =
+  cfg.getNumber('clickhouseInsertConcurrency') ?? 4
+const loaderQueueResetToken = (
+  cfg.get('loaderQueueResetToken') ??
+  process.env.NANOTRACE_LOADER_QUEUE_RESET_TOKEN ??
+  ''
+)
+  .trim()
+  .replace(/[^a-zA-Z0-9-]/g, '-')
 const uploadPollIntervalMs =
   cfg.getNumber('uploadPollIntervalMs') ??
   numberEnv('UPLOAD_POLL_INTERVAL_MS', 500)
@@ -400,7 +412,10 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
   versioningConfiguration: { status: 'Enabled' }
 })
 
-const loaderQueue = new aws.sqs.Queue(`${name}-loader-events`, {
+const loaderQueueName = loaderQueueResetToken
+  ? `${name}-loader-events-${loaderQueueResetToken}`
+  : `${name}-loader-events`
+const loaderQueue = new aws.sqs.Queue(loaderQueueName, {
   kmsMasterKeyId: dataKmsKeyArn,
   messageRetentionSeconds: 345_600,
   visibilityTimeoutSeconds: 300,
@@ -1453,6 +1468,9 @@ const userData = pulumi
         maxRequestBytes,
         partMaxAgeSecs,
         partMaxBytes,
+        clickhouseInsertConcurrency,
+        loaderConcurrency,
+        loaderDefinitionsRefreshSecs,
         port,
         prefix,
         region,
@@ -1698,6 +1716,9 @@ interface UserDataArgs {
   maxRequestBytes: number
   partMaxAgeSecs: number
   partMaxBytes: number
+  clickhouseInsertConcurrency: number
+  loaderConcurrency: number
+  loaderDefinitionsRefreshSecs: number
   port: number
   prefix: string
   region: string
@@ -1869,6 +1890,8 @@ docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e LOADER_SQS_QUEUE_URL=${shellQuote(args.loaderQueueUrl)} \\
+  -e LOADER_CONCURRENCY=${args.loaderConcurrency} \\
+  -e LOADER_DEFINITIONS_REFRESH_SECS=${args.loaderDefinitionsRefreshSecs} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
@@ -1876,6 +1899,7 @@ docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e CLICKHOUSE_INSERT_CONCURRENCY=${args.clickhouseInsertConcurrency} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-loader
 `

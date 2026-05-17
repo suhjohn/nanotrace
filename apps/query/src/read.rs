@@ -281,6 +281,7 @@ impl ReadStore {
             "event_index",
             "field_index",
             "field_counts_5m",
+            "event_density_1s",
             "span_fragments",
             "spans",
             "trace_summaries",
