@@ -891,8 +891,8 @@ enum CodexWorkflow {
 impl CodexWorkflow {
     fn for_group(group: u64) -> Self {
         match group % 10 {
-            0 | 1 | 2 => Self::CodeEdit,
-            3 | 4 => Self::DebugFailure,
+            0..=2 => Self::CodeEdit,
+            3..=4 => Self::DebugFailure,
             5 => Self::CanvasEdit,
             6 => Self::DocsLookup,
             7 => Self::ImageGeneration,
@@ -2870,7 +2870,6 @@ async fn clickhouse_stats(
     context: &LoadContext,
     clickhouse: &ClickHouseConfig,
 ) -> Result<ClickHouseStats> {
-    let event_prefix = format!("{}-", context.config.run_id);
     let ingest_lag =
         "toUnixTimestamp64Milli(ingested_timestamp) - toUnixTimestamp64Milli(timestamp)";
     let sql = format!(
@@ -2883,13 +2882,11 @@ SELECT
     quantileExact(0.95)({ingest_lag}) AS p95_ingest_lag_ms,
     max({ingest_lag}) AS max_ingest_lag_ms
 FROM {}.{}
-WHERE data._loadtest.run_id = '{}'
-  AND startsWith(event_id, '{}')
+WHERE getSubcolumn(data, '_loadtest.run_id') = '{}'
 FORMAT JSON",
         quote_identifier(&clickhouse.database),
         quote_identifier(&clickhouse.table),
-        escape_sql_string(&context.config.run_id),
-        escape_sql_string(&event_prefix)
+        escape_sql_string(&context.config.run_id)
     );
 
     let response = context
@@ -2930,14 +2927,13 @@ fn output_string(outputs: Option<&Value>, key: &str) -> Option<String> {
 }
 
 fn validate_identifier(value: &str, env_key: &str) -> Result<()> {
-    let valid = value
-        .chars()
-        .enumerate()
-        .all(|(index, character)| match (index, character) {
-            (0, 'A'..='Z' | 'a'..='z' | '_') => true,
-            (_, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_') => true,
-            _ => false,
-        });
+    let valid = value.chars().enumerate().all(|(index, character)| {
+        matches!(
+            (index, character),
+            (0, 'A'..='Z' | 'a'..='z' | '_')
+                | (_, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')
+        )
+    });
     if !valid {
         bail!("{env_key} must be a simple ClickHouse identifier");
     }
@@ -3238,9 +3234,7 @@ mod tests {
         let event = make_event(&context, "test_mix").expect("event");
         let object = event.as_object().expect("event object");
 
-        assert!(
-            Uuid::parse_str(object["event_id"].as_str().unwrap()).is_ok()
-        );
+        assert!(Uuid::parse_str(object["event_id"].as_str().unwrap()).is_ok());
         assert!(object.get("tenant_id").is_none());
         assert!(object.get("service").is_none());
         assert!(object.get("event_type").is_none());
@@ -3525,10 +3519,11 @@ mod tests {
 
         let first = make_event(&context, "codex_mix").expect("first event");
         let second = make_event(&context, "codex_mix").expect("second event");
-        let llm = (0..3)
-            .map(|_| make_event(&context, "codex_mix").expect("event"))
-            .last()
-            .expect("llm event");
+        let mut llm = None;
+        for _ in 0..3 {
+            llm = Some(make_event(&context, "codex_mix").expect("event"));
+        }
+        let llm = llm.expect("llm event");
         let first_data = first["data"].as_object().expect("first data");
         let second_data = second["data"].as_object().expect("second data");
         let llm_data = llm["data"].as_object().expect("llm data");

@@ -30,6 +30,22 @@ x-app-env: &app-env
   PROCESSOR_S3_BUCKET: nanotrace-dev-events
   PROCESSOR_PREFIX: processors
   PROCESSOR_BUILDER_CMD: "true"
+  NANOTRACE_LAKEHOUSE_ENABLED: ${NANOTRACE_LAKEHOUSE_ENABLED:-true}
+  NANOTRACE_INGEST_LEDGER_ENABLED: ${NANOTRACE_INGEST_LEDGER_ENABLED:-true}
+  NANOTRACE_INGEST_LEDGER_STALE_SECS: ${NANOTRACE_INGEST_LEDGER_STALE_SECS:-3600}
+  NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR: /data/lakehouse
+  NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES: ${NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES:-536870912}
+  NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP: ${NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP:-10000}
+  NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS: ${NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS:-604800000}
+  NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX: ${NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX:-100}
+  NANOTRACE_REBUILD_TRUNCATE: ${NANOTRACE_REBUILD_TRUNCATE:-false}
+  NANOTRACE_REBUILD_RAW: ${NANOTRACE_REBUILD_RAW:-true}
+  NANOTRACE_REBUILD_DERIVED: ${NANOTRACE_REBUILD_DERIVED:-true}
+  NANOTRACE_MATERIALIZE_INCREMENTAL: ${NANOTRACE_MATERIALIZE_INCREMENTAL:-false}
+  NANOTRACE_MATERIALIZE_LOOP: ${NANOTRACE_MATERIALIZE_LOOP:-false}
+  NANOTRACE_MATERIALIZE_POLL_SECS: ${NANOTRACE_MATERIALIZE_POLL_SECS:-5}
+  NANOTRACE_REBUILD_ALLOW_NON_EMPTY: ${NANOTRACE_REBUILD_ALLOW_NON_EMPTY:-false}
+  NANOTRACE_REBUILD_FROM_SEQUENCE: ${NANOTRACE_REBUILD_FROM_SEQUENCE:-0}
   RUST_LOG: info
 
 services:
@@ -113,6 +129,7 @@ services:
       CLICKHOUSE_DATABASE: observatory
       CLICKHOUSE_TABLE: events
       CLICKHOUSE_SCHEMA_PATH: deploy/clickhouse/schema.sql
+      CLICKHOUSE_RESET_DATABASE: ${CLICKHOUSE_RESET_DATABASE:-false}
       NANOTRACE_DEFAULT_TENANT_ID: org_default
     volumes:
       - .:/workspace:ro
@@ -152,7 +169,28 @@ services:
       <<: *app-env
       LOADER_SQS_QUEUE_URL: http://localstack:4566/000000000000/nanotrace-dev-events
       LOADER_POLL_WAIT_SECS: "1"
+    volumes:
+      - lakehouse-data:/data/lakehouse
     command: ["/usr/local/bin/nanotrace-loader"]
+
+  materializer:
+    image: nanotrace-dev-app:latest
+    depends_on:
+      server:
+        condition: service_started
+      clickhouse-schema:
+        condition: service_completed_successfully
+      localstack-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      NANOTRACE_MATERIALIZE_LOOP: "true"
+      NANOTRACE_REBUILD_COMMIT_SOURCE: clickhouse
+      NANOTRACE_REBUILD_RAW: "false"
+      NANOTRACE_REBUILD_DERIVED: "true"
+    volumes:
+      - lakehouse-data:/data/lakehouse
+    command: ["/usr/local/bin/nanotrace-lakehouse-rebuild"]
 
   ui:
     image: node:24-bookworm
@@ -177,6 +215,7 @@ services:
 volumes:
   clickhouse-data:
   localstack-data:
+  lakehouse-data:
   postgres-data:
   server-data:
   ui-node-modules:

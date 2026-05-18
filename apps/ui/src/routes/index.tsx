@@ -640,14 +640,15 @@ export function ObservatoryHome({
   })
   const flamegraphQuery = useQuery({
     enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphModeBeforeFlamegraph === 'flamegraph'),
-    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams],
+    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange],
     queryFn: () =>
       fetchFlamegraph({
         apiBaseUrl: observatoryUrl,
         eventFilter: eventFilterParams,
         groupBy,
         maxSpans: 20_000,
-        selectedGroupValue
+        selectedGroupValue,
+        timeRange: selectedTimeRange
       }),
     retry: false
   })
@@ -2306,7 +2307,8 @@ function FlamegraphCanvas({
   const axisHeight = 26
   const scenePaddingX = 24
   const scenePaddingY = 16
-  const baseMsToPx = Math.max(viewport.clientWidth - scenePaddingX * 2, 960) / 10_000
+  const baseTimelineWidth = Math.max(viewport.clientWidth - scenePaddingX * 2, 960)
+  const baseMsToPx = baseTimelineWidth / Math.max(flamegraph.totalDuration, 1)
   const msToPx = baseMsToPx * zoom
   const sceneWidth = Math.max(flamegraph.totalDuration * msToPx + scenePaddingX * 2, 960)
   const sceneHeight = Math.max(axisHeight + flamegraph.rows.length * (rowHeight + rowGap) + scenePaddingY * 2, 96)
@@ -3463,7 +3465,7 @@ function jsonTreeNodeType(value: JsonValue): JsonTreeNode['type'] {
   return 'object'
 }
 
-function buildFlamegraph(events: TraceEvent[]): Flamegraph {
+function buildFlamegraph(events: TraceEvent[], domain?: TimeDomain | null): Flamegraph {
   const latestEventMs = Math.max(...events.map(event => traceTimeMs(event.createdAt)).filter(Number.isFinite), 0)
   const spanCandidates = new Map<
     string,
@@ -3555,8 +3557,12 @@ function buildFlamegraph(events: TraceEvent[]): Flamegraph {
 
   spans.sort((a, b) => (a.startMs !== b.startMs ? a.startMs - b.startMs : b.endMs - a.endMs))
 
-  const minStart = Math.min(...spans.map(span => span.startMs))
-  const maxEnd = Math.max(...spans.map(span => span.endMs))
+  const spanMinStart = Math.min(...spans.map(span => span.startMs))
+  const spanMaxEnd = Math.max(...spans.map(span => span.endMs))
+  const domainFromMs = domain ? traceTimeMs(domain.from) : Number.NaN
+  const domainToMs = domain ? traceTimeMs(domain.to) : Number.NaN
+  const minStart = Number.isFinite(domainFromMs) ? domainFromMs : spanMinStart
+  const maxEnd = Number.isFinite(domainToMs) ? domainToMs : spanMaxEnd
   const spansById = new Map(spans.map(span => [span.id, span]))
   const depthCache = new Map<string, number>()
   const rows: FlameSpan[][] = []
@@ -3672,6 +3678,11 @@ type ClickHouseResponse<T> = {
 
 type QueryParameters = Record<string, string | number | boolean>
 
+type TimeDomain = {
+  from: string
+  to: string
+}
+
 type ResolvedTimeRange = {
   createdAfter?: string
   createdBefore?: string
@@ -3704,12 +3715,9 @@ type FlamegraphEventRow = {
 }
 
 const defaultTableName = 'observatory.events'
-const defaultFacetsTableName = 'observatory.field_counts_5m'
 const defaultDensityRollupsTableName = 'observatory.event_density_1s'
-const defaultEventIndexTableName = 'observatory.field_index'
+const defaultFieldIndexTableName = 'observatory.field_index'
 const defaultFieldValuesTableName = 'observatory.field_index'
-const defaultSpansTableName = 'observatory.spans'
-const defaultTraceSummariesTableName = 'observatory.trace_summaries'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -3791,18 +3799,6 @@ async function fetchGroups({
   sortKey: GroupSortKey
   timeRange: ResolvedTimeRange
 }): Promise<LogGroupPage> {
-  if (facetKey(groupBy) === 'trace_id') {
-    try {
-      const tracePage = await fetchTraceSummaryGroups({ apiBaseUrl, groupBy, limit, offset, search, sortKey, timeRange })
-      if (tracePage.groups.length > 0 || search) return tracePage
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  const timeFilter = timeRangeWhereClause(timeRange, 'bucket_time')
   const exactFilter = search ? ' AND value = {group_value:String}' : ''
   const pageLimit = limit + 1
   const baseParameters = {
@@ -3832,7 +3828,7 @@ async function fetchGroups({
           ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
           ', uniqExact(event_id) AS count',
           ", uniqExactIf(event_id, endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
-          `FROM ${eventIndexTable()}`,
+          `FROM ${fieldIndexTable()}`,
           `PREWHERE field_name = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
           'GROUP BY value',
           'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
@@ -3845,42 +3841,6 @@ async function fetchGroups({
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
       }
-    }
-  }
-
-  try {
-    const response = await postQuery<{
-      count: number
-      durationMs: number
-      endedAt: string
-      errorCount: number
-      startedAt: string
-      value: string
-    }>({
-      apiBaseUrl,
-      parameters: baseParameters,
-      query: [
-        'SELECT value',
-        ', min(bucket_time) AS startedAt',
-        ', max(bucket_time) AS endedAt',
-        ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs",
-        ', sum(count) AS count',
-        ', sum(error_count) AS errorCount',
-        `FROM ${facetsTable()}`,
-        `PREWHERE field_name = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
-        `WHERE value != ''${exactFilter}`,
-        'GROUP BY value',
-        groupOrderByClause({ groupBy, hasErrorCount: true, sortKey }),
-        'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
-      ].join(' ')
-    })
-    const rows = response.data ?? []
-    if (rows.length > 0) {
-      return groupPageFromResponse(rows, groupBy, limit, offset)
-    }
-  } catch (error) {
-    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-      throw error
     }
   }
 
@@ -3921,116 +3881,35 @@ async function fetchGroups({
     }
   }
 
+  const valueExpression = eventValueExpression(groupBy)
+  const rawTimeFilter = timeRangeWhereClause(timeRange, 'e.timestamp')
   const response = await postQuery<{
     count: number
     durationMs: number
     endedAt: string
+    errorCount: number
     startedAt: string
     value: string
   }>({
     apiBaseUrl,
     parameters: baseParameters,
     query: [
-      'SELECT value',
-      ', min(bucket_time) AS startedAt',
-      ', max(bucket_time) AS endedAt',
-      ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs",
-      ', sum(count) AS count',
-      `FROM ${facetsTable()}`,
-      `PREWHERE field_name = {group_key:String}${timeFilter ? ` AND ${timeFilter}` : ''}`,
-      `WHERE value != ''${exactFilter}`,
+      `SELECT ${valueExpression} AS value`,
+      ', min(e.timestamp) AS startedAt',
+      ', max(e.timestamp) AS endedAt',
+      ", dateDiff('millisecond', min(e.timestamp), max(e.timestamp)) AS durationMs",
+      ', count() AS count',
+      `, countIf(${errorExpression()}) AS errorCount`,
+      `FROM ${eventsTable()} AS e`,
+      rawTimeFilter ? `PREWHERE ${rawTimeFilter}` : '',
+      `WHERE ${valueExpression} != ''${search ? ` AND ${valueExpression} = {group_value:String}` : ''}`,
       'GROUP BY value',
-      groupOrderByClause({ groupBy, hasErrorCount: false, sortKey }),
+      groupOrderByClause({ groupBy, hasErrorCount: true, sortKey }),
       'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
     ].join(' ')
   })
 
   return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
-}
-
-async function fetchTraceSummaryGroups({
-  apiBaseUrl,
-  groupBy,
-  limit,
-  offset,
-  search,
-  sortKey,
-  timeRange
-}: {
-  apiBaseUrl: string
-  groupBy: string
-  limit: number
-  offset: number
-  search: string
-  sortKey: GroupSortKey
-  timeRange: ResolvedTimeRange
-}): Promise<LogGroupPage> {
-  const timeFilter = timeRangeWhereClause(timeRange, 'bucket_time')
-  const pageLimit = limit + 1
-  const response = await postQuery<{
-    count: number
-    durationMs: number
-    endedAt: string
-    errorCount: number
-    rootName: string
-    rootService: string
-    startedAt: string
-    value: string
-  }>({
-    apiBaseUrl,
-    parameters: {
-      group_value: search,
-      limit: pageLimit,
-      offset,
-      ...timeRangeParameters(timeRange)
-    },
-    query: [
-      'SELECT trace_id AS value',
-      ', minMerge(trace_start_state) AS startedAt',
-      ', maxMerge(trace_end_state) AS endedAt',
-      ", dateDiff('millisecond', startedAt, endedAt) AS durationMs",
-      ', uniqCombined64Merge(span_count_state) AS count',
-      ', sumMerge(error_count_state) AS errorCount',
-      ', argMinMerge(root_service_state) AS rootService',
-      ', argMinMerge(root_name_state) AS rootName',
-      `FROM ${traceSummariesTable()}`,
-      timeFilter ? `PREWHERE ${timeFilter}` : '',
-      search ? 'WHERE trace_id = {group_value:String}' : '',
-      'GROUP BY trace_id',
-      traceSummaryOrderByClause(sortKey),
-      'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
-    ].join(' ')
-  })
-  const pageRows = (response.data ?? []).slice(0, limit)
-  return {
-    groups: pageRows.map(group => ({
-      count: Number(group.count) || 0,
-      durationMs: Number(group.durationMs) || 0,
-      endedAt: normalizeTimestamp(group.endedAt),
-      errorCount: Number(group.errorCount) || 0,
-      fields: compactObject({
-        rootName: group.rootName,
-        rootService: group.rootService
-      }),
-      groupBy,
-      startedAt: normalizeTimestamp(group.startedAt),
-      value: group.value
-    })),
-    nextOffset: (response.data ?? []).length > limit ? offset + limit : undefined
-  }
-}
-
-function traceSummaryOrderByClause(sortKey: GroupSortKey) {
-  switch (sortKey) {
-    case 'count':
-      return 'ORDER BY count DESC, errorCount DESC, endedAt DESC'
-    case 'duration':
-      return 'ORDER BY durationMs DESC, endedAt DESC'
-    case 'value':
-      return 'ORDER BY value ASC'
-    case 'recent':
-      return 'ORDER BY endedAt DESC, errorCount DESC, count DESC'
-  }
 }
 
 function fieldValueTimeRangeWhereClause(timeRange: ResolvedTimeRange) {
@@ -4121,10 +4000,9 @@ async function fetchLatest({
       apiBaseUrl,
       parameters,
       query: [
-      'SELECT max(bucket_time) AS lastCreatedAt',
-      `FROM ${facetsTable()}`,
-      'PREWHERE field_name = {group_key:String}',
-      'WHERE value = {group_value:String}'
+        'SELECT max(timestamp) AS lastCreatedAt',
+        `FROM ${fieldIndexTable()}`,
+        'PREWHERE field_name = {group_key:String} AND value = {group_value:String}'
       ].join(' ')
     })
     const lastCreatedAt = normalizeTimestamp(response.data?.[0]?.lastCreatedAt)
@@ -4135,16 +4013,17 @@ async function fetchLatest({
     }
   }
 
-  const response = await postQuery<{ lastCreatedAt: string }>({
+  const valueExpression = eventValueExpression(groupBy)
+  const rawResponse = await postQuery<{ lastCreatedAt: string }>({
     apiBaseUrl,
     parameters,
     query: [
-      'SELECT max(timestamp) AS lastCreatedAt',
-      `FROM ${eventIndexTable()}`,
-      'PREWHERE field_name = {group_key:String} AND value = {group_value:String}'
+      'SELECT max(e.timestamp) AS lastCreatedAt',
+      `FROM ${eventsTable()} AS e`,
+      `WHERE ${valueExpression} = {group_value:String}`
     ].join(' ')
   })
-  return { lastCreatedAt: normalizeTimestamp(response.data?.[0]?.lastCreatedAt) }
+  return { lastCreatedAt: normalizeTimestamp(rawResponse.data?.[0]?.lastCreatedAt) }
 }
 
 async function fetchSummary({
@@ -4169,9 +4048,10 @@ async function fetchSummary({
     }
   }
 
-  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
     try {
-      return await fetchSummaryFromIndex({ apiBaseUrl, eventFilter, groupBy, selectedGroupValue })
+      const fieldIndexSummary = await fetchSummaryFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, selectedGroupValue })
+      if (fieldIndexSummary.count > 0) return fieldIndexSummary
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -4216,7 +4096,7 @@ async function fetchSummaryFromDensityRollup({
   return { capped: false, count, limit: count }
 }
 
-async function fetchSummaryFromIndex({
+async function fetchSummaryFromFieldIndex({
   apiBaseUrl,
   eventFilter,
   groupBy,
@@ -4227,15 +4107,15 @@ async function fetchSummaryFromIndex({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogSummary> {
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
+  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true })
   const response = await postQuery<{ count: number }>({
     apiBaseUrl,
     parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
     query: [
       'SELECT uniqExact(i.event_id) AS count',
-      `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' })
+      `FROM ${fieldIndexTable()} AS i`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
+      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i' })
     ].join(' ')
   })
   const count = Number(response.data?.[0]?.count) || 0
@@ -4261,9 +4141,10 @@ async function fetchEvents({
   sortDirection: EventSortDirection
   timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
     try {
-      return await fetchEventsFromIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue, sortDirection, timeRange })
+      const fieldIndexPage = await fetchEventsFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue, sortDirection, timeRange })
+      if (fieldIndexPage.events.length > 0) return fieldIndexPage
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -4333,7 +4214,7 @@ async function fetchEvents({
   }
 }
 
-async function fetchEventsFromIndex({
+async function fetchEventsFromFieldIndex({
   apiBaseUrl,
   eventFilter,
   groupBy,
@@ -4363,7 +4244,7 @@ async function fetchEventsFromIndex({
       : pageParam.around
         ? "i.timestamp <= {cursor:DateTime64(3, 'UTC')}"
         : ''
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter, timeRange })
+  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter, timeRange })
   const parameters = {
     ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
     limit,
@@ -4378,9 +4259,9 @@ async function fetchEventsFromIndex({
       'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
       ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
       ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
-      `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      eventIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
+      `FROM ${fieldIndexTable()} AS i`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
+      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
       'GROUP BY i.event_id, i.timestamp',
       `ORDER BY i.timestamp ${queryOrder}, i.event_id ${queryOrder}`,
       'LIMIT {limit:UInt64}'
@@ -4408,17 +4289,20 @@ async function fetchFlamegraph({
   eventFilter,
   groupBy,
   maxSpans,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
   groupBy: string
   maxSpans: number
   selectedGroupValue: string
+  timeRange: ResolvedTimeRange
 }): Promise<LogFlamegraph> {
-  if (facetKey(groupBy) === 'trace_id' && selectedGroupValue) {
+  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
     try {
-      return await fetchFlamegraphFromSpans({ apiBaseUrl, maxSpans, selectedTraceId: selectedGroupValue })
+      const fieldIndexFlamegraph = await fetchFlamegraphFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, maxSpans, selectedGroupValue, timeRange })
+      if ((fieldIndexFlamegraph.spanCount ?? 0) > 0) return fieldIndexFlamegraph
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -4426,21 +4310,11 @@ async function fetchFlamegraph({
     }
   }
 
-  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
-    try {
-      return await fetchFlamegraphFromIndex({ apiBaseUrl, eventFilter, groupBy, maxSpans, selectedGroupValue })
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
+  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue, timeRange })
   const response = await postQuery<FlamegraphEventRow>({
     apiBaseUrl,
     parameters: {
-      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
       limit: maxSpans
     },
     query: [
@@ -4458,7 +4332,8 @@ async function fetchFlamegraph({
     ].join(' ')
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  const flamegraph = buildFlamegraph(events)
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: events[0]?.createdAt, fallbackTo: events[events.length - 1]?.createdAt, timeRange })
+  const flamegraph = buildFlamegraph(events, domain)
   return {
     ...flamegraph,
     capped: events.length >= maxSpans,
@@ -4466,85 +4341,43 @@ async function fetchFlamegraph({
   }
 }
 
-async function fetchFlamegraphFromSpans({
-  apiBaseUrl,
-  maxSpans,
-  selectedTraceId
-}: {
-  apiBaseUrl: string
-  maxSpans: number
-  selectedTraceId: string
-}): Promise<LogFlamegraph> {
-  const response = await postQuery<FlamegraphEventRow>({
-    apiBaseUrl,
-    parameters: {
-      limit: maxSpans,
-      trace_id: selectedTraceId
-    },
-    query: [
-      'SELECT event_id, start_time AS timestamp, event_type, signal, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms',
-      'FROM (',
-      'SELECT if(length(arrayFlatten(groupArray(event_ids))) > 0, arrayFlatten(groupArray(event_ids))[1], span_id) AS event_id',
-      ', anyLast(event_type) AS event_type',
-      ', anyLast(signal) AS signal',
-      ', trace_id',
-      ', span_id',
-      ', anyLast(parent_span_id) AS parent_span_id',
-      ', anyLast(name) AS name',
-      ', min(start_time) AS start_time',
-      ', max(end_time) AS end_time',
-      ', ifNull(max(duration_ms), 0) AS duration_ms',
-      `FROM ${spansTable()}`,
-      'PREWHERE trace_id = {trace_id:String}',
-      'GROUP BY trace_id, span_id',
-      ')',
-      'ORDER BY start_time ASC, span_id ASC',
-      'LIMIT {limit:UInt64}'
-    ].join(' ')
-  })
-  const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  const flamegraph = buildFlamegraph(events)
-  return {
-    ...flamegraph,
-    capped: events.length >= maxSpans,
-    spanCount: flamegraph.rows.reduce((count, row) => count + row.length, 0)
-  }
-}
-
-async function fetchFlamegraphFromIndex({
+async function fetchFlamegraphFromFieldIndex({
   apiBaseUrl,
   eventFilter,
   groupBy,
   maxSpans,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
   groupBy: string
   maxSpans: number
   selectedGroupValue: string
+  timeRange: ResolvedTimeRange
 }): Promise<LogFlamegraph> {
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true })
+  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
   const response = await postQuery<FlamegraphEventRow>({
     apiBaseUrl,
     parameters: {
-      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
+      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
       limit: maxSpans
     },
     query: [
       'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
       ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
       ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
-      `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      eventIndexFacetWhere({ eventFilter, outerAlias: 'i' }),
+      `FROM ${fieldIndexTable()} AS i`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
+      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
       'GROUP BY i.event_id, i.timestamp',
       'ORDER BY i.timestamp ASC, i.event_id ASC',
       'LIMIT {limit:UInt64}'
     ].join(' ')
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  const flamegraph = buildFlamegraph(events)
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: events[0]?.createdAt, fallbackTo: events[events.length - 1]?.createdAt, timeRange })
+  const flamegraph = buildFlamegraph(events, domain)
   return {
     ...flamegraph,
     capped: events.length >= maxSpans,
@@ -4578,9 +4411,10 @@ async function fetchDensity({
     }
   }
 
-  if (groupBy && selectedGroupValue && canUseFacetIndex(eventFilter)) {
+  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
     try {
-      return await fetchDensityFromIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue, timeRange })
+      const fieldIndexDensity = await fetchDensityFromFieldIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue, timeRange })
+      if (fieldIndexDensity.buckets.length > 0) return fieldIndexDensity
     } catch (error) {
       if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
         throw error
@@ -4601,13 +4435,12 @@ async function fetchDensity({
     ].join(' ')
   })
   const row = range.data?.[0]
-  const from = normalizeTimestamp(row?.from)
-  const to = normalizeTimestamp(row?.to)
-  const fromMs = Date.parse(from)
-  const toMs = Date.parse(to)
-  if (!Number(row?.count) || !Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
+  if (!Number(row?.count) || !domain) {
     return { bucketMs: 1, buckets: [], from: '', to: '' }
   }
+  const fromMs = Date.parse(domain.from)
+  const toMs = Date.parse(domain.to)
 
   const bucketMs = niceTimeInterval(Math.max(1, (toMs - fromMs) / buckets))
   const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
@@ -4632,8 +4465,8 @@ async function fetchDensity({
       errorCount: Number(bucket.errorCount) || 0,
       start: new Date(Number(bucket.bucket)).toISOString()
     })),
-    from,
-    to
+    from: domain.from,
+    to: domain.to
   }
 }
 
@@ -4660,13 +4493,12 @@ async function fetchDensityFromRollup({
     ].join(' ')
   })
   const row = range.data?.[0]
-  const from = normalizeTimestamp(eventFilter.createdAfter || timeRange.createdAfter || row?.from)
-  const to = normalizeTimestamp(eventFilter.createdBefore || timeRange.createdBefore || row?.to)
-  const fromMs = Date.parse(from)
-  const toMs = Date.parse(to)
-  if (!Number(row?.count) || !Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
+  if (!Number(row?.count) || !domain) {
     return { bucketMs: 1, buckets: [], from: '', to: '' }
   }
+  const fromMs = Date.parse(domain.from)
+  const toMs = Date.parse(domain.to)
 
   const bucketMs = Math.max(1_000, niceTimeInterval(Math.max(1_000, (toMs - fromMs) / buckets)))
   const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
@@ -4689,12 +4521,12 @@ async function fetchDensityFromRollup({
       errorCount: Number(bucket.errorCount) || 0,
       start: new Date(Number(bucket.bucket)).toISOString()
     })),
-    from,
-    to
+    from: domain.from,
+    to: domain.to
   }
 }
 
-async function fetchDensityFromIndex({
+async function fetchDensityFromFieldIndex({
   apiBaseUrl,
   buckets,
   eventFilter,
@@ -4710,26 +4542,25 @@ async function fetchDensityFromIndex({
   timeRange: ResolvedTimeRange
 }): Promise<LogDensity> {
   const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange })
-  const indexPrewhere = eventIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
-  const indexWhere = eventIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange })
+  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
+  const fieldIndexWhere = fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange })
   const range = await postQuery<{ count: number; from: string; to: string }>({
     apiBaseUrl,
     parameters,
     query: [
       'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, uniqExact(i.event_id) AS count',
-      `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      indexWhere
+      `FROM ${fieldIndexTable()} AS i`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
+      fieldIndexWhere
     ].join(' ')
   })
   const row = range.data?.[0]
-  const from = normalizeTimestamp(row?.from)
-  const to = normalizeTimestamp(row?.to)
-  const fromMs = Date.parse(from)
-  const toMs = Date.parse(to)
-  if (!Number(row?.count) || !Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
+  if (!Number(row?.count) || !domain) {
     return { bucketMs: 1, buckets: [], from: '', to: '' }
   }
+  const fromMs = Date.parse(domain.from)
+  const toMs = Date.parse(domain.to)
 
   const bucketMs = niceTimeInterval(Math.max(1, (toMs - fromMs) / buckets))
   const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
@@ -4739,9 +4570,9 @@ async function fetchDensityFromIndex({
       'WITH intDiv(toUnixTimestamp64Milli(i.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
       'SELECT bucket, uniqExact(i.event_id) AS count',
       ", uniqExactIf(i.event_id, endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
-      `FROM ${eventIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${indexPrewhere ? ` AND ${indexPrewhere}` : ''}`,
-      indexWhere,
+      `FROM ${fieldIndexTable()} AS i`,
+      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
+      fieldIndexWhere,
       'GROUP BY bucket',
       'ORDER BY bucket ASC'
     ].join(' ')
@@ -4754,8 +4585,8 @@ async function fetchDensityFromIndex({
       errorCount: Number(bucket.errorCount) || 0,
       start: new Date(Number(bucket.bucket)).toISOString()
     })),
-    from,
-    to
+    from: domain.from,
+    to: domain.to
   }
 }
 
@@ -4943,19 +4774,6 @@ function eventsTable() {
     : defaultTableName
 }
 
-function facetsTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_COUNTS_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.field_counts_5m` : 'field_counts_5m'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultFacetsTableName
-}
-
 function densityRollupsTable() {
   const configured = String(import.meta.env.VITE_NANOTRACE_EVENT_DENSITY_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
@@ -4969,7 +4787,7 @@ function densityRollupsTable() {
     : defaultDensityRollupsTableName
 }
 
-function eventIndexTable() {
+function fieldIndexTable() {
   const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_INDEX_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
     return configured
@@ -4979,7 +4797,7 @@ function eventIndexTable() {
   const derived = database ? `${database}.field_index` : 'field_index'
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
-    : defaultEventIndexTableName
+    : defaultFieldIndexTableName
 }
 
 function fieldValuesTable() {
@@ -4993,32 +4811,6 @@ function fieldValuesTable() {
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFieldValuesTableName
-}
-
-function spansTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_SPANS_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.spans` : 'spans'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultSpansTableName
-}
-
-function traceSummariesTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_TRACE_SUMMARIES_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.trace_summaries` : 'trace_summaries'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultTraceSummariesTableName
 }
 
 function eventMetadataSelect(alias: string) {
@@ -5078,7 +4870,35 @@ function timeRangeParameters(range: ResolvedTimeRange): QueryParameters {
   }
 }
 
-function eventIndexPrewhere({
+function queryTimeDomain({
+  eventFilter,
+  fallbackFrom,
+  fallbackTo,
+  timeRange
+}: {
+  eventFilter: ParsedEventFilter
+  fallbackFrom?: string
+  fallbackTo?: string
+  timeRange: ResolvedTimeRange
+}): TimeDomain | null {
+  let from = normalizeTimestamp(eventFilter.createdAfter || timeRange.createdAfter)
+  let to = normalizeTimestamp(eventFilter.createdBefore || timeRange.createdBefore)
+
+  if (!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange.lookbackMinutes) {
+    const toMs = Date.now()
+    if (!to) to = new Date(toMs).toISOString()
+    if (!from) from = new Date(toMs - timeRange.lookbackMinutes * 60 * 1000).toISOString()
+  }
+
+  if (!from) from = normalizeTimestamp(fallbackFrom)
+  if (!to) to = normalizeTimestamp(fallbackTo)
+
+  const fromMs = Date.parse(from)
+  const toMs = Date.parse(to)
+  return Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs ? { from, to } : null
+}
+
+function fieldIndexPrewhere({
   eventFilter,
   includeAlias,
   includeCursor = '',
@@ -5099,7 +4919,7 @@ function eventIndexPrewhere({
   ].filter(Boolean).join(' AND ')
 }
 
-function eventIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string, timeRange?: ResolvedTimeRange) {
+function fieldIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string, timeRange?: ResolvedTimeRange) {
   const column = `${alias}.timestamp`
   const useTimeRange = !eventFilter.createdAfter && !eventFilter.createdBefore
   return [
@@ -5109,7 +4929,7 @@ function eventIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string, t
   ].filter(Boolean).join(' AND ')
 }
 
-function eventIndexFacetWhere({
+function fieldIndexFacetWhere({
   eventFilter,
   outerAlias,
   timeRange
@@ -5120,10 +4940,10 @@ function eventIndexFacetWhere({
 }) {
   const clauses = (eventFilter.facets ?? []).map((_filter, index) => {
       const alias = `f${index}`
-      const timePrewhere = eventIndexTimePrewhere(eventFilter, alias, timeRange)
+      const timePrewhere = fieldIndexTimePrewhere(eventFilter, alias, timeRange)
       return [
         `${outerAlias}.event_id IN (`,
-        `SELECT ${alias}.event_id FROM ${eventIndexTable()} AS ${alias}`,
+        `SELECT ${alias}.event_id FROM ${fieldIndexTable()} AS ${alias}`,
         `PREWHERE ${alias}.field_name = {facet_filter_${index}_key:String} AND ${alias}.value = {facet_filter_${index}_value:String}${timePrewhere ? ` AND ${timePrewhere}` : ''}`,
         ')'
       ].join(' ')
@@ -5656,7 +5476,7 @@ function hasAppliedEventFilter(filter: ParsedEventFilter) {
   return filter.text !== '' || Boolean(filter.createdAfter) || Boolean(filter.createdBefore) || Boolean(filter.facets?.length)
 }
 
-function canUseFacetIndex(filter: ParsedEventFilter) {
+function canUseFieldIndex(filter: ParsedEventFilter) {
   return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed)
 }
 

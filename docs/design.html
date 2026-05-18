@@ -3,566 +3,653 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Nanotrace — Engineering Architecture</title>
+<title>Nanotrace - Current System Design</title>
 <style>
   :root {
-    --bg: #0b0d10;
-    --panel: #14181d;
-    --panel-2: #1b2027;
-    --line: #2a313b;
-    --text: #e6e8eb;
-    --muted: #9aa3ad;
-    --accent: #7cc5ff;
-    --accent-2: #b6f0c8;
-    --warn: #ffd27a;
-    --code-bg: #0e1216;
-    --max-width: 1100px;
+    --bg: #090b0d;
+    --panel: #11161b;
+    --panel-2: #171d24;
+    --panel-3: #0d1116;
+    --line: #27303a;
+    --text: #e7eaee;
+    --muted: #9aa4af;
+    --soft: #6f7b87;
+    --blue: #79c7ff;
+    --green: #abe8bb;
+    --yellow: #ffd27a;
+    --red: #ff8f8f;
+    --violet: #cab6ff;
+    --max-width: 1120px;
   }
+
   * { box-sizing: border-box; }
-  html, body {
+
+  html,
+  body {
     margin: 0;
     padding: 0;
-    background: var(--bg);
+    background:
+      radial-gradient(circle at 18% 0%, rgba(121, 199, 255, 0.14), transparent 28rem),
+      linear-gradient(180deg, #0f1419 0%, var(--bg) 24rem);
     color: var(--text);
-    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font: 15px/1.6 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   }
-  a { color: var(--accent); text-decoration: none; }
+
+  a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
+
+  code {
+    padding: 1px 5px;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: var(--panel-2);
+    color: #dce6ef;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  pre {
+    margin: 0 0 16px;
+    padding: 15px 17px;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #080b0f;
+    color: #d7dde4;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
   header.page {
     border-bottom: 1px solid var(--line);
-    background: linear-gradient(180deg, #11161c 0%, #0b0d10 100%);
   }
-  header.page .inner {
-    max-width: var(--max-width);
+
+  header.page .inner,
+  main {
+    width: min(var(--max-width), calc(100vw - 48px));
     margin: 0 auto;
-    padding: 36px 24px 28px;
   }
-  header.page h1 {
-    margin: 0 0 6px;
-    font-size: 28px;
-    letter-spacing: -0.01em;
+
+  header.page .inner {
+    padding: 42px 0 30px;
   }
-  header.page p.sub {
+
+  h1 {
+    margin: 0 0 8px;
+    font-size: 32px;
+    line-height: 1.12;
+    letter-spacing: -0.03em;
+  }
+
+  .sub {
+    max-width: 820px;
     margin: 0;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 14.5px;
   }
+
   main {
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 28px 24px 80px;
+    padding: 28px 0 84px;
   }
+
   nav.toc {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
     flex-wrap: wrap;
-    gap: 8px 14px;
-    padding: 14px 16px;
-    margin: 0 0 28px;
-    background: var(--panel);
+    gap: 8px 16px;
+    margin: 0 0 30px;
+    padding: 13px 15px;
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: 12px;
+    background: rgba(17, 22, 27, 0.92);
+    backdrop-filter: blur(10px);
     font-size: 13px;
   }
+
   nav.toc a { color: var(--muted); }
   nav.toc a:hover { color: var(--text); }
-  section { margin: 0 0 40px; }
-  section h2 {
-    font-size: 20px;
+
+  section { margin: 0 0 44px; }
+
+  h2 {
     margin: 0 0 14px;
-    padding: 0 0 8px;
+    padding: 0 0 9px;
     border-bottom: 1px solid var(--line);
+    font-size: 20px;
+    letter-spacing: -0.01em;
   }
-  section h3 {
-    font-size: 16px;
-    margin: 22px 0 8px;
-    color: var(--accent);
+
+  h3 {
+    margin: 24px 0 9px;
+    color: var(--blue);
+    font-size: 15.5px;
   }
-  p { margin: 0 0 12px; }
-  ul, ol { margin: 0 0 12px; padding-left: 22px; }
-  li { margin: 0 0 4px; }
-  pre {
-    background: var(--code-bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 14px 16px;
-    overflow-x: auto;
-    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #d4dadf;
-  }
-  code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12.5px;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 1px 5px;
-  }
+
+  p { margin: 0 0 13px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin: 0 0 5px; }
+
   table {
     width: 100%;
+    margin: 0 0 16px;
     border-collapse: collapse;
-    margin: 0 0 14px;
     font-size: 13px;
   }
-  th, td {
-    text-align: left;
+
+  th,
+  td {
     padding: 8px 10px;
     border-bottom: 1px solid var(--line);
+    text-align: left;
     vertical-align: top;
   }
-  th { color: var(--muted); font-weight: 600; }
-  .figure {
-    background: var(--panel);
+
+  th {
+    color: var(--muted);
+    font-weight: 650;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 0 0 16px;
+  }
+
+  .card,
+  .figure,
+  .callout {
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 18px;
+    border-radius: 12px;
+    background: rgba(17, 22, 27, 0.84);
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  .card strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+
+  .card span {
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .figure {
     margin: 0 0 18px;
+    padding: 18px;
     overflow-x: auto;
   }
-  .figure svg { display: block; margin: 0 auto; }
-  .figure-caption {
+
+  .figure svg {
+    display: block;
+    margin: 0 auto;
+  }
+
+  .caption {
     margin-top: 10px;
-    color: var(--muted);
+    color: var(--soft);
     font-size: 12.5px;
     text-align: center;
   }
+
   .callout {
-    border-left: 3px solid var(--accent);
-    background: var(--panel-2);
-    padding: 10px 14px;
-    border-radius: 0 6px 6px 0;
-    margin: 0 0 14px;
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    border-left: 3px solid var(--blue);
     color: var(--muted);
     font-size: 13.5px;
   }
-  .callout.warn { border-left-color: var(--warn); }
+
+  .callout.warn { border-left-color: var(--yellow); }
+
   footer {
     border-top: 1px solid var(--line);
-    color: var(--muted);
+    padding: 18px 24px;
+    color: var(--soft);
     font-size: 12.5px;
     text-align: center;
-    padding: 18px 24px;
   }
 
-  /* ── Diagram unified styles ───────────────────────────── */
-  .fn { fill: #14181d; stroke: #252b33; stroke-width: 0.8; }
-  .ft { font: 600 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fs { fill: #8a929c; font: 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fa { stroke: #4a5a6a; stroke-width: 1.2; fill: none; }
-  .fad { stroke: #4a5a6a; stroke-width: 1; fill: none; stroke-dasharray: 4 3; }
-  .fg { fill: #0e1115; stroke: #1e242c; stroke-width: 0.8; }
-  .fgl { fill: #5a6a7a; font: 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fst { fill: #7cc5ff; font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fts { font: 600 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fss { fill: #8a929c; font: 9.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
-  .fsl { fill: #5a6a7a; font: italic 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .cc { fill: #7cc5ff; }
-  .cs { fill: #b6f0c8; }
-  .cq { fill: #ffd27a; }
-  .cd { fill: #c9b1ff; }
-  .ce { fill: #e6e8eb; }
-  .cm { fill: #9aa3ad; }
+  .node { fill: #121820; stroke: #2b3440; stroke-width: 1; }
+  .group { fill: #0b0f14; stroke: #202833; stroke-width: 1; }
+  .arrow { stroke: #556574; stroke-width: 1.35; fill: none; }
+  .dash { stroke: #556574; stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  .title { fill: #e7eaee; font: 650 12px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .label { fill: #9aa4af; font: 10.5px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .mini { fill: #6f7b87; font: 10px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .blue { fill: var(--blue); }
+  .green { fill: var(--green); }
+  .yellow { fill: var(--yellow); }
+  .violet { fill: var(--violet); }
+
+  @media (max-width: 780px) {
+    header.page .inner,
+    main {
+      width: min(100vw - 28px, var(--max-width));
+    }
+
+    .grid {
+      grid-template-columns: 1fr;
+    }
+
+    nav.toc {
+      position: static;
+    }
+  }
 </style>
 </head>
 <body>
 <header class="page">
   <div class="inner">
-    <h1>Nanotrace — Engineering Architecture</h1>
-    <p class="sub">Tenant-keyed observability ingest pipeline. One <code>/events</code> API, object storage, a message queue, a Rust loader, and ClickHouse, deployed on AWS via Pulumi.</p>
+    <h1>Nanotrace Current System Design</h1>
+    <p class="sub">
+      Raw-first, tenant-scoped event analytics on ClickHouse. The ingest hot path writes one canonical event fact table by default; every additional analytical read model is explicit, schema-defined, and backfillable.
+    </p>
   </div>
 </header>
 
 <main>
   <nav class="toc">
-    <a href="#overview">Overview</a>
-    <a href="#storage">Storage model</a>
-    <a href="#auth">Auth &amp; security</a>
+    <a href="#principles">Principles</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#ingest">Ingest</a>
+    <a href="#loader">Loader</a>
+    <a href="#storage">ClickHouse</a>
+    <a href="#materialization">Materialization</a>
+    <a href="#queries">Queries</a>
+    <a href="#security">Security</a>
     <a href="#deployment">Deployment</a>
   </nav>
 
-  <section id="overview">
-    <h2>1. System overview</h2>
-    <p>
-      Nanotrace ingests JSON events through an HTTP API, durably stages them
-      across multiple concurrent writer lanes into local NDJSON part files, uploads
-      closed parts to object storage, then loads each part into ClickHouse via
-      storage queue notifications. The data model is tenant-keyed end-to-end:
-      every write materializes a <code>tenant_id</code> and every read injects it
-      into the query plan. Reads go through a stateless query service backed by
-      ClickHouse for aggregates and object storage for raw event byte-range lookup.
-    </p>
-
-    <div class="figure">
-      <svg viewBox="0 0 860 280" width="100%" style="max-width:860px" aria-label="High-level architecture">
-        <defs>
-          <marker id="a1" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
-            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-          </marker>
-        </defs>
-
-        <!-- Backend group -->
-        <rect class="fg" x="155" y="12" width="692" height="258" rx="12" ry="12"/>
-        <text class="fgl" x="168" y="28">Backend</text>
-
-        <!-- UI / CDN -->
-        <rect class="fn" x="170" y="28" width="108" height="44" rx="10" ry="10"/>
-        <text class="ft ce" x="224" y="48" text-anchor="middle">UI</text>
-        <text class="fs" x="224" y="62" text-anchor="middle">CDN &middot; SPA</text>
-
-        <!-- App / SDK -->
-        <rect class="fn" x="10" y="112" width="118" height="50" rx="10" ry="10"/>
-        <text class="ft ce" x="69" y="134" text-anchor="middle">App / SDK</text>
-        <text class="fs" x="69" y="150" text-anchor="middle">HTTP &middot; UDP</text>
-
-        <!-- ALB -->
-        <rect class="fn" x="170" y="112" width="108" height="50" rx="10" ry="10"/>
-        <text class="ft cc" x="224" y="134" text-anchor="middle">Load Balancer</text>
-        <text class="fs" x="224" y="150" text-anchor="middle">HTTPS routing</text>
-
-        <!-- Server -->
-        <rect class="fn" x="325" y="36" width="152" height="70" rx="10" ry="10"/>
-        <text class="ft cc" x="401" y="58" text-anchor="middle">nanotrace-server</text>
-        <text class="fs" x="401" y="74" text-anchor="middle">ingest &middot; auth &middot; facets</text>
-        <text class="fs" x="401" y="88" text-anchor="middle">uploader &middot; retention</text>
-
-        <!-- Query -->
-        <rect class="fn" x="325" y="192" width="152" height="62" rx="10" ry="10"/>
-        <text class="ft cc" x="401" y="216" text-anchor="middle">nanotrace-query</text>
-        <text class="fs" x="401" y="232" text-anchor="middle">stateless reads</text>
-
-        <!-- S3 -->
-        <rect class="fn" x="530" y="36" width="124" height="50" rx="10" ry="10"/>
-        <text class="ft cs" x="592" y="56" text-anchor="middle">Object Storage</text>
-        <text class="fs" x="592" y="72" text-anchor="middle">events/ &middot; processors/</text>
-
-        <!-- SQS -->
-        <rect class="fn" x="530" y="112" width="124" height="46" rx="10" ry="10"/>
-        <text class="ft cq" x="592" y="132" text-anchor="middle">Message Queue</text>
-        <text class="fs" x="592" y="148" text-anchor="middle">notifications</text>
-
-        <!-- Loader -->
-        <rect class="fn" x="530" y="192" width="124" height="52" rx="10" ry="10"/>
-        <text class="ft cc" x="592" y="214" text-anchor="middle">nanotrace-loader</text>
-        <text class="fs" x="592" y="230" text-anchor="middle">JSONEachRow insert</text>
-
-        <!-- ClickHouse -->
-        <rect class="fn" x="708" y="112" width="124" height="54" rx="10" ry="10"/>
-        <text class="ft cd" x="770" y="134" text-anchor="middle">ClickHouse</text>
-        <text class="fs" x="770" y="150" text-anchor="middle">observatory.*</text>
-
-        <!-- Postgres -->
-        <rect class="fn" x="708" y="36" width="124" height="50" rx="10" ry="10"/>
-        <text class="ft cd" x="770" y="56" text-anchor="middle">Postgres</text>
-        <text class="fs" x="770" y="72" text-anchor="middle">auth &middot; sessions</text>
-
-        <!-- Arrows -->
-        <path class="fa" d="M128,137 L170,137" marker-end="url(#a1)"/>
-        <path class="fa" d="M224,72 L224,112" marker-end="url(#a1)"/>
-        <path class="fa" d="M278,127 C306,98 306,82 325,74" marker-end="url(#a1)"/>
-        <path class="fa" d="M278,148 C306,178 306,210 325,220" marker-end="url(#a1)"/>
-        <path class="fa" d="M477,66 L530,62" marker-end="url(#a1)"/>
-        <path class="fa" d="M477,78 L708,62" marker-end="url(#a1)"/>
-        <path class="fa" d="M592,86 L592,112" marker-end="url(#a1)"/>
-        <path class="fa" d="M592,158 L592,192" marker-end="url(#a1)"/>
-        <path class="fa" d="M654,220 C678,200 688,168 708,152" marker-end="url(#a1)"/>
-        <path class="fa" d="M477,218 C555,198 680,158 708,142" marker-end="url(#a1)"/>
-        <path class="fad" d="M430,192 C430,142 540,100 558,86" marker-end="url(#a1)"/>
-      </svg>
-      <div class="figure-caption">Solid lines show the primary flow; dashed line is the on-demand byte-range event fetch.</div>
+  <section id="principles">
+    <h2>1. Design Principles</h2>
+    <div class="grid">
+      <div class="card">
+        <strong>Raw first</strong>
+        <span><code>observatory.events</code> is the canonical fact table. It stores accepted events exactly once in the default loader mode.</span>
+      </div>
+      <div class="card">
+        <strong>Explicit acceleration</strong>
+        <span>Core group-by rollups are created by default; additional fields, measures, entity states, cohorts, and reports become derived tables after promotion.</span>
+      </div>
+      <div class="card">
+        <strong>Tenant scoped</strong>
+        <span>Every table is keyed by <code>tenant_id</code>. The read layer injects tenant filters from authenticated identity.</span>
+      </div>
     </div>
 
-    <h3>Write path</h3>
+    <p>
+      The current system writes one canonical raw event table and a bounded default analytics pack for core group-by, histogram, flamegraph, and exact-id lookup paths. Arbitrary JSON fields are still raw-first until promotion/materialization. The schema also includes the control-plane tables needed for a full analytics system: query usage, recommendations, materialization jobs, chunk status, completed versions, and watermarks. The actual user-driven promotion executor remains separate from the raw loader hot path.
+    </p>
+  </section>
+
+  <section id="architecture">
+    <h2>2. Architecture</h2>
 
     <div class="figure">
-      <svg viewBox="0 0 940 210" width="100%" style="max-width:940px" aria-label="Write-path data flow">
+      <svg viewBox="0 0 940 300" width="100%" style="max-width: 940px" aria-label="Nanotrace architecture">
         <defs>
-          <marker id="a2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
-            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <marker id="arrow-main" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
+            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#556574" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
           </marker>
         </defs>
 
-        <!-- POST /events -->
-        <rect class="fn" x="10" y="58" width="112" height="52" rx="10" ry="10"/>
-        <text class="ft cc" x="66" y="80" text-anchor="middle">POST /events</text>
-        <text class="fs" x="66" y="96" text-anchor="middle">validate</text>
+        <rect class="group" x="148" y="16" width="770" height="262" rx="14"/>
+        <text class="mini" x="166" y="36">AWS deployment</text>
 
-        <!-- EventLogWriter -->
-        <rect class="fn" x="162" y="58" width="138" height="52" rx="10" ry="10"/>
-        <text class="ft cc" x="231" y="80" text-anchor="middle">EventLogWriter</text>
-        <text class="fs" x="231" y="96" text-anchor="middle">4 lanes &middot; NDJSON</text>
+        <rect class="node" x="20" y="112" width="104" height="54" rx="10"/>
+        <text class="title blue" x="72" y="135" text-anchor="middle">SDK / App</text>
+        <text class="label" x="72" y="151" text-anchor="middle">HTTP or UDP</text>
 
-        <!-- Uploader -->
-        <rect class="fn" x="340" y="58" width="112" height="52" rx="10" ry="10"/>
-        <text class="ft cc" x="396" y="80" text-anchor="middle">Uploader</text>
-        <text class="fs" x="396" y="96" text-anchor="middle">processors &rarr; PUT</text>
+        <rect class="node" x="174" y="112" width="110" height="54" rx="10"/>
+        <text class="title blue" x="229" y="135" text-anchor="middle">ALB</text>
+        <text class="label" x="229" y="151" text-anchor="middle">path routing</text>
 
-        <!-- Object Storage -->
-        <rect class="fn" x="495" y="18" width="128" height="48" rx="10" ry="10"/>
-        <text class="ft cs" x="559" y="38" text-anchor="middle">Object Storage</text>
-        <text class="fs" x="559" y="54" text-anchor="middle">system of record</text>
+        <rect class="node" x="326" y="40" width="152" height="66" rx="10"/>
+        <text class="title blue" x="402" y="64" text-anchor="middle">nanotrace-server</text>
+        <text class="label" x="402" y="80" text-anchor="middle">ingest, auth, files</text>
+        <text class="label" x="402" y="94" text-anchor="middle">writer + uploader</text>
 
-        <!-- Message Queue -->
-        <rect class="fn" x="495" y="128" width="128" height="44" rx="10" ry="10"/>
-        <text class="ft cq" x="559" y="148" text-anchor="middle">Message Queue</text>
-        <text class="fs" x="559" y="164" text-anchor="middle">object notifications</text>
+        <rect class="node" x="326" y="194" width="152" height="58" rx="10"/>
+        <text class="title blue" x="402" y="217" text-anchor="middle">nanotrace-query</text>
+        <text class="label" x="402" y="233" text-anchor="middle">read-only SQL proxy</text>
 
-        <!-- Loader -->
-        <rect class="fn" x="668" y="58" width="118" height="52" rx="10" ry="10"/>
-        <text class="ft cc" x="727" y="80" text-anchor="middle">Loader</text>
-        <text class="fs" x="727" y="96" text-anchor="middle">fetch &rarr; decode</text>
+        <rect class="node" x="532" y="32" width="128" height="52" rx="10"/>
+        <text class="title green" x="596" y="54" text-anchor="middle">S3</text>
+        <text class="label" x="596" y="70" text-anchor="middle">raw NDJSON parts</text>
 
-        <!-- ClickHouse -->
-        <rect class="fn" x="830" y="48" width="100" height="72" rx="10" ry="10"/>
-        <text class="ft cd" x="880" y="76" text-anchor="middle">ClickHouse</text>
-        <text class="fs" x="880" y="92" text-anchor="middle">events</text>
-        <text class="fs" x="880" y="106" text-anchor="middle">+ facets</text>
+        <rect class="node" x="532" y="118" width="128" height="48" rx="10"/>
+        <text class="title yellow" x="596" y="139" text-anchor="middle">SQS</text>
+        <text class="label" x="596" y="154" text-anchor="middle">object events</text>
 
-        <!-- Arrows -->
-        <path class="fa" d="M122,84 L162,84" marker-end="url(#a2)"/>
-        <path class="fa" d="M300,84 L340,84" marker-end="url(#a2)"/>
-        <path class="fa" d="M452,76 C472,56 478,46 495,42" marker-end="url(#a2)"/>
-        <path class="fa" d="M559,66 L559,128" marker-end="url(#a2)"/>
-        <path class="fa" d="M623,150 C645,134 648,108 668,96" marker-end="url(#a2)"/>
-        <path class="fa" d="M786,84 L830,80" marker-end="url(#a2)"/>
+        <rect class="node" x="532" y="204" width="128" height="52" rx="10"/>
+        <text class="title blue" x="596" y="226" text-anchor="middle">nanotrace-loader</text>
+        <text class="label" x="596" y="242" text-anchor="middle">S3 to ClickHouse</text>
 
-        <!-- Step numbers -->
-        <text class="fst" x="142" y="52">1</text>
-        <text class="fst" x="322" y="52">2</text>
-        <text class="fst" x="468" y="52">3</text>
-        <text class="fst" x="636" y="170">4</text>
-        <text class="fst" x="810" y="52">5</text>
+        <rect class="node" x="720" y="112" width="150" height="64" rx="10"/>
+        <text class="title violet" x="795" y="136" text-anchor="middle">ClickHouse</text>
+        <text class="label" x="795" y="152" text-anchor="middle">events + definitions</text>
+        <text class="label" x="795" y="166" text-anchor="middle">optional read models</text>
 
-        <!-- File lifecycle annotation -->
-        <text class="fsl" x="170" y="200">.tmp</text>
-        <text class="fs" x="203" y="200">&rarr;</text>
-        <text class="fsl" x="218" y="200">.ready</text>
-        <text class="fs" x="264" y="200">&rarr;</text>
-        <text class="fsl" x="279" y="200">.uploading</text>
-        <text class="fs" x="345" y="200">&rarr;</text>
-        <text class="fsl" x="360" y="200">.done</text>
-        <text class="fs" x="400" y="200">&rarr;</text>
-        <text class="fsl" x="415" y="200">cleanup</text>
+        <rect class="node" x="720" y="36" width="150" height="50" rx="10"/>
+        <text class="title violet" x="795" y="57" text-anchor="middle">Postgres</text>
+        <text class="label" x="795" y="72" text-anchor="middle">auth and sessions</text>
+
+        <path class="arrow" d="M124,139 L174,139" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M284,130 C308,106 310,82 326,72" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M284,150 C312,178 312,211 326,222" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M478,62 L532,58" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M596,84 L596,118" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M596,166 L596,204" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M660,230 C690,206 700,166 720,150" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M478,222 C570,214 674,170 720,146" marker-end="url(#arrow-main)"/>
+        <path class="arrow" d="M478,74 C572,72 654,62 720,60" marker-end="url(#arrow-main)"/>
+        <path class="dash" d="M402,194 C432,142 502,96 548,76" marker-end="url(#arrow-main)"/>
       </svg>
-      <div class="figure-caption">Write path: validate &rarr; durable NDJSON &rarr; object storage &rarr; queue &rarr; loader &rarr; ClickHouse. File states shown below.</div>
+      <div class="caption">Solid lines are normal control/data flow. The dashed line is on-demand raw event byte-range lookup from S3.</div>
+    </div>
+
+    <table>
+      <tr><th>Component</th><th>Current responsibility</th></tr>
+      <tr><td><code>nanotrace-server</code></td><td>Accepts events, authenticates users and API keys, writes durable local NDJSON parts, uploads closed parts to S3, and manages auth resources.</td></tr>
+      <tr><td><code>nanotrace-loader</code></td><td>Consumes S3 notifications from SQS, fetches object parts, optionally transforms NDJSON, and inserts ClickHouse batches.</td></tr>
+      <tr><td><code>materializer workers</code></td><td>Planned separate workers that claim materialization jobs/chunks and populate optimized analytical read models. The schema exists; executor logic is not implemented in this pass.</td></tr>
+      <tr><td><code>nanotrace-query</code></td><td>Runs constrained read-only ClickHouse SQL with tenant injection and table allowlisting.</td></tr>
+      <tr><td><code>apps/ui</code></td><td>Logs, histograms, grouping, flamegraph rendering, schema/report management, and API key management.</td></tr>
+      <tr><td><code>Postgres</code></td><td>Browser auth, sessions, magic links, users, and API key metadata.</td></tr>
+      <tr><td><code>ClickHouse</code></td><td>Canonical event facts, density rollups, schema definitions, and promoted analytical read models.</td></tr>
+    </table>
+  </section>
+
+  <section id="ingest">
+    <h2>3. Ingest Path</h2>
+
+    <div class="figure">
+      <svg viewBox="0 0 940 210" width="100%" style="max-width: 940px" aria-label="Ingest path">
+        <defs>
+          <marker id="arrow-ingest" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
+            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#556574" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <rect class="node" x="12" y="76" width="110" height="52" rx="10"/>
+        <text class="title blue" x="67" y="98" text-anchor="middle">POST /events</text>
+        <text class="label" x="67" y="114" text-anchor="middle">validate batch</text>
+
+        <rect class="node" x="164" y="76" width="142" height="52" rx="10"/>
+        <text class="title blue" x="235" y="98" text-anchor="middle">writer lanes</text>
+        <text class="label" x="235" y="114" text-anchor="middle">local NDJSON parts</text>
+
+        <rect class="node" x="348" y="76" width="118" height="52" rx="10"/>
+        <text class="title blue" x="407" y="98" text-anchor="middle">uploader</text>
+        <text class="label" x="407" y="114" text-anchor="middle">PUT to S3</text>
+
+        <rect class="node" x="508" y="34" width="124" height="48" rx="10"/>
+        <text class="title green" x="570" y="55" text-anchor="middle">S3 object</text>
+        <text class="label" x="570" y="70" text-anchor="middle">system of record</text>
+
+        <rect class="node" x="508" y="130" width="124" height="44" rx="10"/>
+        <text class="title yellow" x="570" y="150" text-anchor="middle">SQS notice</text>
+        <text class="label" x="570" y="165" text-anchor="middle">loader queue</text>
+
+        <rect class="node" x="674" y="76" width="116" height="52" rx="10"/>
+        <text class="title blue" x="732" y="98" text-anchor="middle">loader</text>
+        <text class="label" x="732" y="114" text-anchor="middle">batch insert</text>
+
+        <rect class="node" x="834" y="66" width="94" height="72" rx="10"/>
+        <text class="title violet" x="881" y="94" text-anchor="middle">ClickHouse</text>
+        <text class="label" x="881" y="110" text-anchor="middle">events</text>
+        <text class="label" x="881" y="124" text-anchor="middle">+ optional</text>
+
+        <path class="arrow" d="M122,102 L164,102" marker-end="url(#arrow-ingest)"/>
+        <path class="arrow" d="M306,102 L348,102" marker-end="url(#arrow-ingest)"/>
+        <path class="arrow" d="M466,92 C486,72 492,62 508,58" marker-end="url(#arrow-ingest)"/>
+        <path class="arrow" d="M570,82 L570,130" marker-end="url(#arrow-ingest)"/>
+        <path class="arrow" d="M632,152 C654,138 656,112 674,102" marker-end="url(#arrow-ingest)"/>
+        <path class="arrow" d="M790,102 L834,102" marker-end="url(#arrow-ingest)"/>
+
+        <text class="mini" x="164" y="180">.tmp -> .ready -> .uploading -> .done</text>
+      </svg>
+      <div class="caption">Accepted events are durably staged locally before S3 upload. S3 is the handoff boundary to the loader.</div>
     </div>
 
     <ol>
-      <li><strong>Accept.</strong> Server validates each event against the schema-shaped JSON contract; rejects malformed payloads with 400.</li>
-      <li><strong>Stage.</strong> Accepted events are round-robin dispatched to one of <code>NANOTRACE_WRITER_LANES</code> (default 4) concurrent writer lanes, each backed by its own NDJSON part file on an XFS-formatted EBS volume. The writer flushes (fsyncs) at <code>NANOTRACE_WRITER_FLUSH_BYTES</code> (default 1 MiB) or <code>NANOTRACE_WRITER_FLUSH_INTERVAL_MS</code> (default 10 ms), whichever comes first. The HTTP 200 is returned after the event is committed to the lane queue. Parts rotate to <code>.ready</code> when they reach <code>NANOTRACE_PART_MAX_BYTES</code> (default 64 MiB) or <code>NANOTRACE_PART_MAX_AGE_SECS</code> (default 1 second).</li>
-      <li><strong>Upload.</strong> The background uploader picks up <code>.ready</code> files, renames them to <code>.uploading</code>, optionally runs upload-stage processors, and PUTs them to object storage. The S3 key layout is Hive-partitioned: <code>&lt;prefix&gt;/dt=YYYY-MM-DD/hour=HH/host=&lt;hostname&gt;/lane=&lt;id&gt;/part-&lt;timestamp_ms&gt;.ndjson</code>. On success the local file transitions to <code>.done</code>; on failure it becomes <code>.failed</code>.</li>
-      <li><strong>Notify.</strong> A bucket notification fans object creation events into the loader message queue.</li>
-      <li><strong>Load.</strong> The loader fetches each object, decodes lines, derives facet rows, and inserts via the ClickHouse HTTP <code>JSONEachRow</code> endpoint into <code>observatory.events</code>, <code>observatory.field_counts_5m</code>, and <code>observatory.field_index</code>.</li>
+      <li><strong>Accept.</strong> The server receives batches through <code>/events</code>, authenticates the API key/session, validates event structure, and materializes tenant identity.</li>
+      <li><strong>Stage.</strong> Events are written to local NDJSON part files through concurrent writer lanes. The HTTP path is decoupled from ClickHouse availability.</li>
+      <li><strong>Upload.</strong> Closed parts move through <code>.ready</code>, <code>.uploading</code>, and <code>.done</code>. Upload-stage processors may transform the part before it is PUT to S3.</li>
+      <li><strong>Notify.</strong> S3 object-created notifications feed SQS. Loader instances share that queue.</li>
+      <li><strong>Load.</strong> The loader fetches objects and posts <code>FORMAT JSONEachRow</code> batches to ClickHouse using async insert.</li>
     </ol>
 
-    <h3>Read path</h3>
-    <ul>
-      <li><code>POST /query</code> on <code>nanotrace-query</code> compiles a constrained query against <code>observatory.events</code> with tenant scoping pinned to the caller's identity.</li>
-      <li><code>GET /events/{event_id}</code> resolves the event's <code>source_file</code>, <code>source_offset</code>, and <code>source_length</code> from ClickHouse, then issues a ranged object storage GET to return the original line.</li>
-    </ul>
-
-    <h3>Sidecar / SDK</h3>
+    <h3>Durability model</h3>
     <p>
-      The UDP sidecar binds <code>127.0.0.1:4319</code>, batches events, and POSTs to <code>/events</code> so the application thread never blocks on the ingest path. SDKs (<code>packages/sdk-js</code>, <code>packages/sdk-py</code>) call the same HTTP API with an API key.
+      Ingest durability is object-store centered. The local writer protects the request path from immediate process failures; S3 stores the immutable accepted NDJSON part; SQS drives eventual loading. Delivery is at-least-once, so downstream tables and insert tokens must tolerate retry. The system optimizes for not dropping events over exactly-once visibility.
+    </p>
+  </section>
+
+  <section id="loader">
+    <h2>4. Loader Modes</h2>
+
+    <p>
+      The loader has two intentional derivation modes today. The production default is <code>raw</code>; this inserts only <code>observatory.events</code>. The optional <code>promoted</code> mode inserts raw events plus definition-backed rows into secondary tables, but the final analytics architecture keeps that work outside the raw loader path. Promotion, report refresh, cohort construction, and sequence materialization should be performed by separate workers using the job tables described below.
+    </p>
+
+    <table>
+      <tr><th>Mode</th><th>Writes</th><th>Use case</th></tr>
+      <tr>
+        <td><code>raw</code></td>
+        <td><code>events</code></td>
+        <td>Default high-throughput ingest. No per-event field fanout except ClickHouse materialized columns and materialized views already attached to <code>events</code>.</td>
+      </tr>
+      <tr>
+        <td><code>promoted</code></td>
+        <td><code>events</code>, <code>field_index</code>, <code>event_measures</code>, <code>entity_state_updates</code></td>
+        <td>Acceleration for explicitly promoted business analytics fields, numeric measures, and entity state changes.</td>
+      </tr>
+    </table>
+
+    <pre>LOADER_DERIVATION_MODE=raw
+LOADER_DEFINITIONS_REFRESH_SECS=60
+CLICKHOUSE_INSERT_CONCURRENCY=4
+CLICKHOUSE_INSERT_MAX_ROWS=100000
+CLICKHOUSE_INSERT_MAX_BYTES=67108864</pre>
+
+    <p>
+      Definition refreshes are cached for one minute by default. Raw mode does not need definitions and skips the definition query entirely. Promoted mode reads enabled definitions from ClickHouse and derives only the configured paths.
     </p>
   </section>
 
   <section id="storage">
-    <h2>2. Storage model</h2>
+    <h2>5. ClickHouse Storage Model</h2>
 
+    <div class="callout">
+      Current schema source: <code>deploy/clickhouse/schema.sql</code>. Applying it creates the current raw-first schema and drops obsolete write-time materialized views and tables from previous designs.
+    </div>
+
+    <h3>Canonical fact table</h3>
     <p>
-      All semantic fields live inside a typed JSON column on <code>observatory.events</code>.
-      Since ClickHouse 25.3, typed JSON paths are stored as physical columnar
-      subcolumns. A field is only promoted to a top-level <code>MATERIALIZED</code>
-      column when it must participate in <code>ORDER BY</code>, carry a skip
-      index, or use a non-default codec.
+      <code>observatory.events</code> is a <code>MergeTree</code> table partitioned by day and ordered by <code>(tenant_id, timestamp, event_type, event_id)</code>. It stores event identity, timestamps, S3 source byte pointers, and a typed ClickHouse <code>JSON</code> payload. A small set of hot routing columns is materialized from JSON because they participate in sorting, filtering, or bloom indexes.
     </p>
 
-    <h3>Tables</h3>
+    <pre>CREATE TABLE observatory.events (
+  event_id String,
+  timestamp DateTime64(3, 'UTC'),
+  source_file String,
+  source_offset UInt64,
+  source_length UInt32,
+  data JSON(...),
+  tenant_id LowCardinality(String) MATERIALIZED ifNull(data.tenant_id, ''),
+  event_type String MATERIALIZED ifNull(data.event_type, ''),
+  trace_id String MATERIALIZED ifNull(data.trace_id, ''),
+  span_id String MATERIALIZED ifNull(data.span_id, ''),
+  signal LowCardinality(String) MATERIALIZED multiIf(...),
+  INDEX idx_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 4,
+  INDEX idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 4,
+  INDEX idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 4
+) ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
+
+    <h3>Current tables</h3>
     <table>
       <tr><th>Table</th><th>Engine</th><th>Purpose</th></tr>
-      <tr>
-        <td><code>observatory.events</code></td>
-        <td>MergeTree</td>
-        <td>Canonical event store. <code>ORDER BY (tenant_id, event_type, timestamp, trace_id, span_id)</code>; partitioned by day. Bloom-filter indexes on <code>trace_id</code>, <code>span_id</code>, <code>event_id</code>.</td>
-      </tr>
-      <tr>
-        <td><code>observatory.field_counts_5m</code></td>
-        <td>SummingMergeTree</td>
-        <td>Pre-aggregated counts per <code>(tenant_id, key, value, bucket_time)</code> for fast facet listings.</td>
-      </tr>
-      <tr>
-        <td><code>observatory.field_index</code></td>
-        <td>MergeTree</td>
-        <td>Facet &rarr; event lookup index. Lets the UI jump from a value chip to matching events without scanning <code>events</code>.</td>
-      </tr>
-      <tr>
-        <td><code>observatory.definitions</code></td>
-        <td>ReplacingMergeTree</td>
-        <td>Per-tenant configuration of which JSON paths are tracked for facets. Refreshed by the loader.</td>
-      </tr>
+      <tr><td><code>events</code></td><td>MergeTree</td><td>Canonical raw event facts and source byte pointers.</td></tr>
+      <tr><td><code>event_density_1s</code></td><td>SummingMergeTree</td><td>Always-on global density histogram by tenant and second. Populated by <code>mv_event_density_1s</code>.</td></tr>
+      <tr><td><code>definitions</code></td><td>ReplacingMergeTree</td><td>Enabled field, measure, rollup, state, cohort, and report definitions.</td></tr>
+      <tr><td><code>field_index</code></td><td>ReplacingMergeTree</td><td>Definition-backed field value to event lookup for promoted filters/group-bys.</td></tr>
+      <tr><td><code>field_values</code></td><td>MergeTree</td><td>Default exact lookup index for core ids such as trace, span, request, user, account, session, organization, thread, and conversation.</td></tr>
+      <tr><td><code>field_density_1s</code></td><td>SummingMergeTree</td><td>Default grouped histogram rollup for core group-by fields at one-second granularity.</td></tr>
+      <tr><td><code>field_topk_1m</code></td><td>SummingMergeTree</td><td>Default top-value rollup for core group-by fields at one-minute granularity.</td></tr>
+      <tr><td><code>flamegraph_rollups_1m</code></td><td>SummingMergeTree</td><td>Default hierarchical rollups for core flamegraph paths such as service/name and signal/service/name.</td></tr>
+      <tr><td><code>event_measures</code></td><td>ReplacingMergeTree</td><td>Definition-backed numeric observations extracted from events.</td></tr>
+      <tr><td><code>measure_rollups</code></td><td>AggregatingMergeTree</td><td>Aggregate states over <code>event_measures</code>, populated by <code>mv_measure_rollups</code>.</td></tr>
+      <tr><td><code>entity_state_updates</code></td><td>ReplacingMergeTree</td><td>Promoted state transitions for users/accounts/sessions or other entities.</td></tr>
+      <tr><td><code>cohort_memberships</code></td><td>ReplacingMergeTree</td><td>Backfilled or refreshed cohort membership materialization.</td></tr>
+      <tr><td><code>report_results</code></td><td>ReplacingMergeTree</td><td>Reusable summary report outputs keyed by report and bucket time.</td></tr>
+      <tr><td><code>sequence_report_results</code></td><td>ReplacingMergeTree</td><td>Funnel/sequence step outputs.</td></tr>
+      <tr><td><code>definition_stats</code></td><td>ReplacingMergeTree</td><td>Cardinality, scan, storage, and recommendation metadata for definitions.</td></tr>
+      <tr><td><code>query_usage</code></td><td>MergeTree</td><td>Observed query fingerprints, raw fallback status, JSON paths touched, scanned bytes, latency, and result size.</td></tr>
+      <tr><td><code>optimization_recommendations</code></td><td>ReplacingMergeTree</td><td>Recommendation records for proposed field, measure, report, cohort, funnel, or alert materialization.</td></tr>
+      <tr><td><code>materialization_jobs</code></td><td>ReplacingMergeTree</td><td>Top-level jobs for backfills, report refreshes, cohort builds, and sequence materialization.</td></tr>
+      <tr><td><code>materialization_chunks</code></td><td>ReplacingMergeTree</td><td>Claimable bounded work chunks with status, lease, attempt, row, byte, and error tracking.</td></tr>
+      <tr><td><code>materialization_versions</code></td><td>ReplacingMergeTree</td><td>Completed or building target versions used to serve stable, version-selected analytical outputs.</td></tr>
+      <tr><td><code>materialization_watermarks</code></td><td>ReplacingMergeTree</td><td>Per-target source watermarks and lag for incremental materialization.</td></tr>
+      <tr><td><code>pipeline_metrics</code></td><td>MergeTree</td><td>Operational metrics emitted by Nanotrace components.</td></tr>
     </table>
 
     <h3>Why JSON-first</h3>
     <ul>
-      <li>Open schema for OTEL semantic conventions, product analytics, and exotic per-tenant fields without DDL changes.</li>
-      <li>Hot paths get type hints (e.g. <code>http.method LowCardinality(Nullable(String))</code>) so they compress and scan as columnar data.</li>
-      <li>Sort-key columns are <code>MATERIALIZED ifNull(data.x, '')</code> — columns in <code>ORDER BY</code> cannot be nullable, but the JSON path stays nullable so absent vs empty stays distinguishable.</li>
-      <li><code>signal</code> is a derived <code>multiIf</code> classifier so trace / metric / log / analytics rows can be filtered without inspecting <code>event_type</code> string-by-string.</li>
+      <li>The event payload remains open-ended enough for product analytics, observability data, and tenant-specific attributes.</li>
+      <li>Hot paths in the JSON type declaration get columnar subcolumns without forcing every path into a top-level table column.</li>
+      <li>New user attributes can be queried from raw data immediately, then promoted later if repeated query cost justifies a read model.</li>
+      <li>Default write fanout is bounded to the core analytics pack; additional fanout is controlled by definitions instead of by arbitrary event shape.</li>
     </ul>
-
-    <pre>data JSON (
-  tenant_id LowCardinality(Nullable(String)),
-  service   LowCardinality(Nullable(String)),
-  event_type LowCardinality(Nullable(String)),
-  trace_id  Nullable(String),
-  span_id   Nullable(String),
-  http.method LowCardinality(Nullable(String)),
-  http.status_code Nullable(UInt16),
-  duration_ms Nullable(Float64),
-  ...
-  max_dynamic_paths = 8192,
-  max_dynamic_types = 8
-)</pre>
   </section>
 
-  <section id="auth">
-    <h2>3. Auth &amp; security</h2>
+  <section id="materialization">
+    <h2>6. Materialization Control Plane</h2>
+
+    <p>
+      A full analytics system needs optimized serving tables. Core group-by, histogram, flamegraph, and exact-id lookup tables are populated by ClickHouse materialized views from raw events. User-promoted fields and reports should be populated by controlled jobs rather than by arbitrary loader fanout. The schema has the records needed to plan, track, retry, and serve those additional materializations without implementing the promotion executor yet.
+    </p>
+
+    <h3>Lifecycle</h3>
+    <ol>
+      <li><strong>Observe.</strong> <code>query_usage</code> records query fingerprints, JSON paths, raw fallback status, latency, and scan cost.</li>
+      <li><strong>Recommend.</strong> <code>optimization_recommendations</code> stores proposed fields, measures, reports, cohorts, funnels, and alert rollups.</li>
+      <li><strong>Plan.</strong> A future executor creates <code>materialization_jobs</code> and bounded <code>materialization_chunks</code> for historical or incremental windows.</li>
+      <li><strong>Build.</strong> Workers claim chunks with leases, write target serving tables, and update row/byte/error progress.</li>
+      <li><strong>Publish.</strong> <code>materialization_versions</code> marks completed target versions. Readers can select completed versions instead of partial writes.</li>
+      <li><strong>Continue.</strong> <code>materialization_watermarks</code> tracks high-water marks for incremental refresh lag.</li>
+    </ol>
+
+    <h3>Idempotency model</h3>
+    <p>
+      Raw events remain append-only. Derived outputs are keyed by tenant, target id, target version, bucket/window, and deterministic dimension or entity identity. Retried jobs should rewrite the same logical target version. Serving queries should prefer completed versions from <code>materialization_versions</code> and avoid reading partially built versions.
+    </p>
+
+    <div class="callout warn">
+      This pass creates the schema and documentation for the materialization control plane. It does not implement automatic promotion, recommendation generation, job claiming, report execution, cohort execution, or sequence execution.
+    </div>
+  </section>
+
+  <section id="queries">
+    <h2>7. Query and UI Behavior</h2>
+
+    <h3>Default logs view</h3>
+    <p>
+      With no grouping and no restrictive filter, the UI uses <code>event_density_1s</code> for the histogram and <code>events</code> for the event table. The flamegraph area is still present, but without a selected group it shows histogram-only density.
+    </p>
+
+    <h3>Group-by and filters</h3>
+    <p>
+      Core group lists read <code>field_topk_1m</code>, grouped histograms read <code>field_density_1s</code>, and core flamegraphs read <code>flamegraph_rollups_1m</code>. Exact id lookups can use <code>field_values</code> or the native event indexes. Non-core fields still require promotion/materialization before they are treated as guaranteed-fast group-bys.
+    </p>
+
+    <table>
+      <tr><th>Query shape</th><th>Preferred path</th><th>Fallback</th></tr>
+      <tr><td>No group, recent density</td><td><code>event_density_1s</code></td><td><code>events</code></td></tr>
+      <tr><td>Core group-by list</td><td><code>field_topk_1m</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
+      <tr><td>Core grouped histogram</td><td><code>field_density_1s</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
+      <tr><td>Core flamegraph</td><td><code>flamegraph_rollups_1m</code></td><td><code>events</code> raw aggregation</td></tr>
+      <tr><td>Group by promoted field</td><td><code>field_index</code> or a report-specific rollup</td><td><code>events.data.&lt;path&gt;</code></td></tr>
+      <tr><td>Multi-field promoted filters</td><td><code>field_index</code> semi-joins by <code>event_id</code></td><td><code>events</code> raw predicates</td></tr>
+      <tr><td>Numeric measure aggregates</td><td><code>measure_rollups</code> or <code>event_measures</code></td><td><code>events</code> raw extraction</td></tr>
+      <tr><td>Funnel/retention/cohort reports</td><td><code>sequence_report_results</code>, <code>report_results</code>, <code>cohort_memberships</code></td><td>Ad hoc raw query or report backfill</td></tr>
+      <tr><td>Single event lookup</td><td><code>events</code> by <code>event_id</code>, then S3 byte range when raw line is needed</td><td>ClickHouse row payload</td></tr>
+    </table>
+
+    <h3>Schema and report promotion</h3>
+    <p>
+      Schema/report definitions are the mechanism for making a repeated query shape fast. A definition identifies a tenant, a path or measure, extraction mode, and versioned config. Historical work should be represented as materialization jobs and chunks; completed outputs should be published as materialization versions. The raw loader should remain independent from this lifecycle.
+    </p>
+  </section>
+
+  <section id="security">
+    <h2>8. Auth and Security</h2>
 
     <h3>Authentication</h3>
     <ul>
-      <li><strong>Browser login</strong> uses one-time magic links sent via AWS SES. Tokens are 256-bit random, SHA-256 hashed before storage in Postgres, and expire after <code>NANOTRACE_MAGIC_LINK_TTL_SECS</code> (default 10 min). Deleted on use to prevent replay.</li>
-      <li><strong>Sessions</strong> are SHA-256 hashed server-side. Cookies are <code>HttpOnly</code>, <code>SameSite=Lax</code>, and <code>Secure</code> when the public base URL is HTTPS. Default TTL is 7 days.</li>
-      <li><strong>API keys</strong> use <code>ntak_…</code> prefix with 32 bytes of random entropy. Only the SHA-256 hash and a short prefix are stored; the full key is revealed once at creation. Keys carry a role (Viewer, Service, Admin) and scoped permissions (<code>ingest:write</code>, <code>query:read</code>, <code>facets:write</code>, etc.), with optional expiration and revocation.</li>
-      <li><strong>Allowed emails</strong> are configured via <code>NANOTRACE_ALLOWED_EMAILS</code> / <code>NANOTRACE_ADMIN_EMAILS</code> (literal addresses, <code>*@domain</code> globs, or <code>/regex/</code>).</li>
+      <li>Browser login uses one-time magic links. Tokens are random, hashed before storage, TTL-bound, and deleted on use.</li>
+      <li>Sessions are server-side hashed and stored in Postgres. Cookies are <code>HttpOnly</code>, <code>SameSite=Lax</code>, and secure when served over HTTPS.</li>
+      <li>API keys use an <code>ntak_</code> prefix. Only hashes and short prefixes are stored; the full key is shown only at creation.</li>
+      <li>Roles and permissions separate ingest, query, schema/report writes, API key management, and admin actions.</li>
     </ul>
 
     <h3>Tenant isolation</h3>
     <p>
-      The data model is tenant-keyed end-to-end. <code>tenant_id</code> is the first column in every ClickHouse <code>ORDER BY</code> key. At query time, the auth layer injects a <code>WHERE tenant_id = {__nanotrace_tenant_id:String}</code> clause into every SQL plan — the parameter value comes from the caller's authenticated identity, never from user input. Every ingested event row is materialized with the same tenant key. A single deployment can carry several logical tenants behind one auth domain.
+      Tenant identity is not accepted from arbitrary query input. The read service rewrites allowed table references into tenant-filtered subqueries using <code>{__nanotrace_tenant_id:String}</code>. The canonical table exposes materialized <code>tenant_id</code>, <code>event_type</code>, <code>trace_id</code>, <code>span_id</code>, and <code>signal</code> for efficient tenant-scoped reads.
     </p>
 
     <h3>Query sandbox</h3>
     <ul>
-      <li>Only <code>SELECT</code> / <code>WITH</code> statements allowed; DDL, DML, and multi-statement queries are rejected.</li>
-      <li>Table references are validated against a hard-coded whitelist (<code>events</code>, <code>field_counts_5m</code>, <code>field_index</code>, <code>definitions</code>). Access to <code>system.*</code> or other tables is blocked.</li>
-      <li>User values are passed as ClickHouse query parameters, not interpolated into SQL. Parameter names are validated as identifiers; only scalar types are accepted.</li>
-      <li>ClickHouse queries execute with <code>readonly=1</code>, <code>max_execution_time=30s</code>, <code>max_result_rows=100000</code>, and <code>max_bytes_to_read=1GB</code>.</li>
-      <li>SQL comments are stripped before analysis to prevent obfuscation.</li>
-    </ul>
-
-    <h3>Encryption</h3>
-    <ul>
-      <li><strong>At rest.</strong> S3 objects use SSE with a configurable KMS key or AES-256 default. EBS volumes and RDS storage are encrypted. ClickHouse Cloud manages its own encryption.</li>
-      <li><strong>In transit.</strong> TLS terminates at the ALB (ACM cert) or at the edge (Cloudflare). Internal traffic to S3, SQS, and SES uses the AWS SDK over TLS. RDS connections are within private subnets.</li>
-    </ul>
-
-    <h3>Network &amp; infrastructure</h3>
-    <ul>
-      <li><strong>VPC isolation.</strong> Per-stack VPC (<code>10.42.0.0/16</code>). ALB SG accepts 80/443 from the Internet; instance SG accepts the app port only from the ALB SG; Postgres SG accepts 5432 only from the instance SG.</li>
-      <li><strong>IMDSv2 enforced.</strong> <code>httpTokens=required</code> on all EC2 instances to prevent SSRF-based credential theft.</li>
-      <li><strong>IAM least-privilege.</strong> Instance role is scoped to specific S3 prefixes, the loader SQS queue, the ECR repository, SES sending, and the data KMS key. No wildcard resources.</li>
+      <li>Only read-only SQL is accepted; multi-statement DDL/DML paths are rejected.</li>
+      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>field_index</code>, <code>field_values</code>, <code>field_density_1s</code>, <code>field_topk_1m</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>optimization_recommendations</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
+      <li>User values are passed as ClickHouse parameters; identifier-like names are validated.</li>
+      <li>ClickHouse requests are sent with readonly and bounded execution/result settings.</li>
     </ul>
   </section>
 
   <section id="deployment">
-    <h2>4. Deployment</h2>
+    <h2>9. Deployment</h2>
+
     <p>
-      One Pulumi program (<code>deploy/pulumi/nanotrace</code>) provisions a self-contained stack per deployment: VPC, ALB, two EC2 Auto Scaling Groups, S3, SQS, RDS Postgres, ECR, CloudFront, SES, and IAM. External dependencies are AWS credentials, ClickHouse connection settings, and DNS ownership.
+      The Pulumi program in <code>deploy/pulumi/nanotrace</code> provisions the AWS stack: VPC, public ALB, EC2 Auto Scaling Groups, S3 buckets, SQS queue, RDS Postgres, ECR, CloudFront, SES, KMS/IAM policy, and the ClickHouse schema application command. The schema path defaults to <code>deploy/clickhouse/schema.sql</code>.
     </p>
 
-    <div class="figure">
-      <svg viewBox="0 0 960 440" width="100%" style="max-width:960px" aria-label="Deployment topology">
-        <defs>
-          <marker id="a3" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
-            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#4a5a6a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-          </marker>
-        </defs>
+    <table>
+      <tr><th>Runtime</th><th>Default shape</th></tr>
+      <tr><td>Server ASG</td><td>Runs <code>nanotrace-server</code> and <code>nanotrace-loader</code> containers. Uses EBS for local part staging.</td></tr>
+      <tr><td>Query ASG</td><td>Runs <code>nanotrace-query</code> for read-only SQL and event lookup.</td></tr>
+      <tr><td>S3 event bucket</td><td>Stores raw NDJSON parts and processor artifacts under configured prefixes.</td></tr>
+      <tr><td>SQS loader queue</td><td>Receives object-created notifications. Loader deletes messages after ClickHouse accepts insert requests.</td></tr>
+      <tr><td>RDS Postgres</td><td>Auth/session/key metadata.</td></tr>
+      <tr><td>ClickHouse</td><td>External OLAP endpoint configured by env/Pulumi settings.</td></tr>
+    </table>
 
-        <!-- Edge group -->
-        <rect class="fg" x="10" y="10" width="940" height="96" rx="12" ry="12"/>
-        <text class="ft cc" x="24" y="30">Edge / DNS</text>
+    <h3>Important deployment knobs</h3>
+    <pre>CLICKHOUSE_SCHEMA_PATH=deploy/clickhouse/schema.sql
+CLICKHOUSE_DATABASE=observatory
+CLICKHOUSE_TABLE=events
+LOADER_DERIVATION_MODE=raw
+LOADER_DEFINITIONS_REFRESH_SECS=60
+NANOTRACE_WRITER_LANES=4
+NANOTRACE_PART_MAX_BYTES=67108864
+NANOTRACE_PART_MAX_AGE_SECS=5</pre>
 
-        <rect class="fn" x="30"  y="44" width="148" height="48" rx="8" ry="8"/>
-        <text class="fts ce" x="104" y="64" text-anchor="middle">Cloudflare DNS</text>
-        <text class="fss" x="104" y="78" text-anchor="middle">UI &middot; API aliases</text>
-
-        <rect class="fn" x="194" y="44" width="148" height="48" rx="8" ry="8"/>
-        <text class="fts ce" x="268" y="64" text-anchor="middle">Route53 zone</text>
-        <text class="fss" x="268" y="78" text-anchor="middle">SES &amp; ACM records</text>
-
-        <rect class="fn" x="358" y="44" width="160" height="48" rx="8" ry="8"/>
-        <text class="fts ce" x="438" y="64" text-anchor="middle">CloudFront (UI)</text>
-        <text class="fss" x="438" y="78" text-anchor="middle">OAC &rarr; S3 ui bucket</text>
-
-        <rect class="fn" x="534" y="44" width="160" height="48" rx="8" ry="8"/>
-        <text class="fts ce" x="614" y="64" text-anchor="middle">ACM (us-east-1)</text>
-        <text class="fss" x="614" y="78" text-anchor="middle">CloudFront cert</text>
-
-        <rect class="fn" x="710" y="44" width="226" height="48" rx="8" ry="8"/>
-        <text class="fts ce" x="823" y="64" text-anchor="middle">SES domain identity</text>
-        <text class="fss" x="823" y="78" text-anchor="middle">DKIM &middot; MAIL FROM &middot; DMARC</text>
-
-        <!-- VPC group -->
-        <rect class="fg" x="10" y="120" width="940" height="280" rx="12" ry="12"/>
-        <text class="ft cc" x="24" y="140">VPC (per-stack)</text>
-
-        <!-- Public subnets -->
-        <rect x="28" y="152" width="590" height="234" rx="10" ry="10" fill="none" stroke="#1e242c" stroke-width="0.6" stroke-dasharray="5 3"/>
-        <text class="fgl" x="40" y="168">Public subnets &middot; multi-AZ</text>
-
-        <rect class="fn" x="50" y="184" width="168" height="46" rx="8" ry="8"/>
-        <text class="fts cc" x="134" y="204" text-anchor="middle">ALB</text>
-        <text class="fss" x="134" y="218" text-anchor="middle">HTTP(S) &middot; path routing</text>
-
-        <rect class="fn" x="50"  y="250" width="168" height="56" rx="8" ry="8"/>
-        <text class="fts cc" x="134" y="272" text-anchor="middle">server ASG</text>
-        <text class="fss" x="134" y="286" text-anchor="middle">EC2 + EBS &middot; server+loader</text>
-        <text class="fss" x="134" y="298" text-anchor="middle">launch template</text>
-
-        <rect class="fn" x="240" y="250" width="168" height="56" rx="8" ry="8"/>
-        <text class="fts cc" x="324" y="272" text-anchor="middle">query ASG</text>
-        <text class="fss" x="324" y="286" text-anchor="middle">EC2 &middot; stateless reads</text>
-        <text class="fss" x="324" y="298" text-anchor="middle">launch template</text>
-
-        <rect class="fn" x="430" y="250" width="172" height="56" rx="8" ry="8"/>
-        <text class="fts cd" x="516" y="272" text-anchor="middle">RDS Postgres</text>
-        <text class="fss" x="516" y="286" text-anchor="middle">auth store</text>
-        <text class="fss" x="516" y="298" text-anchor="middle">private SG</text>
-
-        <!-- AWS data services -->
-        <rect x="636" y="152" width="300" height="234" rx="10" ry="10" fill="none" stroke="#1e242c" stroke-width="0.6" stroke-dasharray="5 3"/>
-        <text class="fgl" x="648" y="168">AWS data services</text>
-
-        <rect class="fn" x="654" y="184" width="126" height="46" rx="8" ry="8"/>
-        <text class="fts cs" x="717" y="204" text-anchor="middle">S3 events</text>
-        <text class="fss" x="717" y="218" text-anchor="middle">SSE &middot; versioned</text>
-
-        <rect class="fn" x="794" y="184" width="126" height="46" rx="8" ry="8"/>
-        <text class="fts cs" x="857" y="204" text-anchor="middle">S3 ui assets</text>
-        <text class="fss" x="857" y="218" text-anchor="middle">CloudFront origin</text>
-
-        <rect class="fn" x="654" y="248" width="126" height="46" rx="8" ry="8"/>
-        <text class="fts cq" x="717" y="268" text-anchor="middle">SQS loader</text>
-        <text class="fss" x="717" y="282" text-anchor="middle">S3 notifications</text>
-
-        <rect class="fn" x="794" y="248" width="126" height="46" rx="8" ry="8"/>
-        <text class="fts cm" x="857" y="268" text-anchor="middle">KMS key</text>
-        <text class="fss" x="857" y="282" text-anchor="middle">optional data key</text>
-
-        <rect class="fn" x="654" y="312" width="266" height="52" rx="8" ry="8"/>
-        <text class="fts cm" x="787" y="334" text-anchor="middle">ECR &middot; ClickHouse Cloud</text>
-        <text class="fss" x="787" y="348" text-anchor="middle">image registry &middot; OLAP store</text>
-
-        <!-- IAM strip -->
-        <rect class="fg" x="10" y="410" width="940" height="26" rx="8" ry="8"/>
-        <text class="fss" x="22" y="428">IAM: instance role &amp; policy (ECR pull, S3 read/write, SQS receive/delete, KMS use, SES send), SSM core attachment</text>
-      </svg>
-      <div class="figure-caption">AWS deployment topology provisioned by Pulumi.</div>
+    <div class="callout warn">
+      Applying the current schema to an existing cluster intentionally removes obsolete write-time read models. If historical derived data from those old tables is needed, snapshot it before applying the current schema.
     </div>
   </section>
 </main>
 
 <footer>
-  Generated for <code>github.com/&lt;org&gt;/nanotrace</code> &middot; branch <code>suhjohn/multi-tenant</code>
+  Current-state design for Nanotrace. Last updated 2026-05-17.
 </footer>
 </body>
 </html>

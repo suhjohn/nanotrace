@@ -1,22 +1,20 @@
 [package]
-name = "nanotrace-loader"
+name = "nanotrace-lakehouse-rebuild"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow = "1"
+arrow-array = "57.3"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
-aws-sdk-sqs = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["clock"] }
 nanotrace-lakehouse = { path = "../../crates/lakehouse" }
-nanotrace-processor-runtime = { path = "../../crates/processor-runtime" }
+parquet = { version = "57.3", default-features = false, features = ["arrow", "zstd"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-urlencoding = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

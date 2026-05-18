@@ -42,6 +42,90 @@ cargo clippy --all-targets --all-features
 cargo test --all-features
 ```
 
+## Local Rewrite
+
+Bring up the local stack, drop/recreate the ClickHouse schema, and repopulate
+it through the normal ingest path with the loadtester:
+
+```sh
+npm run dev:up:detached
+npm run dev:rewrite:loadtest
+```
+
+`dev:rewrite:loadtest` runs the schema applicator with
+`CLICKHOUSE_RESET_DATABASE=true`, then posts generated events to
+`http://localhost:18473` and waits until the accepted `_loadtest.run_id` rows
+are visible in local ClickHouse at `http://localhost:18123`. Override
+`NANOTRACE_LOADTEST_TOTAL_EVENTS`, `NANOTRACE_LOADTEST_BATCH_SIZES`,
+`NANOTRACE_LOADTEST_PROFILE`, or `NANOTRACE_LOADTEST_RUN_ID` to change the
+rewrite size and shape.
+
+Local Compose enables the lakehouse writer by default. The loader commits each
+processed event batch to a local Apache Iceberg V2 table under
+`/data/lakehouse/nanotrace/events`, then loads the same committed batch into
+ClickHouse serving tables. ClickHouse stores commit and serving watermark rows
+in `observatory.lakehouse_commits` and `observatory.serving_watermarks`.
+After a ClickHouse reset, refill serving rows from the committed lakehouse files
+with:
+
+```sh
+npm run lakehouse:rebuild:local
+```
+
+The rebuild command restores raw `events` and, when active definitions exist,
+materializes promoted `field_index`, `event_measures`, and
+`entity_state_updates` rows from the same lakehouse snapshots. It refuses to
+rewrite raw or derived rows into non-empty ClickHouse serving tables unless
+`NANOTRACE_REBUILD_TRUNCATE=true` or `NANOTRACE_REBUILD_ALLOW_NON_EMPTY=true`.
+Set `NANOTRACE_REBUILD_RAW=false` to run materialization only, or
+`NANOTRACE_REBUILD_DERIVED=false` to skip derived serving tables. Data files may
+be local `file://` paths or remote `s3://`/`s3a://` paths; S3 rebuilds use the
+standard AWS environment and cap each fetched Parquet file with
+`NANOTRACE_REBUILD_S3_MAX_FILE_BYTES`.
+
+For normal catch-up after new lakehouse commits, run the same command with
+`NANOTRACE_MATERIALIZE_INCREMENTAL=true NANOTRACE_REBUILD_RAW=false`. That mode
+uses `observatory.serving_watermarks` to materialize only promoted serving
+tables that are behind the latest committed Iceberg sequence, so it can run
+against non-empty derived tables without a destructive refill.
+
+Local Compose also includes a long-running materializer service:
+
+```sh
+npm run lakehouse:materializer:local
+```
+
+The service runs `nanotrace-lakehouse-rebuild` with
+`NANOTRACE_MATERIALIZE_LOOP=true`, reloads active definitions every poll, and
+continuously advances promoted serving watermarks from committed lakehouse
+snapshots. Set `NANOTRACE_MATERIALIZE_POLL_SECS` to tune its cadence. In
+service mode it can use `NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse` so workers
+read shared `observatory.lakehouse_commits` metadata instead of local sidecar
+files. Commit metadata stores the full Iceberg data-file list for each
+snapshot, so materializers replay every file when a high-throughput commit rolls
+over into multiple Parquet parts.
+
+Lakehouse tables are created and kept current with production-oriented Iceberg
+properties for ZSTD Parquet writes, target file sizing, metadata cleanup, and
+snapshot-retention policy. Tune these with
+`NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES`,
+`NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP`,
+`NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS`, and
+`NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX`.
+
+When `NANOTRACE_POSTGRES_URL` is configured, the loader also uses a Postgres
+`nanotrace_ingest_batches` ledger keyed by the deterministic S3 batch token. A
+concurrent loader that sees the same batch will either skip it if completed or
+leave the SQS message for the active owner before downloading S3 objects; stale
+processing rows can be reclaimed after `NANOTRACE_INGEST_LEDGER_STALE_SECS`.
+
+Query APIs check `observatory.serving_watermarks` before reading raw or promoted
+serving tables. Requests that intentionally accept stale serving data can set
+`allow_stale_serving: true` in the `/v1/query` JSON body.
+
+See [docs/iceberg-final-spec.md](/Users/johnsuh/nanotrace/docs/iceberg-final-spec.md)
+for the Iceberg-native final design and current implementation slice.
+
 ## AWS Quickstart
 
 Deploy commands read only the process environment. Inject variables before
@@ -149,8 +233,8 @@ The AWS deployment runs `nanotrace-loader` beside `nanotrace-server` on each EC2
 instance. S3 sends object-created notifications to SQS; loader instances share
 that queue, fetch raw NDJSON objects from S3, and insert JSONEachRow batches into
 `observatory.events`. Processors are shared for the deployment under the
-`processors` S3 prefix. The uploaded row fields match
-[deploy/clickhouse/schema.sql](/Users/johnsuh/nanotrace/deploy/clickhouse/schema.sql).
+`processors` S3 prefix. The uploaded row fields match the raw-first analytics
+schema in [deploy/clickhouse/schema.sql](/Users/johnsuh/nanotrace/deploy/clickhouse/schema.sql).
 
 Destroy AWS resources:
 

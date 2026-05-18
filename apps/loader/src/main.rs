@@ -9,10 +9,12 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sqs::{Client as SqsClient, types::Message};
+use nanotrace_lakehouse::{LakehouseCommit, LakehouseConfig, LakehouseRestCatalogConfig};
 use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{sync::RwLock, task::JoinSet};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,6 +22,40 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 const DEFAULT_CLICKHOUSE_INSERT_MAX_ROWS: usize = 100_000;
 const DEFAULT_CLICKHOUSE_INSERT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CLICKHOUSE_INSERT_CONCURRENCY: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DerivationMode {
+    Raw,
+    Promoted,
+}
+
+#[derive(Clone, Copy)]
+struct DerivationPlan {
+    promoted_fields: bool,
+    promoted_measures: bool,
+    promoted_states: bool,
+}
+
+impl DerivationMode {
+    fn plan(self) -> DerivationPlan {
+        match self {
+            Self::Raw => DerivationPlan {
+                promoted_fields: false,
+                promoted_measures: false,
+                promoted_states: false,
+            },
+            Self::Promoted => DerivationPlan {
+                promoted_fields: true,
+                promoted_measures: true,
+                promoted_states: true,
+            },
+        }
+    }
+
+    fn needs_definitions(self) -> bool {
+        matches!(self, Self::Promoted)
+    }
+}
 
 #[derive(Clone)]
 struct Config {
@@ -30,7 +66,6 @@ struct Config {
     clickhouse_database: String,
     clickhouse_table: String,
     clickhouse_field_index_table: String,
-    clickhouse_span_fragments_table: String,
     clickhouse_event_measures_table: String,
     clickhouse_entity_state_updates_table: String,
     clickhouse_definitions_table: String,
@@ -44,6 +79,17 @@ struct Config {
     processor_prefix: String,
     processor_poll_interval: Duration,
     processor_dir: PathBuf,
+    postgres_url: Option<String>,
+    ingest_ledger_enabled: bool,
+    ingest_ledger_stale_after: Duration,
+    lakehouse_enabled: bool,
+    lakehouse_warehouse_dir: PathBuf,
+    lakehouse_target_file_size_bytes: u64,
+    lakehouse_min_snapshots_to_keep: u64,
+    lakehouse_max_snapshot_age_ms: u64,
+    lakehouse_metadata_previous_versions_max: u64,
+    iceberg_rest_catalog: Option<LakehouseRestCatalogConfig>,
+    derivation_mode: DerivationMode,
     clickhouse_insert_max_rows: usize,
     clickhouse_insert_max_bytes: usize,
     clickhouse_insert_concurrency: usize,
@@ -56,10 +102,18 @@ struct Loader {
     processors: ProcessorRuntime,
     s3: S3Client,
     sqs: SqsClient,
+    ingest_ledger: Option<IngestLedger>,
     definitions_cache: Arc<RwLock<CachedDefinitions>>,
 }
 
 #[derive(Clone)]
+struct IngestLedger {
+    pg: PgPool,
+    owner: String,
+    stale_after: Duration,
+}
+
+#[derive(Clone, Default)]
 struct CachedDefinitions {
     definitions: ExtractionDefinitions,
     fetched_at: Option<Instant>,
@@ -89,18 +143,23 @@ struct BatchBuffers {
     objects: usize,
     raw: Vec<u8>,
     field_index: Vec<u8>,
-    span_fragments: Vec<u8>,
     event_measures: Vec<u8>,
     entity_state_updates: Vec<u8>,
     raw_bytes: usize,
     field_index_bytes: usize,
-    span_fragment_bytes: usize,
     event_measure_bytes: usize,
     entity_state_update_bytes: usize,
     s3_ms: u64,
     transform_ms: u64,
     definitions_ms: u64,
     derive_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerAcquire {
+    Acquired,
+    AlreadyCompleted,
+    InProgress,
 }
 
 impl BatchBuffers {
@@ -111,7 +170,6 @@ impl BatchBuffers {
             batch.rows += object.rows;
             batch.raw_bytes += object.raw.len();
             batch.field_index_bytes += object.derived.field_index.len();
-            batch.span_fragment_bytes += object.derived.span_fragments.len();
             batch.event_measure_bytes += object.derived.event_measures.len();
             batch.entity_state_update_bytes += object.derived.entity_state_updates.len();
             batch.s3_ms += object.s3_ms;
@@ -121,7 +179,6 @@ impl BatchBuffers {
 
             append_ndjson(&mut batch.raw, &object.raw);
             append_ndjson(&mut batch.field_index, &object.derived.field_index);
-            append_ndjson(&mut batch.span_fragments, &object.derived.span_fragments);
             append_ndjson(&mut batch.event_measures, &object.derived.event_measures);
             append_ndjson(
                 &mut batch.entity_state_updates,
@@ -140,21 +197,6 @@ fn append_ndjson(dst: &mut Vec<u8>, src: &[u8]) {
     if !src.ends_with(b"\n") {
         dst.push(b'\n');
     }
-}
-
-impl Default for CachedDefinitions {
-    fn default() -> Self {
-        Self {
-            definitions: ExtractionDefinitions::default(),
-            fetched_at: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FieldCapabilities {
-    lookup: Vec<String>,
-    aggregate: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -311,34 +353,6 @@ struct S3Object {
     key: String,
 }
 
-#[cfg(test)]
-#[derive(Debug, Serialize)]
-struct EventIndexRow {
-    tenant_id: String,
-    timestamp: String,
-    bucket_time: String,
-    event_id: String,
-    event_type: String,
-    signal: String,
-    service: String,
-    environment: String,
-    name: String,
-    title: String,
-    is_error: u8,
-    correlation_id: String,
-    parent_id: String,
-    trace_id: String,
-    span_id: String,
-    parent_span_id: String,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    duration_ms: Option<f64>,
-    source_file: String,
-    source_offset: u64,
-    source_length: u32,
-    data: Value,
-}
-
 #[derive(Debug, Serialize)]
 struct FieldIndexRow {
     tenant_id: String,
@@ -398,33 +412,37 @@ struct EntityStateUpdateRow {
 }
 
 #[derive(Debug, Serialize)]
-struct SpanFragmentRow {
-    tenant_id: String,
-    trace_id: String,
-    span_id: String,
-    parent_span_id: String,
-    event_id: String,
-    event_type: String,
-    signal: String,
-    service: String,
-    environment: String,
-    name: String,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    duration_ms: Option<f64>,
-    is_error: u8,
-    timestamp: String,
-    source_file: String,
-    source_offset: u64,
-    source_length: u32,
-    data: Value,
+struct LakehouseCommitRow<'a> {
+    namespace: &'a str,
+    table_name: &'a str,
+    snapshot_id: &'a str,
+    sequence_number: u64,
+    committed_at_ms: u64,
+    data_file: &'a str,
+    data_files: &'a [String],
+    record_count: u64,
+    content_sha256: &'a str,
+    metadata_location: &'a str,
+    source_batch_id: &'a str,
+    deduplicated: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct ServingWatermarkRow<'a> {
+    serving_table: &'a str,
+    source_namespace: &'a str,
+    source_table: &'a str,
+    source_snapshot_id: &'a str,
+    source_sequence_number: u64,
+    source_record_count: u64,
+    status: &'a str,
+    attributes: Value,
 }
 
 #[derive(Debug, Default)]
 struct DerivedBuffers {
     rows: usize,
     field_index: Vec<u8>,
-    span_fragments: Vec<u8>,
     event_measures: Vec<u8>,
     entity_state_updates: Vec<u8>,
 }
@@ -439,6 +457,7 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let aws_config = aws_config::load_from_env().await;
     let s3 = s3_client(&aws_config);
+    let ingest_ledger = IngestLedger::from_config(&cfg).await?;
     let processors = match cfg.processor_bucket.clone() {
         Some(bucket) => ProcessorRuntime::start(
             s3.clone(),
@@ -458,10 +477,15 @@ async fn main() -> Result<()> {
         processors,
         s3,
         sqs: SqsClient::new(&aws_config),
+        ingest_ledger,
         definitions_cache: Arc::new(RwLock::new(CachedDefinitions::default())),
     };
 
-    info!("nanotrace loader starting");
+    info!(
+        derivation_mode = ?loader.cfg.derivation_mode,
+        ingest_ledger_enabled = loader.ingest_ledger.is_some(),
+        "nanotrace loader starting"
+    );
     loader.run().await
 }
 
@@ -479,6 +503,32 @@ fn env_bool(key: &str) -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn env_bool_default(key: &str, fallback: bool) -> bool {
+    env::var(key).ok().map_or(fallback, |value| {
+        matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+    })
+}
+
+fn iceberg_rest_catalog_from_env() -> Option<LakehouseRestCatalogConfig> {
+    let uri = optional("NANOTRACE_ICEBERG_REST_URI")?;
+    let warehouse = env_or("NANOTRACE_ICEBERG_WAREHOUSE", "s3://nanotrace-lakehouse");
+    let catalog_name = env_or("NANOTRACE_ICEBERG_CATALOG_NAME", "nanotrace");
+    let mut properties = Map::new();
+    if let Some(prefix) = optional("NANOTRACE_ICEBERG_REST_PREFIX") {
+        properties.insert("prefix".to_string(), Value::String(prefix));
+    }
+
+    Some(LakehouseRestCatalogConfig {
+        catalog_name,
+        uri,
+        warehouse,
+        properties: properties
+            .into_iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+            .collect(),
+    })
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -488,8 +538,6 @@ impl Config {
         let clickhouse_database = env_or("CLICKHOUSE_DATABASE", "observatory");
         let clickhouse_table = env_or("CLICKHOUSE_TABLE", "events");
         let clickhouse_field_index_table = env_or("CLICKHOUSE_FIELD_INDEX_TABLE", "field_index");
-        let clickhouse_span_fragments_table =
-            env_or("CLICKHOUSE_SPAN_FRAGMENTS_TABLE", "span_fragments");
         let clickhouse_event_measures_table =
             env_or("CLICKHOUSE_EVENT_MEASURES_TABLE", "event_measures");
         let clickhouse_entity_state_updates_table = env_or(
@@ -502,10 +550,6 @@ impl Config {
         validate_identifier(
             "CLICKHOUSE_FIELD_INDEX_TABLE",
             &clickhouse_field_index_table,
-        )?;
-        validate_identifier(
-            "CLICKHOUSE_SPAN_FRAGMENTS_TABLE",
-            &clickhouse_span_fragments_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_EVENT_MEASURES_TABLE",
@@ -529,7 +573,6 @@ impl Config {
             clickhouse_database,
             clickhouse_table,
             clickhouse_field_index_table,
-            clickhouse_span_fragments_table,
             clickhouse_event_measures_table,
             clickhouse_entity_state_updates_table,
             clickhouse_definitions_table,
@@ -553,6 +596,39 @@ impl Config {
                 30,
             )?),
             processor_dir: PathBuf::from(env_or("PROCESSOR_DIR", "/tmp/nanotrace-processors")),
+            postgres_url: optional("NANOTRACE_POSTGRES_URL"),
+            ingest_ledger_enabled: env_bool_default("NANOTRACE_INGEST_LEDGER_ENABLED", true),
+            ingest_ledger_stale_after: Duration::from_secs(parse_env(
+                "NANOTRACE_INGEST_LEDGER_STALE_SECS",
+                3600_u64,
+            )?),
+            lakehouse_enabled: env_bool("NANOTRACE_LAKEHOUSE_ENABLED"),
+            lakehouse_warehouse_dir: PathBuf::from(env_or(
+                "NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR",
+                "/data/lakehouse",
+            )),
+            lakehouse_target_file_size_bytes: parse_env(
+                "NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES",
+                512_u64 * 1024 * 1024,
+            )?,
+            lakehouse_min_snapshots_to_keep: parse_env(
+                "NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP",
+                10_000_u64,
+            )?,
+            lakehouse_max_snapshot_age_ms: parse_env(
+                "NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS",
+                7_u64 * 24 * 60 * 60 * 1000,
+            )?,
+            lakehouse_metadata_previous_versions_max: parse_env(
+                "NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX",
+                100_u64,
+            )?,
+            iceberg_rest_catalog: iceberg_rest_catalog_from_env(),
+            derivation_mode: parse_derivation_mode(
+                &env_or("LOADER_DERIVATION_MODE", "raw")
+                    .trim()
+                    .to_ascii_lowercase(),
+            )?,
             clickhouse_insert_max_rows: parse_env(
                 "CLICKHOUSE_INSERT_MAX_ROWS",
                 DEFAULT_CLICKHOUSE_INSERT_MAX_ROWS,
@@ -579,13 +655,6 @@ impl Config {
         )
     }
 
-    fn span_fragments_table_name(&self) -> String {
-        format!(
-            "{}.{}",
-            self.clickhouse_database, self.clickhouse_span_fragments_table
-        )
-    }
-
     fn event_measures_table_name(&self) -> String {
         format!(
             "{}.{}",
@@ -605,6 +674,161 @@ impl Config {
             "{}.{}",
             self.clickhouse_database, self.clickhouse_definitions_table
         )
+    }
+}
+
+fn parse_derivation_mode(value: &str) -> Result<DerivationMode> {
+    match value {
+        "raw" | "none" | "off" => Ok(DerivationMode::Raw),
+        "promoted" | "schema" | "definitions" => Ok(DerivationMode::Promoted),
+        _ => bail!("LOADER_DERIVATION_MODE must be raw or promoted; got {value}"),
+    }
+}
+
+impl IngestLedger {
+    async fn from_config(cfg: &Config) -> Result<Option<Self>> {
+        if !cfg.ingest_ledger_enabled {
+            return Ok(None);
+        }
+        let Some(postgres_url) = cfg.postgres_url.as_ref() else {
+            return Ok(None);
+        };
+        let pg = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(postgres_url)
+            .await
+            .context("connect ingest ledger postgres")?;
+        let ledger = Self {
+            pg,
+            owner: ledger_owner(),
+            stale_after: cfg.ingest_ledger_stale_after,
+        };
+        ledger.ensure_table().await?;
+        Ok(Some(ledger))
+    }
+
+    async fn ensure_table(&self) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS nanotrace_ingest_batches (
+                source_batch_id text PRIMARY KEY,
+                status text NOT NULL,
+                owner text NOT NULL,
+                source_objects jsonb NOT NULL,
+                rows bigint NOT NULL,
+                attempts bigint NOT NULL DEFAULT 1,
+                lakehouse_snapshot_id text,
+                lakehouse_sequence_number bigint,
+                acquired_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                completed_at timestamptz,
+                error text
+            )",
+        )
+        .execute(&self.pg)
+        .await
+        .context("create ingest ledger table")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS nanotrace_ingest_batches_status_idx
+             ON nanotrace_ingest_batches (status, updated_at)",
+        )
+        .execute(&self.pg)
+        .await
+        .context("create ingest ledger status index")?;
+        Ok(())
+    }
+
+    async fn acquire(&self, source_batch_id: &str, objects: &[ObjectRef]) -> Result<LedgerAcquire> {
+        let source_objects = source_objects_json(objects);
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO nanotrace_ingest_batches
+                (source_batch_id, status, owner, source_objects, rows)
+             VALUES ($1, 'processing', $2, $3, $4)
+             ON CONFLICT DO NOTHING
+             RETURNING source_batch_id",
+        )
+        .bind(source_batch_id)
+        .bind(&self.owner)
+        .bind(source_objects)
+        .bind(0_i64)
+        .fetch_optional(&self.pg)
+        .await
+        .context("insert ingest ledger row")?;
+        if inserted.is_some() {
+            return Ok(LedgerAcquire::Acquired);
+        }
+
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM nanotrace_ingest_batches WHERE source_batch_id = $1",
+        )
+        .bind(source_batch_id)
+        .fetch_optional(&self.pg)
+        .await
+        .context("read ingest ledger status")?;
+        if status.as_deref() == Some("completed") {
+            return Ok(LedgerAcquire::AlreadyCompleted);
+        }
+
+        let stale_secs = i64::try_from(self.stale_after.as_secs()).unwrap_or(i64::MAX);
+        let reclaimed: Option<String> = sqlx::query_scalar(
+            "UPDATE nanotrace_ingest_batches
+             SET status = 'processing',
+                 owner = $2,
+                 source_objects = $3,
+                 attempts = attempts + 1,
+                 updated_at = now(),
+                 error = NULL
+             WHERE source_batch_id = $1
+               AND status <> 'completed'
+               AND updated_at < now() - ($4::bigint * interval '1 second')
+             RETURNING source_batch_id",
+        )
+        .bind(source_batch_id)
+        .bind(&self.owner)
+        .bind(source_objects_json(objects))
+        .bind(stale_secs)
+        .fetch_optional(&self.pg)
+        .await
+        .context("reclaim stale ingest ledger row")?;
+        if reclaimed.is_some() {
+            Ok(LedgerAcquire::Acquired)
+        } else {
+            Ok(LedgerAcquire::InProgress)
+        }
+    }
+
+    async fn complete(
+        &self,
+        source_batch_id: &str,
+        prepared: &[PreparedObject],
+        rows: usize,
+        commit: Option<&LakehouseCommit>,
+    ) -> Result<()> {
+        let snapshot_id = commit.map(|commit| commit.snapshot_id.as_str());
+        let sequence_number =
+            commit.map(|commit| i64::try_from(commit.sequence_number).unwrap_or(i64::MAX));
+        let rows = i64::try_from(rows).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE nanotrace_ingest_batches
+             SET status = 'completed',
+                 source_objects = $3,
+                 rows = $4,
+                 lakehouse_snapshot_id = $5,
+                 lakehouse_sequence_number = $6,
+                 updated_at = now(),
+                 completed_at = now(),
+                 error = NULL
+             WHERE source_batch_id = $1 AND owner = $2",
+        )
+        .bind(source_batch_id)
+        .bind(&self.owner)
+        .bind(source_objects_json_from_prepared(prepared))
+        .bind(rows)
+        .bind(snapshot_id)
+        .bind(sequence_number)
+        .execute(&self.pg)
+        .await
+        .context("update ingest ledger completion")?;
+        Ok(())
     }
 }
 
@@ -659,41 +883,154 @@ impl Loader {
             );
         }
 
+        let objects = normalize_objects(objects);
+        if objects.is_empty() {
+            self.delete_messages(&messages).await?;
+            return Ok(());
+        }
+
+        let token_prefix = batch_token_prefix(&objects);
+        if let Some(ledger) = self.ingest_ledger.as_ref() {
+            match ledger
+                .acquire(&token_prefix, &objects)
+                .await
+                .context("acquire ingest ledger batch")?
+            {
+                LedgerAcquire::Acquired => {}
+                LedgerAcquire::AlreadyCompleted => {
+                    info!(
+                        source_batch_id = token_prefix,
+                        "skipping already completed ingest batch"
+                    );
+                    self.delete_messages(&messages).await?;
+                    return Ok(());
+                }
+                LedgerAcquire::InProgress => {
+                    info!(
+                        source_batch_id = token_prefix,
+                        "leaving ingest batch for active ledger owner"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let prepared = self.prepare_batch(objects).await?;
         if prepared.is_empty() {
+            if let Some(ledger) = self.ingest_ledger.as_ref() {
+                ledger
+                    .complete(&token_prefix, &prepared, 0, None)
+                    .await
+                    .context("complete empty ingest ledger batch")?;
+            }
             self.delete_messages(&messages).await?;
             return Ok(());
         }
 
         let batch = BatchBuffers::from_prepared(&prepared);
-        let token_prefix = batch_token_prefix(&prepared);
+
+        let lakehouse_commit_started = Instant::now();
+        let lakehouse_commit = if self.cfg.lakehouse_enabled {
+            let mut cfg = LakehouseConfig::events_table(self.cfg.lakehouse_warehouse_dir.clone())
+                .with_write_target_file_size_bytes(self.cfg.lakehouse_target_file_size_bytes)
+                .with_snapshot_retention(
+                    self.cfg.lakehouse_min_snapshots_to_keep,
+                    self.cfg.lakehouse_max_snapshot_age_ms,
+                    self.cfg.lakehouse_metadata_previous_versions_max,
+                );
+            if let Some(rest) = self.cfg.iceberg_rest_catalog.clone() {
+                cfg = cfg.with_rest_catalog(rest);
+            }
+            Some(
+                tokio::task::spawn_blocking({
+                    let raw = batch.raw.clone();
+                    let source_batch_id = token_prefix.clone();
+                    move || {
+                        nanotrace_lakehouse::commit_events_ndjson_with_source(
+                            &cfg,
+                            &raw,
+                            Some(&source_batch_id),
+                        )
+                    }
+                })
+                .await
+                .context("join lakehouse commit task")?
+                .context("commit events to lakehouse")?,
+            )
+        } else {
+            None
+        };
+        let lakehouse_commit_ms = elapsed_ms(lakehouse_commit_started);
 
         let raw_insert_started = Instant::now();
         self.insert_clickhouse(&self.cfg.table_name(), &batch.raw, &token_prefix, true)
             .await?;
         let raw_insert_ms = elapsed_ms(raw_insert_started);
 
+        let derived_insert_started = Instant::now();
+        self.insert_derived_tables(&batch, &token_prefix).await?;
+        let derived_insert_ms = elapsed_ms(derived_insert_started);
+
+        if let Some(commit) = lakehouse_commit.as_ref() {
+            self.insert_lakehouse_serving_metadata(commit, &batch, &token_prefix)
+                .await?;
+        }
+
+        if let Some(ledger) = self.ingest_ledger.as_ref() {
+            ledger
+                .complete(
+                    &token_prefix,
+                    &prepared,
+                    batch.rows,
+                    lakehouse_commit.as_ref(),
+                )
+                .await
+                .context("complete ingest ledger batch")?;
+        }
+
+        self.delete_messages(&messages).await?;
+
+        info!(
+            objects = batch.objects,
+            rows = batch.rows,
+            bytes = batch.raw_bytes,
+            field_index_bytes = batch.field_index_bytes,
+            event_measure_bytes = batch.event_measure_bytes,
+            entity_state_update_bytes = batch.entity_state_update_bytes,
+            s3_ms = batch.s3_ms,
+            transform_ms = batch.transform_ms,
+            definitions_ms = batch.definitions_ms,
+            derive_ms = batch.derive_ms,
+            lakehouse_enabled = self.cfg.lakehouse_enabled,
+            lakehouse_snapshot_id = lakehouse_commit
+                .as_ref()
+                .map(|commit| commit.snapshot_id.as_str()),
+            lakehouse_sequence_number = lakehouse_commit
+                .as_ref()
+                .map(|commit| commit.sequence_number),
+            lakehouse_deduplicated = lakehouse_commit.as_ref().map(|commit| commit.deduplicated),
+            lakehouse_commit_ms,
+            raw_insert_ms,
+            derived_insert_ms,
+            "loaded event object batch"
+        );
+
+        Ok(())
+    }
+
+    async fn insert_derived_tables(&self, batch: &BatchBuffers, token_prefix: &str) -> Result<()> {
         let field_index_table = self.cfg.field_index_table_name();
-        let span_fragments_table = self.cfg.span_fragments_table_name();
         let event_measures_table = self.cfg.event_measures_table_name();
         let entity_state_updates_table = self.cfg.entity_state_updates_table_name();
         let field_index_token_prefix = format!("{token_prefix}:field_index");
-        let span_fragments_token_prefix = format!("{token_prefix}:span_fragments");
         let event_measures_token_prefix = format!("{token_prefix}:event_measures");
         let entity_state_updates_token_prefix = format!("{token_prefix}:entity_state_updates");
 
-        let derived_insert_started = Instant::now();
         tokio::try_join!(
             self.insert_clickhouse(
                 &field_index_table,
                 &batch.field_index,
                 &field_index_token_prefix,
-                true,
-            ),
-            self.insert_clickhouse(
-                &span_fragments_table,
-                &batch.span_fragments,
-                &span_fragments_token_prefix,
                 true,
             ),
             self.insert_clickhouse(
@@ -709,27 +1046,129 @@ impl Loader {
                 true,
             ),
         )?;
-        let derived_insert_ms = elapsed_ms(derived_insert_started);
 
-        self.delete_messages(&messages).await?;
+        Ok(())
+    }
 
-        info!(
-            objects = batch.objects,
-            rows = batch.rows,
-            bytes = batch.raw_bytes,
-            field_index_bytes = batch.field_index_bytes,
-            span_fragment_bytes = batch.span_fragment_bytes,
-            event_measure_bytes = batch.event_measure_bytes,
-            entity_state_update_bytes = batch.entity_state_update_bytes,
-            s3_ms = batch.s3_ms,
-            transform_ms = batch.transform_ms,
-            definitions_ms = batch.definitions_ms,
-            derive_ms = batch.derive_ms,
-            raw_insert_ms,
-            derived_insert_ms,
-            "loaded event object batch"
-        );
+    async fn insert_lakehouse_serving_metadata(
+        &self,
+        commit: &LakehouseCommit,
+        batch: &BatchBuffers,
+        token_prefix: &str,
+    ) -> Result<()> {
+        let commit_row = LakehouseCommitRow {
+            namespace: &commit.namespace,
+            table_name: &commit.table,
+            snapshot_id: &commit.snapshot_id,
+            sequence_number: commit.sequence_number,
+            committed_at_ms: commit.committed_at_ms.try_into().unwrap_or(0),
+            data_file: &commit.data_file,
+            data_files: &commit.data_files,
+            record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
+            content_sha256: &commit.content_sha256,
+            metadata_location: &commit.metadata_location,
+            source_batch_id: commit.source_batch_id.as_deref().unwrap_or(""),
+            deduplicated: u8::from(commit.deduplicated),
+        };
+        let mut watermark_rows = vec![ServingWatermarkRow {
+            serving_table: &self.cfg.clickhouse_table,
+            source_namespace: &commit.namespace,
+            source_table: &commit.table,
+            source_snapshot_id: &commit.snapshot_id,
+            source_sequence_number: commit.sequence_number,
+            source_record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
+            status: "loaded",
+            attributes: serde_json::json!({
+                "data_file": &commit.data_file,
+                "data_files": &commit.data_files,
+                "content_sha256": &commit.content_sha256,
+                "metadata_location": &commit.metadata_location,
+                "source_batch_id": &commit.source_batch_id,
+                "deduplicated": commit.deduplicated,
+            }),
+        }];
 
+        let plan = self.cfg.derivation_mode.plan();
+        if plan.promoted_fields {
+            watermark_rows.push(ServingWatermarkRow {
+                serving_table: &self.cfg.clickhouse_field_index_table,
+                source_namespace: &commit.namespace,
+                source_table: &commit.table,
+                source_snapshot_id: &commit.snapshot_id,
+                source_sequence_number: commit.sequence_number,
+                source_record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
+                status: "loaded",
+                attributes: serde_json::json!({
+                    "metadata_location": &commit.metadata_location,
+                    "source_batch_id": &commit.source_batch_id,
+                    "field_index_rows": count_ndjson_rows(&batch.field_index),
+                }),
+            });
+        }
+        if plan.promoted_measures {
+            watermark_rows.push(ServingWatermarkRow {
+                serving_table: &self.cfg.clickhouse_event_measures_table,
+                source_namespace: &commit.namespace,
+                source_table: &commit.table,
+                source_snapshot_id: &commit.snapshot_id,
+                source_sequence_number: commit.sequence_number,
+                source_record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
+                status: "loaded",
+                attributes: serde_json::json!({
+                    "metadata_location": &commit.metadata_location,
+                    "source_batch_id": &commit.source_batch_id,
+                    "event_measure_rows": count_ndjson_rows(&batch.event_measures),
+                }),
+            });
+        }
+        if plan.promoted_states {
+            watermark_rows.push(ServingWatermarkRow {
+                serving_table: &self.cfg.clickhouse_entity_state_updates_table,
+                source_namespace: &commit.namespace,
+                source_table: &commit.table,
+                source_snapshot_id: &commit.snapshot_id,
+                source_sequence_number: commit.sequence_number,
+                source_record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
+                status: "loaded",
+                attributes: serde_json::json!({
+                    "metadata_location": &commit.metadata_location,
+                    "source_batch_id": &commit.source_batch_id,
+                    "entity_state_update_rows": count_ndjson_rows(&batch.entity_state_updates),
+                }),
+            });
+        }
+
+        let mut commit_body = Vec::new();
+        serde_json::to_writer(&mut commit_body, &commit_row)
+            .context("serialize lakehouse commit row")?;
+        commit_body.push(b'\n');
+
+        let mut watermark_body = Vec::new();
+        for row in &watermark_rows {
+            serde_json::to_writer(&mut watermark_body, row)
+                .context("serialize serving watermark row")?;
+            watermark_body.push(b'\n');
+        }
+
+        let lakehouse_commits_table = format!("{}.lakehouse_commits", self.cfg.clickhouse_database);
+        let serving_watermarks_table =
+            format!("{}.serving_watermarks", self.cfg.clickhouse_database);
+        let lakehouse_commits_token = format!("{token_prefix}:lakehouse_commits");
+        let serving_watermarks_token = format!("{token_prefix}:serving_watermarks");
+        tokio::try_join!(
+            self.insert_clickhouse(
+                &lakehouse_commits_table,
+                &commit_body,
+                &lakehouse_commits_token,
+                false,
+            ),
+            self.insert_clickhouse(
+                &serving_watermarks_table,
+                &watermark_body,
+                &serving_watermarks_token,
+                false,
+            ),
+        )?;
         Ok(())
     }
 
@@ -813,16 +1252,20 @@ impl Loader {
             return Ok(None);
         }
 
-        let capabilities = builtin_field_capabilities();
-        let definitions_started = Instant::now();
-        let definitions = self.cached_definitions().await.unwrap_or_else(|err| {
-            warn!(error = %err, "failed to load dynamic definitions; continuing with built-ins");
-            ExtractionDefinitions::default()
-        });
-        let definitions_ms = elapsed_ms(definitions_started);
         let derive_started = Instant::now();
-        let derived = derived_buffers(&processed, &capabilities, &definitions)
-            .context("derive event rows")?;
+        let plan = self.cfg.derivation_mode.plan();
+        let definitions_started = Instant::now();
+        let definitions = if self.cfg.derivation_mode.needs_definitions() {
+            self.cached_definitions().await.unwrap_or_else(|err| {
+                warn!(error = %err, "failed to load dynamic definitions; continuing without promoted derivation");
+                ExtractionDefinitions::default()
+            })
+        } else {
+            ExtractionDefinitions::default()
+        };
+        let definitions_ms = elapsed_ms(definitions_started);
+        let derived =
+            derived_buffers(&processed, plan, &definitions).context("derive event rows")?;
         let derive_ms = elapsed_ms(derive_started);
 
         Ok(Some(PreparedObject {
@@ -1019,10 +1462,15 @@ async fn wait_for_insert_task(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
 
 fn derived_buffers(
     bytes: &[u8],
-    capabilities: &FieldCapabilities,
+    plan: DerivationPlan,
     definitions: &ExtractionDefinitions,
 ) -> Result<DerivedBuffers> {
     let mut buffers = DerivedBuffers::default();
+    if !plan.promoted_fields && !plan.promoted_measures && !plan.promoted_states {
+        buffers.rows = count_ndjson_rows(bytes);
+        return Ok(buffers);
+    }
+
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -1034,192 +1482,35 @@ fn derived_buffers(
             continue;
         };
 
-        for field_row in field_index_rows(row, capabilities, definitions) {
-            serde_json::to_writer(&mut buffers.field_index, &field_row)
-                .context("serialize field index row")?;
-            buffers.field_index.push(b'\n');
+        if plan.promoted_fields {
+            for field_row in field_index_rows(row, definitions) {
+                serde_json::to_writer(&mut buffers.field_index, &field_row)
+                    .context("serialize field index row")?;
+                buffers.field_index.push(b'\n');
+            }
         }
 
-        if let Some(span_row) = span_fragment_row(row) {
-            serde_json::to_writer(&mut buffers.span_fragments, &span_row)
-                .context("serialize span fragment row")?;
-            buffers.span_fragments.push(b'\n');
+        if plan.promoted_measures {
+            for measure in event_measure_rows(row, definitions) {
+                serde_json::to_writer(&mut buffers.event_measures, &measure)
+                    .context("serialize event measure row")?;
+                buffers.event_measures.push(b'\n');
+            }
         }
 
-        for measure in event_measure_rows(row, definitions) {
-            serde_json::to_writer(&mut buffers.event_measures, &measure)
-                .context("serialize event measure row")?;
-            buffers.event_measures.push(b'\n');
-        }
-
-        for state_update in entity_state_update_rows(row, definitions) {
-            serde_json::to_writer(&mut buffers.entity_state_updates, &state_update)
-                .context("serialize entity state update row")?;
-            buffers.entity_state_updates.push(b'\n');
+        if plan.promoted_states {
+            for state_update in entity_state_update_rows(row, definitions) {
+                serde_json::to_writer(&mut buffers.entity_state_updates, &state_update)
+                    .context("serialize entity state update row")?;
+                buffers.entity_state_updates.push(b'\n');
+            }
         }
     }
     Ok(buffers)
 }
 
 #[cfg(test)]
-fn event_index_ndjson(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let row: Value = serde_json::from_slice(line).context("parse event row for event index")?;
-        let Some(row) = row.as_object() else {
-            continue;
-        };
-        let Some(index_row) = event_index_row(row) else {
-            continue;
-        };
-        serde_json::to_writer(&mut out, &index_row).context("serialize event index row")?;
-        out.push(b'\n');
-    }
-    Ok(out)
-}
-
-fn span_fragment_row(row: &Map<String, Value>) -> Option<SpanFragmentRow> {
-    let timestamp = string_value(row.get("timestamp"));
-    if timestamp.is_empty() {
-        return None;
-    }
-    let data = row.get("data").and_then(Value::as_object)?;
-    let context = EventIndexContext::from_row(row, data, timestamp.clone());
-    if context.trace_id.is_empty() || context.span_id.is_empty() {
-        return None;
-    }
-
-    let event_type = context.event_type.as_str();
-    let start_time = optional_time(data.get("start_time"))
-        .or_else(|| optional_time(data.get("span_start_time")))
-        .or_else(|| optional_time(data.get("startedAt")));
-    let end_time = optional_time(data.get("end_time"))
-        .or_else(|| optional_time(data.get("span_end_time")))
-        .or_else(|| optional_time(data.get("endedAt")));
-    let duration_ms = context
-        .duration_ms
-        .or_else(|| optional_number_value(data.get("durationMs")))
-        .or_else(|| optional_number_value(data.get("elapsed_ms")))
-        .or_else(|| optional_number_value(data.get("latency_ms")));
-
-    let is_lifecycle_span = matches!(event_type, "span_start" | "span_end" | "span");
-    let is_operation_span = context.signal == "trace"
-        || (duration_ms.is_some()
-            && !matches!(
-                event_type,
-                "log" | "metric" | "analytics" | "track" | "page" | "screen"
-            ));
-    if !is_lifecycle_span && !is_operation_span {
-        return None;
-    }
-
-    let normalized_start_time = match event_type {
-        "span_end" => start_time,
-        _ => start_time.or_else(|| Some(timestamp.clone())),
-    };
-    let normalized_end_time = match event_type {
-        "span_start" => end_time,
-        _ => end_time.or_else(|| {
-            if duration_ms.is_some() {
-                None
-            } else {
-                Some(timestamp.clone())
-            }
-        }),
-    };
-
-    Some(SpanFragmentRow {
-        tenant_id: context.tenant_id.clone(),
-        trace_id: context.trace_id.clone(),
-        span_id: context.span_id.clone(),
-        parent_span_id: context.parent_span_id.clone(),
-        event_id: context.event_id.clone(),
-        event_type: context.event_type.clone(),
-        signal: context.signal.clone(),
-        service: string_value(data.get("service")),
-        environment: string_value(data.get("environment")),
-        name: context.name.clone(),
-        start_time: normalized_start_time,
-        end_time: normalized_end_time,
-        duration_ms,
-        is_error: u8::from(is_error_row(row)),
-        timestamp,
-        source_file: string_value(row.get("source_file")),
-        source_offset: u64_value(row.get("source_offset")),
-        source_length: u32_value(row.get("source_length")),
-        data: Value::Object(data.clone()),
-    })
-}
-
-#[cfg(test)]
-fn event_index_row(row: &Map<String, Value>) -> Option<EventIndexRow> {
-    let timestamp = string_value(row.get("timestamp"));
-    if timestamp.is_empty() {
-        return None;
-    }
-    let data = row.get("data").and_then(Value::as_object)?;
-    let context = EventIndexContext::from_row(row, data, timestamp);
-    let service = string_value(data.get("service"));
-    let environment = string_value(data.get("environment"));
-    let title = context
-        .name
-        .clone()
-        .into_non_empty()
-        .or_else(|| string_value(data.get("metric_name")).into_non_empty())
-        .or_else(|| string_value(data.get("body")).into_non_empty())
-        .unwrap_or_else(|| context.event_type.clone());
-    let correlation_id = context
-        .trace_id
-        .clone()
-        .into_non_empty()
-        .or_else(|| string_value(data.get("request_id")).into_non_empty())
-        .or_else(|| context.span_id.clone().into_non_empty())
-        .or_else(|| string_value(data.get("session_id")).into_non_empty())
-        .or_else(|| string_value(data.get("account_id")).into_non_empty())
-        .or_else(|| string_value(data.get("user_id")).into_non_empty())
-        .unwrap_or_default();
-    let parent_id = context
-        .parent_span_id
-        .clone()
-        .into_non_empty()
-        .unwrap_or_default();
-
-    Some(EventIndexRow {
-        tenant_id: context.tenant_id.clone(),
-        timestamp: context.timestamp.clone(),
-        bucket_time: context.bucket_time.clone(),
-        event_id: context.event_id.clone(),
-        event_type: context.event_type.clone(),
-        signal: context.signal.clone(),
-        service,
-        environment,
-        name: context.name.clone(),
-        title,
-        is_error: u8::from(is_error_row(row)),
-        correlation_id,
-        parent_id,
-        trace_id: context.trace_id.clone(),
-        span_id: context.span_id.clone(),
-        parent_span_id: context.parent_span_id.clone(),
-        start_time: context.start_time.clone(),
-        end_time: context.end_time.clone(),
-        duration_ms: context.duration_ms,
-        source_file: string_value(row.get("source_file")),
-        source_offset: u64_value(row.get("source_offset")),
-        source_length: u32_value(row.get("source_length")),
-        data: Value::Object(data.clone()),
-    })
-}
-
-#[cfg(test)]
-fn field_index_ndjson(
-    bytes: &[u8],
-    capabilities: &FieldCapabilities,
-    definitions: &ExtractionDefinitions,
-) -> Result<Vec<u8>> {
+fn field_index_ndjson(bytes: &[u8], definitions: &ExtractionDefinitions) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -1229,7 +1520,7 @@ fn field_index_ndjson(
         let Some(row) = row.as_object() else {
             continue;
         };
-        for field_row in field_index_rows(row, capabilities, definitions) {
+        for field_row in field_index_rows(row, definitions) {
             serde_json::to_writer(&mut out, &field_row).context("serialize field index row")?;
             out.push(b'\n');
         }
@@ -1239,7 +1530,6 @@ fn field_index_ndjson(
 
 fn field_index_rows(
     row: &Map<String, Value>,
-    capabilities: &FieldCapabilities,
     definitions: &ExtractionDefinitions,
 ) -> Vec<FieldIndexRow> {
     let timestamp = string_value(row.get("timestamp"));
@@ -1249,54 +1539,9 @@ fn field_index_rows(
     let Some(data) = row.get("data").and_then(Value::as_object) else {
         return Vec::new();
     };
-    let context = EventIndexContext::from_row(row, data, timestamp);
+    let context = EventContext::from_row(row, data, timestamp);
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
-    let aggregate = capabilities
-        .aggregate
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    for key in &capabilities.aggregate {
-        if let Some(value) = indexed_value_for_key(row, data, &context, key) {
-            collect_field_index_rows(
-                &context,
-                row,
-                BuiltFieldIndex {
-                    mode: "facet",
-                    field_name: key,
-                    value_type: None,
-                    definition_id: "",
-                    definition_version: 0,
-                },
-                &value,
-                &mut seen,
-                &mut rows,
-            );
-        }
-    }
-    for key in &capabilities.lookup {
-        if aggregate.contains(key) {
-            continue;
-        }
-        if let Some(value) = indexed_value_for_key(row, data, &context, key) {
-            collect_field_index_rows(
-                &context,
-                row,
-                BuiltFieldIndex {
-                    mode: "lookup",
-                    field_name: key,
-                    value_type: None,
-                    definition_id: "",
-                    definition_version: 0,
-                },
-                &value,
-                &mut seen,
-                &mut rows,
-            );
-        }
-    }
     for definition in &definitions.fields {
         if definition.tenant_id != context.tenant_id {
             continue;
@@ -1331,7 +1576,7 @@ struct BuiltFieldIndex<'a> {
 }
 
 fn collect_field_index_rows(
-    context: &EventIndexContext,
+    context: &EventContext,
     row: &Map<String, Value>,
     field: BuiltFieldIndex<'_>,
     value: &Value,
@@ -1384,7 +1629,7 @@ fn collect_field_index_rows(
 }
 
 fn push_field_index_row(
-    context: &EventIndexContext,
+    context: &EventContext,
     row: &Map<String, Value>,
     field: &BuiltFieldIndex<'_>,
     value: String,
@@ -1456,47 +1701,8 @@ fn event_measure_rows(
     let Some(data) = row.get("data").and_then(Value::as_object) else {
         return Vec::new();
     };
-    let context = EventIndexContext::from_row(row, data, timestamp);
-    let service = string_value(data.get("service"));
-    let metric_unit = string_value(data.get("metric_unit"));
+    let context = EventContext::from_row(row, data, timestamp);
     let mut rows = Vec::new();
-    for (name, unit) in [
-        ("duration_ms", "ms"),
-        ("metric_value", metric_unit.as_str()),
-        ("revenue", ""),
-        ("price", ""),
-        ("quantity", ""),
-        ("count", ""),
-        ("sum", ""),
-        ("metric_count", ""),
-        ("metric_sum", ""),
-        ("metric_min", ""),
-        ("metric_max", ""),
-    ] {
-        let Some(value) = optional_number_value(value_at_path(data, name)) else {
-            continue;
-        };
-        rows.push(EventMeasureRow {
-            tenant_id: context.tenant_id.clone(),
-            definition_id: String::new(),
-            definition_version: 0,
-            measure_name: name.to_string(),
-            value,
-            unit: unit.to_string(),
-            timestamp: context.timestamp.clone(),
-            bucket_time: context.bucket_time.clone(),
-            bucket_seconds: 300,
-            event_id: context.event_id.clone(),
-            event_type: context.event_type.clone(),
-            signal: context.signal.clone(),
-            dimension_name: if service.is_empty() {
-                String::new()
-            } else {
-                "service".to_string()
-            },
-            dimension_value: service.clone(),
-        });
-    }
     for definition in &definitions.measures {
         if definition.tenant_id != context.tenant_id {
             continue;
@@ -1564,7 +1770,7 @@ fn entity_state_update_rows(
     let Some(data) = row.get("data").and_then(Value::as_object) else {
         return Vec::new();
     };
-    let context = EventIndexContext::from_row(row, data, timestamp);
+    let context = EventContext::from_row(row, data, timestamp);
     let mut rows = Vec::new();
     for definition in &definitions.states {
         if definition.tenant_id != context.tenant_id {
@@ -1593,7 +1799,7 @@ fn entity_state_update_rows(
     rows
 }
 
-struct EventIndexContext {
+struct EventContext {
     tenant_id: String,
     timestamp: String,
     bucket_time: String,
@@ -1609,7 +1815,7 @@ struct EventIndexContext {
     duration_ms: Option<f64>,
 }
 
-impl EventIndexContext {
+impl EventContext {
     fn from_row(row: &Map<String, Value>, data: &Map<String, Value>, timestamp: String) -> Self {
         let event_id = string_value(row.get("event_id"));
         let event_type = string_value(data.get("event_type"));
@@ -1631,37 +1837,6 @@ impl EventIndexContext {
             end_time: optional_time(data.get("end_time")),
             duration_ms: optional_number_value(data.get("duration_ms")),
         }
-    }
-}
-
-fn builtin_field_capabilities() -> FieldCapabilities {
-    // Keep field_index schema-defined by default. Builtin event fields already
-    // live on `events`; high-cardinality lookups must be explicitly promoted so
-    // the loader does not multiply every ingest batch by default.
-    let aggregate: [&str; 0] = [];
-    let lookup_only: [&str; 0] = [];
-    let mut lookup = BTreeSet::new();
-    for key in aggregate.into_iter().chain(lookup_only) {
-        lookup.insert(key.to_string());
-    }
-    FieldCapabilities {
-        lookup: lookup.into_iter().collect(),
-        aggregate: aggregate.into_iter().map(str::to_string).collect(),
-    }
-}
-
-fn indexed_value_for_key(
-    row: &Map<String, Value>,
-    data: &Map<String, Value>,
-    context: &EventIndexContext,
-    key: &str,
-) -> Option<Value> {
-    match key {
-        "event_id" => Some(Value::String(context.event_id.clone())),
-        "signal" => Some(Value::String(context.signal.clone())),
-        _ => value_at_path(data, key)
-            .cloned()
-            .or_else(|| row.get(key).cloned()),
     }
 }
 
@@ -1726,18 +1901,6 @@ fn config_string_default(config: &Value, key: &str, fallback: &str) -> String {
 
 fn optional_time(value: Option<&Value>) -> Option<String> {
     string_value(value).into_non_empty()
-}
-
-fn u64_value(value: Option<&Value>) -> u64 {
-    match value {
-        Some(Value::Number(value)) => value.as_u64().unwrap_or_default(),
-        Some(Value::String(value)) => value.parse().unwrap_or_default(),
-        _ => 0,
-    }
-}
-
-fn u32_value(value: Option<&Value>) -> u32 {
-    u64_value(value).try_into().unwrap_or_default()
 }
 
 fn optional_number_value(value: Option<&Value>) -> Option<f64> {
@@ -1855,15 +2018,66 @@ fn ndjson_chunks(bytes: &[u8], max_rows: usize, max_bytes: usize) -> Vec<&[u8]> 
     chunks
 }
 
-fn batch_token_prefix(prepared: &[PreparedObject]) -> String {
+fn normalize_objects(objects: Vec<ObjectRef>) -> Vec<ObjectRef> {
+    let mut unique = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for object in objects {
+        if unique.insert((object.bucket.clone(), object.key.clone())) {
+            normalized.push(object);
+        }
+    }
+    normalized.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    normalized
+}
+
+fn batch_token_prefix(objects: &[ObjectRef]) -> String {
     let mut hasher = Sha256::new();
-    for object in prepared {
-        hasher.update(object.object_ref.bucket.as_bytes());
+    for object in objects {
+        hasher.update(object.bucket.as_bytes());
         hasher.update(b"\0");
-        hasher.update(object.object_ref.key.as_bytes());
+        hasher.update(object.key.as_bytes());
         hasher.update(b"\0");
     }
     format!("s3-batch:{:x}", hasher.finalize())
+}
+
+fn source_objects_json(objects: &[ObjectRef]) -> Value {
+    Value::Array(
+        objects
+            .iter()
+            .map(|object| {
+                serde_json::json!({
+                    "bucket": object.bucket,
+                    "key": object.key,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn source_objects_json_from_prepared(prepared: &[PreparedObject]) -> Value {
+    Value::Array(
+        prepared
+            .iter()
+            .map(|object| {
+                serde_json::json!({
+                    "bucket": object.object_ref.bucket,
+                    "key": object.object_ref.key,
+                    "rows": object.rows,
+                    "bytes": object.raw.len(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn ledger_owner() -> String {
+    let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+    format!("{host}:{}", std::process::id())
 }
 
 fn insert_deduplication_token(prefix: &str, table: &str, chunk_index: usize) -> String {
@@ -1942,9 +2156,10 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtractionDefinitions, FieldDefinition, MeasureDefinition, StateDefinition,
-        builtin_field_capabilities, count_ndjson_rows, entity_state_updates_ndjson,
-        event_index_ndjson, event_measures_ndjson, field_index_ndjson, parse_s3_records,
+        DerivationMode, ExtractionDefinitions, FieldDefinition, MeasureDefinition, ObjectRef,
+        StateDefinition, batch_token_prefix, count_ndjson_rows, derived_buffers,
+        entity_state_updates_ndjson, event_measures_ndjson, field_index_ndjson, normalize_objects,
+        parse_derivation_mode, parse_s3_records,
     };
     use serde_json::Value;
 
@@ -1980,27 +2195,79 @@ mod tests {
     }
 
     #[test]
-    fn generates_event_index_with_raw_source_pointer() {
-        let index = event_index_ndjson(
-            br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","source_file":"events/part.ndjson","source_offset":42,"source_length":321,"data":{"tenant_id":"tenant-a","event_type":"span_start","service":"api","environment":"prod","trace_id":"trace-1","span_id":"span-1","parent_span_id":"root","name":"GET /users","duration_ms":12.5}}"#,
-        )
-        .expect("generate event index");
-        let row: Value =
-            serde_json::from_slice(index.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+    fn normalizes_objects_before_batch_token() {
+        let normalized = normalize_objects(vec![
+            ObjectRef {
+                bucket: "b".to_string(),
+                key: "z".to_string(),
+            },
+            ObjectRef {
+                bucket: "a".to_string(),
+                key: "x".to_string(),
+            },
+            ObjectRef {
+                bucket: "a".to_string(),
+                key: "x".to_string(),
+            },
+        ]);
 
-        assert_eq!(row["event_id"], "evt_1");
-        assert_eq!(row["service"], "api");
-        assert_eq!(row["correlation_id"], "trace-1");
-        assert_eq!(row["source_file"], "events/part.ndjson");
-        assert_eq!(row["source_offset"], 42);
-        assert_eq!(row["source_length"], 321);
+        assert_eq!(
+            normalized,
+            vec![
+                ObjectRef {
+                    bucket: "a".to_string(),
+                    key: "x".to_string(),
+                },
+                ObjectRef {
+                    bucket: "b".to_string(),
+                    key: "z".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            batch_token_prefix(&normalized),
+            batch_token_prefix(&normalize_objects(vec![
+                ObjectRef {
+                    bucket: "b".to_string(),
+                    key: "z".to_string(),
+                },
+                ObjectRef {
+                    bucket: "a".to_string(),
+                    key: "x".to_string(),
+                },
+            ]))
+        );
     }
 
     #[test]
-    fn skips_builtin_field_index_without_schema_definitions() {
+    fn parses_derivation_mode_aliases() {
+        assert_eq!(parse_derivation_mode("raw").unwrap(), DerivationMode::Raw);
+        assert_eq!(
+            parse_derivation_mode("promoted").unwrap(),
+            DerivationMode::Promoted
+        );
+        assert!(parse_derivation_mode("everything").is_err());
+    }
+
+    #[test]
+    fn raw_derivation_mode_does_not_build_secondary_buffers() {
+        let buffers = derived_buffers(
+            b"{\"event_id\":\"evt_1\",\"timestamp\":\"2026-05-12T00:00:00.000Z\",\"data\":{\"tenant_id\":\"tenant-a\",\"event_type\":\"span\",\"trace_id\":\"trace-1\",\"span_id\":\"span-1\",\"duration_ms\":12.5,\"revenue\":9.99}}\n",
+            DerivationMode::Raw.plan(),
+            &ExtractionDefinitions::default(),
+        )
+        .expect("derive raw mode");
+
+        assert_eq!(buffers.rows, 1);
+        assert!(buffers.field_index.is_empty());
+        assert!(buffers.event_measures.is_empty());
+        assert!(buffers.entity_state_updates.is_empty());
+    }
+
+    #[test]
+    fn skips_field_index_without_schema_definitions() {
         let index = field_index_ndjson(
             br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","data":{"tenant_id":"tenant-a","event_type":"span_start","service":"api","trace_id":"trace-1","span_id":"span-1","name":"GET /users","request_id":"req_1","http":{"route":"/users/:id","method":"GET"}}}"#,
-            &builtin_field_capabilities(),
             &ExtractionDefinitions::default(),
         )
         .expect("generate field index");
@@ -2041,8 +2308,7 @@ mod tests {
         };
         let event = br#"{"event_id":"evt_1","timestamp":"2026-05-12T00:00:00.000Z","data":{"tenant_id":"tenant-a","event_type":"inference_complete","service":"worker","account":{"id":"acct_1","plan":"pro"},"gpu":{"ms":42.5}}}"#;
 
-        let fields =
-            field_index_ndjson(event, &builtin_field_capabilities(), &definitions).unwrap();
+        let fields = field_index_ndjson(event, &definitions).unwrap();
         let field_rows: Vec<Value> = String::from_utf8(fields)
             .unwrap()
             .lines()

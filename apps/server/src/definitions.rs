@@ -914,10 +914,9 @@ mod tests {
 
     #[test]
     fn backfill_stats_treats_null_distinct_values_as_zero() {
-        let response: ClickHouseResponse<BackfillStats> = serde_json::from_str(
-            r#"{"data":[{"rows_matched":0,"distinct_values":null}]}"#,
-        )
-        .expect("response should deserialize");
+        let response: ClickHouseResponse<BackfillStats> =
+            serde_json::from_str(r#"{"data":[{"rows_matched":0,"distinct_values":null}]}"#)
+                .expect("response should deserialize");
 
         let stats = response.data.into_iter().next().expect("stats row");
         assert_eq!(stats.rows_matched, 0);

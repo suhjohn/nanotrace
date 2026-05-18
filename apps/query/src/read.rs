@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
@@ -20,6 +23,8 @@ pub struct QueryRequest {
     pub query: String,
     #[serde(default)]
     pub parameters: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub allow_stale_serving: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +65,11 @@ impl ReadStore {
     pub async fn query(&self, request: QueryRequest, tenant_id: &str) -> Result<Value, ReadError> {
         let query = checked_select_query(&request.query)?;
         let query = normalize_prewhere(&query);
+        let sources = query_sources(&query);
         validate_query_sources(&query, &self.allowed_table_names())?;
+        if !request.allow_stale_serving {
+            self.ensure_serving_fresh(&sources).await?;
+        }
         let query = self.scope_query(&query);
         let mut parameters = request.parameters;
         parameters.insert(
@@ -243,6 +252,99 @@ impl ReadStore {
         )
     }
 
+    async fn ensure_serving_fresh(&self, sources: &[String]) -> Result<(), ReadError> {
+        let requested = sources
+            .iter()
+            .filter_map(|source| self.guarded_serving_table(source))
+            .collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let latest_sequence = self.latest_lakehouse_sequence().await?;
+        if latest_sequence == 0 {
+            return Ok(());
+        }
+
+        let watermarks = self.serving_sequences(&requested).await?;
+        for table in requested {
+            let serving_sequence = watermarks.get(&table).copied().unwrap_or(0);
+            if serving_sequence < latest_sequence {
+                return Err(ReadError::InvalidQuery(format!(
+                    "serving table {table} is stale: source_sequence_number={serving_sequence}, lakehouse_sequence_number={latest_sequence}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn latest_lakehouse_sequence(&self) -> Result<u64, ReadError> {
+        let query = format!(
+            "SELECT ifNull(max(sequence_number), 0) AS sequence_number FROM {} WHERE namespace = 'nanotrace' AND table_name = 'events'",
+            self.lakehouse_commits_table_name()
+        );
+        let parameters = serde_json::Map::new();
+        let text = self.clickhouse_query(&query, &parameters).await?;
+        let response: ClickHouseResponse<LakehouseSequenceRow> =
+            serde_json::from_str(&text).map_err(ReadError::InvalidStoredEvent)?;
+        Ok(response
+            .data
+            .into_iter()
+            .next()
+            .map(|row| row.sequence_number)
+            .unwrap_or(0))
+    }
+
+    async fn serving_sequences(
+        &self,
+        requested: &BTreeSet<String>,
+    ) -> Result<HashMap<String, u64>, ReadError> {
+        let serving_tables = requested
+            .iter()
+            .map(|table| format!("'{}'", table.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT serving_table, max(source_sequence_number) AS source_sequence_number FROM {} WHERE source_namespace = 'nanotrace' AND source_table = 'events' AND serving_table IN ({serving_tables}) GROUP BY serving_table",
+            self.serving_watermarks_table_name()
+        );
+        let parameters = serde_json::Map::new();
+        let text = self.clickhouse_query(&query, &parameters).await?;
+        let response: ClickHouseResponse<ServingSequenceRow> =
+            serde_json::from_str(&text).map_err(ReadError::InvalidStoredEvent)?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|row| (row.serving_table, row.source_sequence_number))
+            .collect())
+    }
+
+    fn guarded_serving_table(&self, source: &str) -> Option<String> {
+        let source = self.unqualified_source(source);
+        let events_table = self.cfg.clickhouse_table.as_str();
+        if source.eq_ignore_ascii_case(events_table) {
+            return Some(events_table.to_string());
+        }
+        ["field_index", "event_measures", "entity_state_updates"]
+            .into_iter()
+            .find(|table| source.eq_ignore_ascii_case(table))
+            .map(str::to_string)
+    }
+
+    fn unqualified_source<'a>(&self, source: &'a str) -> &'a str {
+        source
+            .strip_prefix(&format!("{}.", self.cfg.clickhouse_database))
+            .unwrap_or(source)
+    }
+
+    fn lakehouse_commits_table_name(&self) -> String {
+        format!("{}.lakehouse_commits", self.cfg.clickhouse_database)
+    }
+
+    fn serving_watermarks_table_name(&self) -> String {
+        format!("{}.serving_watermarks", self.cfg.clickhouse_database)
+    }
+
     fn scope_query(&self, query: &str) -> String {
         let mut scoped = query.to_string();
         for table in self.allowed_table_names().iter() {
@@ -278,15 +380,13 @@ impl ReadStore {
 
     fn allowed_table_names(&self) -> Vec<String> {
         const ANALYTICS_TABLES: &[&str] = &[
-            "event_index",
             "field_index",
-            "field_counts_5m",
+            "field_values",
+            "field_density_1s",
+            "field_topk_1m",
+            "flamegraph_rollups_1m",
             "event_density_1s",
-            "span_fragments",
-            "spans",
-            "trace_summaries",
             "definitions",
-            "event_rollups_5m",
             "event_measures",
             "measure_rollups",
             "entity_state_updates",
@@ -294,7 +394,15 @@ impl ReadStore {
             "sequence_report_results",
             "cohort_memberships",
             "definition_stats",
+            "query_usage",
+            "optimization_recommendations",
+            "materialization_jobs",
+            "materialization_chunks",
+            "materialization_versions",
+            "materialization_watermarks",
             "pipeline_metrics",
+            "lakehouse_commits",
+            "serving_watermarks",
         ];
 
         [self.cfg.clickhouse_table.as_str()]
@@ -320,6 +428,17 @@ struct EventPointer {
     source_file: String,
     source_offset: u64,
     source_length: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct LakehouseSequenceRow {
+    sequence_number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServingSequenceRow {
+    serving_table: String,
+    source_sequence_number: u64,
 }
 
 fn checked_select_query(query: &str) -> Result<String, ReadError> {
@@ -431,8 +550,23 @@ fn keyword_at(value: &str, index: usize, keyword: &str) -> bool {
 }
 
 fn validate_query_sources(query: &str, allowed_tables: &[String]) -> Result<(), ReadError> {
+    for source in query_sources(query) {
+        if !allowed_tables
+            .iter()
+            .any(|allowed| source.eq_ignore_ascii_case(allowed))
+        {
+            return Err(ReadError::InvalidQuery(format!(
+                "query source is not allowed: {source}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn query_sources(query: &str) -> Vec<String> {
     let code = sql_code(query);
     let bytes = code.as_bytes();
+    let mut sources = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         let Some((keyword_start, keyword)) = next_source_keyword(&code[index..]) else {
@@ -458,14 +592,7 @@ fn validate_query_sources(query: &str, allowed_tables: &[String]) -> Result<(), 
             if source.is_empty() {
                 break;
             }
-            if !allowed_tables
-                .iter()
-                .any(|allowed| source.eq_ignore_ascii_case(allowed))
-            {
-                return Err(ReadError::InvalidQuery(format!(
-                    "query source is not allowed: {source}"
-                )));
-            }
+            sources.push(source.to_string());
             while index < bytes.len() && bytes[index].is_ascii_whitespace() {
                 index += 1;
             }
@@ -475,7 +602,7 @@ fn validate_query_sources(query: &str, allowed_tables: &[String]) -> Result<(), 
             index += 1;
         }
     }
-    Ok(())
+    sources
 }
 
 fn next_source_keyword(value: &str) -> Option<(usize, &'static str)> {
@@ -645,8 +772,8 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadError, checked_select_query, normalize_prewhere, validate_parameter_name,
-        validate_query_sources,
+        ReadError, checked_select_query, normalize_prewhere, query_sources,
+        validate_parameter_name, validate_query_sources,
     };
 
     #[test]
@@ -729,6 +856,28 @@ mod tests {
         assert!(
             validate_query_sources("SELECT * FROM observatory.events, system.tables", &allowed)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn extracts_query_sources_for_freshness_checks() {
+        assert_eq!(
+            query_sources(
+                "SELECT * FROM observatory.events JOIN observatory.field_index ON events.event_id = field_index.event_id"
+            ),
+            vec![
+                "observatory.events".to_string(),
+                "observatory.field_index".to_string()
+            ]
+        );
+        assert_eq!(
+            query_sources(
+                "SELECT * FROM observatory.events WHERE event_id IN (SELECT event_id FROM observatory.event_measures)"
+            ),
+            vec![
+                "observatory.events".to_string(),
+                "observatory.event_measures".to_string()
+            ]
         );
     }
 }

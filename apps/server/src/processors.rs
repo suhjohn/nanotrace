@@ -124,10 +124,9 @@ impl ProcessorStore {
             if let Ok(manifest) = self
                 .get_json::<ProcessorManifest>(bucket, &self.manifest_key(&name))
                 .await
+                && manifest.status != "deleted"
             {
-                if manifest.status != "deleted" {
-                    processors.push(manifest);
-                }
+                processors.push(manifest);
             }
         }
         Ok(processors)

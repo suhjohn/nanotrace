@@ -222,8 +222,8 @@ source_offset = byte offset
 source_length = byte length
 ClickHouse table
 
-Use the provided table as the append-only query index:
-@schema.sql
+Use the raw-first table as the append-only query index:
+@deploy/clickhouse/schema.sql
 
 This table does not dedupe.
 It stores what was accepted.

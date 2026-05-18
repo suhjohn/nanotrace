@@ -497,10 +497,11 @@ async fn auth_callback(
 
 fn callback_return_to(cfg: &Config, return_to: &str) -> String {
     let return_to = return_to.trim();
-    if return_to.starts_with('/') && !return_to.starts_with("//") {
-        if let Some(app_base_url) = cfg.app_base_url.as_deref() {
-            return format!("{}{}", app_base_url.trim_end_matches('/'), return_to);
-        }
+    if return_to.starts_with('/')
+        && !return_to.starts_with("//")
+        && let Some(app_base_url) = cfg.app_base_url.as_deref()
+    {
+        return format!("{}{}", app_base_url.trim_end_matches('/'), return_to);
     }
     return_to.to_string()
 }

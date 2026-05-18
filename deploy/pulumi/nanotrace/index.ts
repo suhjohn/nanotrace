@@ -59,6 +59,10 @@ const clickhouseDatabase =
   process.env.CLICKHOUSE_DATABASE ??
   'observatory'
 const clickhouseTable = process.env.CLICKHOUSE_TABLE ?? 'events'
+const clickhouseSchemaPath =
+  cfg.get('clickhouseSchemaPath') ??
+  process.env.CLICKHOUSE_SCHEMA_PATH ??
+  'deploy/clickhouse/schema.sql'
 const clickhouseMaxBytesToRead =
   numberEnv('CLICKHOUSE_MAX_BYTES_TO_READ', 1_000_000_000_000)
 
@@ -83,6 +87,10 @@ const partMaxAgeSecs = cfg.getNumber('partMaxAgeSecs') ?? 5
 const loaderConcurrency = cfg.getNumber('loaderConcurrency') ?? 8
 const loaderDefinitionsRefreshSecs =
   cfg.getNumber('loaderDefinitionsRefreshSecs') ?? 60
+const loaderDerivationMode =
+  cfg.get('loaderDerivationMode') ??
+  process.env.LOADER_DERIVATION_MODE ??
+  'raw'
 const clickhouseInsertConcurrency =
   cfg.getNumber('clickhouseInsertConcurrency') ?? 4
 const loaderQueueResetToken = (
@@ -119,6 +127,44 @@ const writerFlushBytes =
 const compactBatchReceipts =
   cfg.getBoolean('compactBatchReceipts') ??
   booleanEnv('NANOTRACE_COMPACT_BATCH_RECEIPTS', false)
+const lakehouseEnabled =
+  cfg.getBoolean('lakehouseEnabled') ??
+  booleanEnv('NANOTRACE_LAKEHOUSE_ENABLED', true)
+const lakehouseWarehouseDir =
+  cfg.get('lakehouseWarehouseDir') ??
+  process.env.NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR ??
+  '/data/lakehouse'
+const icebergRestUri =
+  cfg.get('icebergRestUri') ?? process.env.NANOTRACE_ICEBERG_REST_URI ?? ''
+const icebergWarehouse =
+  cfg.get('icebergWarehouse') ??
+  process.env.NANOTRACE_ICEBERG_WAREHOUSE ??
+  ''
+const icebergCatalogName =
+  cfg.get('icebergCatalogName') ??
+  process.env.NANOTRACE_ICEBERG_CATALOG_NAME ??
+  'nanotrace'
+const icebergTargetFileSizeBytes =
+  cfg.getNumber('icebergTargetFileSizeBytes') ??
+  numberEnv('NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES', 512 * 1024 * 1024)
+const icebergMinSnapshotsToKeep =
+  cfg.getNumber('icebergMinSnapshotsToKeep') ??
+  numberEnv('NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP', 10_000)
+const icebergMaxSnapshotAgeMs =
+  cfg.getNumber('icebergMaxSnapshotAgeMs') ??
+  numberEnv('NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS', 7 * 24 * 60 * 60 * 1000)
+const icebergMetadataPreviousVersionsMax =
+  cfg.getNumber('icebergMetadataPreviousVersionsMax') ??
+  numberEnv('NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX', 100)
+const ingestLedgerEnabled =
+  cfg.getBoolean('ingestLedgerEnabled') ??
+  booleanEnv('NANOTRACE_INGEST_LEDGER_ENABLED', true)
+const ingestLedgerStaleSecs =
+  cfg.getNumber('ingestLedgerStaleSecs') ??
+  numberEnv('NANOTRACE_INGEST_LEDGER_STALE_SECS', 3600)
+const materializePollSecs =
+  cfg.getNumber('materializePollSecs') ??
+  numberEnv('NANOTRACE_MATERIALIZE_POLL_SECS', 5)
 const postgresMode =
   cfg.get('postgresMode') ??
   process.env.NANOTRACE_POSTGRES_MODE ??
@@ -259,7 +305,7 @@ const buildImage = cfg.getBoolean('buildImage') ?? !imageUriOverride
 const imageBuildId = cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest'
 const schemaHash = createHash('sha256')
   .update(
-    readFileSync(path.join(repoRoot, 'deploy/clickhouse/schema.sql'), 'utf8')
+    readFileSync(path.join(repoRoot, clickhouseSchemaPath), 'utf8')
   )
   .digest('hex')
 const schemaScriptHash = createHash('sha256')
@@ -664,7 +710,7 @@ const clickHouseSchema = new command.local.Command(
       CLICKHOUSE_PASSWORD: clickhousePassword,
       CLICKHOUSE_DATABASE: clickhouseDatabase,
       CLICKHOUSE_TABLE: clickhouseTable,
-      CLICKHOUSE_SCHEMA_PATH: 'deploy/clickhouse/schema.sql'
+      CLICKHOUSE_SCHEMA_PATH: clickhouseSchemaPath
     },
     triggers: [
       schemaHash,
@@ -1470,6 +1516,7 @@ const userData = pulumi
         partMaxBytes,
         clickhouseInsertConcurrency,
         loaderConcurrency,
+        loaderDerivationMode,
         loaderDefinitionsRefreshSecs,
         port,
         prefix,
@@ -1480,6 +1527,18 @@ const userData = pulumi
         writerLanes,
         writerQueueCapacity,
         compactBatchReceipts,
+        lakehouseEnabled,
+        lakehouseWarehouseDir,
+        icebergRestUri,
+        icebergWarehouse,
+        icebergCatalogName,
+        icebergTargetFileSizeBytes,
+        icebergMinSnapshotsToKeep,
+        icebergMaxSnapshotAgeMs,
+        icebergMetadataPreviousVersionsMax,
+        ingestLedgerEnabled,
+        ingestLedgerStaleSecs,
+        materializePollSecs,
         databaseUrl: resolvedDatabaseUrl,
         allowedEmails,
         appBaseUrl,
@@ -1718,6 +1777,7 @@ interface UserDataArgs {
   partMaxBytes: number
   clickhouseInsertConcurrency: number
   loaderConcurrency: number
+  loaderDerivationMode: string
   loaderDefinitionsRefreshSecs: number
   port: number
   prefix: string
@@ -1737,6 +1797,18 @@ interface UserDataArgs {
   writerQueueCapacity: number
   compactBatchReceipts: boolean
   processorPrefix: string
+  lakehouseEnabled: boolean
+  lakehouseWarehouseDir: string
+  icebergRestUri: string
+  icebergWarehouse: string
+  icebergCatalogName: string
+  icebergTargetFileSizeBytes: number
+  icebergMinSnapshotsToKeep: number
+  icebergMaxSnapshotAgeMs: number
+  icebergMetadataPreviousVersionsMax: number
+  ingestLedgerEnabled: boolean
+  ingestLedgerStaleSecs: number
+  materializePollSecs: number
 }
 
 interface QueryUserDataArgs {
@@ -1779,11 +1851,13 @@ upload_debug() {
   (docker ps -a 2>&1 || true) > /tmp/docker-ps.txt
   (docker logs nanotrace-server 2>&1 || true) > /tmp/docker-logs.txt
   (docker logs nanotrace-loader 2>&1 || true) > /tmp/docker-loader-logs.txt
+  (docker logs nanotrace-materializer 2>&1 || true) > /tmp/docker-materializer-logs.txt
   (docker inspect nanotrace-server 2>&1 || true) > /tmp/docker-inspect.txt
   (docker inspect nanotrace-loader 2>&1 || true) > /tmp/docker-loader-inspect.txt
+  (docker inspect nanotrace-materializer 2>&1 || true) > /tmp/docker-materializer-inspect.txt
   (journalctl -u docker --no-pager 2>&1 || true) > /tmp/docker-journal.txt
   (cat /var/log/cloud-init-output.log 2>&1 || true) > /tmp/cloud-init-output.log
-  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-loader-logs.txt /tmp/docker-inspect.txt /tmp/docker-loader-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
+  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-loader-logs.txt /tmp/docker-materializer-logs.txt /tmp/docker-inspect.txt /tmp/docker-loader-inspect.txt /tmp/docker-materializer-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
     aws s3 cp "$f" "$S3_DEBUG_PREFIX/$(basename "$f")" --region ${shellQuote(
       args.region
     )} || true
@@ -1833,6 +1907,7 @@ if [ -n "$DATA_DEVICE" ]; then
 fi
 
 mkdir -p ${shellQuote(args.localDataDir)}
+mkdir -p ${shellQuote(args.lakehouseWarehouseDir)}
 aws ecr get-login-password --region ${shellQuote(
     args.region
   )} | docker login --username AWS --password-stdin "$(echo ${shellQuote(
@@ -1841,6 +1916,7 @@ aws ecr get-login-password --region ${shellQuote(
 docker pull ${shellQuote(args.imageUri)}
 docker rm -f nanotrace-server >/dev/null 2>&1 || true
 docker rm -f nanotrace-loader >/dev/null 2>&1 || true
+docker rm -f nanotrace-materializer >/dev/null 2>&1 || true
 docker run -d --name nanotrace-server --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
   -v ${shellQuote(args.localDataDir)}:${shellQuote(args.localDataDir)} \\
@@ -1887,10 +1963,15 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e PROCESSOR_BUILDER_CMD=${shellQuote('python3 /usr/local/bin/modal_processor_builder.py')} \\
   ${shellQuote(args.imageUri)}
 docker run -d --name nanotrace-loader --restart unless-stopped \\
+  -v ${shellQuote(args.lakehouseWarehouseDir)}:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
+  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
+  -e NANOTRACE_INGEST_LEDGER_ENABLED=${args.ingestLedgerEnabled ? 'true' : 'false'} \\
+  -e NANOTRACE_INGEST_LEDGER_STALE_SECS=${args.ingestLedgerStaleSecs} \\
   -e LOADER_SQS_QUEUE_URL=${shellQuote(args.loaderQueueUrl)} \\
   -e LOADER_CONCURRENCY=${args.loaderConcurrency} \\
+  -e LOADER_DERIVATION_MODE=${shellQuote(args.loaderDerivationMode)} \\
   -e LOADER_DEFINITIONS_REFRESH_SECS=${args.loaderDefinitionsRefreshSecs} \\
   -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
@@ -1900,8 +1981,34 @@ docker run -d --name nanotrace-loader --restart unless-stopped \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
   -e CLICKHOUSE_INSERT_CONCURRENCY=${args.clickhouseInsertConcurrency} \\
+  -e NANOTRACE_LAKEHOUSE_ENABLED=${args.lakehouseEnabled ? 'true' : 'false'} \\
+  -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
+  -e NANOTRACE_ICEBERG_REST_URI=${shellQuote(args.icebergRestUri)} \\
+  -e NANOTRACE_ICEBERG_WAREHOUSE=${shellQuote(args.icebergWarehouse)} \\
+  -e NANOTRACE_ICEBERG_CATALOG_NAME=${shellQuote(args.icebergCatalogName)} \\
+  -e NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES=${args.icebergTargetFileSizeBytes} \\
+  -e NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP=${args.icebergMinSnapshotsToKeep} \\
+  -e NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS=${args.icebergMaxSnapshotAgeMs} \\
+  -e NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX=${args.icebergMetadataPreviousVersionsMax} \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-loader
+docker run -d --name nanotrace-materializer --restart unless-stopped \\
+  -v ${shellQuote(args.lakehouseWarehouseDir)}:${shellQuote(args.lakehouseWarehouseDir)} \\
+  -e AWS_REGION=${shellQuote(args.region)} \\
+  -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
+  -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
+  -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
+  -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
+  -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
+  -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
+  -e NANOTRACE_MATERIALIZE_LOOP=true \\
+  -e NANOTRACE_MATERIALIZE_POLL_SECS=${args.materializePollSecs} \\
+  -e NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse \\
+  -e NANOTRACE_REBUILD_RAW=false \\
+  -e NANOTRACE_REBUILD_DERIVED=true \\
+  ${shellQuote(args.imageUri)} \\
+  /usr/local/bin/nanotrace-lakehouse-rebuild
 `
 }
 

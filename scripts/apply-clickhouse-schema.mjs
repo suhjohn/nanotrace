@@ -10,22 +10,41 @@ const password = requiredEnv("CLICKHOUSE_PASSWORD");
 const database = identifier(process.env.CLICKHOUSE_DATABASE || "observatory", "CLICKHOUSE_DATABASE");
 const eventsTable = identifier(process.env.CLICKHOUSE_TABLE || "events", "CLICKHOUSE_TABLE");
 const schemaPath = path.resolve(root, process.env.CLICKHOUSE_SCHEMA_PATH || "deploy/clickhouse/schema.sql");
+const resetDatabase = boolEnv("CLICKHOUSE_RESET_DATABASE") || boolEnv("CLICKHOUSE_DROP_SCHEMA");
 
 const eventsTableToken = "__NANOTRACE_EVENTS_TABLE__";
 const schema = readFileSync(schemaPath, "utf8")
     .replace(/\bobservatory\.events\b/g, eventsTableToken)
     .replaceAll(eventsTableToken, `${quoteIdentifier(database)}.${quoteIdentifier(eventsTable)}`);
 
+if (resetDatabase) {
+    await query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`);
+}
 await query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(database)}`);
 for (const statement of splitStatements(schema)) {
     await query(statement);
 }
+await applySchemaMigrations();
 
 console.log(`clickhouse_schema=${database}.${eventsTable}`);
-console.log(`clickhouse_event_index_schema=${database}.event_index`);
-console.log(`clickhouse_field_index_schema=${database}.field_index`);
-console.log(`clickhouse_field_counts_schema=${database}.field_counts_5m`);
-console.log(`clickhouse_event_measures_schema=${database}.event_measures`);
+console.log(`clickhouse_schema_path=${path.relative(root, schemaPath)}`);
+console.log(`clickhouse_reset_database=${resetDatabase ? "true" : "false"}`);
+
+async function applySchemaMigrations() {
+    const lakehouseCommitsTable = `${quoteIdentifier(database)}.${quoteIdentifier("lakehouse_commits")}`;
+    await query(
+        `ALTER TABLE ${lakehouseCommitsTable} ADD COLUMN IF NOT EXISTS data_files Array(String) DEFAULT [] CODEC(ZSTD(1)) AFTER data_file`
+    );
+    await query(
+        `ALTER TABLE ${lakehouseCommitsTable} ADD COLUMN IF NOT EXISTS metadata_location String DEFAULT '' CODEC(ZSTD(1)) AFTER content_sha256`
+    );
+    await query(
+        `ALTER TABLE ${lakehouseCommitsTable} ADD COLUMN IF NOT EXISTS source_batch_id String DEFAULT '' CODEC(ZSTD(1)) AFTER metadata_location`
+    );
+    await query(
+        `ALTER TABLE ${lakehouseCommitsTable} ADD COLUMN IF NOT EXISTS deduplicated UInt8 DEFAULT 0 CODEC(T64, ZSTD(1)) AFTER source_batch_id`
+    );
+}
 
 async function query(sql) {
     const url = new URL(clickhouseUrl);
@@ -51,6 +70,11 @@ function requiredEnv(key) {
         throw new Error(`${key} is required`);
     }
     return value;
+}
+
+function boolEnv(key) {
+    const value = process.env[key];
+    return value === "1" || value === "true" || value === "TRUE" || value === "yes" || value === "YES";
 }
 
 function identifier(value, key) {

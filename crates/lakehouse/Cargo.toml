@@ -1,0 +1,20 @@
+[package]
+name = "nanotrace-lakehouse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+arrow-array = "57.3"
+arrow-schema = "57.3"
+chrono = { version = "0.4", features = ["serde"] }
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-storage-opendal = { version = "0.9.1", default-features = false, features = ["opendal-fs", "opendal-s3"] }
+parquet = { version = "57.3", default-features = false, features = ["arrow", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
