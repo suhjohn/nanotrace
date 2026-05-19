@@ -44,6 +44,66 @@ async function applySchemaMigrations() {
     await query(
         `ALTER TABLE ${lakehouseCommitsTable} ADD COLUMN IF NOT EXISTS deduplicated UInt8 DEFAULT 0 CODEC(T64, ZSTD(1)) AFTER source_batch_id`
     );
+    await migrateServingWatermarks();
+}
+
+async function migrateServingWatermarks() {
+    const servingWatermarksTable = `${quoteIdentifier(database)}.${quoteIdentifier("serving_watermarks")}`;
+    const servingWatermarksNext = `${quoteIdentifier(database)}.${quoteIdentifier("serving_watermarks_next")}`;
+    const servingWatermarksBackup = `${quoteIdentifier(database)}.${quoteIdentifier("serving_watermarks_backup")}`;
+    const lakehouseCommitsTable = `${quoteIdentifier(database)}.${quoteIdentifier("lakehouse_commits")}`;
+    const servingEventsTable = quoteString(eventsTable);
+
+    await query(`DROP TABLE IF EXISTS ${servingWatermarksNext}`);
+    await query(`
+        CREATE TABLE ${servingWatermarksNext} (
+            serving_table LowCardinality(String),
+            source_namespace LowCardinality(String),
+            source_table LowCardinality(String),
+            source_snapshot_id String CODEC(ZSTD(1)),
+            source_sequence_number UInt64 CODEC(Delta, ZSTD(1)),
+            source_record_count UInt64 CODEC(Delta, ZSTD(1)),
+            status LowCardinality(String) DEFAULT 'loaded',
+            updated_at DateTime64(3, 'UTC') DEFAULT now64(3),
+            attributes JSON(max_dynamic_paths = 128, max_dynamic_types = 8)
+        ) ENGINE = ReplacingMergeTree(source_sequence_number)
+        ORDER BY (serving_table, source_namespace, source_table)
+    `);
+    await query(`
+        INSERT INTO ${servingWatermarksNext}
+        SELECT
+            serving_table,
+            source_namespace,
+            source_table,
+            argMax(source_snapshot_id, source_sequence_number),
+            max(source_sequence_number),
+            argMax(source_record_count, source_sequence_number),
+            argMax(status, source_sequence_number),
+            argMax(updated_at, source_sequence_number),
+            argMax(attributes, source_sequence_number)
+        FROM ${servingWatermarksTable}
+        WHERE serving_table != ${servingEventsTable}
+        GROUP BY serving_table, source_namespace, source_table
+    `);
+    await query(`
+        INSERT INTO ${servingWatermarksNext}
+        SELECT
+            ${servingEventsTable},
+            'nanotrace',
+            'events',
+            argMax(snapshot_id, sequence_number),
+            max(sequence_number),
+            argMax(record_count, sequence_number),
+            'loaded',
+            now64(3),
+            CAST('{}', 'JSON(max_dynamic_paths=128, max_dynamic_types=8)')
+        FROM ${lakehouseCommitsTable}
+        WHERE namespace = 'nanotrace' AND table_name = 'events'
+        HAVING max(sequence_number) > 0
+    `);
+    await query(`DROP TABLE IF EXISTS ${servingWatermarksBackup}`);
+    await query(`RENAME TABLE ${servingWatermarksTable} TO ${servingWatermarksBackup}`);
+    await query(`RENAME TABLE ${servingWatermarksNext} TO ${servingWatermarksTable}`);
 }
 
 async function query(sql) {
@@ -86,6 +146,10 @@ function identifier(value, key) {
 
 function quoteIdentifier(value) {
     return `\`${value.replaceAll("`", "``")}\``;
+}
+
+function quoteString(value) {
+    return `'${value.replaceAll("'", "''")}'`;
 }
 
 function splitStatements(sql) {

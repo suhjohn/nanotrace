@@ -336,7 +336,7 @@
   <div class="wrap hero">
     <h1>Nanotrace Query Use Cases</h1>
     <p class="lede">
-      A practical taxonomy for what runs now, what becomes fast after schema/report materialization, and what needs a new subsystem when the target load is 1M requests/sec and 100M events/sec.
+      A practical taxonomy for what runs now on the Iceberg-backed ClickHouse serving plane, what becomes fast after schema/report materialization, and what needs a new subsystem when the target load is 1M requests/sec and 100M events/sec.
     </p>
     <div class="scale">
       <div class="scale-card">
@@ -348,8 +348,8 @@
         <span>Business and observability flows can emit many correlated events per request.</span>
       </div>
       <div class="scale-card">
-        <strong>100M events/s</strong>
-        <span>Repeated broad queries must become promoted fields, materialized reports, or new systems.</span>
+        <strong>Iceberg source</strong>
+        <span>Serving tables are rebuildable from committed lakehouse snapshots and guarded by watermarks.</span>
       </div>
     </div>
   </div>
@@ -369,11 +369,12 @@
 <main class="wrap">
   <section id="groups">
     <h2>Classification</h2>
-    <p>At this scale, the raw table remains the source of truth, not the serving layer for every analytical question.</p>
+    <p>At this scale, Iceberg is the durable source of truth. ClickHouse raw and promoted tables are serving indexes, not the only copy of analytical history.</p>
+    <p>The load-test profile that best exercises this design is <code>codex</code>: it emits correlated agent workflows rather than isolated rows, including span start/end, planning, retrieval, LLM calls, tool calls, evaluation, safety, runtime metrics, processor events, and logs.</p>
     <div class="summary-grid">
       <div class="group-card">
         <b>Group 1: run now</b>
-        <p>Uses default tables and indexes already maintained by the system.</p>
+        <p>Uses default serving tables, indexes, and freshness watermarks already maintained by the system.</p>
       </div>
       <div class="group-card">
         <b>Group 2: promote/materialize/report</b>
@@ -388,7 +389,7 @@
 
   <section id="lifecycle">
     <h2>Optimization Lifecycle</h2>
-    <p>Group 2 means the serving model is known and schema-backed. This pass defines the control-plane tables; automatic recommendation, promotion execution, job claiming, and report/cohort/sequence workers are separate implementation work.</p>
+    <p>Group 2 means the serving model is known and schema-backed. The current system already has Iceberg commit tracking, raw rebuild, serving watermarks, and a continuous materializer for promoted fields, measures, and entity states. Recommendation generation and report/cohort/sequence executors remain separate implementation work.</p>
     <div class="summary-grid">
       <div class="group-card">
         <b>Observe</b>
@@ -400,11 +401,11 @@
       </div>
       <div class="group-card">
         <b>Build</b>
-        <p><code>materialization_jobs</code> and <code>materialization_chunks</code> track bounded, retryable backfill and refresh work.</p>
+        <p>The current promoted-table materializer reads <code>lakehouse_commits</code> and <code>serving_watermarks</code>; broader executors use <code>materialization_jobs</code> and <code>materialization_chunks</code>.</p>
       </div>
       <div class="group-card">
         <b>Serve</b>
-        <p><code>materialization_versions</code> and <code>materialization_watermarks</code> let readers select completed versions and observe lag.</p>
+        <p><code>serving_watermarks</code>, <code>materialization_versions</code>, and <code>materialization_watermarks</code> let readers select caught-up serving data and observe lag.</p>
       </div>
     </div>
   </section>
@@ -416,7 +417,7 @@
 
   <section id="group-2">
     <h2>Group 2: Optimizable With Schema / Report / Materialization</h2>
-    <p>Each case below shows the raw <code>observatory.events</code> query shape that is too expensive at 100M events/sec, then the post-optimization serving query and why it is faster. The optimized query assumes a completed materialization version exists for the target definition or report.</p>
+    <p>Each case below shows the raw <code>observatory.events</code> serving query shape that is too expensive at 100M events/sec, then the post-optimization serving query and why it is faster. The optimized query assumes the target definition/report is caught up to the required Iceberg sequence or has a completed materialization version.</p>
     <div id="group2" class="case-list"></div>
   </section>
 

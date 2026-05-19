@@ -5050,12 +5050,45 @@ function eventFilterClauses({
   if (!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange) {
     clauses.prewhere.push(timeRangeWhereClause(timeRange, 'e.timestamp'))
   }
-  for (const [index, filter] of (eventFilter.facets ?? []).entries()) {
-    clauses.prewhere.push(`${eventValueExpression(filter.path)} = {facet_filter_${index}_value:String}`)
+  const facets = eventFilter.facets ?? []
+  if (facets.length > 0 && facets.every(isSimpleFacetFilter)) {
+    for (const [index, filter] of facets.entries()) {
+      clauses.prewhere.push(`${eventValueExpression(filter.path)} = {facet_filter_${index}_value:String}`)
+    }
+  } else if (facets.length > 0) {
+    const facetWhere = eventFacetWhereClause(facets)
+    if (facetWhere) clauses.where.push(facetWhere)
   }
   const textFilter = eventTextWhereClause(eventFilter)
   if (textFilter) clauses.where.push(textFilter)
   return clauses
+}
+
+function isSimpleFacetFilter(filter: ParsedFacetFilter) {
+  return (filter.operator ?? 'eq') === 'eq' && !filter.negated && filter.join !== 'or'
+}
+
+function eventFacetWhereClause(filters: ParsedFacetFilter[]) {
+  const clauses = filters.map((filter, index) => {
+    const expression = eventValueExpression(filter.path)
+    const operator = filter.operator ?? 'eq'
+    const parameter = `facet_filter_${index}_value`
+    let clause = ''
+    if (operator === 'contains') {
+      clause = `positionCaseInsensitive(${expression}, {${parameter}:String}) > 0`
+    } else if (operator === 'in') {
+      const placeholders = (filter.values ?? [])
+        .map((_value, valueIndex) => `{facet_filter_${index}_value_${valueIndex}:String}`)
+        .join(', ')
+      clause = placeholders ? `${expression} IN (${placeholders})` : '0'
+    } else {
+      clause = `${expression} = {${parameter}:String}`
+    }
+    if (filter.negated) clause = `NOT (${clause})`
+    const join = index > 0 && filter.join === 'or' ? 'OR' : 'AND'
+    return `${index > 0 ? `${join} ` : ''}(${clause})`
+  })
+  return clauses.length ? `(${clauses.join(' ')})` : ''
 }
 
 function eventValueExpression(path: string) {
@@ -5099,12 +5132,18 @@ function eventQueryParameters({
   selectedGroupValue: string
   timeRange?: ResolvedTimeRange
 }): QueryParameters {
-  const facetParameters = Object.fromEntries(
-    (eventFilter.facets ?? []).flatMap((filter, index) => [
-      [`facet_filter_${index}_key`, facetKey(filter.path)],
-      [`facet_filter_${index}_value`, filter.value]
-    ])
-  )
+  const facetParameterEntries: [string, string][] = []
+  for (const [index, filter] of (eventFilter.facets ?? []).entries()) {
+    facetParameterEntries.push([`facet_filter_${index}_key`, facetKey(filter.path)])
+    if (filter.operator === 'in') {
+      for (const [valueIndex, value] of (filter.values ?? []).entries()) {
+        facetParameterEntries.push([`facet_filter_${index}_value_${valueIndex}`, value])
+      }
+    } else {
+      facetParameterEntries.push([`facet_filter_${index}_value`, filter.value])
+    }
+  }
+  const facetParameters = Object.fromEntries(facetParameterEntries)
   return {
     group_key: facetKey(groupBy),
     group_value: selectedGroupValue,
@@ -5417,10 +5456,17 @@ type ParsedEventFilter = {
   text: string
 }
 
+type ParsedFacetJoin = 'and' | 'or'
+type ParsedFacetOperator = 'contains' | 'eq' | 'in'
+
 type ParsedFacetFilter = {
   indexed: boolean
+  join?: ParsedFacetJoin
+  negated?: boolean
+  operator?: ParsedFacetOperator
   path: string
   value: string
+  values?: string[]
 }
 
 function defaultTimeRangeFilter({
@@ -5452,9 +5498,24 @@ function defaultTimeRangeFilter({
 
 function eventFilterInputText(filter: ParsedEventFilter) {
   return [
-    ...(filter.facets ?? []).map(facet => `${facet.path}=${quoteFilterValue(facet.value)}`),
+    ...(filter.facets ?? []).map((facet, index) => facetFilterInputText(facet, index)),
     filter.text
   ].filter(Boolean).join(' ')
+}
+
+function facetFilterInputText(facet: ParsedFacetFilter, index: number) {
+  const join = index > 0 && facet.join === 'or' ? 'OR ' : ''
+  const negated = facet.negated ? 'NOT ' : ''
+  const operator = facet.operator ?? 'eq'
+  const value = operator === 'in'
+    ? `[${(facet.values ?? []).map(quoteFilterValue).join(',')}]`
+    : quoteFilterValue(facet.value)
+  const expression = operator === 'contains'
+    ? `${facet.path} CONTAINS ${value}`
+    : operator === 'in'
+      ? `${facet.path} IN ${value}`
+      : `${facet.path}=${value}`
+  return `${join}${negated}${expression}`
 }
 
 function eventFilterWithoutTimeRange(filter: ParsedEventFilter): ParsedEventFilter {
@@ -5477,7 +5538,7 @@ function hasAppliedEventFilter(filter: ParsedEventFilter) {
 }
 
 function canUseFieldIndex(filter: ParsedEventFilter) {
-  return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed)
+  return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed && isSimpleFacetFilter(facet))
 }
 
 function canUseDensityRollup({
@@ -5546,18 +5607,31 @@ function parseEventFilter({
 
   const facetFilters: ParsedFacetFilter[] = []
   const text = withoutTimestamps.replace(
-    /(?:^|\s)([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*("[^"]*"|'[^']*'|\S+)/g,
-    (match: string, rawPath: string, rawValue: string) => {
+    /(?:^|\s)(?:(AND|OR)\s+)?(NOT\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:(=|!=)|\b(CONTAINS|IN)\b)\s*(\[[^\]]*\]|\([^\)]*\)|"[^"]*"|'[^']*'|\S+)/gi,
+    (
+      match: string,
+      rawJoin: string | undefined,
+      rawNegated: string | undefined,
+      rawPath: string,
+      rawSymbolOperator: string | undefined,
+      rawWordOperator: string | undefined,
+      rawValue: string
+    ) => {
       const path = normalizedPayloadPath(rawPath)
-      const parsedValue = unquoteFilterValue(rawValue)
-      if (!isSupportedFacetFilterPath(path) || !parsedValue) {
+      const operator = facetOperator(rawSymbolOperator, rawWordOperator)
+      const values = operator === 'in' ? parseFilterList(rawValue) : [unquoteFilterValue(rawValue)]
+      if (!isSupportedFacetFilterPath(path) || values.length === 0 || values.some(value => !value)) {
         return match
       }
       const displayPath = displayFacetPath(path)
       facetFilters.push({
         indexed: Boolean(facetPaths?.has(path) || facetPaths?.has(displayPath)),
+        join: rawJoin?.toLowerCase() === 'or' ? 'or' : 'and',
+        negated: Boolean(rawNegated) || rawSymbolOperator === '!=',
+        operator,
         path: displayPath,
-        value: parsedValue
+        value: values[0]!,
+        ...(operator === 'in' ? { values } : {})
       })
       return ' '
     }
@@ -5572,6 +5646,47 @@ function parseEventFilter({
 
 function isSupportedFacetFilterPath(path: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*(?:[.-][A-Za-z0-9_]+)*$/.test(path)
+}
+
+function facetOperator(symbolOperator?: string, wordOperator?: string): ParsedFacetOperator {
+  if (wordOperator?.toLowerCase() === 'contains') return 'contains'
+  if (wordOperator?.toLowerCase() === 'in') return 'in'
+  return 'eq'
+}
+
+function parseFilterList(value: string) {
+  const trimmed = value.trim()
+  const body = (trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('(') && trimmed.endsWith(')'))
+    ? trimmed.slice(1, -1)
+    : trimmed
+  const values: string[] = []
+  let current = ''
+  let quote = ''
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index]!
+    if (quote) {
+      if (char === quote) {
+        quote = ''
+      } else {
+        current += char
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === ',') {
+      const parsed = current.trim()
+      if (parsed) values.push(parsed)
+      current = ''
+      continue
+    }
+    current += char
+  }
+  const parsed = current.trim()
+  if (parsed) values.push(parsed)
+  return values
 }
 
 function unquoteFilterValue(value: string) {

@@ -880,7 +880,7 @@ CREATE TABLE
         status LowCardinality (String) DEFAULT 'loaded',
         updated_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
         attributes JSON (max_dynamic_paths = 128, max_dynamic_types = 8)
-    ) ENGINE = ReplacingMergeTree (updated_at)
+    ) ENGINE = ReplacingMergeTree (source_sequence_number)
 ORDER BY
     (serving_table, source_namespace, source_table);
 

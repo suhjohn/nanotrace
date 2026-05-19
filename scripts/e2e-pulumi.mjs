@@ -109,7 +109,7 @@ try {
 console.log("E2E passed");
 
 async function expectUnauthorized(baseUrl) {
-    const response = await fetch(`${baseUrl}/events`, {
+    const response = await fetch(`${baseUrl}/v1/events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -123,7 +123,7 @@ async function expectUnauthorized(baseUrl) {
 }
 
 async function postEvent(baseUrl, token, event) {
-    const response = await fetch(`${baseUrl}/events`, {
+    const response = await fetch(`${baseUrl}/v1/events`, {
         method: "POST",
         headers: {
             authorization: `Bearer ${token}`,
@@ -132,12 +132,12 @@ async function postEvent(baseUrl, token, event) {
         body: JSON.stringify(event),
     });
     const text = await response.text();
-    assert(response.ok, `POST /events failed: ${response.status} ${text}`);
+    assert(response.ok, `POST /v1/events failed: ${response.status} ${text}`);
     return JSON.parse(text);
 }
 
 async function putProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/processors/${encodeURIComponent(name)}`, {
+    const response = await fetch(`${baseUrl}/v1/processors/${encodeURIComponent(name)}`, {
         method: "PUT",
         headers: {
             authorization: `Bearer ${token}`,
@@ -197,7 +197,7 @@ async function waitForProcessorReady(baseUrl, token, name, waitMs, pollMs) {
 }
 
 async function getProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/processors`, {
+    const response = await fetch(`${baseUrl}/v1/processors`, {
         headers: { authorization: `Bearer ${token}` },
     });
     const text = await response.text();
@@ -207,7 +207,7 @@ async function getProcessor(baseUrl, token, name) {
 }
 
 async function deleteProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/processors/${encodeURIComponent(name)}`, {
+    const response = await fetch(`${baseUrl}/v1/processors/${encodeURIComponent(name)}`, {
         method: "DELETE",
         headers: { authorization: `Bearer ${token}` },
     });
