@@ -1,6 +1,7 @@
 # Nanotrace Python SDK
 
-Python SDK for sending Nanotrace events, logs, metrics, and spans.
+Python SDK for sending Nanotrace events, logs, metrics, and spans to the
+Nanotrace `/v1/events` write path.
 
 ## Sync
 
@@ -96,5 +97,9 @@ Use direct HTTP for scripts, tests, or serverless jobs:
 ```py
 http_transport("https://api.nanotrace.dev", key="...")
 ```
+
+Direct HTTP posts to `/v1/events`. Local sidecar HTTP posts to the sidecar's
+`/events` intake. CamelCase public fields are normalized to Nanotrace event
+fields, and OpenTelemetry-style dotted attributes can be passed directly.
 
 Async transports are available with the `async_` prefix. Event methods are fire-and-forget for both sync and async clients; call `flush()` when you need to wait for delivery.

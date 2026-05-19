@@ -18,6 +18,11 @@ const fieldMap: Record<string, string> = {
   anonymousId: 'anonymous_id',
   sessionId: 'session_id',
   accountId: 'account_id',
+  groupId: 'group_id',
+  organizationId: 'organization_id',
+  requestId: 'request_id',
+  threadId: 'thread_id',
+  conversationId: 'conversation_id',
   durationMs: 'duration_ms',
   startTime: 'start_time',
   endTime: 'end_time',
@@ -33,7 +38,11 @@ const fieldMap: Record<string, string> = {
   productId: 'product_id',
   revenueType: 'revenue_type',
   experimentId: 'experiment_id',
-  featureFlag: 'feature_flag'
+  featureFlag: 'feature_flag',
+  llmModel: 'llm.model',
+  llmProvider: 'llm.provider',
+  toolName: 'tool_name',
+  processorName: 'processor_name'
 }
 
 export function normalizeCommon(...items: Array<CommonFields | undefined>): JsonObject {

@@ -41,11 +41,20 @@ export type CommonFields = {
   anonymousId?: string
   sessionId?: string
   accountId?: string
+  groupId?: string
+  organizationId?: string
+  requestId?: string
+  threadId?: string
+  conversationId?: string
   loggerName?: string
   threadName?: string
   metricUnit?: string
   metricTemporality?: string
   metricIsMonotonic?: boolean
+  llmModel?: string
+  llmProvider?: string
+  toolName?: string
+  processorName?: string
   [key: string]: Json | undefined
 }
 

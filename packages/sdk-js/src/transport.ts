@@ -10,7 +10,7 @@ export function httpTransport({
   key: string
   fetchImpl?: typeof fetch
 }): Transport {
-  const eventsUrl = `${url.replace(/\/+$/, '')}/events`
+  const eventsUrl = `${url.replace(/\/+$/, '')}/v1/events`
   const auth = `Bearer ${key}`
   return {
     async send(event) {

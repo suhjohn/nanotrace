@@ -153,7 +153,7 @@ impl Config {
         Ok(Self {
             udp_bind,
             http_bind,
-            events_url: format!("{}/events", trim_trailing_slash(url)),
+            events_url: format!("{}/v1/events", trim_trailing_slash(url)),
             auth_header: format!("Bearer {key}"),
             enrichment: default_enrichment(),
             batch_max_events,

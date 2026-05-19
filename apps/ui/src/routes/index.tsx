@@ -3717,7 +3717,7 @@ type FlamegraphEventRow = {
 const defaultTableName = 'observatory.events'
 const defaultDensityRollupsTableName = 'observatory.event_density_1s'
 const defaultFieldIndexTableName = 'observatory.field_index'
-const defaultFieldValuesTableName = 'observatory.field_index'
+const defaultFieldValuesTableName = 'observatory.field_values'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -4801,13 +4801,13 @@ function fieldIndexTable() {
 }
 
 function fieldValuesTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_INDEX_TABLE || '').trim()
+  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_VALUES_TABLE || '').trim()
   if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
     return configured
   }
   const table = eventsTable()
   const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.field_index` : 'field_index'
+  const derived = database ? `${database}.field_values` : 'field_values'
   return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
     ? derived
     : defaultFieldValuesTableName

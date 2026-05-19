@@ -2,7 +2,7 @@
 
 `nanotrace-client` is a local UDP and HTTP sidecar for application servers. It
 is not a general OpenTelemetry SDK or OTLP collector replacement; it is
-intentionally smaller and only forwards Nanotrace event JSON to `POST /events`.
+intentionally smaller and only forwards Nanotrace event JSON to `POST /v1/events`.
 
 Applications send Nanotrace event JSON to UDP or local HTTP on localhost. The
 client validates that each payload is a JSON event object or non-empty event
@@ -11,8 +11,8 @@ HTTP cluster. If common service metadata environment variables are present, the
 client fills missing fields inside `data`. Event fields sent by the application
 always win.
 
-UDP datagrams and local `POST /events` use the same event contract as the remote
-server:
+UDP datagrams and local `POST /events` use the same event contract as the
+remote server's `POST /v1/events` endpoint:
 
 ```json
 {"event_id":"evt_1","timestamp":"2026-05-11T23:00:00Z","data":{"service":"api"}}

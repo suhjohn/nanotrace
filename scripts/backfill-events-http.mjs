@@ -92,7 +92,7 @@ async function enqueue(lines) {
 async function postBatch(lines) {
   const body = `[${lines.join(',')}]`
   for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
-    const response = await fetch(`${url}/events`, {
+    const response = await fetch(`${url}/v1/events`, {
       body,
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -106,7 +106,7 @@ async function postBatch(lines) {
     const status = response.error ? 'request_error' : response.status
     const text = response.error ? response.error.message : await response.text()
     if (attempt >= retryLimit || (typeof status === 'number' && status < 500 && status !== 429)) {
-      throw new Error(`POST /events failed status=${status} attempt=${attempt + 1}: ${text}`)
+      throw new Error(`POST /v1/events failed status=${status} attempt=${attempt + 1}: ${text}`)
     }
     await sleep(Math.min(30_000, 500 * 2 ** attempt))
   }

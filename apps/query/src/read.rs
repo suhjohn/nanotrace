@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aws_sdk_s3::Client as S3Client;
@@ -8,6 +9,9 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlparser::{dialect::ClickHouseDialect, parser::Parser};
+use tracing::warn;
 
 use crate::config::Config;
 
@@ -67,8 +71,28 @@ impl ReadStore {
         let query = normalize_prewhere(&query);
         let sources = query_sources(&query);
         validate_query_sources(&query, &self.allowed_table_names())?;
+        let usage_shape = query_usage_shape(&query);
+        let usage_hash = query_shape_hash(&usage_shape);
+        let parameter_types = parameter_types(&request.parameters);
+        let started_at = Instant::now();
         if !request.allow_stale_serving {
-            self.ensure_serving_fresh(&sources).await?;
+            if let Err(err) = self.ensure_serving_fresh(&sources).await {
+                self.record_query_usage(QueryUsageRecord {
+                    tenant_id,
+                    query_shape: &usage_shape,
+                    query_hash: usage_hash,
+                    source_tables: &sources,
+                    parameter_types: &parameter_types,
+                    elapsed_ms: elapsed_ms(started_at.elapsed()),
+                    result_rows: 0,
+                    read_rows: 0,
+                    read_bytes: 0,
+                    status: query_error_status(&err),
+                    allow_stale_serving: request.allow_stale_serving,
+                })
+                .await;
+                return Err(err);
+            }
         }
         let query = self.scope_query(&query);
         let mut parameters = request.parameters;
@@ -76,8 +100,62 @@ impl ReadStore {
             "__nanotrace_tenant_id".to_string(),
             Value::String(tenant_id.to_string()),
         );
-        let text = self.clickhouse_query(&query, &parameters).await?;
-        serde_json::from_str(&text).map_err(ReadError::InvalidStoredEvent)
+        let text = match self.clickhouse_query(&query, &parameters).await {
+            Ok(text) => text,
+            Err(err) => {
+                self.record_query_usage(QueryUsageRecord {
+                    tenant_id,
+                    query_shape: &usage_shape,
+                    query_hash: usage_hash,
+                    source_tables: &sources,
+                    parameter_types: &parameter_types,
+                    elapsed_ms: elapsed_ms(started_at.elapsed()),
+                    result_rows: 0,
+                    read_rows: 0,
+                    read_bytes: 0,
+                    status: query_error_status(&err),
+                    allow_stale_serving: request.allow_stale_serving,
+                })
+                .await;
+                return Err(err);
+            }
+        };
+        let response: Value = match serde_json::from_str(&text) {
+            Ok(response) => response,
+            Err(err) => {
+                self.record_query_usage(QueryUsageRecord {
+                    tenant_id,
+                    query_shape: &usage_shape,
+                    query_hash: usage_hash,
+                    source_tables: &sources,
+                    parameter_types: &parameter_types,
+                    elapsed_ms: elapsed_ms(started_at.elapsed()),
+                    result_rows: 0,
+                    read_rows: 0,
+                    read_bytes: 0,
+                    status: "invalid_clickhouse_json",
+                    allow_stale_serving: request.allow_stale_serving,
+                })
+                .await;
+                return Err(ReadError::InvalidStoredEvent(err));
+            }
+        };
+        let stats = query_response_stats(&response);
+        self.record_query_usage(QueryUsageRecord {
+            tenant_id,
+            query_shape: &usage_shape,
+            query_hash: usage_hash,
+            source_tables: &sources,
+            parameter_types: &parameter_types,
+            elapsed_ms: elapsed_ms(started_at.elapsed()),
+            result_rows: stats.result_rows,
+            read_rows: stats.read_rows,
+            read_bytes: stats.read_bytes,
+            status: "ok",
+            allow_stale_serving: request.allow_stale_serving,
+        })
+        .await;
+        Ok(response)
     }
 
     pub async fn event_bytes(&self, event_id: &str, tenant_id: &str) -> Result<Bytes, ReadError> {
@@ -243,6 +321,66 @@ impl ReadStore {
             return Err(ReadError::ClickHouseResponse { status, body });
         }
         Ok(body)
+    }
+
+    async fn record_query_usage(&self, record: QueryUsageRecord<'_>) {
+        let Some(url) = self.cfg.clickhouse_url.as_deref() else {
+            return;
+        };
+
+        let row = QueryUsageRow {
+            tenant_id: record.tenant_id,
+            query_id: query_usage_id(record.query_hash),
+            query_hash: record.query_hash,
+            query_shape: record.query_shape,
+            source_tables: record.source_tables,
+            result_rows: record.result_rows,
+            read_rows: record.read_rows,
+            read_bytes: record.read_bytes,
+            elapsed_ms: record.elapsed_ms,
+            status: record.status,
+            error: "",
+            attributes: serde_json::json!({
+                "allow_stale_serving": record.allow_stale_serving,
+                "parameter_types": record.parameter_types,
+                "sanitizer": "sqlparser-clickhouse-token-shape-v1",
+            }),
+        };
+        let mut row_body = match serde_json::to_vec(&row) {
+            Ok(row_body) => row_body,
+            Err(err) => {
+                warn!(error = %err, "failed to serialize query usage row");
+                return;
+            }
+        };
+        row_body.push(b'\n');
+
+        let table = format!("{}.query_usage", self.cfg.clickhouse_database);
+        let query = format!("INSERT INTO {table} FORMAT JSONEachRow");
+        let mut body = Vec::with_capacity(query.len() + 1 + row_body.len());
+        body.extend_from_slice(query.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(&row_body);
+        let mut request = self
+            .http
+            .post(url)
+            .timeout(self.cfg.request_timeout)
+            .query(&[("database", self.cfg.clickhouse_database.as_str())])
+            .body(body);
+        if let Some(user) = self.cfg.clickhouse_user.as_deref() {
+            request = request.basic_auth(user, self.cfg.clickhouse_password.as_deref());
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!(%status, body = %body, "failed to insert query usage row");
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to insert query usage row");
+            }
+        }
     }
 
     fn table_name(&self) -> String {
@@ -439,6 +577,419 @@ struct LakehouseSequenceRow {
 struct ServingSequenceRow {
     serving_table: String,
     source_sequence_number: u64,
+}
+
+struct QueryUsageRecord<'a> {
+    tenant_id: &'a str,
+    query_shape: &'a str,
+    query_hash: u64,
+    source_tables: &'a [String],
+    parameter_types: &'a Value,
+    elapsed_ms: u64,
+    result_rows: u64,
+    read_rows: u64,
+    read_bytes: u64,
+    status: &'static str,
+    allow_stale_serving: bool,
+}
+
+#[derive(Serialize)]
+struct QueryUsageRow<'a> {
+    tenant_id: &'a str,
+    query_id: String,
+    query_hash: u64,
+    query_shape: &'a str,
+    source_tables: &'a [String],
+    result_rows: u64,
+    read_rows: u64,
+    read_bytes: u64,
+    elapsed_ms: u64,
+    status: &'a str,
+    error: &'a str,
+    attributes: Value,
+}
+
+#[derive(Default)]
+struct QueryResponseStats {
+    result_rows: u64,
+    read_rows: u64,
+    read_bytes: u64,
+}
+
+fn query_usage_shape(query: &str) -> String {
+    let parser_query = query_for_parser(query);
+    let shape = sanitize_sql_shape(query);
+    if Parser::parse_sql(&ClickHouseDialect {}, &parser_query).is_err() {
+        return format!("parse_failed {shape}");
+    }
+    shape
+}
+
+fn query_for_parser(query: &str) -> String {
+    replace_parameters_for_parser(query, "0")
+}
+
+fn replace_parameters_for_parser(query: &str, replacement: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' => {
+                out.push('\'');
+                index += 1;
+                while index < chars.len() {
+                    let current = chars[index];
+                    out.push(current);
+                    if current == '\\' && index + 1 < chars.len() {
+                        index += 1;
+                        out.push(chars[index]);
+                    } else if current == '\'' {
+                        if chars.get(index + 1) == Some(&'\'') {
+                            index += 1;
+                            out.push('\'');
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            '-' if chars.get(index + 1) == Some(&'-') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                out.push('/');
+                out.push('*');
+                index += 2;
+                while index < chars.len() {
+                    out.push(chars[index]);
+                    if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        index += 1;
+                        out.push('/');
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            '{' => {
+                if let Some(end) = parameter_end(&chars, index) {
+                    out.push_str(replacement);
+                    index = end + 1;
+                } else {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            ch => {
+                out.push(ch);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+fn sanitize_sql_shape(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch == '-' && chars.get(index + 1) == Some(&'-') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < chars.len() {
+                if chars[index] == '*' && chars[index + 1] == '/' {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '\'' {
+            tokens.push("?string".to_string());
+            index += 1;
+            while index < chars.len() {
+                let current = chars[index];
+                if current == '\\' && index + 1 < chars.len() {
+                    index += 2;
+                    continue;
+                }
+                if current == '\'' {
+                    if chars.get(index + 1) == Some(&'\'') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if ch == '"' || ch == '`' {
+            tokens.push("?identifier".to_string());
+            let quote = ch;
+            index += 1;
+            while index < chars.len() {
+                let current = chars[index];
+                index += 1;
+                if current == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '{' {
+            if let Some(end) = parameter_end(&chars, index) {
+                let raw = chars[index + 1..end].iter().collect::<String>();
+                tokens.push(sanitize_parameter(&raw));
+                index = end + 1;
+                continue;
+            }
+        }
+        if ch.is_ascii_digit()
+            || (ch == '.'
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_digit()))
+        {
+            tokens.push("?number".to_string());
+            index = consume_number(&chars, index);
+            continue;
+        }
+        if is_identifier_start(ch) {
+            let start = index;
+            index += 1;
+            while index < chars.len() && is_identifier_continue(chars[index]) {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect::<String>());
+            continue;
+        }
+        if let Some(next) = chars.get(index + 1) {
+            let pair = [ch, *next].iter().collect::<String>();
+            if matches!(
+                pair.as_str(),
+                ">=" | "<=" | "!=" | "<>" | "==" | "||" | "&&" | "::" | "->"
+            ) {
+                tokens.push(pair);
+                index += 2;
+                continue;
+            }
+        }
+        tokens.push(ch.to_string());
+        index += 1;
+    }
+    compact_shape_tokens(tokens)
+}
+
+fn parameter_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '}' => return Some(index),
+            '\n' | '\r' => return None,
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn sanitize_parameter(raw: &str) -> String {
+    let mut parts = raw.splitn(2, ':');
+    let name = parts.next().unwrap_or_default().trim();
+    let kind = parts.next().unwrap_or_default().trim();
+    if valid_parameter_part(name) && !kind.is_empty() && valid_parameter_type(kind) {
+        format!("{{{name}:{kind}}}")
+    } else if valid_parameter_part(name) {
+        format!("{{{name}}}")
+    } else {
+        "{param}".to_string()
+    }
+}
+
+fn valid_parameter_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn valid_parameter_type(value: &str) -> bool {
+    value.len() <= 120
+        && value.chars().all(|ch| {
+            ch == '_'
+                || ch == '('
+                || ch == ')'
+                || ch == ','
+                || ch == ' '
+                || ch.is_ascii_alphanumeric()
+        })
+}
+
+fn consume_number(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    if chars[index] == '0' && matches!(chars.get(index + 1), Some('x' | 'X')) {
+        index += 2;
+        while index < chars.len() && chars[index].is_ascii_hexdigit() {
+            index += 1;
+        }
+        return index;
+    }
+    while index < chars.len() && (chars[index].is_ascii_digit() || chars[index] == '.') {
+        index += 1;
+    }
+    if matches!(chars.get(index), Some('e' | 'E')) {
+        let exp = index + 1;
+        let digits = if matches!(chars.get(exp), Some('+' | '-')) {
+            exp + 1
+        } else {
+            exp
+        };
+        if chars.get(digits).is_some_and(|ch| ch.is_ascii_digit()) {
+            index = digits + 1;
+            while index < chars.len() && chars[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    index
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch == '.' || ch.is_ascii_alphanumeric()
+}
+
+fn compact_shape_tokens(tokens: Vec<String>) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        let no_space_before = matches!(token.as_str(), ")" | "," | "." | "]");
+        let no_space_after_previous = out
+            .chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, '(' | '.' | '['));
+        if !out.is_empty() && !no_space_before && !no_space_after_previous {
+            out.push(' ');
+        }
+        out.push_str(&token);
+    }
+    if out.len() > 4096 {
+        out.truncate(4096);
+        out.push_str("...");
+    }
+    out
+}
+
+fn query_shape_hash(query_shape: &str) -> u64 {
+    let digest = Sha256::digest(query_shape.as_bytes());
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest has eight bytes"),
+    )
+}
+
+fn query_usage_id(query_hash: u64) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("qry_{millis}_{query_hash:016x}")
+}
+
+fn parameter_types(parameters: &serde_json::Map<String, Value>) -> Value {
+    let values = parameters
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                Value::String(
+                    match value {
+                        Value::String(_) => "string",
+                        Value::Number(_) => "number",
+                        Value::Bool(_) => "bool",
+                        Value::Null => "null",
+                        Value::Array(_) => "array",
+                        Value::Object(_) => "object",
+                    }
+                    .to_string(),
+                ),
+            )
+        })
+        .collect();
+    Value::Object(values)
+}
+
+fn query_response_stats(response: &Value) -> QueryResponseStats {
+    let result_rows = response
+        .get("rows")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            response
+                .get("data")
+                .and_then(Value::as_array)
+                .map(|data| data.len() as u64)
+        })
+        .unwrap_or_default();
+    let statistics = response.get("statistics");
+    QueryResponseStats {
+        result_rows,
+        read_rows: statistics
+            .and_then(|stats| stats.get("rows_read"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        read_bytes: statistics
+            .and_then(|stats| stats.get("bytes_read"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    }
+}
+
+fn query_error_status(err: &ReadError) -> &'static str {
+    match err {
+        ReadError::InvalidQuery(_) => "invalid_query",
+        ReadError::ClickHouseNotConfigured => "clickhouse_not_configured",
+        ReadError::ClickHouseResponse { status, .. } if status.is_client_error() => {
+            "clickhouse_client_error"
+        }
+        ReadError::ClickHouseResponse { .. } => "clickhouse_server_error",
+        ReadError::Http(_) => "clickhouse_request_error",
+        ReadError::InvalidStoredEvent(_) => "invalid_clickhouse_json",
+        ReadError::S3NotConfigured => "s3_not_configured",
+        ReadError::S3(_) => "s3_error",
+        ReadError::NotFound => "not_found",
+        ReadError::MissingSourceRange => "missing_source_range",
+        ReadError::EventIDMismatch => "event_id_mismatch",
+        ReadError::InvalidClickHouseResponse => "invalid_clickhouse_response",
+    }
+}
+
+fn elapsed_ms(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn checked_select_query(query: &str) -> Result<String, ReadError> {
@@ -772,7 +1323,7 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadError, checked_select_query, normalize_prewhere, query_sources,
+        ReadError, checked_select_query, normalize_prewhere, query_sources, query_usage_shape,
         validate_parameter_name, validate_query_sources,
     };
 
@@ -835,6 +1386,30 @@ mod tests {
         assert!(validate_parameter_name("_from").is_ok());
         assert!(validate_parameter_name("1bad").is_err());
         assert!(validate_parameter_name("bad-name").is_err());
+    }
+
+    #[test]
+    fn query_usage_shape_removes_literals_but_keeps_structure() {
+        assert_eq!(
+            query_usage_shape(
+                "SELECT count(), service FROM observatory.events WHERE service = 'api' AND duration_ms >= 123.4 AND timestamp >= {from:String} GROUP BY service LIMIT 10"
+            ),
+            "SELECT count (), service FROM observatory.events WHERE service = ?string AND duration_ms >= ?number AND timestamp >= {from:String} GROUP BY service LIMIT ?number"
+        );
+    }
+
+    #[test]
+    fn query_usage_shape_drops_comments_and_string_contents() {
+        let shape = query_usage_shape(
+            "SELECT 'alice@example.com' AS email FROM observatory.events -- account_id=acct_123\nWHERE request_id = 'req_secret'",
+        );
+        assert_eq!(
+            shape,
+            "SELECT ?string AS email FROM observatory.events WHERE request_id = ?string"
+        );
+        assert!(!shape.contains("alice"));
+        assert!(!shape.contains("acct_123"));
+        assert!(!shape.contains("req_secret"));
     }
 
     #[test]

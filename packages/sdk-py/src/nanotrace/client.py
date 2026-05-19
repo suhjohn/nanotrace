@@ -120,11 +120,11 @@ class Nanotrace:
         self._write(
             "log",
             {
-                **normalize_common(data),
                 "severity_text": normalized_level.upper(),
                 "severity_number": _severity_number(normalized_level),
                 "body": message,
                 "is_error": 1 if normalized_level == "error" else 0,
+                **normalize_common(data),
             },
         )
 
@@ -211,7 +211,6 @@ class Nanotrace:
         self._write(
             "span",
             {
-                **normalize_common(without_keys(data, {"method", "route", "path", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
                 "name": f"{method} {route or path or url or ''}".strip(),
                 "span_kind": "server",
                 "http.method": method,
@@ -222,6 +221,7 @@ class Nanotrace:
                 **({"http.status_code": status_code, "http.response.status_code": status_code} if status_code else {}),
                 "duration_ms": duration_ms,
                 "is_error": 1 if isinstance(status_code, int) and status_code >= 500 else 0,
+                **normalize_common(without_keys(data, {"method", "route", "path", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
             },
         )
 
@@ -230,7 +230,6 @@ class Nanotrace:
         self._write(
             "span",
             {
-                **normalize_common(without_keys(data, {"method", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
                 "name": f"{method} {url}",
                 "span_kind": "client",
                 "http.method": method,
@@ -239,6 +238,7 @@ class Nanotrace:
                 **({"http.status_code": status_code, "http.response.status_code": status_code} if status_code else {}),
                 "duration_ms": duration_ms,
                 "is_error": 1 if isinstance(status_code, int) and status_code >= 500 else 0,
+                **normalize_common(without_keys(data, {"method", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
             },
         )
 
@@ -506,11 +506,11 @@ class AsyncNanotrace:
         self._write(
             "log",
             {
-                **normalize_common(data),
                 "severity_text": normalized_level.upper(),
                 "severity_number": _severity_number(normalized_level),
                 "body": message,
                 "is_error": 1 if normalized_level == "error" else 0,
+                **normalize_common(data),
             },
         )
 
@@ -597,7 +597,6 @@ class AsyncNanotrace:
         self._write(
             "span",
             {
-                **normalize_common(without_keys(data, {"method", "route", "path", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
                 "name": f"{method} {route or path or url or ''}".strip(),
                 "span_kind": "server",
                 "http.method": method,
@@ -608,6 +607,7 @@ class AsyncNanotrace:
                 **({"http.status_code": status_code, "http.response.status_code": status_code} if status_code else {}),
                 "duration_ms": duration_ms,
                 "is_error": 1 if isinstance(status_code, int) and status_code >= 500 else 0,
+                **normalize_common(without_keys(data, {"method", "route", "path", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
             },
         )
 
@@ -616,7 +616,6 @@ class AsyncNanotrace:
         self._write(
             "span",
             {
-                **normalize_common(without_keys(data, {"method", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
                 "name": f"{method} {url}",
                 "span_kind": "client",
                 "http.method": method,
@@ -625,6 +624,7 @@ class AsyncNanotrace:
                 **({"http.status_code": status_code, "http.response.status_code": status_code} if status_code else {}),
                 "duration_ms": duration_ms,
                 "is_error": 1 if isinstance(status_code, int) and status_code >= 500 else 0,
+                **normalize_common(without_keys(data, {"method", "url", "status_code", "statusCode", "duration_ms", "durationMs"})),
             },
         )
 

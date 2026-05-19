@@ -1,13 +1,13 @@
 Build
 
-POST /events writes events to local append-only files.
+POST /v1/events writes events to local append-only files.
 A separate uploader ships closed files to S3.
 `apps/loader` ingests the S3 files into observatory.events.
 
 S3 is the raw log. ClickHouse is the query index.
 
 Event write path
-POST /events
+POST /v1/events
 -> validate API key from Authorization: Bearer ntak_...
 -> parse JSON
 -> build event envelope
@@ -28,7 +28,7 @@ event_id: non-empty string
 timestamp: non-empty string
 data: JSON object
 
-POST /events also accepts a non-empty JSON array of the same event objects.
+POST /v1/events also accepts a non-empty JSON array of the same event objects.
 Single-event requests return one write receipt. Batch requests return an array
 of write receipts in request order.
 
@@ -103,7 +103,7 @@ same bearer token as ingest, accepts only one `SELECT`/`WITH` statement, adds
 }
 ```
 
-`GET /events/{event_id}` uses ClickHouse only as the pointer index:
+`GET /v1/events/{event_id}` uses ClickHouse only as the pointer index:
 
 ```sql
 SELECT source_file, source_offset, source_length
@@ -176,7 +176,7 @@ ClickHouse fills `observed_timestamp` and `ingested_timestamp` when omitted.
 So any ClickHouse row can point back to the exact raw bytes in S3.
 
 Minimal pseudocode
-on POST /events:
+on POST /v1/events:
 if request.Authorization is not a valid API key:
 return 401
 

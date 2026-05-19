@@ -1,19 +1,94 @@
 # Nanotrace
 
-Nanotrace is a single-tenant observability ingest pipeline built around one
-`/events` API, S3, SQS, a Rust loader, and ClickHouse.
+A unified event table for business analytics, observability, and AI-agent
+debugging.
 
-The current AWS deployment path is:
+Nanotrace is built around one simple idea: the easiest system to query is the
+one where every meaningful fact lands in the same event model. Logs, spans,
+metrics, product actions, account state changes, LLM calls, tool executions,
+retrieval steps, evals, and safety events all become rows in one queryable
+timeline.
+
+That gives humans and AI agents a single way to ask questions across the full
+state of the system:
 
 ```text
-HTTP clients -> ALB -> EC2/EBS ingest servers -> S3 -> SQS -> loader -> ClickHouse
+Which customers hit this error after upgrading plans?
+What did the agent see, decide, retrieve, and call before this bad answer?
+Which model/tool path correlates with slow checkouts or failed workflows?
+What changed in account state before support tickets, latency, or churn spiked?
 ```
 
-The server validates event JSON, writes durable local NDJSON parts, uploads
-closed parts to S3, and a loader service consumes S3 notifications to insert
-rows into ClickHouse.
+Instead of stitching together separate logging, tracing, metrics, product
+analytics, warehouse, and agent-evaluation systems, Nanotrace stores operational
+telemetry and business facts in the same lakehouse-backed event table. Common
+fields make events easy to scan and join; raw JSON keeps domain-specific context
+intact until a field is important enough to promote into a fast serving index.
 
-## Layout
+## What Nanotrace Offers
+
+- **One query surface for the whole system:** query product behavior,
+  infrastructure signals, workflow state, and AI-agent execution through the
+  same event model.
+- **AI-debuggable context:** preserve the timeline an agent needs: prompt and
+  model activity, tool calls, retrieval, decisions, traces, errors, customer
+  state, and business outcomes.
+- **Unified high-cardinality events:** accept structured JSON over HTTP, SDKs,
+  or a local sidecar, with stable fields for time, tenant, signal, service,
+  trace/span identity, name, duration, and error state.
+- **Raw-first analytics:** keep arbitrary customer and application fields in
+  `data` by default, so new questions do not require a schema migration or a new
+  pipeline.
+- **Promotion when queries repeat:** turn useful JSON paths into indexed fields,
+  measures, state updates, rollups, reports, or dashboards when they need to be
+  fast.
+- **Open durable history:** commit accepted event batches to Apache
+  Iceberg/Parquet, then use ClickHouse as a rebuildable serving layer for
+  interactive queries.
+
+## Why A Unified Table
+
+Most analytics and observability stacks split reality across specialized
+stores. Logs answer one class of question, traces another, metrics another, and
+business analytics another. That separation is painful for people, and it is
+especially painful for AI agents that need complete context to debug behavior.
+
+Nanotrace treats everything as an event first. A checkout failure, a span end, a
+tool call, a token-usage record, an account-plan update, and an evaluation score
+can be filtered, grouped, and correlated with the same language. You can start
+from a business symptom and drill into infrastructure, or start from an error
+and climb back up to the customer, workflow, model, account, and outcome it
+affected.
+
+The core design is lakehouse-first. ClickHouse makes the UI fast, but Iceberg is
+the durable record. If an index, rollup, or promoted table changes, Nanotrace can
+replay committed snapshots and produce a new serving view.
+
+## Data Path
+
+The production data path is:
+
+```text
+HTTP clients
+  -> ALB
+  -> EC2/EBS ingest servers
+  -> S3 landing objects
+  -> SQS
+  -> loader
+  -> Iceberg/Parquet commit
+  -> ClickHouse raw serving rows + commit metadata
+  -> materializer
+  -> promoted serving tables and rollups
+```
+
+The server validates event JSON, writes durable local NDJSON parts, and uploads
+closed parts to S3. The loader consumes S3 notifications, commits the batch to
+the Iceberg event table, records the lakehouse snapshot in ClickHouse, and then
+loads the committed events into ClickHouse serving tables. A separate
+materializer keeps derived serving tables caught up from the same lakehouse
+commit stream.
+
+## Repository Layout
 
 ```text
 apps/server        Rust ingest server and raw S3 uploader
@@ -22,10 +97,70 @@ apps/query         Rust stateless read/query service
 apps/sidecar      UDP sidecar client that batches and forwards events
 packages/sdk-js    TypeScript SDK for app instrumentation
 tools/loadtest     Rust deploy-aware load testing tool
+tools/lakehouse-rebuild  Lakehouse replay and materialization worker
 deploy/clickhouse  ClickHouse schema
 deploy/pulumi/nanotrace  Pulumi EC2/EBS/S3 infrastructure
 scripts            E2E commands
 ```
+
+## How It Works
+
+Nanotrace has three durable layers:
+
+- Landing: ingest servers write accepted batches to local disk first, then S3.
+- Lakehouse: the loader writes canonical Parquet files and commits them through
+  Apache Iceberg table metadata.
+- Serving: ClickHouse stores raw rows, rollups, indexes, and watermarks for
+  interactive reads.
+
+The canonical event table keeps a stable flattened vocabulary for common fields:
+tenant, event id, timestamps, signal, event type, trace/span ids, service,
+environment, name, duration, error state, and the raw `data` JSON. Arbitrary
+customer fields stay in `data` until they become useful enough to promote.
+
+Each Iceberg commit is mirrored into `observatory.lakehouse_commits`. Each
+ClickHouse serving table records the latest source snapshot it has consumed in
+`observatory.serving_watermarks`. Query APIs compare those watermarks before
+reading raw or promoted serving tables, so stale serving data is rejected by
+default. Diagnostic callers can opt in with `allow_stale_serving: true`.
+
+## Query and Index Model
+
+ClickHouse is used as a serving/index engine on top of Iceberg, not as the
+system of record. Query planning follows this ladder:
+
+- `events`: raw serving rows. This is the correctness fallback for every query.
+  Time-window and tenant predicates use the table order key for pruning.
+- `event_density_1s`: global histogram rollup used when the UI has no selected
+  group and no restrictive filter.
+- `field_density_1s` and `field_topk_1m`: always-on grouped histograms and
+  top-value lists for core fields such as `signal`, `event_type`, `service`,
+  `environment`, `name`, HTTP route/status/method, severity, model/provider,
+  tool, processor, plan, country/region, user group, `user_id`, and
+  `account_id`.
+- `field_values`: exact lookup index for common identifiers such as `trace_id`,
+  `span_id`, `request_id`, `user_id`, `anonymous_id`, `account_id`,
+  `session_id`, `group_id`, `organization_id`, `thread_id`, and
+  `conversation_id`.
+- `field_index`: definition-backed promoted-field index. Materializers populate
+  this for fields that need guaranteed-fast filtering, grouping, or drilldown.
+
+The UI filter DSL supports equality, inequality, negation, disjunction,
+substring matching, and set membership:
+
+```text
+service=llm-gateway
+http.route=/v1/responses OR http.route=/v1/chat/completions
+NOT environment=dev
+request_id IN [req_1, req_2, req_3]
+message CONTAINS timeout
+```
+
+Simple indexed equality filters can use `field_index` semi-joins by `event_id`.
+Advanced boolean filters, `CONTAINS`, and unpromoted JSON paths fall back to raw
+`events` predicates so the result stays correct. Repeated broad queries should
+become a promoted field, measure, report, cohort, or another materialized output
+rather than repeatedly scanning arbitrary JSON.
 
 ## Toolchains
 
@@ -123,8 +258,8 @@ Query APIs check `observatory.serving_watermarks` before reading raw or promoted
 serving tables. Requests that intentionally accept stale serving data can set
 `allow_stale_serving: true` in the `/v1/query` JSON body.
 
-See [docs/iceberg-final-spec.md](/Users/johnsuh/nanotrace/docs/iceberg-final-spec.md)
-for the Iceberg-native final design and current implementation slice.
+See [docs/iceberg-final-spec.md](docs/iceberg-final-spec.md) for the
+Iceberg-native final design and current implementation slice.
 
 ## AWS Quickstart
 
@@ -231,10 +366,11 @@ Pulumi outputs.
 
 The AWS deployment runs `nanotrace-loader` beside `nanotrace-server` on each EC2
 instance. S3 sends object-created notifications to SQS; loader instances share
-that queue, fetch raw NDJSON objects from S3, and insert JSONEachRow batches into
-`observatory.events`. Processors are shared for the deployment under the
-`processors` S3 prefix. The uploaded row fields match the raw-first analytics
-schema in [deploy/clickhouse/schema.sql](/Users/johnsuh/nanotrace/deploy/clickhouse/schema.sql).
+that queue, fetch raw NDJSON objects from S3, commit the batch to Iceberg, and
+load the committed rows into ClickHouse serving tables. Processors are shared
+for the deployment under the `processors` S3 prefix. The uploaded row fields
+match the raw-first analytics schema in
+[deploy/clickhouse/schema.sql](deploy/clickhouse/schema.sql).
 
 Destroy AWS resources:
 
@@ -250,7 +386,7 @@ Pulumi config `nanotrace:name` or `nanotrace:deploymentId`.
 Run `nanotrace-client` beside an application server when the application should
 avoid blocking on the Nanotrace HTTP ingest path. The app sends event JSON to a
 local UDP socket; the client batches events and forwards them to
-`POST /events` on the configured Nanotrace URL.
+`POST /v1/events` on the configured Nanotrace URL.
 
 ```sh
 NANOTRACE_URL=http://nanotrace-prod-alb.example.com \
@@ -259,5 +395,5 @@ cargo run -p nanotrace-client
 ```
 
 Default UDP bind address is `127.0.0.1:4319`. See
-[apps/sidecar/README.md](/Users/johnsuh/nanotrace/apps/sidecar/README.md) for
-batching and retry settings.
+[apps/sidecar/README.md](apps/sidecar/README.md) for batching and retry
+settings.

@@ -70,11 +70,11 @@ export class Nanotrace {
 
   log(level: LogLevel, message: string, data: CommonFields = {}): void {
     this.write('log', {
-      ...normalizeCommon(data),
       severity_text: level.toUpperCase(),
       severity_number: severityNumber(level),
       body: message,
-      is_error: level === 'error' ? 1 : 0
+      is_error: level === 'error' ? 1 : 0,
+      ...normalizeCommon(data)
     })
   }
 
@@ -180,7 +180,6 @@ export class Nanotrace {
 
   httpServerRequest(data: HttpServerRequest): void {
     this.write('span', {
-      ...normalizeCommon(withoutKeys(data, ['method', 'route', 'path', 'url', 'statusCode', 'durationMs'])),
       name: `${data.method} ${data.route ?? data.path ?? data.url ?? ''}`.trim(),
       span_kind: 'server',
       'http.method': data.method,
@@ -190,13 +189,13 @@ export class Nanotrace {
       ...(data.url ? { 'url.full': data.url } : {}),
       ...(data.statusCode ? { 'http.status_code': data.statusCode, 'http.response.status_code': data.statusCode } : {}),
       duration_ms: data.durationMs,
-      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0
+      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0,
+      ...normalizeCommon(withoutKeys(data, ['method', 'route', 'path', 'url', 'statusCode', 'durationMs']))
     })
   }
 
   httpClientRequest(data: HttpClientRequest): void {
     this.write('span', {
-      ...normalizeCommon(withoutKeys(data, ['method', 'url', 'statusCode', 'durationMs'])),
       name: `${data.method} ${data.url}`,
       span_kind: 'client',
       'http.method': data.method,
@@ -204,7 +203,8 @@ export class Nanotrace {
       'url.full': data.url,
       ...(data.statusCode ? { 'http.status_code': data.statusCode, 'http.response.status_code': data.statusCode } : {}),
       duration_ms: data.durationMs,
-      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0
+      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0,
+      ...normalizeCommon(withoutKeys(data, ['method', 'url', 'statusCode', 'durationMs']))
     })
   }
 

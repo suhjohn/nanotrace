@@ -22,7 +22,7 @@ class HttpTransport:
     timeout: float = 5.0
 
     def __post_init__(self) -> None:
-        self.events_url = f"{self.url.rstrip('/')}/events"
+        self.events_url = f"{self.url.rstrip('/')}/v1/events"
         self.auth = f"Bearer {self.key}"
 
     def send(self, event: JsonObject) -> None:

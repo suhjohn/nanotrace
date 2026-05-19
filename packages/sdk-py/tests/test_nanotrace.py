@@ -8,6 +8,8 @@ from nanotrace import (
     NanotraceFlushError,
     create_async_nanotrace,
     create_nanotrace,
+    http_transport,
+    sidecar_http_transport,
     trace_context,
 )
 
@@ -84,6 +86,31 @@ class NanotraceTests(unittest.TestCase):
 
         self.assertEqual(transport.events[0]["data"]["trace_id"], "trace-1")
         self.assertEqual(transport.events[0]["data"]["span_id"], "span-1")
+
+    def test_camel_case_fields_match_write_path_names(self) -> None:
+        transport = RecordingTransport()
+        nt = create_nanotrace(transport)
+
+        nt.info(
+            "hello",
+            isError=True,
+            requestId="req_1",
+            organizationId="org_1",
+            llmModel="gpt-test",
+            toolName="shell",
+        )
+        nt.flush()
+
+        data = transport.events[0]["data"]
+        self.assertEqual(data["is_error"], True)
+        self.assertEqual(data["request_id"], "req_1")
+        self.assertEqual(data["organization_id"], "org_1")
+        self.assertEqual(data["llm.model"], "gpt-test")
+        self.assertEqual(data["tool_name"], "shell")
+
+    def test_http_transports_use_supported_ingest_paths(self) -> None:
+        self.assertEqual(http_transport("https://api.example.com", "key").events_url, "https://api.example.com/v1/events")
+        self.assertEqual(sidecar_http_transport("http://127.0.0.1:4320").events_url, "http://127.0.0.1:4320/events")
 
     def test_flush_surfaces_delivery_errors(self) -> None:
         nt = create_nanotrace(FailingTransport())
