@@ -16,7 +16,7 @@ Include:
 Example:
 
 ```md
-The dataset covers 2026-03-16 to 2026-05-16. `event_index`, `field_counts_5m`, `event_measures`, `spans`, and `trace_summaries` are populated. `report_results` is empty, so long-range funnel/revenue widgets should be materialized before becoming production dashboard cards.
+The dataset covers 2026-03-16 to 2026-05-16. `event_density_1s`, `field_topk_1m`, `field_density_1s`, `event_measures`, and `measure_rollups` are populated. `report_results` is empty, so long-range funnel/revenue widgets should be materialized before becoming production dashboard cards.
 ```
 
 ## Discovered Data Model
@@ -58,7 +58,7 @@ For each recommendation:
 ### 1. Service Health
 
 Confidence: high
-Cost profile: cheap with `event_rollups_5m`; moderate fallback with `event_index`
+Cost profile: cheap with `event_density_1s`, `field_topk_1m`, `field_density_1s`, and `measure_rollups`; moderate fallback with tightly bounded `events`
 
 What it answers:
 Shows whether services are healthy by volume, error rate, and latency.
@@ -66,18 +66,19 @@ Shows whether services are healthy by volume, error rate, and latency.
 Evidence:
 - `service` has 7 observed values.
 - `duration_ms` exists in `event_measures`.
-- `event_rollups_5m` has rows across the selected range.
+- `event_density_1s` and `field_density_1s` have rows across the selected range.
 
 Widgets:
 - Events/errors over time by service.
 - p95 duration by service.
 - Top routes by error rate.
-- Recent slow/error traces.
+- Recent slow/error event samples.
 
 Read models:
-- `event_rollups_5m`
+- `event_density_1s`
+- `field_density_1s`
+- `field_topk_1m`
 - `measure_rollups`
-- `trace_summaries`
 
 Missing prerequisites:
 - None, or list exact definitions/rollups needed.
@@ -103,7 +104,7 @@ Widgets:
 
 3. Calls by model
    Type: horizontal bar
-   Query source: `field_counts_5m`
+   Query source: `field_topk_1m`
    Dimension: `model`
 ```
 

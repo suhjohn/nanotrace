@@ -16,6 +16,7 @@ pub struct Config {
     pub clickhouse_max_execution_secs: u64,
     pub clickhouse_max_bytes_to_read: u64,
     pub max_request_bytes: usize,
+    #[allow(dead_code)]
     pub request_timeout: Duration,
     pub auth: AuthConfig,
     pub cors_allowed_origins: Vec<String>,

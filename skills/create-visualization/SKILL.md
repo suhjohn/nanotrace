@@ -37,9 +37,9 @@ Assume production read models are massive by default:
 
 - Baseline planning size: 1M requests/sec and at least 10 events/request, or roughly 10M events/sec.
 - That is roughly 864B events/day and 25.92T events/30 days.
-- Raw/per-event read models such as `events`, `event_index`, `field_index`, and `event_measures` can be extremely large even for a single tenant.
+- Raw/per-event read models such as `events`, `field_index`, `field_values`, and `event_measures` can be extremely large even for a single tenant.
 - A dashboard card is an interactive surface. It must not casually scan days or months of raw/high-cardinality event-level rows.
-- Prefer precomputed or reduced read models first: `report_results`, `sequence_report_results`, `cohort_memberships`, `measure_rollups`, `event_rollups_5m`, and `field_counts_5m`.
+- Prefer precomputed or reduced read models first: `report_results`, `sequence_report_results`, `cohort_memberships`, `measure_rollups`, `event_density_1s`, `field_density_1s`, and `field_topk_1m`.
 - If the dashboard needs a query that would scan raw or per-event read models over a large range, state the missing prerequisite instead: define/backfill the field, measure, rollup, state, cohort, or report first.
 
 Concrete rule: a dashboard visualization may use raw/per-event read models for recent, bounded exploration, but durable dashboard widgets should use rollups, facet counts, state histories, or materialized report outputs.
@@ -116,12 +116,11 @@ rows: {
 - Use `/v1/query` through `nanotrace.query({ query, parameters })` for dashboard reads. Do not call write/control-plane endpoints such as `/v1/definitions` or `/v1/reports` from iframe visualizations.
 - Treat `/v1/reports` as the saved report-spec API. Dashboard widgets should usually read materialized report output through `/v1/query`, not fetch report specs at render time.
 - Use `observatory.events` only when the visualization needs raw JSON payloads or a bespoke calculation over a tightly bounded time range.
-- Use `observatory.event_index` for event timelines, recent-event lists, and queries that need common event columns plus raw source pointers without scanning full JSON first.
-- Use `observatory.trace_summaries` for trace lists and trace pickers. Merge aggregate states with `minMerge`, `maxMerge`, `uniqCombined64Merge`, `sumMerge`, and `argMinMerge`.
-- Use `observatory.spans` for trace flamegraphs/waterfalls. Group by `trace_id, span_id` when reading so duplicate lifecycle fragments collapse without relying on `FINAL`.
-- Use `observatory.field_index` for exact field-to-event drilldowns. Filter by `field_name`, `value`, `mode`, and time whenever possible.
-- Use `observatory.field_counts_5m` for facet/value lists and top values. Aggregate with `sum(count)` and `sum(error_count)`.
-- Use `observatory.event_rollups_5m` for built-in event counts/errors/duration grouped by facet-capable fields.
+- Use `observatory.event_density_1s` for global event volume and error-count trends when no group/filter is selected.
+- Use `observatory.field_topk_1m` for top values on core fields such as service, event_type, http.method, http.route, status, model, provider, plan, country, user_group, user_id, and account_id.
+- Use `observatory.field_density_1s` for grouped histograms over those same core fields.
+- Use `observatory.field_values` for exact lookup identifiers such as trace_id, span_id, request_id, user_id, account_id, session_id, thread_id, and conversation_id.
+- Use `observatory.field_index` for definition-backed promoted field drilldowns. Filter by `field_name`, `value`, `mode`, and time whenever possible.
 - Use `observatory.event_measures` for short-window ad hoc numeric aggregations when no rollup exists.
 - Use `observatory.measure_rollups` for precomputed rollup charts. Finalize aggregate states with `sumMerge`, `minMerge`, `maxMerge`, `avgMerge`, and `quantilesTDigestMerge`.
 - Use `observatory.entity_state_updates` for longitudinal state-transition analytics such as plan changes, risk-tier changes, or state before/after a key event.
@@ -223,7 +222,7 @@ SELECT
   sum(count) AS events,
   sum(error_count) AS errors,
   max(bucket_time) AS last_seen
-FROM observatory.field_counts_5m
+FROM observatory.field_topk_1m
 WHERE bucket_time >= now() - INTERVAL 24 HOUR
 GROUP BY field_name, value
 ORDER BY events DESC
@@ -286,13 +285,11 @@ If discovery shows no materialized report, no rollup, and no relevant definition
 ## Nanotrace Read Model Catalog
 
 - `events`: canonical raw JSON event log plus source pointer fields. Use for raw payload inspection and tight exploratory queries.
-- `event_index`: narrow serving copy for event timelines, event lists, flamegraph/event-lane views, and source-file drilldowns.
-- `span_fragments`: append-only normalized span lifecycle fragments derived from raw span-shaped events.
-- `spans`: queryable logical span records for flamegraphs/waterfalls; group by `trace_id, span_id` in reads to collapse start/end fragments.
-- `trace_summaries`: aggregate-state trace list rows for fast trace pickers, error counts, span counts, and trace duration.
-- `field_index`: per-event extracted string fields. Use for exact value-to-event drilldowns and joining selected events back to `event_index`.
-- `field_counts_5m`: 5-minute facet counts from `field_index` where `mode = 'facet'`. Use for top values and facet panels.
-- `event_rollups_5m`: 5-minute event counts/errors/duration grouped by facet field. Use for service/status/route/event_type trend charts.
+- `event_density_1s`: global per-second event and error counts. Use for unfiltered volume/error trends.
+- `field_density_1s`: per-second counts by always-on core fields. Use for grouped histograms.
+- `field_topk_1m`: per-minute top-value counts by always-on core fields. Use for top values and facet panels.
+- `field_values`: exact lookup index for common identifiers. Use for trace/request/user/account/session/thread/conversation drilldowns.
+- `field_index`: definition-backed promoted fields. Use for exact promoted value-to-event drilldowns and promoted facet grouping.
 - `definitions`: active schema definitions: `field`, `measure`, `rollup`, `state`.
 - `definition_stats`: latest estimate/backfill evidence for definitions.
 - `event_measures`: per-event numeric observations. Use for narrow ad hoc numeric aggregations.
@@ -305,68 +302,70 @@ If discovery shows no materialized report, no rollup, and no relevant definition
 
 ## Concrete Query Patterns
 
-Event count over time from `event_index`:
+Global event count over time from `event_density_1s`:
 
 ```sql
 SELECT
-  toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS bucket,
-  count() AS events,
-  sum(is_error) AS errors
-FROM observatory.event_index
-WHERE ${params.sql.where}
+  toStartOfInterval(bucket_time, INTERVAL 5 MINUTE) AS bucket,
+  sum(count) AS events,
+  sum(error_count) AS errors
+FROM observatory.event_density_1s
+WHERE bucket_time >= {created_after:DateTime64(3, 'UTC')}
+  AND bucket_time <= {created_before:DateTime64(3, 'UTC')}
 GROUP BY bucket
 ORDER BY bucket
 ```
 
-Grouped event trend from `event_rollups_5m`:
+Grouped event trend from `field_density_1s`:
 
 ```sql
 SELECT
-  bucket_time,
-  group_value,
+  toStartOfInterval(bucket_time, INTERVAL 5 MINUTE) AS bucket,
+  value,
   sum(count) AS events,
   sum(error_count) AS errors,
   sum(duration_sum) / nullIf(sum(duration_count), 0) AS avg_duration_ms
-FROM observatory.event_rollups_5m
-WHERE group_name = 'service'
-  AND ${params.sql.where}
-GROUP BY bucket_time, group_value
-ORDER BY bucket_time, events DESC
+FROM observatory.field_density_1s
+WHERE field_name = 'service'
+  AND bucket_time >= {created_after:DateTime64(3, 'UTC')}
+  AND bucket_time <= {created_before:DateTime64(3, 'UTC')}
+GROUP BY bucket, value
+ORDER BY bucket, events DESC
 ```
 
-Top facet values from `field_counts_5m`:
+Top facet values from `field_topk_1m`:
 
 ```sql
 SELECT
   value,
   sum(count) AS events,
   sum(error_count) AS errors
-FROM observatory.field_counts_5m
+FROM observatory.field_topk_1m
 WHERE field_name = 'service'
-  AND ${params.sql.where}
+  AND bucket_time >= {created_after:DateTime64(3, 'UTC')}
+  AND bucket_time <= {created_before:DateTime64(3, 'UTC')}
 GROUP BY value
 ORDER BY events DESC
 LIMIT 20
 ```
 
-Exact drilldown from `field_index` to event rows:
+Exact identifier drilldown from `field_values` to event rows:
 
 ```sql
 SELECT
   e.timestamp,
-  e.name,
+  ifNull(toString(e.data.name), '') AS name,
   e.event_type,
   e.signal,
   e.event_id,
   e.source_file,
   e.source_offset,
   e.source_length
-FROM observatory.field_index f
-INNER JOIN observatory.event_index e
+FROM observatory.field_values f
+INNER JOIN observatory.events e
   ON e.event_id = f.event_id
 WHERE f.field_name = 'request_id'
   AND f.value = {request_id:String}
-  AND f.mode = 'lookup'
   AND ${params.sql.where}
 ORDER BY e.timestamp DESC
 LIMIT 200
@@ -431,7 +430,7 @@ SELECT
   source_file,
   source_offset,
   source_length
-FROM observatory.event_index
+FROM observatory.events
 WHERE ${params.sql.where}
 ORDER BY timestamp DESC
 LIMIT 200
@@ -512,12 +511,12 @@ Use this order when choosing a read model:
 
 1. Saved report already exists and has materialized output: use `report_results`, `sequence_report_results`, or `cohort_memberships`.
 2. Numeric chart maps to a rollup definition: use `measure_rollups`.
-3. Trace picker/list: use `trace_summaries`.
-4. Trace flamegraph/waterfall: use `spans`.
-5. Top values/facets: use `field_counts_5m`.
-6. Event timeline/list: use `event_index`.
-7. Exact field drilldown: use `field_index` joined or followed by `event_index`/`events` if more payload is needed.
-8. Raw bespoke calculation: use `events`, with strict time predicates and limits.
+3. Global event volume/errors: use `event_density_1s`.
+4. Top values/facets on core fields: use `field_topk_1m`.
+5. Grouped histograms on core fields: use `field_density_1s`.
+6. Exact identifier drilldown: use `field_values`, then hydrate from `events` if payload is needed.
+7. Promoted custom field drilldown/grouping: use `field_index`, then hydrate from `events` if payload is needed.
+8. Raw bespoke calculation or event timeline/list: use `events`, with strict time predicates and limits.
 
 ## Charting Library Choice
 

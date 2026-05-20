@@ -15,7 +15,7 @@ use axum::{
 };
 use config::Config;
 use nanotrace_auth::{AuthError, AuthIdentity, AuthStore};
-use read::{QueryRequest, ReadError, ReadStore};
+use read::{EventsQueryRequest, QueryRequest, ReadError, ReadStore};
 use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -78,6 +78,7 @@ fn router(state: AppState) -> Router {
 
     let router = Router::new()
         .route("/v1/query", post(post_query))
+        .route("/v1/events/query", post(post_events_query))
         .route("/v1/events/{event_id}", get(get_event))
         .route("/healthz", get(healthz))
         .route("/v1/healthz", get(healthz))
@@ -120,6 +121,16 @@ async fn post_query(
     let identity = authorize(&state, &headers).await?;
     require_scope(&identity, "query:read")?;
     Ok(Json(state.read.query(request, &identity.tenant_id).await?).into_response())
+}
+
+async fn post_events_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EventsQueryRequest>,
+) -> Result<Response, ApiError> {
+    let identity = authorize(&state, &headers).await?;
+    require_scope(&identity, "query:read")?;
+    Ok(Json(state.read.events_query(request, &identity.tenant_id).await?).into_response())
 }
 
 async fn get_event(

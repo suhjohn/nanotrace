@@ -12,7 +12,6 @@ import { cn } from '../lib/cn'
 import { useAppShell } from '../lib/app-shell'
 import { Calendar } from '../components/ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '../components/ui/popover'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import {
   HTTPError,
   errorMessage,
@@ -161,6 +160,8 @@ type GroupOption = {
   source?: string
   valueType?: string
 }
+
+const emptyGroupOptions: GroupOption[] = []
 
 type AuthIdentity = {
   auth_type: 'api_key' | 'session'
@@ -490,7 +491,7 @@ export function ObservatoryHome({
     queryKey: ['logs', observatoryUrl, 'group-options'],
     queryFn: () => fetchGroupOptions({ apiBaseUrl: observatoryUrl, limit: 120 })
   })
-  const groupOptions = groupOptionsQuery.data?.fields ?? []
+  const groupOptions = groupOptionsQuery.data?.fields ?? emptyGroupOptions
   const activeFacetPaths = useMemo(() => {
     const paths = new Set<string>()
     for (const option of groupOptions) {
@@ -533,6 +534,16 @@ export function ObservatoryHome({
   const eventFilterReady = eventFilterGroupKey === eventScopeKey
   const hasEventQuery = viewingGroupedEvents ? eventFilterReady : true
   const groupSearch = filter.trim()
+  const groupListTimeRange = useMemo(() => {
+    if (eventFilterParams.createdAfter || eventFilterParams.createdBefore) {
+      return {
+        createdAfter: eventFilterParams.createdAfter,
+        createdBefore: eventFilterParams.createdBefore,
+        key: `filter:${eventFilterParams.createdAfter ?? ''}:${eventFilterParams.createdBefore ?? ''}`
+      }
+    }
+    return selectedTimeRange
+  }, [eventFilterParams.createdAfter, eventFilterParams.createdBefore, selectedTimeRange])
   const groupsQuery = useInfiniteQuery<LogGroupPage, Error, InfiniteData<LogGroupPage>, string[], number>({
     enabled: groupOptions.length > 0 && Boolean(groupBy),
     getNextPageParam: lastPage => lastPage.nextOffset,
@@ -542,9 +553,9 @@ export function ObservatoryHome({
       observatoryUrl,
       'groups',
       groupBy,
-      selectedTimeRange.key,
-      selectedTimeRange.createdAfter ?? '',
-      selectedTimeRange.createdBefore ?? '',
+      groupListTimeRange.key,
+      groupListTimeRange.createdAfter ?? '',
+      groupListTimeRange.createdBefore ?? '',
       groupSortKey,
       groupSearch
     ],
@@ -556,7 +567,7 @@ export function ObservatoryHome({
         offset: pageParam,
         search: groupSearch,
         sortKey: groupSortKey,
-        timeRange: selectedTimeRange
+        timeRange: groupListTimeRange
       })
   })
   const traceList = groupsQuery.data?.pages.flatMap(page => page.groups) ?? []
@@ -594,10 +605,6 @@ export function ObservatoryHome({
     serializeEventFilter(eventFilterParams)
   ].join('\u0000')
   const eventAnchorTimestamp = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.timestamp : ''
-  const eventQueryFilterParams = useMemo(
-    () => eventAnchorTimestamp ? eventFilterWithoutTimeRange(eventFilterParams) : eventFilterParams,
-    [eventAnchorTimestamp, eventFilterParams]
-  )
   const summaryQuery = useQuery({
     enabled: Boolean(hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
@@ -609,18 +616,18 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventQueryFilterParams, selectedTimeRange.key, eventAnchorTimestamp, eventSortDirection],
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange.key, eventAnchorTimestamp, eventSortDirection],
     initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
         apiBaseUrl: observatoryUrl,
-        eventFilter: eventQueryFilterParams,
+        eventFilter: eventFilterParams,
         groupBy,
         limit: 100,
         pageParam,
         selectedGroupValue,
         sortDirection: eventSortDirection,
-        timeRange: eventAnchorTimestamp ? undefined : selectedTimeRange
+        timeRange: selectedTimeRange
       }),
     getNextPageParam: lastPage =>
       lastPage.nextCursor
@@ -1001,7 +1008,10 @@ export function ObservatoryHome({
       } else if (eventPayloadQuery.data?.event) {
         setHighlightedEventIds([selectedEventId])
         const anchorTimestamp = eventPayloadQuery.data.event.createdAt
-        if (anchorTimestamp && eventAnchorOverride?.timestamp !== anchorTimestamp) {
+        if (
+          anchorTimestamp &&
+          (eventAnchorOverride?.key !== eventDataKey || eventAnchorOverride.timestamp !== anchorTimestamp)
+        ) {
           setEventAnchorOverride({ key: eventDataKey, timestamp: anchorTimestamp })
         }
       }
@@ -1010,7 +1020,7 @@ export function ObservatoryHome({
 
     setHighlightedEventIds([selectedEventId])
     setSelectedCanvasSpanId(flamegraph.eventSpanIds[selectedEventId] ?? selectedEventId)
-  }, [eventPayloadQuery.data, eventPayloadQuery.error, flamegraph.eventSpanIds, selectedEvent, selectedEventId])
+  }, [eventAnchorOverride, eventDataKey, eventPayloadQuery.data, eventPayloadQuery.error, flamegraph.eventSpanIds, selectedEvent, selectedEventId])
 
   useEffect(() => {
     document.body.style.cursor = dragging ? (dragging === 'flamegraph' ? 'row-resize' : 'col-resize') : ''
@@ -1166,9 +1176,12 @@ export function ObservatoryHome({
         </form>
         <label className="flex shrink-0 items-center gap-1.5">
           <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Group</span>
-          <Select
+          <select
+            aria-label="Group by"
+            className="h-7 w-[150px] border border-neutral-800 bg-black px-2 text-[12px] text-neutral-200 outline-none hover:bg-white/[0.04] focus:border-neutral-600"
             value={groupBy || noGroupValue}
-            onValueChange={value => {
+            onChange={event => {
+              const value = event.target.value
               resetEventScope('all-events', { force: true })
               setFilter('')
               void navigate({
@@ -1177,18 +1190,13 @@ export function ObservatoryHome({
               })
             }}
           >
-            <SelectTrigger aria-label="Group by" className="w-[150px]">
-              <SelectValue placeholder="Group" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={noGroupValue}>No grouping</SelectItem>
-              {displayedGroupOptions.map(option => (
-                <SelectItem key={option.path} value={option.path}>
-                  {groupOptionLabel(option)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            <option value={noGroupValue}>No grouping</option>
+            {displayedGroupOptions.map(option => (
+              <option key={option.path} value={option.path}>
+                {groupOptionLabel(option)}
+              </option>
+            ))}
+          </select>
         </label>
         <div className="ml-auto flex shrink-0 items-center justify-end gap-1.5">
           <div className="flex overflow-hidden border border-neutral-800 bg-black">
@@ -3678,6 +3686,23 @@ type ClickHouseResponse<T> = {
 
 type QueryParameters = Record<string, string | number | boolean>
 
+type EventsQueryRequest = {
+  buckets?: number
+  filter?: ParsedEventFilter
+  groupBy?: string
+  limit?: number
+  offset?: number
+  page?: EventPageParam & { eventId?: string }
+  search?: string
+  selectedGroupValue?: string
+  sort?: {
+    direction?: EventSortDirection
+    group?: GroupSortKey
+  }
+  timeRange?: ResolvedTimeRange
+  view: 'density' | 'event' | 'events' | 'flamegraph' | 'group_options' | 'groups' | 'latest' | 'summary'
+}
+
 type TimeDomain = {
   from: string
   to: string
@@ -3747,22 +3772,14 @@ async function fetchGroupOptions({
   apiBaseUrl: string
   limit: number
 }): Promise<{ fields: GroupOption[] }> {
-  const response = await postQuery<{
+  const response = await postEventsQuery<{
     capped: boolean
     cardinality: number
     path: string
     valueType: string
   }>({
     apiBaseUrl,
-    parameters: { limit },
-    query: [
-      'SELECT field_name AS path, uniqCombined64(value) AS cardinality, any(value_type) AS valueType, toBool(0) AS capped',
-      `FROM ${fieldValuesTable()}`,
-      "WHERE field_name != '' AND value != ''",
-      'GROUP BY path',
-      'ORDER BY cardinality DESC, path ASC',
-      'LIMIT {limit:UInt64}'
-    ].join(' ')
+    request: { limit, view: 'group_options' }
   })
   const dynamicFields = (response.data ?? []).map(field => ({
     cardinality: Number(field.cardinality) || 0,
@@ -3799,91 +3816,7 @@ async function fetchGroups({
   sortKey: GroupSortKey
   timeRange: ResolvedTimeRange
 }): Promise<LogGroupPage> {
-  const exactFilter = search ? ' AND value = {group_value:String}' : ''
-  const pageLimit = limit + 1
-  const baseParameters = {
-    group_key: facetKey(groupBy),
-    limit: pageLimit,
-    offset,
-    ...(search ? { group_value: search } : {}),
-    ...timeRangeParameters(timeRange)
-  }
-  if (search) {
-    const indexTimeFilter = timeRangeWhereClause(timeRange, 'timestamp')
-    try {
-      const response = await postQuery<{
-        count: number
-        durationMs: number
-        endedAt: string
-        errorCount: number
-        startedAt: string
-        value: string
-      }>({
-        apiBaseUrl,
-        parameters: baseParameters,
-        query: [
-          'SELECT value',
-          ', min(timestamp) AS startedAt',
-          ', max(timestamp) AS endedAt',
-          ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
-          ', uniqExact(event_id) AS count',
-          ", uniqExactIf(event_id, endsWith(lowerUTF8(ifNull(event_type, '')), '_error') OR lowerUTF8(ifNull(event_type, '')) = 'error') AS errorCount",
-          `FROM ${fieldIndexTable()}`,
-          `PREWHERE field_name = {group_key:String} AND value = {group_value:String}${indexTimeFilter ? ` AND ${indexTimeFilter}` : ''}`,
-          'GROUP BY value',
-          'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
-        ].join(' ')
-      })
-      if ((response.data ?? []).length > 0) {
-        return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
-      }
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  try {
-    const valueTimeFilter = fieldValueTimeRangeWhereClause(timeRange)
-    const response = await postQuery<{
-      count: number
-      durationMs: number
-      endedAt: string
-      errorCount: number
-      startedAt: string
-      value: string
-    }>({
-      apiBaseUrl,
-      parameters: baseParameters,
-      query: [
-        'SELECT value',
-        ', min(timestamp) AS startedAt',
-        ', max(timestamp) AS endedAt',
-        ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs",
-        ', count() AS count',
-        ', sum(toUInt64(is_error)) AS errorCount',
-        `FROM ${fieldValuesTable()}`,
-        `PREWHERE field_name = {group_key:String}${valueTimeFilter ? ` AND ${valueTimeFilter}` : ''}`,
-        `WHERE value != ''${exactFilter}`,
-        'GROUP BY value',
-        fieldValueOrderByClause(sortKey),
-        'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
-      ].join(' ')
-    })
-    const rows = response.data ?? []
-    if (rows.length > 0) {
-      return groupPageFromResponse(rows, groupBy, limit, offset)
-    }
-  } catch (error) {
-    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-      throw error
-    }
-  }
-
-  const valueExpression = eventValueExpression(groupBy)
-  const rawTimeFilter = timeRangeWhereClause(timeRange, 'e.timestamp')
-  const response = await postQuery<{
+  const response = await postEventsQuery<{
     count: number
     durationMs: number
     endedAt: string
@@ -3892,21 +3825,15 @@ async function fetchGroups({
     value: string
   }>({
     apiBaseUrl,
-    parameters: baseParameters,
-    query: [
-      `SELECT ${valueExpression} AS value`,
-      ', min(e.timestamp) AS startedAt',
-      ', max(e.timestamp) AS endedAt',
-      ", dateDiff('millisecond', min(e.timestamp), max(e.timestamp)) AS durationMs",
-      ', count() AS count',
-      `, countIf(${errorExpression()}) AS errorCount`,
-      `FROM ${eventsTable()} AS e`,
-      rawTimeFilter ? `PREWHERE ${rawTimeFilter}` : '',
-      `WHERE ${valueExpression} != ''${search ? ` AND ${valueExpression} = {group_value:String}` : ''}`,
-      'GROUP BY value',
-      groupOrderByClause({ groupBy, hasErrorCount: true, sortKey }),
-      'LIMIT {limit:UInt64} OFFSET {offset:UInt64}'
-    ].join(' ')
+    request: {
+      groupBy,
+      limit,
+      offset,
+      search,
+      sort: { group: sortKey },
+      timeRange,
+      view: 'groups'
+    }
   })
 
   return groupPageFromResponse(response.data ?? [], groupBy, limit, offset)
@@ -3994,36 +3921,15 @@ async function fetchLatest({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogLatest> {
-  const parameters = { group_key: facetKey(groupBy), group_value: selectedGroupValue }
-  try {
-    const response = await postQuery<{ lastCreatedAt: string }>({
-      apiBaseUrl,
-      parameters,
-      query: [
-        'SELECT max(timestamp) AS lastCreatedAt',
-        `FROM ${fieldIndexTable()}`,
-        'PREWHERE field_name = {group_key:String} AND value = {group_value:String}'
-      ].join(' ')
-    })
-    const lastCreatedAt = normalizeTimestamp(response.data?.[0]?.lastCreatedAt)
-    if (lastCreatedAt) return { lastCreatedAt }
-  } catch (error) {
-    if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-      throw error
-    }
-  }
-
-  const valueExpression = eventValueExpression(groupBy)
-  const rawResponse = await postQuery<{ lastCreatedAt: string }>({
+  const response = await postEventsQuery<{ lastCreatedAt: string }>({
     apiBaseUrl,
-    parameters,
-    query: [
-      'SELECT max(e.timestamp) AS lastCreatedAt',
-      `FROM ${eventsTable()} AS e`,
-      `WHERE ${valueExpression} = {group_value:String}`
-    ].join(' ')
+    request: {
+      groupBy,
+      selectedGroupValue,
+      view: 'latest'
+    }
   })
-  return { lastCreatedAt: normalizeTimestamp(rawResponse.data?.[0]?.lastCreatedAt) }
+  return { lastCreatedAt: normalizeTimestamp(response.data?.[0]?.lastCreatedAt) }
 }
 
 async function fetchSummary({
@@ -4037,38 +3943,14 @@ async function fetchSummary({
   groupBy: string
   selectedGroupValue: string
 }): Promise<LogSummary> {
-  if (canUseDensityRollup({ eventFilter, groupBy, selectedGroupValue })) {
-    try {
-      const rollupSummary = await fetchSummaryFromDensityRollup({ apiBaseUrl, eventFilter })
-      if (rollupSummary.count > 0) return rollupSummary
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
-    try {
-      const fieldIndexSummary = await fetchSummaryFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, selectedGroupValue })
-      if (fieldIndexSummary.count > 0) return fieldIndexSummary
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue })
-  const response = await postQuery<{ count: number }>({
+  const response = await postEventsQuery<{ count: number }>({
     apiBaseUrl,
-    parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
-    query: [
-      'SELECT count() AS count',
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : ''
-    ].join(' ')
+    request: {
+      filter: eventFilter,
+      groupBy,
+      selectedGroupValue,
+      view: 'summary'
+    }
   })
   const count = Number(response.data?.[0]?.count) || 0
   return { capped: false, count, limit: count }
@@ -4141,61 +4023,22 @@ async function fetchEvents({
   sortDirection: EventSortDirection
   timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
-    try {
-      const fieldIndexPage = await fetchEventsFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, limit, pageParam, selectedGroupValue, sortDirection, timeRange })
-      if (fieldIndexPage.events.length > 0) return fieldIndexPage
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
   const queryOrder = sortDirection === 'desc'
     ? pageParam.after ? 'ASC' : 'DESC'
     : pageParam.before ? 'DESC' : 'ASC'
   const tableOrder = sortDirection === 'desc' ? 'DESC' : 'ASC'
-  const pageFilter = pageParam.before
-    ? "e.timestamp < {cursor:DateTime64(3, 'UTC')}"
-    : pageParam.after
-      ? "e.timestamp > {cursor:DateTime64(3, 'UTC')}"
-      : pageParam.around
-        ? "e.timestamp <= {cursor:DateTime64(3, 'UTC')}"
-        : ''
-  const parameters = {
-    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
-    limit,
-    ...(pageParam.before || pageParam.after || pageParam.around
-      ? { cursor: clickHouseDateTime64(pageParam.before || pageParam.after || pageParam.around || '') }
-      : {})
-  }
-  const filters = eventFilterClauses({
-    eventFilter,
-    groupBy,
-    selectedGroupValue,
-    timeRange,
-    prewhere: pageFilter ? [pageFilter] : []
-  })
-  const response = await postQuery<FlamegraphEventRow>({
+  const response = await postEventsQuery<FlamegraphEventRow>({
     apiBaseUrl,
-    parameters,
-    query: [
-      eventMetadataSelect('e'),
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      'WHERE (e.event_id, e.timestamp) IN (',
-      'SELECT event_id, timestamp FROM (',
-      'SELECT e.event_id AS event_id, e.timestamp AS timestamp',
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : '',
-      `ORDER BY e.timestamp ${queryOrder}, e.event_id ${queryOrder}`,
-      'LIMIT {limit:UInt64}',
-      ')',
-      ')',
-      `ORDER BY e.timestamp ${queryOrder}, e.event_id ${queryOrder}`,
-    ].join(' ')
+    request: {
+      filter: eventFilter,
+      groupBy,
+      limit,
+      page: pageParam,
+      selectedGroupValue,
+      sort: { direction: sortDirection },
+      timeRange,
+      view: 'events'
+    }
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
   if (queryOrder !== tableOrder) events.reverse()
@@ -4299,37 +4142,16 @@ async function fetchFlamegraph({
   selectedGroupValue: string
   timeRange: ResolvedTimeRange
 }): Promise<LogFlamegraph> {
-  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
-    try {
-      const fieldIndexFlamegraph = await fetchFlamegraphFromFieldIndex({ apiBaseUrl, eventFilter, groupBy, maxSpans, selectedGroupValue, timeRange })
-      if ((fieldIndexFlamegraph.spanCount ?? 0) > 0) return fieldIndexFlamegraph
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue, timeRange })
-  const response = await postQuery<FlamegraphEventRow>({
+  const response = await postEventsQuery<FlamegraphEventRow>({
     apiBaseUrl,
-    parameters: {
-      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
-      limit: maxSpans
-    },
-    query: [
-      'SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id',
-      ", ifNull(toString(e.data.parent_span_id), '') AS parent_span_id",
-      ", ifNull(toString(e.data.name), '') AS name",
-      ", ifNull(toString(e.data.start_time), '') AS start_time",
-      ", ifNull(toString(e.data.end_time), '') AS end_time",
-      ', toFloat64OrZero(toString(e.data.duration_ms)) AS duration_ms',
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : '',
-      'ORDER BY e.timestamp ASC, e.event_id ASC',
-      'LIMIT {limit:UInt64}'
-    ].join(' ')
+    request: {
+      filter: eventFilter,
+      groupBy,
+      limit: maxSpans,
+      selectedGroupValue,
+      timeRange,
+      view: 'flamegraph'
+    }
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
   const domain = queryTimeDomain({ eventFilter, fallbackFrom: events[0]?.createdAt, fallbackTo: events[events.length - 1]?.createdAt, timeRange })
@@ -4400,67 +4222,30 @@ async function fetchDensity({
   selectedGroupValue: string
   timeRange: ResolvedTimeRange
 }): Promise<LogDensity> {
-  if (canUseDensityRollup({ eventFilter, groupBy, selectedGroupValue })) {
-    try {
-      const rollupDensity = await fetchDensityFromRollup({ apiBaseUrl, buckets, eventFilter, timeRange })
-      if (rollupDensity.buckets.length > 0) return rollupDensity
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  if (groupBy && selectedGroupValue && canUseFieldIndex(eventFilter)) {
-    try {
-      const fieldIndexDensity = await fetchDensityFromFieldIndex({ apiBaseUrl, buckets, eventFilter, groupBy, selectedGroupValue, timeRange })
-      if (fieldIndexDensity.buckets.length > 0) return fieldIndexDensity
-    } catch (error) {
-      if (!(error instanceof HTTPError) || (error.status !== 400 && error.status !== 404 && error.status !== 502)) {
-        throw error
-      }
-    }
-  }
-
-  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange })
-  const filters = eventFilterClauses({ eventFilter, groupBy, selectedGroupValue, timeRange })
-  const range = await postQuery<{ count: number; from: string; to: string }>({
+  const density = await postEventsQuery<{ bucket: number; count: number; errorCount: number }>({
     apiBaseUrl,
-    parameters,
-    query: [
-      'SELECT min(e.timestamp) AS from, max(e.timestamp) AS to, count() AS count',
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : ''
-    ].join(' ')
+    request: {
+      buckets,
+      filter: eventFilter,
+      groupBy,
+      selectedGroupValue,
+      timeRange,
+      view: 'density'
+    }
   })
-  const row = range.data?.[0]
-  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
-  if (!Number(row?.count) || !domain) {
-    return { bucketMs: 1, buckets: [], from: '', to: '' }
-  }
-  const fromMs = Date.parse(domain.from)
-  const toMs = Date.parse(domain.to)
-
-  const bucketMs = niceTimeInterval(Math.max(1, (toMs - fromMs) / buckets))
-  const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
-    apiBaseUrl,
-    parameters: { ...parameters, bucket_ms: bucketMs },
-    query: [
-      'WITH intDiv(toUnixTimestamp64Milli(e.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
-      'SELECT bucket, count() AS count',
-      `, countIf(${errorExpression()}) AS errorCount`,
-      `FROM ${eventsTable()} AS e`,
-      filters.prewhere.length ? `PREWHERE ${filters.prewhere.join(' AND ')}` : '',
-      filters.where.length ? `WHERE ${filters.where.join(' AND ')}` : '',
-      'GROUP BY bucket',
-      'ORDER BY bucket ASC'
-    ].join(' ')
-  })
-
+  const rows = density.data ?? []
+  const first = rows[0]
+  const last = rows[rows.length - 1]
+  const firstStart = first ? new Date(Number(first.bucket)).toISOString() : ''
+  const lastStart = last ? new Date(Number(last.bucket)).toISOString() : ''
+  const domain = queryTimeDomain({ eventFilter, fallbackFrom: firstStart, fallbackTo: lastStart, timeRange })
+  if (!rows.length || !domain) return { bucketMs: 1, buckets: [], from: '', to: '' }
+  const bucketMs = rows.length > 1
+    ? Math.max(1, Number(rows[1]!.bucket) - Number(rows[0]!.bucket))
+    : niceTimeInterval(Math.max(1, (Date.parse(domain.to) - Date.parse(domain.from)) / buckets))
   return {
     bucketMs,
-    buckets: (density.data ?? []).map(bucket => ({
+    buckets: rows.map(bucket => ({
       count: Number(bucket.count) || 0,
       errorCount: Number(bucket.errorCount) || 0,
       start: new Date(Number(bucket.bucket)).toISOString()
@@ -4611,17 +4396,12 @@ async function fetchEvent({
     // Fall back to the read-only query endpoint when S3 reads are not configured.
   }
 
-  const response = await postQuery<EventRow>({
+  const response = await postEventsQuery<EventRow>({
     apiBaseUrl,
-    parameters: { event_id: eventId },
-    query: [
-      'SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.data AS data',
-      ', e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id',
-      `FROM ${eventsTable()} AS e`,
-      'WHERE event_id = {event_id:String}',
-      'ORDER BY timestamp ASC',
-      'LIMIT 1'
-    ].join(' ')
+    request: {
+      page: { eventId },
+      view: 'event'
+    }
   })
   const row = response.data?.[0]
   if (!row) throw new HTTPError({ message: 'event not found', status: 404 })
@@ -4639,6 +4419,29 @@ async function postQuery<T>({
 }): Promise<ClickHouseResponse<T>> {
   const response = await fetch(queryUrl(apiBaseUrl), {
     body: JSON.stringify({ parameters, query }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  return (await response.json()) as ClickHouseResponse<T>
+}
+
+async function postEventsQuery<T>({
+  apiBaseUrl,
+  request
+}: {
+  apiBaseUrl: string
+  request: EventsQueryRequest
+}): Promise<ClickHouseResponse<T>> {
+  const response = await fetch(eventsQueryUrl(apiBaseUrl), {
+    body: JSON.stringify(request),
     credentials: 'include',
     headers: queryHeaders(),
     method: 'POST'
@@ -4749,6 +4552,11 @@ async function revokeApiKey({
 function queryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/v1/query` : '/v1/query'
+}
+
+function eventsQueryUrl(apiBaseUrl: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/v1/events/query` : '/v1/events/query'
 }
 
 function eventUrl(apiBaseUrl: string, eventId: string) {
@@ -5516,13 +5324,6 @@ function facetFilterInputText(facet: ParsedFacetFilter, index: number) {
       ? `${facet.path} IN ${value}`
       : `${facet.path}=${value}`
   return `${join}${negated}${expression}`
-}
-
-function eventFilterWithoutTimeRange(filter: ParsedEventFilter): ParsedEventFilter {
-  return {
-    ...(filter.facets?.length ? { facets: filter.facets } : {}),
-    text: filter.text
-  }
 }
 
 function serializeEventFilter(filter: ParsedEventFilter) {

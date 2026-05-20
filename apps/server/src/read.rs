@@ -8,7 +8,7 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlparser::{dialect::ClickHouseDialect, parser::Parser};
 use tracing::warn;
@@ -26,9 +26,149 @@ pub struct ReadStore {
 pub struct QueryRequest {
     pub query: String,
     #[serde(default)]
-    pub parameters: serde_json::Map<String, Value>,
+    pub parameters: Map<String, Value>,
     #[serde(default)]
     pub allow_stale_serving: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsQueryRequest {
+    #[serde(default)]
+    pub view: EventsQueryView,
+    #[serde(default)]
+    pub filter: EventFilter,
+    #[serde(default)]
+    pub group_by: String,
+    #[serde(default)]
+    pub selected_group_value: String,
+    #[serde(default)]
+    pub time_range: Option<EventTimeRange>,
+    #[serde(default)]
+    pub page: EventPage,
+    #[serde(default = "default_events_query_limit")]
+    pub limit: u64,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "default_events_query_buckets")]
+    pub buckets: u64,
+    #[serde(default)]
+    pub sort: EventsQuerySort,
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub allow_stale_serving: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventsQueryView {
+    GroupOptions,
+    Groups,
+    Latest,
+    Summary,
+    #[default]
+    Events,
+    Density,
+    Flamegraph,
+    Event,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventFilter {
+    #[serde(default)]
+    pub created_after: String,
+    #[serde(default)]
+    pub created_before: String,
+    #[serde(default)]
+    pub facets: Vec<EventFacetFilter>,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventFacetFilter {
+    #[serde(default)]
+    pub join: EventFacetJoin,
+    #[serde(default)]
+    pub negated: bool,
+    #[serde(default)]
+    pub operator: EventFacetOperator,
+    pub path: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventFacetJoin {
+    #[default]
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventFacetOperator {
+    Contains,
+    #[default]
+    Eq,
+    In,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventTimeRange {
+    #[serde(default)]
+    pub created_after: String,
+    #[serde(default)]
+    pub created_before: String,
+    #[serde(default)]
+    pub lookback_minutes: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventPage {
+    #[serde(default)]
+    pub after: String,
+    #[serde(default)]
+    pub around: String,
+    #[serde(default)]
+    pub before: String,
+    #[serde(default)]
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsQuerySort {
+    #[serde(default)]
+    pub direction: EventSortDirection,
+    #[serde(default)]
+    pub group: GroupSortKey,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupSortKey {
+    #[default]
+    Count,
+    Duration,
+    Recent,
+    Value,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -156,6 +296,460 @@ impl ReadStore {
         })
         .await;
         Ok(response)
+    }
+
+    pub async fn events_query(
+        &self,
+        mut request: EventsQueryRequest,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        request.limit = request.limit.clamp(1, 10_000);
+        request.buckets = request.buckets.clamp(1, 2_000);
+
+        let catalog = match self.event_field_catalog(tenant_id, request.allow_stale_serving).await {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                warn!(error = %err, "failed to load promoted field catalog; using raw fallback planning");
+                EventFieldCatalog::default()
+            }
+        };
+
+        match request.view {
+            EventsQueryView::GroupOptions => {
+                let mut parameters = Map::new();
+                parameters.insert("limit".to_string(), Value::from(request.limit));
+                self.query(
+                    QueryRequest {
+                        query: group_options_query(),
+                        parameters,
+                        allow_stale_serving: true,
+                    },
+                    tenant_id,
+                )
+                    .await
+            }
+            EventsQueryView::Groups => self.groups_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Latest => self.latest_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Summary => self.summary_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Events => self.events_page_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Density => self.density_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Flamegraph => self.flamegraph_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Event => self.event_query(&request, tenant_id).await,
+        }
+    }
+
+    async fn run_events_query_sql(
+        &self,
+        query: String,
+        parameters: Map<String, Value>,
+        request: &EventsQueryRequest,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        self.query(
+            QueryRequest {
+                query,
+                parameters,
+                allow_stale_serving: request.allow_stale_serving,
+            },
+            tenant_id,
+        )
+        .await
+    }
+
+    async fn event_field_catalog(
+        &self,
+        tenant_id: &str,
+        allow_stale_serving: bool,
+    ) -> Result<EventFieldCatalog, ReadError> {
+        let response = self
+            .query(
+                QueryRequest {
+                    query: "SELECT name FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)".to_string(),
+                    parameters: Map::new(),
+                    allow_stale_serving,
+                },
+                tenant_id,
+            )
+            .await?;
+        let mut catalog = EventFieldCatalog::default();
+        if let Some(rows) = response.get("data").and_then(Value::as_array) {
+            for row in rows {
+                if let Some(name) = row.get("name").and_then(Value::as_str) {
+                    catalog.promoted.insert(normalized_payload_path(name));
+                }
+            }
+        }
+        Ok(catalog)
+    }
+
+    async fn groups_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        let group_by = facet_key(&request.group_by)?;
+        let (primary_query, primary_parameters) = if catalog.core_rollup_contains(&group_by) {
+            grouped_rollup_query(request, &group_by)
+        } else if catalog.lookup_contains(&group_by) {
+            grouped_index_query(request, &group_by, "field_values", false)
+        } else if catalog.promoted_contains(&group_by) {
+            grouped_index_query(request, &group_by, "field_index", true)
+        } else {
+            raw_groups_query(request, &group_by)?
+        };
+
+        let response = self
+            .run_events_query_sql(primary_query, primary_parameters, request, tenant_id)
+            .await?;
+        if response_data_len(&response) > 0 || !catalog.has_indexed_path(&group_by) {
+            return Ok(response);
+        }
+
+        let (query, parameters) = raw_groups_query(request, &group_by)?;
+        self.run_events_query_sql(query, parameters, request, tenant_id)
+            .await
+    }
+
+    async fn latest_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        if request.filter.facets.is_empty()
+            && request.filter.text.trim().is_empty()
+            && !request.group_by.trim().is_empty()
+            && !request.selected_group_value.is_empty()
+        {
+            let group_by = facet_key(&request.group_by)?;
+            if catalog.core_rollup_contains(&group_by) {
+                let (query, parameters) = latest_grouped_rollup_query(request, &group_by);
+                return self
+                    .run_events_query_sql(query, parameters, request, tenant_id)
+                    .await;
+            }
+            if catalog.lookup_contains(&group_by) {
+                let (query, parameters) =
+                    latest_grouped_index_query(request, &group_by, "field_values", false);
+                return self
+                    .run_events_query_sql(query, parameters, request, tenant_id)
+                    .await;
+            }
+            if catalog.promoted_contains(&group_by) {
+                let (query, parameters) =
+                    latest_grouped_index_query(request, &group_by, "field_index", true);
+                return self
+                    .run_events_query_sql(query, parameters, request, tenant_id)
+                    .await;
+            }
+        }
+
+        let plan = EventPredicatePlan::new(request, catalog, "e")?;
+        let where_clause = plan.where_clause();
+        self.run_events_query_sql(
+            [
+                "SELECT max(e.timestamp) AS lastCreatedAt".to_string(),
+                "FROM events AS e".to_string(),
+                where_clause,
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+            plan.parameters,
+            request,
+            tenant_id,
+        )
+        .await
+    }
+
+    async fn summary_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        if request.selected_group_value.is_empty()
+            && request.group_by.is_empty()
+            && request.filter.facets.is_empty()
+            && request.filter.text.trim().is_empty()
+        {
+            let (time_clause, parameters) = time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+            return self
+                .run_events_query_sql(
+                    [
+                        "SELECT sum(count) AS count".to_string(),
+                        "FROM event_density_1s AS d".to_string(),
+                        where_keyword(time_clause),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                    parameters,
+                    request,
+                    tenant_id,
+                )
+                .await;
+        }
+
+        let plan = EventPredicatePlan::new(request, catalog, "e")?;
+        self.run_events_query_sql(
+            [
+                "SELECT count() AS count".to_string(),
+                "FROM events AS e".to_string(),
+                plan.where_clause(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+            plan.parameters,
+            request,
+            tenant_id,
+        )
+        .await
+    }
+
+    async fn events_page_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        let mut plan = EventPredicatePlan::new(request, catalog, "e")?;
+        let page_filter = event_page_filter(request, "e", &mut plan.parameters);
+        if !page_filter.is_empty() {
+            plan.clauses.push(page_filter);
+        }
+        let query_order = event_query_order(request);
+        let query = [
+            event_metadata_select("e"),
+            "FROM events AS e".to_string(),
+            "WHERE (e.event_id, e.timestamp) IN (".to_string(),
+            "SELECT event_id, timestamp FROM (".to_string(),
+            "SELECT e.event_id AS event_id, e.timestamp AS timestamp".to_string(),
+            "FROM events AS e".to_string(),
+            plan.where_clause(),
+            format!("ORDER BY e.timestamp {query_order}, e.event_id {query_order}"),
+            "LIMIT {limit:UInt64}".to_string(),
+            ")".to_string(),
+            ")".to_string(),
+            format!("ORDER BY e.timestamp {query_order}, e.event_id {query_order}"),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        plan.parameters
+            .insert("limit".to_string(), Value::from(request.limit));
+        self.run_events_query_sql(query, plan.parameters, request, tenant_id)
+            .await
+    }
+
+    async fn density_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        if request.selected_group_value.is_empty()
+            && request.group_by.is_empty()
+            && request.filter.facets.is_empty()
+            && request.filter.text.trim().is_empty()
+        {
+            let (time_clause, mut parameters) =
+                time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+            parameters.insert("buckets".to_string(), Value::from(request.buckets));
+            let range = self
+                .run_events_query_sql(
+                    [
+                        "SELECT min(d.bucket_time) AS from, max(d.bucket_time) AS to, sum(d.count) AS count".to_string(),
+                        "FROM event_density_1s AS d".to_string(),
+                        where_keyword(time_clause.clone()),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                    parameters.clone(),
+                    request,
+                    tenant_id,
+                )
+                .await?;
+            let bucket_ms = density_bucket_ms(&range, request.buckets, 1_000);
+            parameters.insert("bucket_ms".to_string(), Value::from(bucket_ms));
+            return self
+                .run_events_query_sql(
+                    [
+                        "WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                        "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
+                        "FROM event_density_1s AS d".to_string(),
+                        where_keyword(time_clause),
+                        "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                    parameters,
+                    request,
+                    tenant_id,
+                )
+                .await;
+        }
+
+        if request.filter.facets.is_empty()
+            && request.filter.text.trim().is_empty()
+            && !request.group_by.is_empty()
+            && !request.selected_group_value.is_empty()
+        {
+            let group_by = facet_key(&request.group_by)?;
+            if catalog.core_rollup_contains(&group_by) {
+                let (time_clause, mut parameters) =
+                    time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+                parameters.insert("group_key".to_string(), Value::from(group_by));
+                parameters.insert(
+                    "group_value".to_string(),
+                    Value::from(request.selected_group_value.clone()),
+                );
+                let base = [
+                    "FROM field_density_1s AS d".to_string(),
+                    where_keyword(join_clauses(vec![
+                        "d.field_name = {group_key:String}".to_string(),
+                        "d.value = {group_value:String}".to_string(),
+                        time_clause.clone(),
+                    ])),
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+                let range = self
+                    .run_events_query_sql(
+                        format!("SELECT min(d.bucket_time) AS from, max(d.bucket_time) AS to, sum(d.count) AS count {base}"),
+                        parameters.clone(),
+                        request,
+                        tenant_id,
+                    )
+                    .await?;
+                let bucket_ms = density_bucket_ms(&range, request.buckets, 1);
+                parameters.insert("bucket_ms".to_string(), Value::from(bucket_ms));
+                return self
+                    .run_events_query_sql(
+                        [
+                            "WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                            "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
+                            base,
+                            "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+                        ]
+                        .join(" "),
+                        parameters,
+                        request,
+                        tenant_id,
+                    )
+                    .await;
+            }
+        }
+
+        let plan = EventPredicatePlan::new(request, catalog, "e")?;
+        let range = self
+            .run_events_query_sql(
+                [
+                    "SELECT min(e.timestamp) AS from, max(e.timestamp) AS to, count() AS count".to_string(),
+                    "FROM events AS e".to_string(),
+                    plan.where_clause(),
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+                plan.parameters.clone(),
+                request,
+                tenant_id,
+            )
+            .await?;
+        let mut parameters = plan.parameters;
+        parameters.insert(
+            "bucket_ms".to_string(),
+            Value::from(density_bucket_ms(&range, request.buckets, 1)),
+        );
+        self.run_events_query_sql(
+            [
+                "WITH intDiv(toUnixTimestamp64Milli(e.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                "SELECT bucket, count() AS count".to_string(),
+                format!(", countIf({}) AS errorCount", error_expression("e")),
+                "FROM events AS e".to_string(),
+                EventPredicatePlan { parameters: parameters.clone(), ..plan }.where_clause(),
+                "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+            parameters,
+            request,
+            tenant_id,
+        )
+        .await
+    }
+
+    async fn flamegraph_query(
+        &self,
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        let mut plan = EventPredicatePlan::new(request, catalog, "e")?;
+        plan.parameters
+            .insert("limit".to_string(), Value::from(request.limit));
+        self.run_events_query_sql(
+            [
+                flamegraph_select("e"),
+                "FROM events AS e".to_string(),
+                plan.where_clause(),
+                "ORDER BY e.timestamp ASC, e.event_id ASC".to_string(),
+                "LIMIT {limit:UInt64}".to_string(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+            plan.parameters,
+            request,
+            tenant_id,
+        )
+        .await
+    }
+
+    async fn event_query(
+        &self,
+        request: &EventsQueryRequest,
+        tenant_id: &str,
+    ) -> Result<Value, ReadError> {
+        if request.page.event_id.trim().is_empty() {
+            return Err(ReadError::InvalidQuery("event_id is required".to_string()));
+        }
+        let mut parameters = Map::new();
+        parameters.insert(
+            "event_id".to_string(),
+            Value::from(request.page.event_id.clone()),
+        );
+        self.run_events_query_sql(
+            [
+                "SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.data AS data".to_string(),
+                ", e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id".to_string(),
+                "FROM events AS e".to_string(),
+                "WHERE e.event_id = {event_id:String}".to_string(),
+                "ORDER BY e.timestamp ASC LIMIT 1".to_string(),
+            ]
+            .join(" "),
+            parameters,
+            request,
+            tenant_id,
+        )
+        .await
     }
 
     pub async fn event_bytes(&self, event_id: &str, tenant_id: &str) -> Result<Bytes, ReadError> {
@@ -553,6 +1147,851 @@ impl ReadStore {
             })
             .collect()
     }
+}
+
+fn default_events_query_limit() -> u64 {
+    100
+}
+
+fn default_events_query_buckets() -> u64 {
+    120
+}
+
+#[derive(Clone, Default)]
+struct EventFieldCatalog {
+    promoted: BTreeSet<String>,
+}
+
+impl EventFieldCatalog {
+    fn promoted_contains(&self, path: &str) -> bool {
+        self.promoted.contains(path)
+    }
+
+    fn lookup_contains(&self, path: &str) -> bool {
+        LOOKUP_FIELD_NAMES.contains(&path)
+    }
+
+    fn core_rollup_contains(&self, path: &str) -> bool {
+        CORE_ROLLUP_FIELD_NAMES.contains(&path)
+    }
+
+    fn has_indexed_path(&self, path: &str) -> bool {
+        self.promoted_contains(path) || self.lookup_contains(path)
+    }
+
+    fn index_table(&self, path: &str) -> Option<IndexTable> {
+        if self.lookup_contains(path) {
+            Some(IndexTable::FieldValues)
+        } else if self.promoted_contains(path) {
+            Some(IndexTable::FieldIndex)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IndexTable {
+    FieldIndex,
+    FieldValues,
+}
+
+impl IndexTable {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::FieldIndex => "field_index",
+            Self::FieldValues => "field_values",
+        }
+    }
+
+    fn include_mode(self) -> bool {
+        matches!(self, Self::FieldIndex)
+    }
+}
+
+const CORE_ROLLUP_FIELD_NAMES: &[&str] = &[
+    "signal",
+    "event_type",
+    "name",
+    "service",
+    "environment",
+    "is_error",
+    "http.method",
+    "http.route",
+    "http.status_code",
+    "severity_text",
+    "severity_number",
+    "model",
+    "provider",
+    "tool_name",
+    "processor_name",
+    "plan",
+    "country",
+    "region",
+    "user_group",
+    "user_id",
+    "account_id",
+];
+
+const LOOKUP_FIELD_NAMES: &[&str] = &[
+    "trace_id",
+    "span_id",
+    "request_id",
+    "user_id",
+    "anonymous_id",
+    "account_id",
+    "session_id",
+    "group_id",
+    "organization_id",
+    "thread_id",
+    "conversation_id",
+];
+
+#[derive(Clone)]
+struct EventPredicatePlan {
+    clauses: Vec<String>,
+    parameters: Map<String, Value>,
+}
+
+impl EventPredicatePlan {
+    fn new(
+        request: &EventsQueryRequest,
+        catalog: &EventFieldCatalog,
+        alias: &str,
+    ) -> Result<Self, ReadError> {
+        let mut builder = SqlBuilder::default();
+        let mut clauses = Vec::new();
+        let (time_clause, time_parameters) =
+            time_where_clause(&request.filter, request.time_range.as_ref(), &format!("{alias}.timestamp"));
+        clauses.push(time_clause);
+        builder.parameters.extend(time_parameters);
+
+        if !request.group_by.trim().is_empty() && !request.selected_group_value.is_empty() {
+            let path = facet_key(&request.group_by)?;
+            let value_param = builder.push_string("group_value", &request.selected_group_value);
+            let group_clause = if let Some(index_table) = catalog.index_table(&path) {
+                indexed_value_clause(alias, index_table, &path, vec![value_param], &request.filter, request.time_range.as_ref(), &mut builder)
+            } else {
+                format!("{} = {{{value_param}:String}}", event_value_expression(&path, alias)?)
+            };
+            clauses.push(group_clause);
+        }
+
+        let facet_expr = filter_facets_expression(&request.filter.facets, catalog, alias, &request.filter, request.time_range.as_ref(), &mut builder)?;
+        clauses.push(facet_expr);
+
+        if !request.filter.text.trim().is_empty() {
+            let param = builder.push_string("event_filter", request.filter.text.trim());
+            clauses.push(format!(
+                "(positionCaseInsensitive(toJSONString({alias}.data), {{{param}:String}}) > 0 OR positionCaseInsensitive({alias}.event_id, {{{param}:String}}) > 0)"
+            ));
+        }
+
+        Ok(Self {
+            clauses: clauses.into_iter().filter(|clause| !clause.is_empty()).collect(),
+            parameters: builder.parameters,
+        })
+    }
+
+    fn where_clause(&self) -> String {
+        where_keyword(join_clauses(self.clauses.clone()))
+    }
+}
+
+#[derive(Default)]
+struct SqlBuilder {
+    parameters: Map<String, Value>,
+    next_parameter: usize,
+}
+
+impl SqlBuilder {
+    fn push_string(&mut self, prefix: &str, value: &str) -> String {
+        let key = self.next_key(prefix);
+        self.parameters
+            .insert(key.clone(), Value::String(value.to_string()));
+        key
+    }
+
+    fn next_key(&mut self, prefix: &str) -> String {
+        let key = format!("{prefix}_{}", self.next_parameter);
+        self.next_parameter += 1;
+        key
+    }
+}
+
+fn filter_facets_expression(
+    facets: &[EventFacetFilter],
+    catalog: &EventFieldCatalog,
+    alias: &str,
+    filter: &EventFilter,
+    time_range: Option<&EventTimeRange>,
+    builder: &mut SqlBuilder,
+) -> Result<String, ReadError> {
+    let mut branches: Vec<Vec<&EventFacetFilter>> = vec![Vec::new()];
+    for facet in facets {
+        if facet.join == EventFacetJoin::Or && branches.last().is_some_and(|branch| !branch.is_empty()) {
+            branches.push(Vec::new());
+        }
+        if let Some(branch) = branches.last_mut() {
+            branch.push(facet);
+        }
+    }
+
+    let mut branch_sql = Vec::new();
+    for branch in branches {
+        let mut clauses = Vec::new();
+        for facet in branch {
+            clauses.push(facet_clause(facet, catalog, alias, filter, time_range, builder)?);
+        }
+        let joined = join_clauses(clauses);
+        if !joined.is_empty() {
+            branch_sql.push(format!("({joined})"));
+        }
+    }
+
+    Ok(match branch_sql.len() {
+        0 => String::new(),
+        1 => branch_sql.remove(0),
+        _ => format!("({})", branch_sql.join(" OR ")),
+    })
+}
+
+fn facet_clause(
+    facet: &EventFacetFilter,
+    catalog: &EventFieldCatalog,
+    alias: &str,
+    filter: &EventFilter,
+    time_range: Option<&EventTimeRange>,
+    builder: &mut SqlBuilder,
+) -> Result<String, ReadError> {
+    let path = facet_key(&facet.path)?;
+    let operator = facet.operator;
+    let values = facet_values(facet);
+    if !facet.negated && matches!(operator, EventFacetOperator::Eq | EventFacetOperator::In) {
+        if let Some(index_table) = catalog.index_table(&path) {
+            let params = values
+                .iter()
+                .map(|value| builder.push_string("facet_value", value))
+                .collect::<Vec<_>>();
+            return Ok(indexed_value_clause(alias, index_table, &path, params, filter, time_range, builder));
+        }
+    }
+
+    let expression = event_value_expression(&path, alias)?;
+    let mut clause = match operator {
+        EventFacetOperator::Contains => {
+            let value = values.first().cloned().unwrap_or_default();
+            let param = builder.push_string("facet_value", &value);
+            format!("positionCaseInsensitive({expression}, {{{param}:String}}) > 0")
+        }
+        EventFacetOperator::In => {
+            if values.is_empty() {
+                "0".to_string()
+            } else {
+                let placeholders = values
+                    .iter()
+                    .map(|value| {
+                        let param = builder.push_string("facet_value", value);
+                        format!("{{{param}:String}}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{expression} IN ({placeholders})")
+            }
+        }
+        EventFacetOperator::Eq => {
+            let value = values.first().cloned().unwrap_or_default();
+            let param = builder.push_string("facet_value", &value);
+            format!("{expression} = {{{param}:String}}")
+        }
+    };
+    if facet.negated {
+        clause = format!("NOT ({clause})");
+    }
+    Ok(format!("({clause})"))
+}
+
+fn facet_values(facet: &EventFacetFilter) -> Vec<String> {
+    if facet.operator == EventFacetOperator::In {
+        facet
+            .values
+            .iter()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect()
+    } else if facet.value.is_empty() {
+        Vec::new()
+    } else {
+        vec![facet.value.clone()]
+    }
+}
+
+fn indexed_value_clause(
+    alias: &str,
+    index_table: IndexTable,
+    path: &str,
+    value_params: Vec<String>,
+    filter: &EventFilter,
+    time_range: Option<&EventTimeRange>,
+    builder: &mut SqlBuilder,
+) -> String {
+    let field_param = builder.push_string("facet_key", path);
+    let value_clause = if value_params.len() == 1 {
+        format!("idx.value = {{{}:String}}", value_params[0])
+    } else {
+        let placeholders = value_params
+            .iter()
+            .map(|param| format!("{{{param}:String}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("idx.value IN ({placeholders})")
+    };
+    let (time_clause, time_parameters) = time_where_clause(filter, time_range, "idx.timestamp");
+    builder.parameters.extend(time_parameters);
+    let mode_clause = if index_table.include_mode() {
+        "idx.mode IN ('facet', 'lookup')".to_string()
+    } else {
+        String::new()
+    };
+    let subquery_where = join_clauses(vec![
+        format!("idx.field_name = {{{field_param}:String}}"),
+        value_clause,
+        mode_clause,
+        time_clause,
+    ]);
+    format!(
+        "{alias}.event_id IN (SELECT idx.event_id FROM {} AS idx WHERE {subquery_where})",
+        index_table.table_name()
+    )
+}
+
+fn group_options_query() -> String {
+    let fields = CORE_ROLLUP_FIELD_NAMES
+        .iter()
+        .chain(LOOKUP_FIELD_NAMES.iter())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|field| format!("'{}'", field.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT path, max(cardinality) AS cardinality, any(valueType) AS valueType, toBool(0) AS capped FROM (SELECT arrayJoin([{fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType UNION ALL SELECT name AS path, toUInt64(0) AS cardinality, ifNull(toString(config.value_type), 'string') AS valueType FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)) GROUP BY path ORDER BY cardinality DESC, path ASC LIMIT {{limit:UInt64}}"
+    )
+}
+
+fn grouped_rollup_query(request: &EventsQueryRequest, group_by: &str) -> (String, Map<String, Value>) {
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
+    parameters.insert("limit".to_string(), Value::from(request.limit + 1));
+    parameters.insert("offset".to_string(), Value::from(request.offset));
+    let mut clauses = vec![
+        "field_name = {group_key:String}".to_string(),
+        time_range_clause(request.time_range.as_ref(), "bucket_time"),
+    ];
+    if !request.search.is_empty() {
+        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        clauses.push("value = {group_value:String}".to_string());
+    }
+    (
+        [
+            "SELECT value".to_string(),
+            ", min(bucket_time) AS startedAt, max(bucket_time) AS endedAt".to_string(),
+            ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs".to_string(),
+            ", sum(count) AS count, sum(error_count) AS errorCount".to_string(),
+            "FROM field_topk_1m".to_string(),
+            where_keyword(join_clauses(clauses)),
+            "GROUP BY value".to_string(),
+            group_order_by_clause(group_by, true, request.sort.group),
+            "LIMIT {limit:UInt64} OFFSET {offset:UInt64}".to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+        parameters,
+    )
+}
+
+fn grouped_index_query(
+    request: &EventsQueryRequest,
+    group_by: &str,
+    table: &str,
+    include_mode: bool,
+) -> (String, Map<String, Value>) {
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
+    parameters.insert("limit".to_string(), Value::from(request.limit + 1));
+    parameters.insert("offset".to_string(), Value::from(request.offset));
+    let mut clauses = vec![
+        "field_name = {group_key:String}".to_string(),
+        "value != ''".to_string(),
+        time_range_clause(request.time_range.as_ref(), "timestamp"),
+    ];
+    if include_mode {
+        clauses.push("mode IN ('facet', 'lookup')".to_string());
+    }
+    if !request.search.is_empty() {
+        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        clauses.push("value = {group_value:String}".to_string());
+    }
+    let count_expression = if table == "field_index" {
+        "uniqExact(event_id)"
+    } else {
+        "count()"
+    };
+    (
+        [
+            "SELECT value".to_string(),
+            ", min(timestamp) AS startedAt, max(timestamp) AS endedAt".to_string(),
+            ", dateDiff('millisecond', min(timestamp), max(timestamp)) AS durationMs".to_string(),
+            format!(", {count_expression} AS count"),
+            ", sum(toUInt64(is_error)) AS errorCount".to_string(),
+            format!("FROM {table}"),
+            where_keyword(join_clauses(clauses)),
+            "GROUP BY value".to_string(),
+            group_order_by_clause(group_by, true, request.sort.group),
+            "LIMIT {limit:UInt64} OFFSET {offset:UInt64}".to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+        parameters,
+    )
+}
+
+fn latest_grouped_rollup_query(
+    request: &EventsQueryRequest,
+    group_by: &str,
+) -> (String, Map<String, Value>) {
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
+    parameters.insert(
+        "group_value".to_string(),
+        Value::from(request.selected_group_value.clone()),
+    );
+    let clauses = vec![
+        "field_name = {group_key:String}".to_string(),
+        "value = {group_value:String}".to_string(),
+        time_range_clause(request.time_range.as_ref(), "bucket_time"),
+    ];
+    (
+        [
+            "SELECT max(bucket_time) AS lastCreatedAt".to_string(),
+            "FROM field_topk_1m".to_string(),
+            where_keyword(join_clauses(clauses)),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+        parameters,
+    )
+}
+
+fn latest_grouped_index_query(
+    request: &EventsQueryRequest,
+    group_by: &str,
+    table: &str,
+    include_mode: bool,
+) -> (String, Map<String, Value>) {
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
+    parameters.insert(
+        "group_value".to_string(),
+        Value::from(request.selected_group_value.clone()),
+    );
+    let mut clauses = vec![
+        "field_name = {group_key:String}".to_string(),
+        "value = {group_value:String}".to_string(),
+        time_range_clause(request.time_range.as_ref(), "timestamp"),
+    ];
+    if include_mode {
+        clauses.push("mode IN ('facet', 'lookup')".to_string());
+    }
+    (
+        [
+            "SELECT max(timestamp) AS lastCreatedAt".to_string(),
+            format!("FROM {table}"),
+            where_keyword(join_clauses(clauses)),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+        parameters,
+    )
+}
+
+fn raw_groups_query(
+    request: &EventsQueryRequest,
+    group_by: &str,
+) -> Result<(String, Map<String, Value>), ReadError> {
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("limit".to_string(), Value::from(request.limit + 1));
+    parameters.insert("offset".to_string(), Value::from(request.offset));
+    let value_expression = event_value_expression(group_by, "e")?;
+    let mut clauses = vec![
+        format!("{value_expression} != ''"),
+        time_range_clause(request.time_range.as_ref(), "e.timestamp"),
+    ];
+    if !request.search.is_empty() {
+        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        clauses.push(format!("{value_expression} = {{group_value:String}}"));
+    }
+    Ok((
+        [
+            format!("SELECT {value_expression} AS value"),
+            ", min(e.timestamp) AS startedAt, max(e.timestamp) AS endedAt".to_string(),
+            ", dateDiff('millisecond', min(e.timestamp), max(e.timestamp)) AS durationMs".to_string(),
+            ", count() AS count".to_string(),
+            format!(", countIf({}) AS errorCount", error_expression("e")),
+            "FROM events AS e".to_string(),
+            where_keyword(join_clauses(clauses)),
+            "GROUP BY value".to_string(),
+            group_order_by_clause(group_by, true, request.sort.group),
+            "LIMIT {limit:UInt64} OFFSET {offset:UInt64}".to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+        parameters,
+    ))
+}
+
+fn event_page_filter(
+    request: &EventsQueryRequest,
+    alias: &str,
+    parameters: &mut Map<String, Value>,
+) -> String {
+    let cursor = if !request.page.before.is_empty() {
+        Some(("<", request.page.before.as_str()))
+    } else if !request.page.after.is_empty() {
+        Some((">", request.page.after.as_str()))
+    } else if !request.page.around.is_empty() {
+        Some(("<=", request.page.around.as_str()))
+    } else {
+        None
+    };
+    let Some((operator, value)) = cursor else {
+        return String::new();
+    };
+    parameters.insert("cursor".to_string(), Value::from(clickhouse_datetime64(value)));
+    format!("{alias}.timestamp {operator} {{cursor:DateTime64(3, 'UTC')}}")
+}
+
+fn event_query_order(request: &EventsQueryRequest) -> &'static str {
+    match request.sort.direction {
+        EventSortDirection::Desc if !request.page.after.is_empty() => "ASC",
+        EventSortDirection::Desc => "DESC",
+        EventSortDirection::Asc if !request.page.before.is_empty() => "DESC",
+        EventSortDirection::Asc => "ASC",
+    }
+}
+
+fn time_where_clause(
+    filter: &EventFilter,
+    time_range: Option<&EventTimeRange>,
+    column: &str,
+) -> (String, Map<String, Value>) {
+    let mut clauses = Vec::new();
+    let mut parameters = Map::new();
+    if !filter.created_after.is_empty() {
+        parameters.insert(
+            "created_after".to_string(),
+            Value::from(clickhouse_datetime64(&filter.created_after)),
+        );
+        clauses.push(format!("{column} >= {{created_after:DateTime64(3, 'UTC')}}"));
+    }
+    if !filter.created_before.is_empty() {
+        parameters.insert(
+            "created_before".to_string(),
+            Value::from(clickhouse_datetime64(&filter.created_before)),
+        );
+        clauses.push(format!("{column} <= {{created_before:DateTime64(3, 'UTC')}}"));
+    }
+    if filter.created_after.is_empty() && filter.created_before.is_empty() {
+        let range_clause = time_range_clause(time_range, column);
+        if !range_clause.is_empty() {
+            clauses.push(range_clause);
+            parameters.extend(time_parameters(time_range));
+        }
+    }
+    (join_clauses(clauses), parameters)
+}
+
+fn time_range_clause(time_range: Option<&EventTimeRange>, column: &str) -> String {
+    let Some(time_range) = time_range else {
+        return String::new();
+    };
+    if time_range.lookback_minutes > 0 {
+        return format!("{column} >= now64(3) - toIntervalMinute({{lookback_minutes:UInt64}})");
+    }
+    join_clauses(vec![
+        if time_range.created_after.is_empty() {
+            String::new()
+        } else {
+            format!("{column} >= {{created_after:DateTime64(3, 'UTC')}}")
+        },
+        if time_range.created_before.is_empty() {
+            String::new()
+        } else {
+            format!("{column} <= {{created_before:DateTime64(3, 'UTC')}}")
+        },
+    ])
+}
+
+fn time_parameters(time_range: Option<&EventTimeRange>) -> Map<String, Value> {
+    let mut parameters = Map::new();
+    let Some(time_range) = time_range else {
+        return parameters;
+    };
+    if time_range.lookback_minutes > 0 {
+        parameters.insert(
+            "lookback_minutes".to_string(),
+            Value::from(time_range.lookback_minutes),
+        );
+    }
+    if !time_range.created_after.is_empty() {
+        parameters.insert(
+            "created_after".to_string(),
+            Value::from(clickhouse_datetime64(&time_range.created_after)),
+        );
+    }
+    if !time_range.created_before.is_empty() {
+        parameters.insert(
+            "created_before".to_string(),
+            Value::from(clickhouse_datetime64(&time_range.created_before)),
+        );
+    }
+    parameters
+}
+
+fn where_keyword(clause: String) -> String {
+    if clause.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {clause}")
+    }
+}
+
+fn join_clauses(clauses: Vec<String>) -> String {
+    clauses
+        .into_iter()
+        .filter(|clause| !clause.is_empty())
+        .map(|clause| format!("({clause})"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn event_metadata_select(alias: &str) -> String {
+    flamegraph_select(alias)
+}
+
+fn flamegraph_select(alias: &str) -> String {
+    format!(
+        "SELECT {alias}.event_id AS event_id, {alias}.timestamp AS timestamp, {alias}.event_type AS event_type, {alias}.signal AS signal, {alias}.trace_id AS trace_id, {alias}.span_id AS span_id, ifNull(toString({alias}.data.parent_span_id), '') AS parent_span_id, ifNull(toString({alias}.data.name), '') AS name, ifNull(toString({alias}.data.start_time), '') AS start_time, ifNull(toString({alias}.data.end_time), '') AS end_time, toFloat64OrZero(toString({alias}.data.duration_ms)) AS duration_ms"
+    )
+}
+
+fn event_value_expression(path: &str, alias: &str) -> Result<String, ReadError> {
+    let column = promoted_string_column(path, alias);
+    if !column.is_empty() {
+        return Ok(format!("ifNull(toString(nullIf({column}, '')), '')"));
+    }
+    if !is_supported_path(path) {
+        return Err(ReadError::InvalidQuery(format!(
+            "unsupported field path: {path}"
+        )));
+    }
+    Ok(format!("ifNull(toString({alias}.data.{path}), '')"))
+}
+
+fn promoted_string_column(path: &str, alias: &str) -> String {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    match path {
+        "tenant_id" => format!("{prefix}tenant_id"),
+        "trace_id" => format!("{prefix}trace_id"),
+        "span_id" => format!("{prefix}span_id"),
+        "event_type" => format!("{prefix}event_type"),
+        "signal" => format!("{prefix}signal"),
+        _ => String::new(),
+    }
+}
+
+fn error_expression(alias: &str) -> String {
+    [
+        format!("lowerUTF8(ifNull(toString({alias}.data.is_error), '')) IN ('1', 'true')"),
+        format!("lowerUTF8(ifNull(toString({alias}.data.span_status_code), '')) = 'error'"),
+        format!("endsWith(lowerUTF8(ifNull(toString({alias}.data.event_type), '')), '_error')"),
+    ]
+    .join(" OR ")
+}
+
+fn facet_key(path: &str) -> Result<String, ReadError> {
+    let path = match path {
+        "traceId" => "trace_id".to_string(),
+        "spanId" => "span_id".to_string(),
+        "parentSpanId" => "parent_span_id".to_string(),
+        "startedAt" => "start_time".to_string(),
+        "endedAt" => "end_time".to_string(),
+        "durationMs" => "duration_ms".to_string(),
+        other => normalized_payload_path(other),
+    };
+    if is_supported_path(&path) {
+        Ok(path)
+    } else {
+        Err(ReadError::InvalidQuery(format!(
+            "unsupported field path: {path}"
+        )))
+    }
+}
+
+fn normalized_payload_path(path: &str) -> String {
+    path.trim().replace('-', ".")
+}
+
+fn is_supported_path(path: &str) -> bool {
+    let mut segments = path.split('.');
+    segments.next().is_some_and(is_supported_path_segment)
+        && segments.all(is_supported_path_segment)
+}
+
+fn is_supported_path_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn group_order_by_clause(group_by: &str, has_error_count: bool, sort_key: GroupSortKey) -> String {
+    let error_tie = if has_error_count {
+        ", errorCount DESC"
+    } else {
+        ""
+    };
+    match sort_key {
+        GroupSortKey::Count => format!("ORDER BY count DESC{error_tie}, value ASC"),
+        GroupSortKey::Duration => format!("ORDER BY durationMs DESC, count DESC{error_tie}, value ASC"),
+        GroupSortKey::Value => "ORDER BY value ASC".to_string(),
+        GroupSortKey::Recent => {
+            if is_trace_like_group(group_by) {
+                format!("ORDER BY endedAt DESC, count DESC{error_tie}, value ASC")
+            } else {
+                format!("ORDER BY count DESC{error_tie}, value ASC")
+            }
+        }
+    }
+}
+
+fn is_trace_like_group(path: &str) -> bool {
+    matches!(
+        path,
+        "trace_id" | "span_id" | "request_id" | "session_id" | "thread_id" | "conversation_id"
+    )
+}
+
+fn response_data_len(response: &Value) -> usize {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default()
+}
+
+fn density_bucket_ms(response: &Value, buckets: u64, floor_ms: u64) -> u64 {
+    let Some(row) = response
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+    else {
+        return floor_ms.max(1);
+    };
+    let count = row.get("count").and_then(value_as_u64).unwrap_or_default();
+    if count == 0 {
+        return floor_ms.max(1);
+    }
+    let from = row.get("from").and_then(Value::as_str).unwrap_or_default();
+    let to = row.get("to").and_then(Value::as_str).unwrap_or_default();
+    let Some(from_ms) = parse_clickhouse_time_ms(from) else {
+        return floor_ms.max(1);
+    };
+    let Some(to_ms) = parse_clickhouse_time_ms(to) else {
+        return floor_ms.max(1);
+    };
+    let span = to_ms.saturating_sub(from_ms).max(1);
+    nice_time_interval((span / buckets.max(1)).max(floor_ms)).max(floor_ms)
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn parse_clickhouse_time_ms(value: &str) -> Option<u64> {
+    let normalized = if value.contains('T') {
+        value.to_string()
+    } else {
+        format!("{}Z", value.replace(' ', "T"))
+    };
+    chrono::DateTime::parse_from_rfc3339(&normalized)
+        .ok()
+        .and_then(|timestamp| timestamp.timestamp_millis().try_into().ok())
+}
+
+fn nice_time_interval(target_ms: u64) -> u64 {
+    const INTERVALS: &[u64] = &[
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1_000,
+        2_000,
+        5_000,
+        10_000,
+        15_000,
+        30_000,
+        60_000,
+        120_000,
+        300_000,
+        600_000,
+        900_000,
+        1_800_000,
+        3_600_000,
+        7_200_000,
+        21_600_000,
+        43_200_000,
+        86_400_000,
+        604_800_000,
+    ];
+    INTERVALS
+        .iter()
+        .copied()
+        .find(|interval| *interval >= target_ms)
+        .unwrap_or(*INTERVALS.last().unwrap_or(&604_800_000))
+}
+
+fn clickhouse_datetime64(value: &str) -> String {
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    timestamp
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1322,9 +2761,13 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadError, checked_select_query, normalize_prewhere, query_sources, query_usage_shape,
+        EventFacetFilter, EventFacetOperator, EventFieldCatalog, EventFilter, EventPredicatePlan,
+        EventTimeRange, EventsQueryRequest, ReadError, checked_select_query, group_options_query,
+        grouped_index_query, grouped_rollup_query, latest_grouped_index_query,
+        latest_grouped_rollup_query, normalize_prewhere, query_sources, query_usage_shape,
         validate_parameter_name, validate_query_sources,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn accepts_select_and_with_queries() {
@@ -1453,5 +2896,334 @@ mod tests {
                 "observatory.event_measures".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn event_predicate_plan_uses_indexed_candidates_and_raw_residuals() {
+        let request = EventsQueryRequest {
+            filter: EventFilter {
+                facets: vec![
+                    EventFacetFilter {
+                        path: "service".to_string(),
+                        value: "api".to_string(),
+                        ..Default::default()
+                    },
+                    EventFacetFilter {
+                        operator: EventFacetOperator::Contains,
+                        path: "message".to_string(),
+                        value: "timeout".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let catalog = EventFieldCatalog {
+            promoted: BTreeSet::from(["service".to_string()]),
+        };
+        let plan = EventPredicatePlan::new(&request, &catalog, "e").unwrap();
+        let sql = plan.where_clause();
+        assert!(sql.contains("e.event_id IN (SELECT idx.event_id FROM field_index AS idx"));
+        assert!(sql.contains("positionCaseInsensitive"));
+        assert!(sql.contains("message"));
+    }
+
+    #[test]
+    fn group2_case_7_promoted_facet_grouping_reads_field_index() {
+        let request = EventsQueryRequest {
+            limit: 50,
+            time_range: Some(EventTimeRange {
+                created_after: "2026-05-01T00:00:00Z".to_string(),
+                created_before: "2026-05-02T00:00:00Z".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (query, parameters) = grouped_index_query(&request, "browser", "field_index", true);
+
+        assert!(query.contains("FROM field_index"));
+        assert!(query.contains("field_name = {group_key:String}"));
+        assert!(query.contains("mode IN ('facet', 'lookup')"));
+        assert!(query.contains("uniqExact(event_id) AS count"));
+        assert!(!query.contains("FROM events"));
+        assert_eq!(parameters.get("group_key").and_then(|value| value.as_str()), Some("browser"));
+    }
+
+    #[test]
+    fn group2_case_7_core_grouping_prefers_always_on_topk_rollup() {
+        let request = EventsQueryRequest {
+            limit: 50,
+            time_range: Some(EventTimeRange {
+                lookback_minutes: 60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (query, parameters) = grouped_rollup_query(&request, "plan");
+
+        assert!(query.contains("FROM field_topk_1m"));
+        assert!(query.contains("sum(count) AS count"));
+        assert!(!query.contains("FROM events"));
+        assert_eq!(parameters.get("group_key").and_then(|value| value.as_str()), Some("plan"));
+    }
+
+    #[test]
+    fn grouped_latest_uses_rollup_or_index_instead_of_raw_events() {
+        let request = EventsQueryRequest {
+            selected_group_value: "llm-gateway".to_string(),
+            time_range: Some(EventTimeRange {
+                created_after: "2026-05-17T09:30:00Z".to_string(),
+                created_before: "2026-05-17T09:35:00Z".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (rollup_query, rollup_parameters) = latest_grouped_rollup_query(&request, "service");
+        assert!(rollup_query.contains("FROM field_topk_1m"));
+        assert!(rollup_query.contains("max(bucket_time) AS lastCreatedAt"));
+        assert!(!rollup_query.contains("FROM events"));
+        assert_eq!(
+            rollup_parameters.get("group_value").and_then(|value| value.as_str()),
+            Some("llm-gateway")
+        );
+
+        let (index_query, index_parameters) =
+            latest_grouped_index_query(&request, "browser", "field_index", true);
+        assert!(index_query.contains("FROM field_index"));
+        assert!(index_query.contains("max(timestamp) AS lastCreatedAt"));
+        assert!(index_query.contains("mode IN ('facet', 'lookup')"));
+        assert!(!index_query.contains("FROM events"));
+        assert_eq!(
+            index_parameters.get("group_value").and_then(|value| value.as_str()),
+            Some("llm-gateway")
+        );
+    }
+
+    #[test]
+    fn group2_case_8_multi_field_filters_intersect_promoted_indexes() {
+        let request = EventsQueryRequest {
+            filter: EventFilter {
+                facets: vec![
+                    EventFacetFilter {
+                        path: "plan".to_string(),
+                        value: "pro".to_string(),
+                        ..Default::default()
+                    },
+                    EventFacetFilter {
+                        path: "country".to_string(),
+                        value: "US".to_string(),
+                        ..Default::default()
+                    },
+                    EventFacetFilter {
+                        path: "account_tier".to_string(),
+                        value: "enterprise".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            time_range: Some(EventTimeRange {
+                lookback_minutes: 60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let catalog = EventFieldCatalog {
+            promoted: BTreeSet::from([
+                "plan".to_string(),
+                "country".to_string(),
+                "account_tier".to_string(),
+            ]),
+        };
+
+        let plan = EventPredicatePlan::new(&request, &catalog, "e").unwrap();
+        let sql = plan.where_clause();
+
+        assert_eq!(sql.matches("field_index AS idx").count(), 3);
+        assert_eq!(sql.matches("idx.timestamp >= now64(3) - toIntervalMinute").count(), 3);
+        assert!(sql.contains("idx.mode IN ('facet', 'lookup')"));
+        assert!(!sql.contains("e.data.plan"));
+        assert!(!sql.contains("e.data.country"));
+        assert!(!sql.contains("e.data.account_tier"));
+    }
+
+    #[test]
+    fn group2_case_8_indexed_in_filter_uses_single_index_membership_clause() {
+        let request = EventsQueryRequest {
+            filter: EventFilter {
+                facets: vec![EventFacetFilter {
+                    operator: EventFacetOperator::In,
+                    path: "model".to_string(),
+                    values: vec!["gpt-4.1".to_string(), "gpt-4.1-mini".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            time_range: Some(EventTimeRange {
+                lookback_minutes: 15,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let catalog = EventFieldCatalog {
+            promoted: BTreeSet::from(["model".to_string()]),
+        };
+
+        let plan = EventPredicatePlan::new(&request, &catalog, "e").unwrap();
+        let sql = plan.where_clause();
+
+        assert_eq!(sql.matches("field_index AS idx").count(), 1);
+        assert!(sql.contains("idx.value IN ({facet_value_0:String}, {facet_value_1:String})"));
+        assert!(!sql.contains("e.data.model"));
+    }
+
+    #[test]
+    fn group2_cases_9_through_20_use_materialized_serving_tables() {
+        let cases = [
+            (
+                9,
+                "dimensioned alert",
+                "SELECT bucket_time, toFloat64(metrics.error_rate) AS error_rate FROM observatory.report_results WHERE report_id = 'checkout_error_rate_by_plan'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                10,
+                "promoted arbitrary predicate alert",
+                "SELECT bucket_time, toUInt64(metrics.matching_events) AS matching_events FROM observatory.report_results WHERE report_id = 'foo_bar_region_us_east_alert'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                11,
+                "numeric percentile rollup",
+                "SELECT bucket_time, dimension_value AS service, quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state)[3] AS p95_ms FROM observatory.measure_rollups WHERE measure_name = 'duration_ms' GROUP BY bucket_time, service",
+                vec!["observatory.measure_rollups"],
+            ),
+            (
+                12,
+                "revenue rollup",
+                "SELECT bucket_time, dimension_value AS product_id, sumMerge(sum_state) AS revenue FROM observatory.measure_rollups WHERE measure_name = 'revenue' GROUP BY bucket_time, product_id",
+                vec!["observatory.measure_rollups"],
+            ),
+            (
+                13,
+                "active users report",
+                "SELECT bucket_time, toUInt64(metrics.active_users) AS active_users FROM observatory.report_results WHERE report_id = 'daily_active_users_by_plan'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                14,
+                "top entities report",
+                "SELECT bucket_time, dimensions.account_id AS account_id, toUInt64(metrics.events) AS events FROM observatory.report_results WHERE report_id = 'top_accounts_by_revenue'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                15,
+                "sequence funnel report",
+                "SELECT bucket_time, step_index, step_name, entity_count, conversion_count FROM observatory.sequence_report_results WHERE report_id = 'signup_invite_checkout_7d'",
+                vec!["observatory.sequence_report_results"],
+            ),
+            (
+                16,
+                "retention report",
+                "SELECT bucket_time, dimensions.retention_week AS retention_week, toUInt64(metrics.retained_users) AS retained_users FROM observatory.report_results WHERE report_id = 'june_signup_weekly_retention'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                16,
+                "cohort membership drilldown",
+                "SELECT entity_id, first_seen, last_seen FROM observatory.cohort_memberships WHERE cohort_id = 'june_signups'",
+                vec!["observatory.cohort_memberships"],
+            ),
+            (
+                17,
+                "entity state at time",
+                "SELECT entity_id, argMax(value, timestamp) AS plan_at_time FROM observatory.entity_state_updates WHERE entity_type = 'account' AND state_name = 'account.plan' GROUP BY entity_id",
+                vec!["observatory.entity_state_updates"],
+            ),
+            (
+                18,
+                "experiment report",
+                "SELECT dimensions.variant AS variant, toFloat64(metrics.conversion_rate) AS conversion_rate FROM observatory.report_results WHERE report_id = 'checkout_flow_experiment'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                19,
+                "trace summary report",
+                "SELECT bucket_time, dimensions.trace_id AS trace_id, toFloat64(metrics.duration_ms) AS duration_ms FROM observatory.report_results WHERE report_id = 'top_slow_traces'",
+                vec!["observatory.report_results"],
+            ),
+            (
+                20,
+                "reusable dashboard report",
+                "SELECT bucket_time, dimensions.plan AS plan, toUInt64(metrics.events) AS events FROM observatory.report_results WHERE report_id = 'api_health_by_plan_country'",
+                vec!["observatory.report_results"],
+            ),
+        ];
+        let allowed = group2_allowed_sources();
+
+        for (number, name, query, expected_sources) in cases {
+            assert!(
+                validate_query_sources(query, &allowed).is_ok(),
+                "case {number} {name} should be allowed"
+            );
+            assert_eq!(query_sources(query), expected_sources, "case {number} {name}");
+            assert!(
+                !query_sources(query)
+                    .iter()
+                    .any(|source| source.eq_ignore_ascii_case("observatory.events")),
+                "case {number} {name} should not use raw events"
+            );
+        }
+    }
+
+    #[test]
+    fn group2_promoted_measure_and_state_read_sources_are_allowed() {
+        let cases = [
+            (
+                "bounded event measure drilldown",
+                "SELECT timestamp, event_id, value, dimension_value FROM observatory.event_measures WHERE measure_name = 'duration_ms' AND dimension_name = 'service'",
+                vec!["observatory.event_measures"],
+            ),
+            (
+                "entity state read",
+                "SELECT entity_id, argMax(value, timestamp) AS value FROM observatory.entity_state_updates WHERE entity_type = 'account' AND state_name = 'account.plan' GROUP BY entity_id",
+                vec!["observatory.entity_state_updates"],
+            ),
+        ];
+        let allowed = group2_allowed_sources();
+
+        for (name, query, expected_sources) in cases {
+            assert!(validate_query_sources(query, &allowed).is_ok(), "{name} should be allowed");
+            assert_eq!(query_sources(query), expected_sources, "{name}");
+        }
+    }
+
+    #[test]
+    fn group_options_query_does_not_require_field_values_value_type() {
+        let query = group_options_query();
+        assert!(query.contains("arrayJoin"));
+        assert!(query.contains("FROM definitions"));
+        assert!(!query.contains("FROM field_values"));
+        assert!(!query.contains("any(value_type) AS valueType FROM field_values"));
+    }
+
+    fn group2_allowed_sources() -> Vec<String> {
+        [
+            "observatory.events",
+            "observatory.field_index",
+            "observatory.event_measures",
+            "observatory.measure_rollups",
+            "observatory.entity_state_updates",
+            "observatory.report_results",
+            "observatory.sequence_report_results",
+            "observatory.cohort_memberships",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     }
 }

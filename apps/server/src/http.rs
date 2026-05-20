@@ -37,7 +37,7 @@ use crate::{
     },
     event_log::{EventLogError, EventLogWriter, WriteReceipt},
     processors::{ProcessorListResponse, ProcessorStore, ProcessorStoreError, PutProcessorRequest},
-    read::{QueryRequest, ReadError, ReadStore},
+    read::{EventsQueryRequest, QueryRequest, ReadError, ReadStore},
     reports::{CreateReportRequest, ReportListResponse, ReportStore, ReportStoreError},
 };
 
@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
 
     let router = Router::new()
         .route("/v1/events", post(post_events))
+        .route("/v1/events/query", post(post_events_query))
         .route("/v1/events/{event_id}", get(get_event))
         .route("/v1/processors", get(list_processors))
         .route(
@@ -180,6 +181,16 @@ async fn post_query(
 ) -> Result<Response, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
     let response = state.read.query(request, &identity.tenant_id).await?;
+    Ok(Json(response).into_response())
+}
+
+async fn post_events_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EventsQueryRequest>,
+) -> Result<Response, ApiError> {
+    let identity = authorize_scope(&state, &headers, "query:read").await?;
+    let response = state.read.events_query(request, &identity.tenant_id).await?;
     Ok(Json(response).into_response())
 }
 

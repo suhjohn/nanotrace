@@ -10,6 +10,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 axum = "0.8"
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
 nanotrace-auth = { path = "../../crates/auth" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

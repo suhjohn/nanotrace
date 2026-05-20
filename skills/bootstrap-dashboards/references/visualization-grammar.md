@@ -13,9 +13,8 @@ When data has a timestamp and events:
 
 Best read models:
 
-- `event_rollups_5m`
-- `event_index`
-- `field_counts_5m`
+- `event_density_1s`
+- `field_density_1s` when grouped by a core field
 - `report_results`
 
 ## Dimension + Count
@@ -29,8 +28,9 @@ When a low/medium-cardinality dimension exists:
 
 Best read models:
 
-- `field_counts_5m`
-- `event_rollups_5m`
+- `field_topk_1m` for top values on core fields
+- `field_density_1s` for grouped time series on core fields
+- `field_index` for promoted facet fields
 - `report_results`
 
 Avoid default charts over high-cardinality IDs.
@@ -132,11 +132,11 @@ When trace/span structure exists:
 
 Best read models:
 
-- `trace_summaries`
-- `spans`
-- `event_index` for the selected trace's event lane
+- `field_values` for exact trace/span lookup
+- `events` for selected trace event lanes and payload hydration
+- `report_results` when broad trace reports have been materialized
 
-Do not build trace lists by grouping raw events by trace ID when trace summaries exist.
+Do not build broad trace lists by grouping raw events by trace ID. Use a materialized trace report when the product needs top slow/error trace lists over large windows.
 
 ## Logs / Free Text
 
@@ -180,5 +180,6 @@ Best read models:
 
 - `pipeline_metrics`
 - `event_measures`
-- `event_index`
+- `event_density_1s`
+- `field_topk_1m`
 - `report_results`

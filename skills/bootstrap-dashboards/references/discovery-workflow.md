@@ -20,14 +20,13 @@ Check row presence and time coverage for core read models. Use small aggregate q
 Useful read models to probe:
 
 - `observatory.events`
-- `observatory.event_index`
+- `observatory.event_density_1s`
+- `observatory.field_density_1s`
+- `observatory.field_topk_1m`
+- `observatory.field_values`
 - `observatory.field_index`
-- `observatory.field_counts_5m`
-- `observatory.event_rollups_5m`
 - `observatory.event_measures`
 - `observatory.measure_rollups`
-- `observatory.spans`
-- `observatory.trace_summaries`
 - `observatory.entity_state_updates`
 - `observatory.report_results`
 - `observatory.sequence_report_results`
@@ -44,7 +43,7 @@ For each populated model, capture:
 
 ## 3. Sample Raw Events
 
-Sample a small number of rows across the time range. Prefer `event_index` for event metadata and `events` only when raw JSON is required.
+Sample a small number of rows across the time range. Prefer compact rollups for aggregate discovery and `events` only when raw JSON, payload examples, or exact event hydration is required.
 
 Sample by:
 
@@ -140,7 +139,7 @@ Trace-like data exists when rows contain several of:
 - duration
 - service/name/status
 
-If trace summaries exist and are populated, use them for trace lists. Use spans for selected trace flamegraphs or waterfalls. If only raw trace-shaped events exist, recommend creating the span/trace read models before building production trace dashboards.
+Use `field_values` for exact `trace_id`/`span_id` lookup and `events` for selected trace event lanes. If the product needs broad trace lists such as slowest traces or failing root spans, recommend a materialized trace report before building production trace dashboards.
 
 ## 9. State Transition Checks
 
@@ -162,8 +161,9 @@ Before proposing expensive dashboard cards, check whether compact outputs alread
 - `sequence_report_results`
 - `cohort_memberships`
 - `measure_rollups`
-- `event_rollups_5m`
-- `field_counts_5m`
+- `event_density_1s`
+- `field_density_1s`
+- `field_topk_1m`
 
 If compact outputs are absent, recommend either:
 

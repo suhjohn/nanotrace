@@ -59,10 +59,10 @@ The `observatory.*` names in this skill are Nanotrace read models.
 
 6. **Choose cheap read paths**
    - Prefer materialized reports and rollups for long-range cards.
-   - Prefer field counts for top values.
-   - Prefer trace summaries for trace lists.
-   - Prefer spans for selected trace flamegraphs.
-   - Use event-level rows for recent exploration, samples, drilldowns, and narrow questions.
+   - Prefer `event_density_1s` for global event volume/error trends.
+   - Prefer `field_topk_1m` for top values and `field_density_1s` for grouped histograms on core dimensions.
+   - Prefer `field_values` for exact identifier drilldowns and `field_index` for definition-backed promoted fields.
+   - Use `events` for recent exploration, samples, payload hydration, and narrow correctness fallbacks.
 
 ## Discovery References
 
