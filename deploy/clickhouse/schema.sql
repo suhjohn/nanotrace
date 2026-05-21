@@ -820,3 +820,17 @@ ALTER TABLE observatory.sequence_report_results
 
 ALTER TABLE observatory.sequence_report_results
     ADD COLUMN IF NOT EXISTS segment_hash UInt64 MATERIALIZED cityHash64 (toJSONString (segment)) AFTER segment;
+
+ALTER TABLE observatory.definition_stats
+    DROP COLUMN IF EXISTS estimated_rows_per_sec;
+
+ALTER TABLE observatory.definition_stats
+    DROP COLUMN IF EXISTS estimated_storage_bytes_per_day;
+
+ALTER TABLE observatory.definition_stats
+    DROP COLUMN IF EXISTS cardinality_class;
+
+ALTER TABLE observatory.definition_stats
+    DROP COLUMN IF EXISTS warnings;
+
+DROP TABLE IF EXISTS observatory.optimization_recommendations;

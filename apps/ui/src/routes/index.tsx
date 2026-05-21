@@ -537,6 +537,7 @@ export function ObservatoryHome({
       }),
     [effectiveCustomRangeEnd, effectiveCustomRangeStart, effectiveTimeRangeKey]
   )
+  const selectedTimeRangeCacheKey = timeRangeCacheKey(selectedTimeRange)
   const liveMode = effectiveTimeRangeKey === 'live'
   const liveRefetchInterval = liveMode ? 3000 : false
   const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}` : ''
@@ -614,14 +615,21 @@ export function ObservatoryHome({
   const latestCreatedAt = selectedGroupSummary?.endedAt || latestQuery.data?.lastCreatedAt
   const eventDataKey = [
     eventScopeKey,
-    serializeEventFilter(eventFilterParams)
+    serializeEventFilter(eventFilterParams),
+    selectedTimeRangeCacheKey
   ].join('\u0000')
   const eventAnchorTimestamp = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.timestamp : ''
   const summaryQuery = useQuery({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
+    queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
-      fetchSummary({ apiBaseUrl: observatoryUrl, eventFilter: eventFilterParams, groupBy, selectedGroupValue }),
+      fetchSummary({
+        apiBaseUrl: observatoryUrl,
+        eventFilter: eventFilterParams,
+        groupBy,
+        selectedGroupValue,
+        timeRange: selectedTimeRange
+      }),
     refetchInterval: liveRefetchInterval,
     retry: false
   })
@@ -629,7 +637,7 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange.key, eventAnchorTimestamp, eventSortDirection],
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventSortDirection],
     initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
@@ -660,7 +668,7 @@ export function ObservatoryHome({
   })
   const flamegraphQuery = useQuery({
     enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphModeBeforeFlamegraph === 'flamegraph'),
-    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange],
+    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
       fetchFlamegraph({
         apiBaseUrl: observatoryUrl,
@@ -677,7 +685,7 @@ export function ObservatoryHome({
   const graphMode = flamegraphDisabled ? 'histogram' : selectedGraphMode
   const densityQuery = useQuery({
     enabled: Boolean(hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
-    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRange],
+    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
       fetchDensity({
         apiBaseUrl: observatoryUrl,
@@ -697,7 +705,6 @@ export function ObservatoryHome({
   )
   const liveFreshScopeKey = [
     eventDataKey,
-    selectedTimeRange.key,
     eventSortDirection
   ].join('\u0000')
   useEffect(() => {
@@ -855,15 +862,11 @@ export function ObservatoryHome({
     }
   }
 
-  function filterWithTimeRange(filter: ParsedEventFilter, range: ResolvedTimeRange): ParsedEventFilter {
-    const nextFilter: ParsedEventFilter = {
-      ...(filter.facets?.length ? { facets: filter.facets } : {}),
-      text: filter.text
+  function clearFilterTimeBounds() {
+    if (!eventFilterParams.createdAfter && !eventFilterParams.createdBefore) {
+      return
     }
-    if (range.lookbackMinutes) return nextFilter
-    if (range.createdAfter) nextFilter.createdAfter = range.createdAfter
-    if (range.createdBefore) nextFilter.createdBefore = range.createdBefore
-    return nextFilter
+    commitEventFilter(stripTimeBounds(eventFilterParams))
   }
 
   function syncTimeRangeControlsFromFilter(filter: ParsedEventFilter) {
@@ -871,18 +874,16 @@ export function ObservatoryHome({
       return
     }
 
-    if (filter.createdAfter) {
-      setCustomRangeStart(formatDateTimeLocalInput(new Date(filter.createdAfter)))
-    }
-    if (filter.createdBefore) {
-      setCustomRangeEnd(formatDateTimeLocalInput(new Date(filter.createdBefore)))
-    }
+    const start = filter.createdAfter
+      ? formatDateTimeLocalInput(new Date(filter.createdAfter))
+      : effectiveCustomRangeStart
+    const end = filter.createdBefore
+      ? formatDateTimeLocalInput(new Date(filter.createdBefore))
+      : effectiveCustomRangeEnd
+    setCustomRangeStart(start)
+    setCustomRangeEnd(end)
     setTimeRangeKey('custom')
-  }
-
-  function applyRangeFilter(range: ResolvedTimeRange, { syncUrl = true }: { syncUrl?: boolean } = {}) {
-    filterTouchedRef.current = true
-    commitEventFilter(filterWithTimeRange(eventFilterParams, range), { syncUrl })
+    setTimeRangeSearch('custom', start, end)
   }
 
   function selectTimeRange(key: TimeRangeKey) {
@@ -891,23 +892,24 @@ export function ObservatoryHome({
       setEventSortDirection('desc')
     }
     setTimeRangeSearch(key, key === 'custom' ? effectiveCustomRangeStart : undefined, key === 'custom' ? effectiveCustomRangeEnd : undefined)
-    applyRangeFilter(resolveTimeRange({ customEnd: effectiveCustomRangeEnd, customStart: effectiveCustomRangeStart, key }), {
-      syncUrl: key === 'custom'
-    })
+    clearFilterTimeBounds()
+    setEventAnchorOverride(null)
   }
 
   function setCustomStartRange(value: string) {
     setCustomRangeStart(value)
     setTimeRangeKey('custom')
     setTimeRangeSearch('custom', value, effectiveCustomRangeEnd)
-    applyRangeFilter(resolveTimeRange({ customEnd: effectiveCustomRangeEnd, customStart: value, key: 'custom' }))
+    clearFilterTimeBounds()
+    setEventAnchorOverride(null)
   }
 
   function setCustomEndRange(value: string) {
     setCustomRangeEnd(value)
     setTimeRangeKey('custom')
     setTimeRangeSearch('custom', effectiveCustomRangeStart, value)
-    applyRangeFilter(resolveTimeRange({ customEnd: value, customStart: effectiveCustomRangeStart, key: 'custom' }))
+    clearFilterTimeBounds()
+    setEventAnchorOverride(null)
   }
 
   function setCustomRange(start: string, end: string) {
@@ -915,25 +917,24 @@ export function ObservatoryHome({
     setCustomRangeEnd(end)
     setTimeRangeKey('custom')
     setTimeRangeSearch('custom', start, end)
-    applyRangeFilter(resolveTimeRange({ customEnd: end, customStart: start, key: 'custom' }))
+    clearFilterTimeBounds()
+    setEventAnchorOverride(null)
   }
 
   function applyEventFilter() {
     filterTouchedRef.current = true
     syncTimeRangeControlsFromFilter(draftEventFilterParams)
-    commitEventFilter(draftEventFilterParams)
+    commitEventFilter(stripTimeBounds(draftEventFilterParams))
   }
 
   function clearEventFilter() {
     filterTouchedRef.current = true
-    commitEventFilter(filterWithTimeRange({ text: '' }, selectedTimeRange))
+    commitEventFilter({ text: '' })
   }
 
-  function applyTimeRange({ createdAfter, createdBefore }: { createdAfter: string; createdBefore: string }) {
+  function applyHistogramTimeRange({ createdAfter, createdBefore }: { createdAfter: string; createdBefore: string }) {
     filterTouchedRef.current = true
-    const nextFilter = filterWithTimeRange(eventFilterParams, { createdAfter, createdBefore, key: `custom:${createdAfter}:${createdBefore}` })
-    syncTimeRangeControlsFromFilter(nextFilter)
-    commitEventFilter(nextFilter)
+    setCustomRange(formatDateTimeLocalInput(new Date(createdAfter)), formatDateTimeLocalInput(new Date(createdBefore)))
   }
 
   function resetEventScope(nextEventScopeKey: string, { force = false }: { force?: boolean } = {}) {
@@ -969,9 +970,10 @@ export function ObservatoryHome({
       referenceTimestamp: eventDetail?.group.startedAt ?? latestCreatedAt,
       value: eventFilterSearchText
     })
-    setEventFilterDraft(eventFilterInputText(parsedFilter))
-    setEventFilterParams(parsedFilter)
     syncTimeRangeControlsFromFilter(parsedFilter)
+    const nextFilter = stripTimeBounds(parsedFilter)
+    setEventFilterDraft(eventFilterInputText(nextFilter))
+    setEventFilterParams(nextFilter)
   }, [activeFacetPaths, eventDetail?.group.startedAt, eventFilterSearchText, eventScopeKey, latestCreatedAt])
 
   useEffect(() => {
@@ -981,16 +983,8 @@ export function ObservatoryHome({
   }, [flamegraphDisabled, selectedGraphMode, setSelectedGraphMode])
 
   useEffect(() => {
-    const defaultFilter = liveMode
-      ? null
-      : defaultTimeRangeFilter({
-          lastCreatedAt: latestCreatedAt,
-          timeRange: selectedTimeRange
-        })
-    const initialFilter = defaultFilter ?? (selectedTimeRange.lookbackMinutes ? { text: '' } : null)
     if (
       eventFilterSearchText !== undefined ||
-      !initialFilter ||
       filterTouchedRef.current ||
       seededLatestGroupKeyRef.current === eventScopeKey
     ) {
@@ -998,12 +992,11 @@ export function ObservatoryHome({
     }
 
     seededLatestGroupKeyRef.current = eventScopeKey
-    const defaultFilterText = eventFilterInputText(initialFilter)
     setEventFilterGroupKey(eventScopeKey)
-    setEventFilterDraft(defaultFilterText)
-    setEventFilterParams(initialFilter)
+    setEventFilterDraft('')
+    setEventFilterParams({ text: '' })
     setFilterSearch('')
-  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, liveMode, selectedTimeRange])
+  }, [eventFilterSearchText, eventScopeKey])
 
   useEffect(() => {
     if (liveMode && eventSortDirection !== 'desc') {
@@ -1023,10 +1016,11 @@ export function ObservatoryHome({
           ? `/${encodeURIComponent(groupBy)}/${encodeURIComponent(selectedGroupValue)}`
           : '/events',
         eventTableFilterKey,
+        selectedTimeRangeCacheKey,
         eventSortDirection,
         eventAnchorTimestamp
       ].join('\u0000'),
-    [eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, viewingGroupedEvents]
+    [eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
     if (!eventDetail) return selectedEventColumns
@@ -1443,7 +1437,7 @@ export function ObservatoryHome({
               <DensityHistogramCanvas
                 density={densityQuery.data}
                 totalCount={summaryQuery.data?.count ?? 0}
-                onSelectRange={applyTimeRange}
+                onSelectRange={applyHistogramTimeRange}
               />
             ) : null}
             {!loadingDetail && graphMode === 'histogram' && !hasRenderableDensity(densityQuery.data) ? (
@@ -4098,12 +4092,14 @@ async function fetchSummary({
   apiBaseUrl,
   eventFilter,
   groupBy,
-  selectedGroupValue
+  selectedGroupValue,
+  timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
   groupBy: string
   selectedGroupValue: string
+  timeRange: ResolvedTimeRange
 }): Promise<LogSummary> {
   const response = await postEventsQuery<{ count: number }>({
     apiBaseUrl,
@@ -4111,6 +4107,7 @@ async function fetchSummary({
       filter: eventFilter,
       groupBy,
       selectedGroupValue,
+      timeRange,
       view: 'summary'
     }
   })
@@ -4840,6 +4837,15 @@ function timeRangeParameters(range: ResolvedTimeRange): QueryParameters {
   }
 }
 
+function timeRangeCacheKey(range: ResolvedTimeRange) {
+  return [
+    range.key,
+    range.lookbackMinutes ?? '',
+    range.createdAfter ?? '',
+    range.createdBefore ?? ''
+  ].join('\u0000')
+}
+
 function queryTimeDomain({
   eventFilter,
   fallbackFrom,
@@ -5439,38 +5445,18 @@ type ParsedFacetFilter = {
   values?: string[]
 }
 
-function defaultTimeRangeFilter({
-  lastCreatedAt,
-  timeRange
-}: {
-  lastCreatedAt?: string
-  timeRange: ResolvedTimeRange
-}): ParsedEventFilter | null {
-  if (timeRange.createdAfter || timeRange.createdBefore) {
-    return {
-      createdAfter: timeRange.createdAfter,
-      createdBefore: timeRange.createdBefore,
-      text: ''
-    }
-  }
-
-  if (!lastCreatedAt || !timeRange.lookbackMinutes) return null
-
-  const lastMs = Date.parse(lastCreatedAt)
-  if (!Number.isFinite(lastMs)) return null
-
-  return {
-    createdAfter: new Date(lastMs - timeRange.lookbackMinutes * 60 * 1000).toISOString(),
-    createdBefore: lastCreatedAt,
-    text: ''
-  }
-}
-
 function eventFilterInputText(filter: ParsedEventFilter) {
   return [
     ...(filter.facets ?? []).map((facet, index) => facetFilterInputText(facet, index)),
     filter.text
   ].filter(Boolean).join(' ')
+}
+
+function stripTimeBounds(filter: ParsedEventFilter): ParsedEventFilter {
+  return {
+    ...(filter.facets?.length ? { facets: filter.facets } : {}),
+    text: filter.text
+  }
 }
 
 function facetFilterInputText(facet: ParsedFacetFilter, index: number) {
