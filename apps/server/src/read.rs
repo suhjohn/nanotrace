@@ -306,7 +306,10 @@ impl ReadStore {
         request.limit = request.limit.clamp(1, 10_000);
         request.buckets = request.buckets.clamp(1, 2_000);
 
-        let catalog = match self.event_field_catalog(tenant_id, request.allow_stale_serving).await {
+        let catalog = match self
+            .event_field_catalog(tenant_id, request.allow_stale_serving)
+            .await
+        {
             Ok(catalog) => catalog,
             Err(err) => {
                 warn!(error = %err, "failed to load promoted field catalog; using raw fallback planning");
@@ -326,14 +329,16 @@ impl ReadStore {
                     },
                     tenant_id,
                 )
-                    .await
+                .await
             }
             EventsQueryView::Groups => self.groups_query(&request, &catalog, tenant_id).await,
             EventsQueryView::Latest => self.latest_query(&request, &catalog, tenant_id).await,
             EventsQueryView::Summary => self.summary_query(&request, &catalog, tenant_id).await,
             EventsQueryView::Events => self.events_page_query(&request, &catalog, tenant_id).await,
             EventsQueryView::Density => self.density_query(&request, &catalog, tenant_id).await,
-            EventsQueryView::Flamegraph => self.flamegraph_query(&request, &catalog, tenant_id).await,
+            EventsQueryView::Flamegraph => {
+                self.flamegraph_query(&request, &catalog, tenant_id).await
+            }
             EventsQueryView::Event => self.event_query(&request, tenant_id).await,
         }
     }
@@ -364,7 +369,7 @@ impl ReadStore {
         let response = self
             .query(
                 QueryRequest {
-                    query: "SELECT name FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)".to_string(),
+                    query: "SELECT name, config FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)".to_string(),
                     parameters: Map::new(),
                     allow_stale_serving,
                 },
@@ -376,6 +381,24 @@ impl ReadStore {
             for row in rows {
                 if let Some(name) = row.get("name").and_then(Value::as_str) {
                     catalog.promoted.insert(normalized_payload_path(name));
+                }
+                if let Some(outputs) = row
+                    .get("config")
+                    .and_then(|config| config.get("outputs"))
+                    .and_then(Value::as_array)
+                {
+                    for output in outputs {
+                        if output
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .is_some_and(|target| target != "field_index")
+                        {
+                            continue;
+                        }
+                        if let Some(field_name) = output.get("field_name").and_then(Value::as_str) {
+                            catalog.promoted.insert(normalized_payload_path(field_name));
+                        }
+                    }
                 }
             }
         }
@@ -395,6 +418,8 @@ impl ReadStore {
             grouped_index_query(request, &group_by, "field_values", false)
         } else if catalog.promoted_contains(&group_by) {
             grouped_index_query(request, &group_by, "field_index", true)
+        } else if catalog.raw_groupable_contains(&group_by) {
+            raw_groups_query(request, &group_by)?
         } else {
             raw_groups_query(request, &group_by)?
         };
@@ -475,7 +500,11 @@ impl ReadStore {
             && request.filter.facets.is_empty()
             && request.filter.text.trim().is_empty()
         {
-            let (time_clause, parameters) = time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+            let (time_clause, parameters) = time_where_clause(
+                &request.filter,
+                request.time_range.as_ref(),
+                "d.bucket_time",
+            );
             return self
                 .run_events_query_sql(
                     [
@@ -559,8 +588,11 @@ impl ReadStore {
             && request.filter.facets.is_empty()
             && request.filter.text.trim().is_empty()
         {
-            let (time_clause, mut parameters) =
-                time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+            let (time_clause, mut parameters) = time_where_clause(
+                &request.filter,
+                request.time_range.as_ref(),
+                "d.bucket_time",
+            );
             parameters.insert("buckets".to_string(), Value::from(request.buckets));
             let range = self
                 .run_events_query_sql(
@@ -607,8 +639,11 @@ impl ReadStore {
         {
             let group_by = facet_key(&request.group_by)?;
             if catalog.core_rollup_contains(&group_by) {
-                let (time_clause, mut parameters) =
-                    time_where_clause(&request.filter, request.time_range.as_ref(), "d.bucket_time");
+                let (time_clause, mut parameters) = time_where_clause(
+                    &request.filter,
+                    request.time_range.as_ref(),
+                    "d.bucket_time",
+                );
                 parameters.insert("group_key".to_string(), Value::from(group_by));
                 parameters.insert(
                     "group_value".to_string(),
@@ -657,7 +692,8 @@ impl ReadStore {
         let range = self
             .run_events_query_sql(
                 [
-                    "SELECT min(e.timestamp) AS from, max(e.timestamp) AS to, count() AS count".to_string(),
+                    "SELECT min(e.timestamp) AS from, max(e.timestamp) AS to, count() AS count"
+                        .to_string(),
                     "FROM events AS e".to_string(),
                     plan.where_clause(),
                 ]
@@ -1055,10 +1091,20 @@ impl ReadStore {
         if source.eq_ignore_ascii_case(events_table) {
             return Some(events_table.to_string());
         }
-        ["field_index", "event_measures", "entity_state_updates"]
-            .into_iter()
-            .find(|table| source.eq_ignore_ascii_case(table))
-            .map(str::to_string)
+        [
+            "field_index",
+            "event_measures",
+            "counter_rollups",
+            "gauge_rollups",
+            "histogram_rollups",
+            "entity_state_updates",
+            "report_results",
+            "sequence_report_results",
+            "cohort_memberships",
+        ]
+        .into_iter()
+        .find(|table| source.eq_ignore_ascii_case(table))
+        .map(str::to_string)
     }
 
     fn unqualified_source<'a>(&self, source: &'a str) -> &'a str {
@@ -1120,13 +1166,15 @@ impl ReadStore {
             "definitions",
             "event_measures",
             "measure_rollups",
+            "counter_rollups",
+            "gauge_rollups",
+            "histogram_rollups",
             "entity_state_updates",
             "report_results",
             "sequence_report_results",
             "cohort_memberships",
             "definition_stats",
             "query_usage",
-            "optimization_recommendations",
             "materialization_jobs",
             "materialization_chunks",
             "materialization_versions",
@@ -1175,6 +1223,10 @@ impl EventFieldCatalog {
         CORE_ROLLUP_FIELD_NAMES.contains(&path)
     }
 
+    fn raw_groupable_contains(&self, path: &str) -> bool {
+        RAW_GROUPABLE_FIELD_NAMES.contains(&path)
+    }
+
     fn has_indexed_path(&self, path: &str) -> bool {
         self.promoted_contains(path) || self.lookup_contains(path)
     }
@@ -1216,13 +1268,23 @@ const CORE_ROLLUP_FIELD_NAMES: &[&str] = &[
     "service",
     "environment",
     "is_error",
+];
+
+const RAW_GROUPABLE_FIELD_NAMES: &[&str] = &[
+    "signal",
+    "event_type",
+    "name",
+    "service",
+    "environment",
+    "is_error",
     "http.method",
     "http.route",
     "http.status_code",
+    "http.response.status_code",
     "severity_text",
     "severity_number",
-    "model",
-    "provider",
+    "llm.model",
+    "llm.provider",
     "tool_name",
     "processor_name",
     "plan",
@@ -1231,6 +1293,20 @@ const CORE_ROLLUP_FIELD_NAMES: &[&str] = &[
     "user_group",
     "user_id",
     "account_id",
+    "anonymous_id",
+    "session_id",
+    "group_id",
+    "organization_id",
+    "thread_id",
+    "conversation_id",
+    "request_id",
+    "duration_ms",
+    "metric_name",
+    "metric_type",
+    "metric_unit",
+    "metric_value",
+    "revenue",
+    "currency",
 ];
 
 const LOOKUP_FIELD_NAMES: &[&str] = &[
@@ -1261,8 +1337,11 @@ impl EventPredicatePlan {
     ) -> Result<Self, ReadError> {
         let mut builder = SqlBuilder::default();
         let mut clauses = Vec::new();
-        let (time_clause, time_parameters) =
-            time_where_clause(&request.filter, request.time_range.as_ref(), &format!("{alias}.timestamp"));
+        let (time_clause, time_parameters) = time_where_clause(
+            &request.filter,
+            request.time_range.as_ref(),
+            &format!("{alias}.timestamp"),
+        );
         clauses.push(time_clause);
         builder.parameters.extend(time_parameters);
 
@@ -1270,14 +1349,32 @@ impl EventPredicatePlan {
             let path = facet_key(&request.group_by)?;
             let value_param = builder.push_string("group_value", &request.selected_group_value);
             let group_clause = if let Some(index_table) = catalog.index_table(&path) {
-                indexed_value_clause(alias, index_table, &path, vec![value_param], &request.filter, request.time_range.as_ref(), &mut builder)
+                indexed_value_clause(
+                    alias,
+                    index_table,
+                    &path,
+                    vec![value_param],
+                    &request.filter,
+                    request.time_range.as_ref(),
+                    &mut builder,
+                )
             } else {
-                format!("{} = {{{value_param}:String}}", event_value_expression(&path, alias)?)
+                format!(
+                    "{} = {{{value_param}:String}}",
+                    event_value_expression(&path, alias)?
+                )
             };
             clauses.push(group_clause);
         }
 
-        let facet_expr = filter_facets_expression(&request.filter.facets, catalog, alias, &request.filter, request.time_range.as_ref(), &mut builder)?;
+        let facet_expr = filter_facets_expression(
+            &request.filter.facets,
+            catalog,
+            alias,
+            &request.filter,
+            request.time_range.as_ref(),
+            &mut builder,
+        )?;
         clauses.push(facet_expr);
 
         if !request.filter.text.trim().is_empty() {
@@ -1288,7 +1385,10 @@ impl EventPredicatePlan {
         }
 
         Ok(Self {
-            clauses: clauses.into_iter().filter(|clause| !clause.is_empty()).collect(),
+            clauses: clauses
+                .into_iter()
+                .filter(|clause| !clause.is_empty())
+                .collect(),
             parameters: builder.parameters,
         })
     }
@@ -1329,7 +1429,9 @@ fn filter_facets_expression(
 ) -> Result<String, ReadError> {
     let mut branches: Vec<Vec<&EventFacetFilter>> = vec![Vec::new()];
     for facet in facets {
-        if facet.join == EventFacetJoin::Or && branches.last().is_some_and(|branch| !branch.is_empty()) {
+        if facet.join == EventFacetJoin::Or
+            && branches.last().is_some_and(|branch| !branch.is_empty())
+        {
             branches.push(Vec::new());
         }
         if let Some(branch) = branches.last_mut() {
@@ -1341,7 +1443,9 @@ fn filter_facets_expression(
     for branch in branches {
         let mut clauses = Vec::new();
         for facet in branch {
-            clauses.push(facet_clause(facet, catalog, alias, filter, time_range, builder)?);
+            clauses.push(facet_clause(
+                facet, catalog, alias, filter, time_range, builder,
+            )?);
         }
         let joined = join_clauses(clauses);
         if !joined.is_empty() {
@@ -1373,7 +1477,15 @@ fn facet_clause(
                 .iter()
                 .map(|value| builder.push_string("facet_value", value))
                 .collect::<Vec<_>>();
-            return Ok(indexed_value_clause(alias, index_table, &path, params, filter, time_range, builder));
+            return Ok(indexed_value_clause(
+                alias,
+                index_table,
+                &path,
+                params,
+                filter,
+                time_range,
+                builder,
+            ));
         }
     }
 
@@ -1466,9 +1578,24 @@ fn indexed_value_clause(
 }
 
 fn group_options_query() -> String {
-    let fields = CORE_ROLLUP_FIELD_NAMES
+    let core_fields = CORE_ROLLUP_FIELD_NAMES
         .iter()
-        .chain(LOOKUP_FIELD_NAMES.iter())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|field| format!("'{}'", field.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lookup_fields = LOOKUP_FIELD_NAMES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|field| format!("'{}'", field.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let raw_fields = RAW_GROUPABLE_FIELD_NAMES
+        .iter()
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1476,11 +1603,14 @@ fn group_options_query() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT path, max(cardinality) AS cardinality, any(valueType) AS valueType, toBool(0) AS capped FROM (SELECT arrayJoin([{fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType UNION ALL SELECT name AS path, toUInt64(0) AS cardinality, ifNull(toString(config.value_type), 'string') AS valueType FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)) GROUP BY path ORDER BY cardinality DESC, path ASC LIMIT {{limit:UInt64}}"
+        "SELECT path, max(cardinality) AS cardinality, argMin(valueType, priority) AS valueType, toBool(0) AS capped, argMin(source, priority) AS source, argMin(servingMode, priority) AS servingMode, max(aggregateEnabled) AS aggregateEnabled, max(lookupEnabled) AS lookupEnabled FROM (SELECT arrayJoin([{core_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'core_rollup' AS source, 'rollup' AS servingMode, toBool(1) AS aggregateEnabled, toBool(0) AS lookupEnabled, toUInt8(1) AS priority UNION ALL SELECT arrayJoin([{lookup_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'lookup' AS source, 'lookup' AS servingMode, toBool(0) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(2) AS priority UNION ALL SELECT name AS path, toUInt64(0) AS cardinality, ifNull(toString(config.value_type), 'string') AS valueType, 'promoted' AS source, 'promoted' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(3) AS priority FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at) UNION ALL SELECT JSONExtractString(output, 'field_name') AS path, toUInt64(0) AS cardinality, ifNull(JSONExtractString(output, 'value_type'), 'string') AS valueType, 'promoted' AS source, 'promoted' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(3) AS priority FROM (SELECT arrayJoin(JSONExtractArrayRaw(ifNull(toJSONString(config.outputs), '[]'))) AS output FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)) WHERE path != '' UNION ALL SELECT arrayJoin([{raw_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'raw' AS source, 'raw' AS servingMode, toBool(0) AS aggregateEnabled, toBool(0) AS lookupEnabled, toUInt8(4) AS priority) GROUP BY path ORDER BY cardinality DESC, path ASC LIMIT {{limit:UInt64}}"
     )
 }
 
-fn grouped_rollup_query(request: &EventsQueryRequest, group_by: &str) -> (String, Map<String, Value>) {
+fn grouped_rollup_query(
+    request: &EventsQueryRequest,
+    group_by: &str,
+) -> (String, Map<String, Value>) {
     let mut parameters = time_parameters(request.time_range.as_ref());
     parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
     parameters.insert("limit".to_string(), Value::from(request.limit + 1));
@@ -1490,14 +1620,18 @@ fn grouped_rollup_query(request: &EventsQueryRequest, group_by: &str) -> (String
         time_range_clause(request.time_range.as_ref(), "bucket_time"),
     ];
     if !request.search.is_empty() {
-        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        parameters.insert(
+            "group_value".to_string(),
+            Value::from(request.search.clone()),
+        );
         clauses.push("value = {group_value:String}".to_string());
     }
     (
         [
             "SELECT value".to_string(),
             ", min(bucket_time) AS startedAt, max(bucket_time) AS endedAt".to_string(),
-            ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs".to_string(),
+            ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs"
+                .to_string(),
             ", sum(count) AS count, sum(error_count) AS errorCount".to_string(),
             "FROM field_topk_1m".to_string(),
             where_keyword(join_clauses(clauses)),
@@ -1532,7 +1666,10 @@ fn grouped_index_query(
         clauses.push("mode IN ('facet', 'lookup')".to_string());
     }
     if !request.search.is_empty() {
-        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        parameters.insert(
+            "group_value".to_string(),
+            Value::from(request.search.clone()),
+        );
         clauses.push("value = {group_value:String}".to_string());
     }
     let count_expression = if table == "field_index" {
@@ -1637,14 +1774,18 @@ fn raw_groups_query(
         time_range_clause(request.time_range.as_ref(), "e.timestamp"),
     ];
     if !request.search.is_empty() {
-        parameters.insert("group_value".to_string(), Value::from(request.search.clone()));
+        parameters.insert(
+            "group_value".to_string(),
+            Value::from(request.search.clone()),
+        );
         clauses.push(format!("{value_expression} = {{group_value:String}}"));
     }
     Ok((
         [
             format!("SELECT {value_expression} AS value"),
             ", min(e.timestamp) AS startedAt, max(e.timestamp) AS endedAt".to_string(),
-            ", dateDiff('millisecond', min(e.timestamp), max(e.timestamp)) AS durationMs".to_string(),
+            ", dateDiff('millisecond', min(e.timestamp), max(e.timestamp)) AS durationMs"
+                .to_string(),
             ", count() AS count".to_string(),
             format!(", countIf({}) AS errorCount", error_expression("e")),
             "FROM events AS e".to_string(),
@@ -1678,7 +1819,10 @@ fn event_page_filter(
     let Some((operator, value)) = cursor else {
         return String::new();
     };
-    parameters.insert("cursor".to_string(), Value::from(clickhouse_datetime64(value)));
+    parameters.insert(
+        "cursor".to_string(),
+        Value::from(clickhouse_datetime64(value)),
+    );
     format!("{alias}.timestamp {operator} {{cursor:DateTime64(3, 'UTC')}}")
 }
 
@@ -1703,14 +1847,18 @@ fn time_where_clause(
             "created_after".to_string(),
             Value::from(clickhouse_datetime64(&filter.created_after)),
         );
-        clauses.push(format!("{column} >= {{created_after:DateTime64(3, 'UTC')}}"));
+        clauses.push(format!(
+            "{column} >= {{created_after:DateTime64(3, 'UTC')}}"
+        ));
     }
     if !filter.created_before.is_empty() {
         parameters.insert(
             "created_before".to_string(),
             Value::from(clickhouse_datetime64(&filter.created_before)),
         );
-        clauses.push(format!("{column} <= {{created_before:DateTime64(3, 'UTC')}}"));
+        clauses.push(format!(
+            "{column} <= {{created_before:DateTime64(3, 'UTC')}}"
+        ));
     }
     if filter.created_after.is_empty() && filter.created_before.is_empty() {
         let range_clause = time_range_clause(time_range, column);
@@ -1806,7 +1954,10 @@ fn event_value_expression(path: &str, alias: &str) -> Result<String, ReadError> 
             "unsupported field path: {path}"
         )));
     }
-    Ok(format!("ifNull(toString({alias}.data.{path}), '')"))
+    Ok(format!(
+        "ifNull(toString({}), '')",
+        event_payload_expression(path, alias)
+    ))
 }
 
 fn promoted_string_column(path: &str, alias: &str) -> String {
@@ -1871,6 +2022,22 @@ fn is_supported_path_segment(segment: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn event_payload_expression(path: &str, alias: &str) -> String {
+    let data_column = if alias.is_empty() {
+        "data".to_string()
+    } else {
+        format!("{alias}.data")
+    };
+    if path.contains('.') {
+        format!(
+            "getSubcolumn({data_column}, '{}')",
+            path.replace('\'', "''")
+        )
+    } else {
+        format!("{data_column}.{path}")
+    }
+}
+
 fn group_order_by_clause(group_by: &str, has_error_count: bool, sort_key: GroupSortKey) -> String {
     let error_tie = if has_error_count {
         ", errorCount DESC"
@@ -1879,7 +2046,9 @@ fn group_order_by_clause(group_by: &str, has_error_count: bool, sort_key: GroupS
     };
     match sort_key {
         GroupSortKey::Count => format!("ORDER BY count DESC{error_tie}, value ASC"),
-        GroupSortKey::Duration => format!("ORDER BY durationMs DESC, count DESC{error_tie}, value ASC"),
+        GroupSortKey::Duration => {
+            format!("ORDER BY durationMs DESC, count DESC{error_tie}, value ASC")
+        }
         GroupSortKey::Value => "ORDER BY value ASC".to_string(),
         GroupSortKey::Recent => {
             if is_trace_like_group(group_by) {
@@ -2761,11 +2930,12 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventFacetFilter, EventFacetOperator, EventFieldCatalog, EventFilter, EventPredicatePlan,
-        EventTimeRange, EventsQueryRequest, ReadError, checked_select_query, group_options_query,
-        grouped_index_query, grouped_rollup_query, latest_grouped_index_query,
+        CORE_ROLLUP_FIELD_NAMES, EventFacetFilter, EventFacetOperator, EventFieldCatalog,
+        EventFilter, EventPredicatePlan, EventTimeRange, EventsQueryRequest,
+        RAW_GROUPABLE_FIELD_NAMES, ReadError, checked_select_query, event_value_expression,
+        group_options_query, grouped_index_query, grouped_rollup_query, latest_grouped_index_query,
         latest_grouped_rollup_query, normalize_prewhere, query_sources, query_usage_shape,
-        validate_parameter_name, validate_query_sources,
+        raw_groups_query, validate_parameter_name, validate_query_sources,
     };
     use std::collections::BTreeSet;
 
@@ -2948,7 +3118,10 @@ mod tests {
         assert!(query.contains("mode IN ('facet', 'lookup')"));
         assert!(query.contains("uniqExact(event_id) AS count"));
         assert!(!query.contains("FROM events"));
-        assert_eq!(parameters.get("group_key").and_then(|value| value.as_str()), Some("browser"));
+        assert_eq!(
+            parameters.get("group_key").and_then(|value| value.as_str()),
+            Some("browser")
+        );
     }
 
     #[test]
@@ -2962,12 +3135,38 @@ mod tests {
             ..Default::default()
         };
 
-        let (query, parameters) = grouped_rollup_query(&request, "plan");
+        let (query, parameters) = grouped_rollup_query(&request, "service");
 
         assert!(query.contains("FROM field_topk_1m"));
         assert!(query.contains("sum(count) AS count"));
         assert!(!query.contains("FROM events"));
-        assert_eq!(parameters.get("group_key").and_then(|value| value.as_str()), Some("plan"));
+        assert_eq!(
+            parameters.get("group_key").and_then(|value| value.as_str()),
+            Some("service")
+        );
+    }
+
+    #[test]
+    fn raw_groupable_non_core_field_groups_from_events() {
+        let request = EventsQueryRequest {
+            limit: 50,
+            time_range: Some(EventTimeRange {
+                lookback_minutes: 60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(RAW_GROUPABLE_FIELD_NAMES.contains(&"http.route"));
+        assert!(!CORE_ROLLUP_FIELD_NAMES.contains(&"http.route"));
+        let (query, parameters) = raw_groups_query(&request, "http.route").unwrap();
+
+        assert!(query.contains("FROM events AS e"));
+        assert!(query.contains("getSubcolumn(e.data, 'http.route')"));
+        assert_eq!(
+            parameters.get("limit").and_then(|value| value.as_u64()),
+            Some(51)
+        );
     }
 
     #[test]
@@ -2987,7 +3186,9 @@ mod tests {
         assert!(rollup_query.contains("max(bucket_time) AS lastCreatedAt"));
         assert!(!rollup_query.contains("FROM events"));
         assert_eq!(
-            rollup_parameters.get("group_value").and_then(|value| value.as_str()),
+            rollup_parameters
+                .get("group_value")
+                .and_then(|value| value.as_str()),
             Some("llm-gateway")
         );
 
@@ -2998,7 +3199,9 @@ mod tests {
         assert!(index_query.contains("mode IN ('facet', 'lookup')"));
         assert!(!index_query.contains("FROM events"));
         assert_eq!(
-            index_parameters.get("group_value").and_then(|value| value.as_str()),
+            index_parameters
+                .get("group_value")
+                .and_then(|value| value.as_str()),
             Some("llm-gateway")
         );
     }
@@ -3044,7 +3247,11 @@ mod tests {
         let sql = plan.where_clause();
 
         assert_eq!(sql.matches("field_index AS idx").count(), 3);
-        assert_eq!(sql.matches("idx.timestamp >= now64(3) - toIntervalMinute").count(), 3);
+        assert_eq!(
+            sql.matches("idx.timestamp >= now64(3) - toIntervalMinute")
+                .count(),
+            3
+        );
         assert!(sql.contains("idx.mode IN ('facet', 'lookup')"));
         assert!(!sql.contains("e.data.plan"));
         assert!(!sql.contains("e.data.country"));
@@ -3057,7 +3264,7 @@ mod tests {
             filter: EventFilter {
                 facets: vec![EventFacetFilter {
                     operator: EventFacetOperator::In,
-                    path: "model".to_string(),
+                    path: "llm.model".to_string(),
                     values: vec!["gpt-4.1".to_string(), "gpt-4.1-mini".to_string()],
                     ..Default::default()
                 }],
@@ -3070,7 +3277,7 @@ mod tests {
             ..Default::default()
         };
         let catalog = EventFieldCatalog {
-            promoted: BTreeSet::from(["model".to_string()]),
+            promoted: BTreeSet::from(["llm.model".to_string()]),
         };
 
         let plan = EventPredicatePlan::new(&request, &catalog, "e").unwrap();
@@ -3078,7 +3285,23 @@ mod tests {
 
         assert_eq!(sql.matches("field_index AS idx").count(), 1);
         assert!(sql.contains("idx.value IN ({facet_value_0:String}, {facet_value_1:String})"));
-        assert!(!sql.contains("e.data.model"));
+        assert!(!sql.contains("e.data.llm.model"));
+    }
+
+    #[test]
+    fn nested_payload_paths_use_clickhouse_subcolumn_lookup() {
+        assert_eq!(
+            event_value_expression("llm.model", "e").unwrap(),
+            "ifNull(toString(getSubcolumn(e.data, 'llm.model')), '')"
+        );
+        assert_eq!(
+            event_value_expression("service", "e").unwrap(),
+            "ifNull(toString(e.data.service), '')"
+        );
+        assert_eq!(
+            event_value_expression("llm.provider", "").unwrap(),
+            "ifNull(toString(getSubcolumn(data, 'llm.provider')), '')"
+        );
     }
 
     #[test]
@@ -3170,7 +3393,11 @@ mod tests {
                 validate_query_sources(query, &allowed).is_ok(),
                 "case {number} {name} should be allowed"
             );
-            assert_eq!(query_sources(query), expected_sources, "case {number} {name}");
+            assert_eq!(
+                query_sources(query),
+                expected_sources,
+                "case {number} {name}"
+            );
             assert!(
                 !query_sources(query)
                     .iter()
@@ -3197,7 +3424,10 @@ mod tests {
         let allowed = group2_allowed_sources();
 
         for (name, query, expected_sources) in cases {
-            assert!(validate_query_sources(query, &allowed).is_ok(), "{name} should be allowed");
+            assert!(
+                validate_query_sources(query, &allowed).is_ok(),
+                "{name} should be allowed"
+            );
             assert_eq!(query_sources(query), expected_sources, "{name}");
         }
     }
@@ -3207,6 +3437,12 @@ mod tests {
         let query = group_options_query();
         assert!(query.contains("arrayJoin"));
         assert!(query.contains("FROM definitions"));
+        assert!(query.contains("JSONExtractString(output, 'field_name')"));
+        assert!(query.contains("argMin(source, priority) AS source"));
+        assert!(query.contains("argMin(servingMode, priority) AS servingMode"));
+        assert!(query.contains("'core_rollup' AS source"));
+        assert!(query.contains("'lookup' AS source"));
+        assert!(query.contains("'raw' AS source"));
         assert!(!query.contains("FROM field_values"));
         assert!(!query.contains("any(value_type) AS valueType FROM field_values"));
     }
@@ -3217,6 +3453,9 @@ mod tests {
             "observatory.field_index",
             "observatory.event_measures",
             "observatory.measure_rollups",
+            "observatory.counter_rollups",
+            "observatory.gauge_rollups",
+            "observatory.histogram_rollups",
             "observatory.entity_state_updates",
             "observatory.report_results",
             "observatory.sequence_report_results",

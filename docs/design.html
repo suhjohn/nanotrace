@@ -537,11 +537,10 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
       <tr><td><code>measure_rollups</code></td><td>AggregatingMergeTree</td><td>Aggregate states over <code>event_measures</code>, populated by <code>mv_measure_rollups</code>.</td></tr>
       <tr><td><code>entity_state_updates</code></td><td>ReplacingMergeTree</td><td>Promoted state transitions for users/accounts/sessions or other entities.</td></tr>
       <tr><td><code>cohort_memberships</code></td><td>ReplacingMergeTree</td><td>Backfilled or refreshed cohort membership materialization.</td></tr>
-      <tr><td><code>report_results</code></td><td>ReplacingMergeTree</td><td>Reusable summary report outputs keyed by report and bucket time.</td></tr>
+      <tr><td><code>report_results</code></td><td>ReplacingMergeTree</td><td>Reusable summary, trace summary, and retention outputs keyed by report and bucket time.</td></tr>
       <tr><td><code>sequence_report_results</code></td><td>ReplacingMergeTree</td><td>Funnel/sequence step outputs.</td></tr>
-      <tr><td><code>definition_stats</code></td><td>ReplacingMergeTree</td><td>Cardinality, scan, storage, and recommendation metadata for definitions.</td></tr>
+      <tr><td><code>definition_stats</code></td><td>ReplacingMergeTree</td><td>Backfill and materialization status for definitions.</td></tr>
       <tr><td><code>query_usage</code></td><td>MergeTree</td><td>Observed query fingerprints, raw fallback status, JSON paths touched, scanned bytes, latency, and result size.</td></tr>
-      <tr><td><code>optimization_recommendations</code></td><td>ReplacingMergeTree</td><td>Recommendation records for proposed field, measure, report, cohort, funnel, or alert materialization.</td></tr>
       <tr><td><code>materialization_jobs</code></td><td>ReplacingMergeTree</td><td>Top-level jobs for backfills, report refreshes, cohort builds, and sequence materialization.</td></tr>
       <tr><td><code>materialization_chunks</code></td><td>ReplacingMergeTree</td><td>Claimable bounded work chunks with status, lease, attempt, row, byte, and error tracking.</td></tr>
       <tr><td><code>materialization_versions</code></td><td>ReplacingMergeTree</td><td>Completed or building target versions used to serve stable, version-selected analytical outputs.</td></tr>
@@ -553,7 +552,7 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
     <ul>
       <li>The event payload remains open-ended enough for product analytics, observability data, and tenant-specific attributes.</li>
       <li>Hot paths in the JSON type declaration get columnar subcolumns without forcing every path into a top-level table column.</li>
-      <li>New user attributes can be queried from raw data immediately, then promoted later if repeated query cost justifies a read model.</li>
+      <li>New user attributes can be queried from raw data immediately, then promoted later through explicit SDK-managed or user/admin definitions.</li>
       <li>Default write fanout is bounded to the core analytics pack; additional fanout is controlled by definitions instead of by arbitrary event shape.</li>
       <li>Flattening every JSON path into a column would make the schema and write path widen forever; the final design keeps flexible raw payloads and promotes only paths that earn a serving model.</li>
     </ul>
@@ -563,14 +562,13 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
     <h2>6. Materialization Control Plane</h2>
 
     <p>
-      A full analytics system needs optimized serving tables. Current production has a continuous materializer for definition-backed <code>field_index</code>, <code>event_measures</code>, and <code>entity_state_updates</code>. It reads shared lakehouse commit metadata from ClickHouse, scans only Iceberg snapshots ahead of the target watermarks, and advances only the serving tables it caught up. Broader report, cohort, sequence, and recommendation executors still use the control-plane schema described here.
+      A full analytics system needs optimized serving tables. Current production has a continuous materializer for definition-backed <code>field_index</code>, <code>event_measures</code>, metric rollups, <code>entity_state_updates</code>, summary, trace summary, and retention <code>report_results</code>, <code>sequence_report_results</code>, and <code>cohort_memberships</code>. It reads shared lakehouse commit metadata from ClickHouse, scans only Iceberg snapshots ahead of the target watermarks, and advances only the serving tables it caught up. Full published-version report jobs still use the control-plane schema described here.
     </p>
 
     <h3>Lifecycle</h3>
     <ol>
-      <li><strong>Observe.</strong> <code>query_usage</code> records query fingerprints, JSON paths, raw fallback status, latency, and scan cost.</li>
-      <li><strong>Recommend.</strong> <code>optimization_recommendations</code> stores proposed fields, measures, reports, cohorts, funnels, and alert rollups.</li>
-      <li><strong>Plan.</strong> The current promoted-table materializer plans from <code>serving_watermarks</code>. Future report/cohort executors create <code>materialization_jobs</code> and bounded <code>materialization_chunks</code> for historical or incremental windows.</li>
+      <li><strong>Define.</strong> SDK-managed definitions and user/admin definitions explicitly declare promoted fields, measures, reports, cohorts, funnels, and alert rollups.</li>
+      <li><strong>Plan.</strong> The current materializer plans from <code>serving_watermarks</code>. Future published-report executors create <code>materialization_jobs</code> and bounded <code>materialization_chunks</code> for historical or incremental windows.</li>
       <li><strong>Build.</strong> Workers claim chunks with leases, write target serving tables, and update row/byte/error progress.</li>
       <li><strong>Publish.</strong> <code>materialization_versions</code> marks completed target versions. Readers can select completed versions instead of partial writes.</li>
       <li><strong>Continue.</strong> <code>materialization_watermarks</code> tracks high-water marks for incremental refresh lag.</li>
@@ -582,7 +580,7 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
     </p>
 
     <div class="callout warn">
-      Implemented now: lakehouse commit replay, raw rebuild, incremental promoted-table materialization, continuous materializer service, and serving freshness guards. Still future work: automatic recommendations, report execution, cohort execution, sequence execution, and a full Iceberg REST/object-store production catalog.
+      Implemented now: lakehouse commit replay, raw rebuild, incremental field/measure/metric/state materialization, summary report materialization, trace summary report materialization, retention report materialization, sequence report materialization, cohort membership materialization, continuous materializer service, and serving freshness guards. Still future work: full published-version report jobs and a full Iceberg REST/object-store production catalog.
     </div>
   </section>
 
@@ -642,7 +640,7 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
     <h3>Query sandbox</h3>
     <ul>
       <li>Only read-only SQL is accepted; multi-statement DDL/DML paths are rejected.</li>
-      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code>, <code>field_index</code>, <code>field_values</code>, <code>field_density_1s</code>, <code>field_topk_1m</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>optimization_recommendations</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
+      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code>, <code>field_index</code>, <code>field_values</code>, <code>field_density_1s</code>, <code>field_topk_1m</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
       <li>User values are passed as ClickHouse parameters; identifier-like names are validated.</li>
       <li>ClickHouse requests are sent with readonly and bounded execution/result settings.</li>
     </ul>

@@ -78,13 +78,13 @@ These are not fast by default at 1M req/s scale, but the system has a clear opti
 
 Control-plane lifecycle:
 
-1. Observe raw fallback query shapes in `query_usage`.
-2. Store proposed fields, measures, reports, cohorts, funnels, or alerts in `optimization_recommendations`.
-3. Create bounded, retryable backfill or refresh work in `materialization_jobs` and `materialization_chunks`.
-4. Publish completed target versions in `materialization_versions`.
-5. Track incremental lag with `materialization_watermarks`.
+1. Use SDK-managed definitions and explicit user/admin definitions for fields, measures, reports, cohorts, funnels, or alerts.
+2. Materialize current supported outputs from Iceberg commits into ClickHouse serving tables.
+3. Create bounded, retryable backfill or refresh work in `materialization_jobs` and `materialization_chunks` for larger published-version outputs.
+4. Publish completed target versions in `materialization_versions` where readers need stable report versions.
+5. Track incremental lag with serving or materialization watermarks.
 
-This document describes the serving targets and query shapes. Automatic recommendation, promotion execution, job claiming, and report/cohort/sequence workers are separate implementation work.
+This document describes the serving targets and query shapes. The current materializer handles promoted fields, measures, metric rollups, entity states, summary reports, trace summary reports, sequence reports, retention reports, and cohort memberships. Full published-version report jobs are separate implementation work.
 
 ### 7. Group by arbitrary event field
 
@@ -248,7 +248,7 @@ Each predicate becomes an exact lookup in a narrow table keyed by `(tenant_id, f
 
 Operational caveats:
 
-The selected field set matters. Promoting every possible dynamic path recreates the write fanout problem. The product should recommend promotion after repeated use, high raw scan cost, or explicit user action.
+The selected field set matters. Promoting every possible dynamic path recreates the write fanout problem. Promotion should happen through explicit SDK-managed defaults or user/admin action.
 
 ### 9. Dimensioned alerts
 
@@ -714,7 +714,7 @@ The raw query orders and sequence-matches events per entity. The optimized query
 
 Operational caveats:
 
-The current schema has `sequence_report_results` and report metadata. If a production report worker is not running, this needs a materialization executor to populate the table.
+The current materializer can populate `sequence_report_results` from explicit sequence definitions. Full published-version report jobs are still separate production hardening work.
 
 ### 16. Retention cohorts
 
@@ -987,7 +987,7 @@ Create a trace report model rather than reintroducing always-on trace serving ta
 
 Backfill/materialization:
 
-Backfill per-trace summaries into a report-backed table. The current schema has `report_results`; a trace-specific report executor or table family would be needed for full production support.
+Create an explicit `report` definition with `mode = 'trace_summary'`. The materializer groups matched span-shaped events by tenant, bucket, report, version, and `trace_id`, then writes one per-trace summary row into `report_results`. The row dimensions include `trace_id` plus configured dimensions and best-effort root `service`/`name`; metrics include `duration_ms`, `event_count`, and `errors`.
 
 Optimized serving path:
 
@@ -1017,7 +1017,7 @@ Broad trace analytics require grouping raw events into traces before ranking. A 
 
 Operational caveats:
 
-This is Group 2 because it can be optimized with a report model, but it is not fully implemented as a first-class trace summary worker in the current codebase.
+This is Group 2 because it is optimized with an explicit report model. Raw `events` remain the source of truth for opening a selected trace and for trace shapes that have not been defined as reports.
 
 ### 20. Reusable dashboards
 

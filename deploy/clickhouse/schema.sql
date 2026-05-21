@@ -49,14 +49,32 @@ CREATE TABLE
 
             service LowCardinality (Nullable (String)),
             environment LowCardinality (Nullable (String)),
+            http.method LowCardinality (Nullable (String)),
+            http.route Nullable (String),
+            http.status_code Nullable (String),
+            http.response.status_code Nullable (String),
+            severity_text LowCardinality (Nullable (String)),
+            severity_number Nullable (Int32),
+            llm.model Nullable (String),
+            llm.provider LowCardinality (Nullable (String)),
+            tool_name Nullable (String),
+            processor_name Nullable (String),
 
             trace_id Nullable (String),
             span_id Nullable (String),
             parent_span_id Nullable (String),
+            request_id Nullable (String),
+            organization_id Nullable (String),
+            thread_id Nullable (String),
+            conversation_id Nullable (String),
             start_time Nullable (DateTime64 (3, 'UTC')),
             end_time Nullable (DateTime64 (3, 'UTC')),
             duration_ms Nullable (Float64),
             is_error Nullable (UInt8),
+            metric_name LowCardinality (Nullable (String)),
+            metric_type LowCardinality (Nullable (String)),
+            metric_unit LowCardinality (Nullable (String)),
+            metric_value Nullable (Float64),
 
             revenue Nullable (Float64),
             currency LowCardinality (Nullable (String)),
@@ -145,22 +163,6 @@ WITH
     toString (ifNull (data.service, '')) AS service_value,
     toString (ifNull (data.environment, '')) AS environment_value,
     toString (ifNull (data.name, '')) AS name_value,
-    toString (ifNull (data.plan, '')) AS plan_value,
-    toString (ifNull (data.country, '')) AS country_value,
-    toString (ifNull (data.region, '')) AS region_value,
-    toString (ifNull (data.user_group, '')) AS user_group_value,
-    toString (ifNull (data.user_id, '')) AS user_id_value,
-    toString (ifNull (data.account_id, '')) AS account_id_value,
-    toString (getSubcolumn (data, 'http.method')) AS http_method_value,
-    toString (getSubcolumn (data, 'http.route')) AS http_route_value,
-    toString (getSubcolumn (data, 'http.status_code')) AS http_status_code_value,
-    toString (getSubcolumn (data, 'http.response.status_code')) AS http_response_status_code_value,
-    toString (getSubcolumn (data, 'severity_text')) AS severity_text_value,
-    toString (getSubcolumn (data, 'severity_number')) AS severity_number_value,
-    toString (getSubcolumn (data, 'model')) AS model_value,
-    toString (getSubcolumn (data, 'provider')) AS provider_value,
-    toString (getSubcolumn (data, 'tool_name')) AS tool_name_value,
-    toString (getSubcolumn (data, 'processor_name')) AS processor_name_value,
     toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value,
     toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value
 SELECT
@@ -187,22 +189,7 @@ ARRAY JOIN
             ('name', name_value),
             ('service', service_value),
             ('environment', environment_value),
-            ('is_error', toString (error_value)),
-            ('http.method', http_method_value),
-            ('http.route', http_route_value),
-            ('http.status_code', multiIf (http_status_code_value != '', http_status_code_value, http_response_status_code_value)),
-            ('severity_text', severity_text_value),
-            ('severity_number', severity_number_value),
-            ('model', model_value),
-            ('provider', provider_value),
-            ('tool_name', tool_name_value),
-            ('processor_name', processor_name_value),
-            ('plan', plan_value),
-            ('country', country_value),
-            ('region', region_value),
-            ('user_group', user_group_value),
-            ('user_id', user_id_value),
-            ('account_id', account_id_value)
+            ('is_error', toString (error_value))
         ]
     ) AS dimension
 GROUP BY
@@ -238,22 +225,6 @@ WITH
     toString (ifNull (data.service, '')) AS service_value,
     toString (ifNull (data.environment, '')) AS environment_value,
     toString (ifNull (data.name, '')) AS name_value,
-    toString (ifNull (data.plan, '')) AS plan_value,
-    toString (ifNull (data.country, '')) AS country_value,
-    toString (ifNull (data.region, '')) AS region_value,
-    toString (ifNull (data.user_group, '')) AS user_group_value,
-    toString (ifNull (data.user_id, '')) AS user_id_value,
-    toString (ifNull (data.account_id, '')) AS account_id_value,
-    toString (getSubcolumn (data, 'http.method')) AS http_method_value,
-    toString (getSubcolumn (data, 'http.route')) AS http_route_value,
-    toString (getSubcolumn (data, 'http.status_code')) AS http_status_code_value,
-    toString (getSubcolumn (data, 'http.response.status_code')) AS http_response_status_code_value,
-    toString (getSubcolumn (data, 'severity_text')) AS severity_text_value,
-    toString (getSubcolumn (data, 'severity_number')) AS severity_number_value,
-    toString (getSubcolumn (data, 'model')) AS model_value,
-    toString (getSubcolumn (data, 'provider')) AS provider_value,
-    toString (getSubcolumn (data, 'tool_name')) AS tool_name_value,
-    toString (getSubcolumn (data, 'processor_name')) AS processor_name_value,
     toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value,
     toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value
 SELECT
@@ -280,22 +251,7 @@ ARRAY JOIN
             ('name', name_value),
             ('service', service_value),
             ('environment', environment_value),
-            ('is_error', toString (error_value)),
-            ('http.method', http_method_value),
-            ('http.route', http_route_value),
-            ('http.status_code', multiIf (http_status_code_value != '', http_status_code_value, http_response_status_code_value)),
-            ('severity_text', severity_text_value),
-            ('severity_number', severity_number_value),
-            ('model', model_value),
-            ('provider', provider_value),
-            ('tool_name', tool_name_value),
-            ('processor_name', processor_name_value),
-            ('plan', plan_value),
-            ('country', country_value),
-            ('region', region_value),
-            ('user_group', user_group_value),
-            ('user_id', user_id_value),
-            ('account_id', account_id_value)
+            ('is_error', toString (error_value))
         ]
     ) AS dimension
 GROUP BY
@@ -391,70 +347,12 @@ PARTITION BY
 ORDER BY
     (tenant_id, flamegraph_id, bucket_time, level, parent_path_hash, path_hash, path);
 
-CREATE MATERIALIZED VIEW
-    IF NOT EXISTS observatory.mv_flamegraph_rollups_1m TO observatory.flamegraph_rollups_1m AS
-WITH
-    toString (ifNull (data.service, '')) AS service_value,
-    toString (ifNull (data.environment, '')) AS environment_value,
-    toString (ifNull (data.name, '')) AS name_value,
-    toString (ifNull (data.plan, '')) AS plan_value,
-    toString (ifNull (data.country, '')) AS country_value,
-    toString (getSubcolumn (data, 'http.method')) AS http_method_value,
-    toString (getSubcolumn (data, 'http.route')) AS http_route_value,
-    toString (getSubcolumn (data, 'model')) AS model_value,
-    toString (getSubcolumn (data, 'provider')) AS provider_value,
-    toString (getSubcolumn (data, 'tool_name')) AS tool_name_value,
-    toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value,
-    toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value
-SELECT
-    tenant_id,
-    tupleElement (node, 1) AS flamegraph_id,
-    toStartOfInterval (timestamp, INTERVAL 1 MINUTE) AS bucket_time,
-    tupleElement (node, 2) AS level,
-    tupleElement (node, 3) AS path,
-    tupleElement (node, 4) AS parent_path,
-    count () AS count,
-    sum (error_value) AS error_count,
-    countIf (ifNull (data.duration_ms, 0) > 0) AS duration_count,
-    sum (duration_value) AS duration_sum
-FROM
-    observatory.events
-ARRAY JOIN
-    arrayFilter (
-        node -> tupleElement (node, 3) != '',
-        [
-            ('service.name', toUInt8 (1), service_value, ''),
-            ('service.name', toUInt8 (2), if (service_value != '' AND name_value != '', concat (service_value, '/', name_value), ''), service_value),
-            ('service.http_route.method', toUInt8 (1), service_value, ''),
-            ('service.http_route.method', toUInt8 (2), if (service_value != '' AND http_route_value != '', concat (service_value, '/', http_route_value), ''), service_value),
-            ('service.http_route.method', toUInt8 (3), if (service_value != '' AND http_route_value != '' AND http_method_value != '', concat (service_value, '/', http_route_value, '/', http_method_value), ''), if (service_value != '' AND http_route_value != '', concat (service_value, '/', http_route_value), '')),
-            ('signal.service.name', toUInt8 (1), signal, ''),
-            ('signal.service.name', toUInt8 (2), if (signal != '' AND service_value != '', concat (signal, '/', service_value), ''), signal),
-            ('signal.service.name', toUInt8 (3), if (signal != '' AND service_value != '' AND name_value != '', concat (signal, '/', service_value, '/', name_value), ''), if (signal != '' AND service_value != '', concat (signal, '/', service_value), '')),
-            ('environment.service.name', toUInt8 (1), environment_value, ''),
-            ('environment.service.name', toUInt8 (2), if (environment_value != '' AND service_value != '', concat (environment_value, '/', service_value), ''), environment_value),
-            ('environment.service.name', toUInt8 (3), if (environment_value != '' AND service_value != '' AND name_value != '', concat (environment_value, '/', service_value, '/', name_value), ''), if (environment_value != '' AND service_value != '', concat (environment_value, '/', service_value), '')),
-            ('plan.service.name', toUInt8 (1), plan_value, ''),
-            ('plan.service.name', toUInt8 (2), if (plan_value != '' AND service_value != '', concat (plan_value, '/', service_value), ''), plan_value),
-            ('plan.service.name', toUInt8 (3), if (plan_value != '' AND service_value != '' AND name_value != '', concat (plan_value, '/', service_value, '/', name_value), ''), if (plan_value != '' AND service_value != '', concat (plan_value, '/', service_value), '')),
-            ('country.service.name', toUInt8 (1), country_value, ''),
-            ('country.service.name', toUInt8 (2), if (country_value != '' AND service_value != '', concat (country_value, '/', service_value), ''), country_value),
-            ('country.service.name', toUInt8 (3), if (country_value != '' AND service_value != '' AND name_value != '', concat (country_value, '/', service_value, '/', name_value), ''), if (country_value != '' AND service_value != '', concat (country_value, '/', service_value), '')),
-            ('model.provider.name', toUInt8 (1), model_value, ''),
-            ('model.provider.name', toUInt8 (2), if (model_value != '' AND provider_value != '', concat (model_value, '/', provider_value), ''), model_value),
-            ('model.provider.name', toUInt8 (3), if (model_value != '' AND provider_value != '' AND name_value != '', concat (model_value, '/', provider_value, '/', name_value), ''), if (model_value != '' AND provider_value != '', concat (model_value, '/', provider_value), '')),
-            ('tool_name.event_type.name', toUInt8 (1), tool_name_value, ''),
-            ('tool_name.event_type.name', toUInt8 (2), if (tool_name_value != '' AND event_type != '', concat (tool_name_value, '/', event_type), ''), tool_name_value),
-            ('tool_name.event_type.name', toUInt8 (3), if (tool_name_value != '' AND event_type != '' AND name_value != '', concat (tool_name_value, '/', event_type, '/', name_value), ''), if (tool_name_value != '' AND event_type != '', concat (tool_name_value, '/', event_type), ''))
-        ]
-    ) AS node
-GROUP BY
-    tenant_id,
-    flamegraph_id,
-    bucket_time,
-    level,
-    path,
-    parent_path;
+/*
+ * flamegraph_rollups_1m is retained as an explicit report/materialization
+ * target. It is intentionally not populated by an always-on events MV because
+ * hierarchy rollups add high insert-path fanout and do not back the trace
+ * waterfall UI directly.
+ */
 
 CREATE TABLE
     IF NOT EXISTS observatory.definitions (
@@ -579,6 +477,68 @@ GROUP BY
     dimension_value;
 
 CREATE TABLE
+    IF NOT EXISTS observatory.counter_rollups (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        metric_name LowCardinality (String),
+        unit LowCardinality (String) DEFAULT '',
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 60,
+        dimensions JSON (max_dynamic_paths = 128, max_dynamic_types = 8),
+        dimensions_hash UInt64 MATERIALIZED cityHash64 (toJSONString (dimensions)),
+        count SimpleAggregateFunction (sum, UInt64),
+        sum SimpleAggregateFunction (sum, Float64)
+    ) ENGINE = AggregatingMergeTree
+PARTITION BY
+    toYYYYMM (bucket_time)
+ORDER BY
+    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.gauge_rollups (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        metric_name LowCardinality (String),
+        unit LowCardinality (String) DEFAULT '',
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 60,
+        dimensions JSON (max_dynamic_paths = 128, max_dynamic_types = 8),
+        dimensions_hash UInt64 MATERIALIZED cityHash64 (toJSONString (dimensions)),
+        count SimpleAggregateFunction (sum, UInt64),
+        sum SimpleAggregateFunction (sum, Float64),
+        min SimpleAggregateFunction (min, Float64),
+        max SimpleAggregateFunction (max, Float64),
+        last SimpleAggregateFunction (anyLast, Float64)
+    ) ENGINE = AggregatingMergeTree
+PARTITION BY
+    toYYYYMM (bucket_time)
+ORDER BY
+    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.histogram_rollups (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        metric_name LowCardinality (String),
+        unit LowCardinality (String) DEFAULT '',
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 60,
+        dimensions JSON (max_dynamic_paths = 128, max_dynamic_types = 8),
+        dimensions_hash UInt64 MATERIALIZED cityHash64 (toJSONString (dimensions)),
+        count SimpleAggregateFunction (sum, UInt64),
+        sum SimpleAggregateFunction (sum, Float64),
+        min SimpleAggregateFunction (min, Float64),
+        max SimpleAggregateFunction (max, Float64)
+    ) ENGINE = AggregatingMergeTree
+PARTITION BY
+    toYYYYMM (bucket_time)
+ORDER BY
+    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+
+CREATE TABLE
     IF NOT EXISTS observatory.entity_state_updates (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
@@ -662,11 +622,7 @@ CREATE TABLE
         rows_scanned UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
         rows_matched UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
         distinct_values UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
-        estimated_rows_per_sec Float64 DEFAULT 0 CODEC (ZSTD (1)),
-        estimated_storage_bytes_per_day UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
-        cardinality_class LowCardinality (String) DEFAULT '',
-        decision LowCardinality (String) DEFAULT '',
-        warnings Array (String) DEFAULT []
+        decision LowCardinality (String) DEFAULT ''
     ) ENGINE = ReplacingMergeTree (measured_at)
 ORDER BY
     (tenant_id, definition_id, definition_version);
@@ -699,34 +655,6 @@ PARTITION BY
     toYYYYMMDD (observed_at)
 ORDER BY
     (tenant_id, query_hash, observed_at, query_id);
-
-CREATE TABLE
-    IF NOT EXISTS observatory.optimization_recommendations (
-        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
-        recommendation_id String CODEC (ZSTD (1)),
-        recommendation_version UInt64 DEFAULT 0,
-        status LowCardinality (String) DEFAULT 'open',
-        kind LowCardinality (String),
-        priority UInt8 DEFAULT 50,
-        source_query_hash UInt64 DEFAULT 0,
-        target_type LowCardinality (String) DEFAULT '',
-        target_name String DEFAULT '' CODEC (ZSTD (1)),
-        title String CODEC (ZSTD (1)),
-        rationale String CODEC (ZSTD (3)),
-        suggested_definition JSON (max_dynamic_paths = 512, max_dynamic_types = 8),
-        suggested_report JSON (max_dynamic_paths = 512, max_dynamic_types = 8),
-        estimated_scan_bytes_saved_per_day UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
-        estimated_storage_bytes_per_day UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
-        estimated_write_rows_per_event Float64 DEFAULT 0 CODEC (ZSTD (1)),
-        first_seen_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
-        last_seen_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
-        decided_at Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
-        decision_reason String DEFAULT '' CODEC (ZSTD (3)),
-        updated_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
-        attributes JSON (max_dynamic_paths = 256, max_dynamic_types = 8)
-    ) ENGINE = ReplacingMergeTree (updated_at)
-ORDER BY
-    (tenant_id, status, kind, recommendation_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.materialization_jobs (

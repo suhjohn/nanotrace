@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/definitions",
             get(list_definitions).post(create_definition),
         )
+        .route("/v1/definitions/sdk-defaults", post(seed_sdk_definitions))
         .route("/v1/definitions/{definition_id}", delete(delete_definition))
         .route(
             "/v1/definitions/{definition_id}/backfill",
@@ -190,7 +191,10 @@ async fn post_events_query(
     Json(request): Json<EventsQueryRequest>,
 ) -> Result<Response, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let response = state.read.events_query(request, &identity.tenant_id).await?;
+    let response = state
+        .read
+        .events_query(request, &identity.tenant_id)
+        .await?;
     Ok(Json(response).into_response())
 }
 
@@ -249,6 +253,18 @@ async fn create_definition(
     Ok(Json(
         serde_json::to_value(response).map_err(|err| ApiError::BadRequest(err.to_string()))?,
     ))
+}
+
+async fn seed_sdk_definitions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
+    let definitions = state
+        .definitions
+        .seed_sdk_defaults(&identity.tenant_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "definitions": definitions })))
 }
 
 async fn delete_definition(

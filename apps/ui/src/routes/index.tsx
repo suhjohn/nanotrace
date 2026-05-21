@@ -157,6 +157,7 @@ type GroupOption = {
   lookupEnabled?: boolean
   path: string
   removable?: boolean
+  servingMode?: string
   source?: string
   valueType?: string
 }
@@ -206,7 +207,7 @@ type FlameKind = 'event' | 'run' | 'turn' | 'model' | 'tool'
 type EventSortDirection = 'asc' | 'desc'
 type GraphMode = 'flamegraph' | 'histogram'
 type GroupSortKey = 'count' | 'duration' | 'recent' | 'value'
-type TimeRangeKey = '15m' | '1h' | '6h' | '24h' | '7d' | 'custom'
+type TimeRangeKey = 'live' | '15m' | '1h' | '6h' | '24h' | '7d' | 'custom'
 
 type FlameSpan = {
   eventIds: string[]
@@ -270,6 +271,7 @@ const groupPageSize = 120
 const noGroupValue = '__nanotrace_no_group__'
 const defaultEventColumns: string[] = ['timestamp', 'name', 'traceId', 'data']
 const timeRangeOptions: { key: Exclude<TimeRangeKey, 'custom'>; label: string; minutes: number }[] = [
+  { key: 'live', label: 'Live', minutes: 15 },
   { key: '15m', label: '15m', minutes: 15 },
   { key: '1h', label: '1h', minutes: 60 },
   { key: '6h', label: '6h', minutes: 6 * 60 },
@@ -467,6 +469,7 @@ export function ObservatoryHome({
   const centerRef = useRef<HTMLElement | null>(null)
   const [dragging, setDragging] = useState<null | 'runs' | 'inspector' | 'flamegraph'>(null)
   const [highlightedEventIds, setHighlightedEventIds] = useState<string[]>([])
+  const [freshEventIds, setFreshEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
   const [eventFilterDraft, setEventFilterDraft] = useState('')
@@ -483,6 +486,12 @@ export function ObservatoryHome({
   const filterTouchedRef = useRef(false)
   const groupListRef = useRef<HTMLDivElement | null>(null)
   const groupLoadMoreRef = useRef<HTMLDivElement | null>(null)
+  const freshEventTimeoutRef = useRef<number | null>(null)
+  const liveEventSnapshotRef = useRef<{ ids: Set<string>; maxCreatedMs: number; scopeKey: string }>({
+    ids: new Set(),
+    maxCreatedMs: 0,
+    scopeKey: ''
+  })
   const seededLatestGroupKeyRef = useRef('')
   const previousGroupKeyRef = useRef('')
   const workspaceRef = useRef<HTMLElement | null>(null)
@@ -528,6 +537,8 @@ export function ObservatoryHome({
       }),
     [effectiveCustomRangeEnd, effectiveCustomRangeStart, effectiveTimeRangeKey]
   )
+  const liveMode = effectiveTimeRangeKey === 'live'
+  const liveRefetchInterval = liveMode ? 3000 : false
   const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}` : ''
   const viewingGroupedEvents = Boolean(selectedGroupKey)
   const eventScopeKey = selectedGroupKey || 'all-events'
@@ -568,7 +579,8 @@ export function ObservatoryHome({
         search: groupSearch,
         sortKey: groupSortKey,
         timeRange: groupListTimeRange
-      })
+      }),
+    refetchInterval: liveRefetchInterval
   })
   const traceList = groupsQuery.data?.pages.flatMap(page => page.groups) ?? []
   useEffect(() => {
@@ -610,6 +622,7 @@ export function ObservatoryHome({
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams],
     queryFn: () =>
       fetchSummary({ apiBaseUrl: observatoryUrl, eventFilter: eventFilterParams, groupBy, selectedGroupValue }),
+    refetchInterval: liveRefetchInterval,
     retry: false
   })
   const flamegraphDisabledBySummary = Boolean(summaryQuery.data?.capped)
@@ -642,7 +655,7 @@ export function ObservatoryHome({
           : { before: firstPage.prevCursor }
         : undefined,
     placeholderData: keepPreviousData,
-    refetchInterval: !viewingGroupedEvents && effectiveTimeRangeKey !== 'custom' ? 5000 : false,
+    refetchInterval: liveRefetchInterval,
     retry: false
   })
   const flamegraphQuery = useQuery({
@@ -657,6 +670,7 @@ export function ObservatoryHome({
         selectedGroupValue,
         timeRange: selectedTimeRange
       }),
+    refetchInterval: liveRefetchInterval,
     retry: false
   })
   const flamegraphDisabled = !viewingGroupedEvents || flamegraphDisabledBySummary || Boolean(flamegraphQuery.data?.capped)
@@ -673,6 +687,7 @@ export function ObservatoryHome({
         selectedGroupValue,
         timeRange: selectedTimeRange
       }),
+    refetchInterval: liveRefetchInterval,
     retry: false
   })
   const eventPages = eventsQuery.data?.pages ?? []
@@ -680,6 +695,75 @@ export function ObservatoryHome({
     () => eventPages.flatMap(page => page.events),
     [eventPages]
   )
+  const liveFreshScopeKey = [
+    eventDataKey,
+    selectedTimeRange.key,
+    eventSortDirection
+  ].join('\u0000')
+  useEffect(() => {
+    if (!liveMode) {
+      if (freshEventTimeoutRef.current !== null) {
+        window.clearTimeout(freshEventTimeoutRef.current)
+        freshEventTimeoutRef.current = null
+      }
+      liveEventSnapshotRef.current = { ids: new Set(), maxCreatedMs: 0, scopeKey: '' }
+      setFreshEventIds([])
+      return
+    }
+
+    const currentIds = new Set(allEvents.map(event => event.id))
+    const currentMaxCreatedMs = allEvents.reduce((max, event) => {
+      const createdMs = traceTimeMs(event.createdAt)
+      return Number.isFinite(createdMs) ? Math.max(max, createdMs) : max
+    }, 0)
+    const previous = liveEventSnapshotRef.current
+
+    if (previous.scopeKey !== liveFreshScopeKey) {
+      if (freshEventTimeoutRef.current !== null) {
+        window.clearTimeout(freshEventTimeoutRef.current)
+        freshEventTimeoutRef.current = null
+      }
+      liveEventSnapshotRef.current = {
+        ids: currentIds,
+        maxCreatedMs: currentMaxCreatedMs,
+        scopeKey: liveFreshScopeKey
+      }
+      setFreshEventIds([])
+      return
+    }
+
+    const addedIds = allEvents
+      .filter(event => {
+        const createdMs = traceTimeMs(event.createdAt)
+        return !previous.ids.has(event.id) && Number.isFinite(createdMs) && createdMs > previous.maxCreatedMs
+      })
+      .map(event => event.id)
+
+    if (addedIds.length > 0) {
+      if (freshEventTimeoutRef.current !== null) {
+        window.clearTimeout(freshEventTimeoutRef.current)
+        freshEventTimeoutRef.current = null
+      }
+      setFreshEventIds(addedIds)
+      freshEventTimeoutRef.current = window.setTimeout(() => {
+        setFreshEventIds(current => current.filter(id => !addedIds.includes(id)))
+        freshEventTimeoutRef.current = null
+      }, 6000)
+    }
+
+    liveEventSnapshotRef.current = {
+      ids: currentIds,
+      maxCreatedMs: Math.max(previous.maxCreatedMs, currentMaxCreatedMs),
+      scopeKey: liveFreshScopeKey
+    }
+  }, [allEvents, eventsQuery.dataUpdatedAt, liveFreshScopeKey, liveMode])
+  useEffect(() => {
+    return () => {
+      if (freshEventTimeoutRef.current !== null) {
+        window.clearTimeout(freshEventTimeoutRef.current)
+      }
+    }
+  }, [])
   const traceDetail = viewingGroupedEvents && eventPages[0]?.group
     ? {
         fields: mergeLogFields(eventPages.flatMap(page => page.fields)),
@@ -803,6 +887,9 @@ export function ObservatoryHome({
 
   function selectTimeRange(key: TimeRangeKey) {
     setTimeRangeKey(key)
+    if (key === 'live') {
+      setEventSortDirection('desc')
+    }
     setTimeRangeSearch(key, key === 'custom' ? effectiveCustomRangeStart : undefined, key === 'custom' ? effectiveCustomRangeEnd : undefined)
     applyRangeFilter(resolveTimeRange({ customEnd: effectiveCustomRangeEnd, customStart: effectiveCustomRangeStart, key }), {
       syncUrl: key === 'custom'
@@ -894,11 +981,13 @@ export function ObservatoryHome({
   }, [flamegraphDisabled, selectedGraphMode, setSelectedGraphMode])
 
   useEffect(() => {
-    const defaultFilter = defaultTimeRangeFilter({
-      lastCreatedAt: latestCreatedAt,
-      timeRange: selectedTimeRange
-    })
-    const initialFilter = defaultFilter ?? (!viewingGroupedEvents && selectedTimeRange.lookbackMinutes ? { text: '' } : null)
+    const defaultFilter = liveMode
+      ? null
+      : defaultTimeRangeFilter({
+          lastCreatedAt: latestCreatedAt,
+          timeRange: selectedTimeRange
+        })
+    const initialFilter = defaultFilter ?? (selectedTimeRange.lookbackMinutes ? { text: '' } : null)
     if (
       eventFilterSearchText !== undefined ||
       !initialFilter ||
@@ -914,7 +1003,13 @@ export function ObservatoryHome({
     setEventFilterDraft(defaultFilterText)
     setEventFilterParams(initialFilter)
     setFilterSearch('')
-  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, selectedTimeRange, viewingGroupedEvents])
+  }, [eventFilterSearchText, eventScopeKey, latestCreatedAt, liveMode, selectedTimeRange])
+
+  useEffect(() => {
+    if (liveMode && eventSortDirection !== 'desc') {
+      setEventSortDirection('desc')
+    }
+  }, [eventSortDirection, liveMode, setEventSortDirection])
 
   const filteredTraces = traceList
   const emptyFilter = !loadingList && !listError && Boolean(groupSearch) && traceList.length === 0
@@ -1193,10 +1288,18 @@ export function ObservatoryHome({
             <option value={noGroupValue}>No grouping</option>
             {displayedGroupOptions.map(option => (
               <option key={option.path} value={option.path}>
-                {groupOptionLabel(option)}
+                {groupOptionSelectLabel(option)}
               </option>
             ))}
           </select>
+          {selectedGroupOption ? (
+            <span
+              className="hidden h-5 max-w-[86px] shrink-0 items-center border border-neutral-800 px-1.5 text-[10px] uppercase tracking-[0.08em] text-neutral-500 sm:inline-flex"
+              title={groupOptionServingTitle(selectedGroupOption)}
+            >
+              {groupOptionServingLabel(selectedGroupOption)}
+            </span>
+          ) : null}
         </label>
         <div className="ml-auto flex shrink-0 items-center justify-end gap-1.5">
           <div className="flex overflow-hidden border border-neutral-800 bg-black">
@@ -1425,9 +1528,11 @@ export function ObservatoryHome({
               events={allEvents}
               emptyLabel={hasAppliedEventFilter(eventFilterParams) ? 'No events matched filter.' : 'No events.'}
               fields={eventDetail.fields}
+              freshEventIds={freshEventIds}
               hasMore={eventsQuery.hasNextPage}
               hasPrevious={eventsQuery.hasPreviousPage}
               highlightedEventIds={highlightedEventIds}
+              liveMode={liveMode}
               loading={loadingTableDetail}
               loadingAnchor={loadingAnchoredEvents}
               loadingMore={eventsQuery.isFetchingNextPage}
@@ -1705,6 +1810,46 @@ function previewGroupFields(fields: JsonObject | undefined) {
 
 function groupOptionLabel(option: GroupOption) {
   return option.displayName || displayFacetPath(option.path)
+}
+
+function groupOptionSelectLabel(option: GroupOption) {
+  const label = groupOptionLabel(option)
+  const servingLabel = groupOptionServingLabel(option)
+  return servingLabel ? `${label} - ${servingLabel}` : label
+}
+
+function groupOptionServingLabel(option: GroupOption | null) {
+  switch (option?.servingMode || option?.source) {
+    case 'rollup':
+    case 'core_rollup':
+      return 'Rollup'
+    case 'lookup':
+      return 'Lookup'
+    case 'promoted':
+    case 'field_index':
+      return 'Index'
+    case 'raw':
+      return 'Raw'
+    default:
+      return ''
+  }
+}
+
+function groupOptionServingTitle(option: GroupOption) {
+  switch (option.servingMode || option.source) {
+    case 'rollup':
+    case 'core_rollup':
+      return 'Grouped from the always-on core rollup.'
+    case 'lookup':
+      return 'Grouped from the exact lookup index.'
+    case 'promoted':
+    case 'field_index':
+      return 'Grouped from a promoted field index.'
+    case 'raw':
+      return 'Grouped directly from raw events.'
+    default:
+      return 'Group serving source.'
+  }
 }
 
 function isKnownGroupOption(path: string, options: GroupOption[]) {
@@ -2884,9 +3029,11 @@ function EventPanel({
   events,
   emptyLabel,
   fields,
+  freshEventIds,
   hasMore,
   hasPrevious,
   highlightedEventIds,
+  liveMode,
   loading,
   loadingAnchor,
   loadingMore,
@@ -2907,9 +3054,11 @@ function EventPanel({
   events: TraceEvent[]
   emptyLabel: string
   fields: LogField[]
+  freshEventIds: string[]
   hasMore: boolean
   hasPrevious: boolean
   highlightedEventIds: string[]
+  liveMode: boolean
   loading: boolean
   loadingAnchor: boolean
   loadingMore: boolean
@@ -2943,6 +3092,7 @@ function EventPanel({
   const userScrolledRef = useRef(false)
   const scrollSaveTimeoutRef = useRef<number | null>(null)
   const highlightedEventIdSet = new Set(highlightedEventIds)
+  const freshEventIdSet = new Set(freshEventIds)
   const selectedColumnSet = new Set(selectedColumns)
   const gridTemplateColumns = eventGridTemplate(selectedColumns)
   const allFields = useMemo(() => {
@@ -3132,9 +3282,10 @@ function EventPanel({
               path === 'timestamp' ? (
                 <button
                   key={path}
-                  aria-label={`Sort timestamp ${sortDirection === 'desc' ? 'ascending' : 'descending'}`}
-                  className="inline-flex min-w-0 items-center gap-1 text-left uppercase text-neutral-400 outline-none hover:text-white focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600"
-                  title={`Timestamp ${sortDirection === 'desc' ? 'descending' : 'ascending'}`}
+                  aria-label={liveMode ? 'Live mode uses newest first' : `Sort timestamp ${sortDirection === 'desc' ? 'ascending' : 'descending'}`}
+                  className="inline-flex min-w-0 items-center gap-1 text-left uppercase text-neutral-400 outline-none hover:text-white focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600 disabled:cursor-not-allowed disabled:text-neutral-600 disabled:hover:text-neutral-600"
+                  disabled={liveMode}
+                  title={liveMode ? 'Live mode uses newest first' : `Timestamp ${sortDirection === 'desc' ? 'descending' : 'ascending'}`}
                   type="button"
                   onClick={onToggleSortDirection}
                 >
@@ -3188,6 +3339,7 @@ function EventPanel({
                     className={cn(
                       'absolute left-0 top-0 grid w-full gap-3 border-b border-neutral-900 px-3 py-2 text-left text-[13px] leading-5 outline-none hover:bg-white/[0.03] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600',
                       error && 'border-l-2 border-l-red-400 bg-red-950/25 ring-1 ring-inset ring-red-500/35 hover:bg-red-950/35',
+                      freshEventIdSet.has(event.id) && 'nt-live-row',
                       highlightedEventIdSet.has(event.id) && 'bg-white/[0.05]',
                       event.id === selectedEventId && 'bg-white/[0.1] ring-1 ring-inset ring-white/40'
                     )}
@@ -3773,9 +3925,13 @@ async function fetchGroupOptions({
   limit: number
 }): Promise<{ fields: GroupOption[] }> {
   const response = await postEventsQuery<{
+    aggregateEnabled?: boolean
     capped: boolean
     cardinality: number
+    lookupEnabled?: boolean
     path: string
+    servingMode?: string
+    source?: string
     valueType: string
   }>({
     apiBaseUrl,
@@ -3784,7 +3940,11 @@ async function fetchGroupOptions({
   const dynamicFields = (response.data ?? []).map(field => ({
     cardinality: Number(field.cardinality) || 0,
     capped: Boolean(field.capped),
+    aggregateEnabled: Boolean(field.aggregateEnabled),
+    lookupEnabled: Boolean(field.lookupEnabled),
     path: displayFacetPath(field.path),
+    servingMode: field.servingMode,
+    source: field.source,
     valueType: field.valueType
   }))
   if (dynamicFields.length > 0) {
@@ -3794,7 +3954,9 @@ async function fetchGroupOptions({
     fields: groupableFields.slice(0, limit).map(path => ({
       cardinality: 0,
       capped: false,
-      path
+      path,
+      servingMode: 'raw',
+      source: 'raw'
     }))
   }
 }
@@ -4818,7 +4980,7 @@ function displayFacetPath(path: string) {
 function mergeGroupOptions(fields: GroupOption[], limit: number) {
   const seen = new Set<string>()
   const merged: GroupOption[] = []
-  for (const option of [...fields, ...groupableFields.map(path => ({ cardinality: 0, capped: false, path }))]) {
+  for (const option of [...fields, ...groupableFields.map(path => ({ cardinality: 0, capped: false, path, servingMode: 'raw', source: 'raw' }))]) {
     if (seen.has(option.path)) continue
     seen.add(option.path)
     merged.push(option)

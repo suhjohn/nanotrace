@@ -130,7 +130,13 @@ async fn post_events_query(
 ) -> Result<Response, ApiError> {
     let identity = authorize(&state, &headers).await?;
     require_scope(&identity, "query:read")?;
-    Ok(Json(state.read.events_query(request, &identity.tenant_id).await?).into_response())
+    Ok(Json(
+        state
+            .read
+            .events_query(request, &identity.tenant_id)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn get_event(

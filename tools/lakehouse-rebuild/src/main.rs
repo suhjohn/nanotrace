@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use nanotrace_lakehouse::LakehouseCommit;
 use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::reader::ChunkReader};
 use reqwest::Client;
@@ -29,7 +29,13 @@ struct Config {
     clickhouse_events_table: String,
     clickhouse_field_index_table: String,
     clickhouse_event_measures_table: String,
+    clickhouse_counter_rollups_table: String,
+    clickhouse_gauge_rollups_table: String,
+    clickhouse_histogram_rollups_table: String,
     clickhouse_entity_state_updates_table: String,
+    clickhouse_report_results_table: String,
+    clickhouse_sequence_report_results_table: String,
+    clickhouse_cohort_memberships_table: String,
     clickhouse_definitions_table: String,
     truncate_events: bool,
     rebuild_raw: bool,
@@ -93,57 +99,259 @@ struct DefinitionRecord {
 
 #[derive(Debug, Clone, Default)]
 struct ExtractionDefinitions {
-    fields: Vec<FieldDefinition>,
-    measures: Vec<MeasureDefinition>,
-    states: Vec<StateDefinition>,
+    fields: Vec<FieldRule>,
+    measures: Vec<MeasureRule>,
+    metric_rollups: Vec<MetricRollupRule>,
+    states: Vec<StateRule>,
+    reports: Vec<ReportRule>,
+    trace_reports: Vec<TraceReportRule>,
+    retentions: Vec<RetentionRule>,
+    sequences: Vec<SequenceRule>,
+    cohorts: Vec<CohortRule>,
 }
 
 #[derive(Debug, Clone)]
-struct FieldDefinition {
+struct FieldRule {
     tenant_id: String,
     definition_id: String,
     definition_version: u64,
-    name: String,
+    matcher: Matcher,
+    output: FieldOutput,
+}
+
+#[derive(Debug, Clone)]
+struct FieldOutput {
+    field_name: StringExpr,
     mode: String,
-    path: String,
+    value: ValueExpr,
     value_type: String,
 }
 
 #[derive(Debug, Clone)]
-struct MeasureDefinition {
+struct MeasureRule {
     tenant_id: String,
     definition_id: String,
     definition_version: u64,
-    name: String,
-    path: String,
-    unit: String,
-    dimension: String,
+    matcher: Matcher,
+    output: MeasureOutput,
 }
 
 #[derive(Debug, Clone)]
-struct StateDefinition {
+struct MeasureOutput {
+    measure_name: StringExpr,
+    value: NumberExpr,
+    unit: StringExpr,
+    dimensions: Vec<DimensionOutput>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct DimensionOutput {
+    name: String,
+    value: StringExpr,
+}
+
+#[derive(Debug, Clone)]
+struct MetricRollupRule {
     tenant_id: String,
     definition_id: String,
     definition_version: u64,
-    name: String,
-    path: String,
+    matcher: Matcher,
+    output: MetricRollupOutput,
+}
+
+#[derive(Debug, Clone)]
+struct MetricRollupOutput {
+    metric_name: StringExpr,
+    metric_kind: StringExpr,
+    value: NumberExpr,
+    unit: StringExpr,
+    dimensions: Vec<DimensionOutput>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StateRule {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: StateOutput,
+}
+
+#[derive(Debug, Clone)]
+struct StateOutput {
+    entity_type: StringExpr,
+    entity_id: StringExpr,
+    state_name: StringExpr,
+    value: StringExpr,
     value_type: String,
-    entity_type: String,
-    entity_id_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReportRule {
+    tenant_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: ReportOutput,
+}
+
+#[derive(Debug, Clone)]
+struct ReportOutput {
+    report_id: StringExpr,
+    dimensions: Vec<DimensionOutput>,
+    metrics: Vec<ReportMetricOutput>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ReportMetricOutput {
+    name: String,
+    op: ReportMetricOp,
+    value: Option<NumberExpr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportMetricOp {
+    Count,
+    ErrorCount,
+    Sum,
+}
+
+#[derive(Debug, Clone)]
+struct TraceReportRule {
+    tenant_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: TraceReportOutput,
+}
+
+#[derive(Debug, Clone)]
+struct TraceReportOutput {
+    report_id: StringExpr,
+    dimensions: Vec<DimensionOutput>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RetentionRule {
+    tenant_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: RetentionOutput,
+}
+
+#[derive(Debug, Clone)]
+struct RetentionOutput {
+    report_id: StringExpr,
+    cohort_id: StringExpr,
+    entity_type: StringExpr,
+    entity_id: StringExpr,
+    dimensions: Vec<DimensionOutput>,
+    retention_bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SequenceRule {
+    tenant_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: SequenceOutput,
+}
+
+#[derive(Debug, Clone)]
+struct SequenceOutput {
+    report_id: StringExpr,
+    entity_id: StringExpr,
+    segment: Vec<DimensionOutput>,
+    steps: Vec<SequenceStep>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SequenceStep {
+    name: String,
+    matcher: Matcher,
+}
+
+#[derive(Debug, Clone)]
+struct CohortRule {
+    tenant_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: CohortOutput,
+}
+
+#[derive(Debug, Clone)]
+struct CohortOutput {
+    cohort_id: StringExpr,
+    entity_type: StringExpr,
+    entity_id: StringExpr,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Matcher {
+    predicates: Vec<Predicate>,
+}
+
+#[derive(Debug, Clone)]
+struct Predicate {
+    path: String,
+    op: PredicateOp,
+    value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredicateOp {
+    Exists,
+    Eq,
+    Neq,
+    IsNumber,
+    In,
+}
+
+#[derive(Debug, Clone)]
+enum StringExpr {
+    Literal(String),
+    Path { path: String, default: String },
+}
+
+#[derive(Debug, Clone)]
+enum ValueExpr {
+    Literal(Value),
+    Path { path: String },
+}
+
+#[derive(Debug, Clone)]
+enum NumberExpr {
+    Literal(f64),
+    Path { path: String },
 }
 
 #[derive(Debug, Default)]
 struct MaterializedCounts {
     field_index: usize,
     event_measures: usize,
+    counter_rollups: usize,
+    gauge_rollups: usize,
+    histogram_rollups: usize,
     entity_state_updates: usize,
+    report_results: usize,
+    sequence_report_results: usize,
+    cohort_memberships: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MaterializeTargets {
     field_index: bool,
     event_measures: bool,
+    counter_rollups: bool,
+    gauge_rollups: bool,
+    histogram_rollups: bool,
     entity_state_updates: bool,
+    report_results: bool,
+    sequence_report_results: bool,
+    cohort_memberships: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,12 +366,26 @@ impl MaterializeTargets {
         Self {
             field_index: true,
             event_measures: true,
+            counter_rollups: true,
+            gauge_rollups: true,
+            histogram_rollups: true,
             entity_state_updates: true,
+            report_results: true,
+            sequence_report_results: true,
+            cohort_memberships: true,
         }
     }
 
     fn any(self) -> bool {
-        self.field_index || self.event_measures || self.entity_state_updates
+        self.field_index
+            || self.event_measures
+            || self.counter_rollups
+            || self.gauge_rollups
+            || self.histogram_rollups
+            || self.entity_state_updates
+            || self.report_results
+            || self.sequence_report_results
+            || self.cohort_memberships
     }
 }
 
@@ -210,6 +432,53 @@ struct EventMeasureRow {
 }
 
 #[derive(Debug, Serialize)]
+struct CounterRollupRow {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    metric_name: String,
+    unit: String,
+    bucket_time: String,
+    bucket_seconds: u32,
+    dimensions: Value,
+    count: u64,
+    sum: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct GaugeRollupRow {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    metric_name: String,
+    unit: String,
+    bucket_time: String,
+    bucket_seconds: u32,
+    dimensions: Value,
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    last: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct HistogramRollupRow {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    metric_name: String,
+    unit: String,
+    bucket_time: String,
+    bucket_seconds: u32,
+    dimensions: Value,
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct EntityStateUpdateRow {
     tenant_id: String,
     definition_id: String,
@@ -223,6 +492,40 @@ struct EntityStateUpdateRow {
     event_id: String,
     event_type: String,
     signal: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportResultRow {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    dimensions: Value,
+    metrics: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct SequenceReportResultRow {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    segment: Value,
+    step_index: u16,
+    step_name: String,
+    entity_count: u64,
+    conversion_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CohortMembershipRow {
+    tenant_id: String,
+    cohort_id: String,
+    cohort_version: u64,
+    entity_type: String,
+    entity_id: String,
+    first_seen: String,
+    last_seen: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,10 +604,15 @@ async fn main() -> Result<()> {
             .await
             .context("load active materialization definitions")?;
         println!(
-            "materialization_definitions fields={} measures={} states={}",
+            "materialization_definitions fields={} measures={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
             definitions.fields.len(),
             definitions.measures.len(),
-            definitions.states.len()
+            definitions.states.len(),
+            definitions.reports.len(),
+            definitions.trace_reports.len(),
+            definitions.retentions.len(),
+            definitions.sequences.len(),
+            definitions.cohorts.len()
         );
         Some(definitions)
     } else {
@@ -350,7 +658,13 @@ async fn main() -> Result<()> {
         for table in [
             cfg.qualified_field_index_table(),
             cfg.qualified_event_measures_table(),
+            cfg.qualified_counter_rollups_table(),
+            cfg.qualified_gauge_rollups_table(),
+            cfg.qualified_histogram_rollups_table(),
             cfg.qualified_entity_state_updates_table(),
+            cfg.qualified_report_results_table(),
+            cfg.qualified_sequence_report_results_table(),
+            cfg.qualified_cohort_memberships_table(),
         ] {
             let existing = clickhouse_count(&client, &cfg, &table)
                 .await
@@ -392,10 +706,24 @@ impl Config {
         let clickhouse_field_index_table = env_or("CLICKHOUSE_FIELD_INDEX_TABLE", "field_index");
         let clickhouse_event_measures_table =
             env_or("CLICKHOUSE_EVENT_MEASURES_TABLE", "event_measures");
+        let clickhouse_counter_rollups_table =
+            env_or("CLICKHOUSE_COUNTER_ROLLUPS_TABLE", "counter_rollups");
+        let clickhouse_gauge_rollups_table =
+            env_or("CLICKHOUSE_GAUGE_ROLLUPS_TABLE", "gauge_rollups");
+        let clickhouse_histogram_rollups_table =
+            env_or("CLICKHOUSE_HISTOGRAM_ROLLUPS_TABLE", "histogram_rollups");
         let clickhouse_entity_state_updates_table = env_or(
             "CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE",
             "entity_state_updates",
         );
+        let clickhouse_report_results_table =
+            env_or("CLICKHOUSE_REPORT_RESULTS_TABLE", "report_results");
+        let clickhouse_sequence_report_results_table = env_or(
+            "CLICKHOUSE_SEQUENCE_REPORT_RESULTS_TABLE",
+            "sequence_report_results",
+        );
+        let clickhouse_cohort_memberships_table =
+            env_or("CLICKHOUSE_COHORT_MEMBERSHIPS_TABLE", "cohort_memberships");
         let clickhouse_definitions_table = env_or("CLICKHOUSE_DEFINITIONS_TABLE", "definitions");
         validate_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         validate_identifier("CLICKHOUSE_TABLE", &clickhouse_events_table)?;
@@ -408,8 +736,32 @@ impl Config {
             &clickhouse_event_measures_table,
         )?;
         validate_identifier(
+            "CLICKHOUSE_COUNTER_ROLLUPS_TABLE",
+            &clickhouse_counter_rollups_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_GAUGE_ROLLUPS_TABLE",
+            &clickhouse_gauge_rollups_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_HISTOGRAM_ROLLUPS_TABLE",
+            &clickhouse_histogram_rollups_table,
+        )?;
+        validate_identifier(
             "CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE",
             &clickhouse_entity_state_updates_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_REPORT_RESULTS_TABLE",
+            &clickhouse_report_results_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_SEQUENCE_REPORT_RESULTS_TABLE",
+            &clickhouse_sequence_report_results_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_COHORT_MEMBERSHIPS_TABLE",
+            &clickhouse_cohort_memberships_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_DEFINITIONS_TABLE",
@@ -430,7 +782,13 @@ impl Config {
             clickhouse_events_table,
             clickhouse_field_index_table,
             clickhouse_event_measures_table,
+            clickhouse_counter_rollups_table,
+            clickhouse_gauge_rollups_table,
+            clickhouse_histogram_rollups_table,
             clickhouse_entity_state_updates_table,
+            clickhouse_report_results_table,
+            clickhouse_sequence_report_results_table,
+            clickhouse_cohort_memberships_table,
             clickhouse_definitions_table,
             truncate_events: env_bool("NANOTRACE_REBUILD_TRUNCATE"),
             rebuild_raw: env_bool_default("NANOTRACE_REBUILD_RAW", true),
@@ -486,10 +844,52 @@ impl Config {
         )
     }
 
+    fn qualified_counter_rollups_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_counter_rollups_table
+        )
+    }
+
+    fn qualified_gauge_rollups_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_gauge_rollups_table
+        )
+    }
+
+    fn qualified_histogram_rollups_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_histogram_rollups_table
+        )
+    }
+
     fn qualified_entity_state_updates_table(&self) -> String {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_entity_state_updates_table
+        )
+    }
+
+    fn qualified_report_results_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_report_results_table
+        )
+    }
+
+    fn qualified_sequence_report_results_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_sequence_report_results_table
+        )
+    }
+
+    fn qualified_cohort_memberships_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_cohort_memberships_table
         )
     }
 
@@ -582,7 +982,13 @@ async fn rebuild_commit(
             .await?;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
+            materialized.counter_rollups += counts.counter_rollups;
+            materialized.gauge_rollups += counts.gauge_rollups;
+            materialized.histogram_rollups += counts.histogram_rollups;
             materialized.entity_state_updates += counts.entity_state_updates;
+            materialized.report_results += counts.report_results;
+            materialized.sequence_report_results += counts.sequence_report_results;
+            materialized.cohort_memberships += counts.cohort_memberships;
         }
     }
 
@@ -643,7 +1049,13 @@ async fn run_incremental_materialize(
             .await?;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
+            materialized.counter_rollups += counts.counter_rollups;
+            materialized.gauge_rollups += counts.gauge_rollups;
+            materialized.histogram_rollups += counts.histogram_rollups;
             materialized.entity_state_updates += counts.entity_state_updates;
+            materialized.report_results += counts.report_results;
+            materialized.sequence_report_results += counts.sequence_report_results;
+            materialized.cohort_memberships += counts.cohort_memberships;
         }
         insert_incremental_materialization_metadata(client, cfg, commit, &materialized, targets)
             .await?;
@@ -659,20 +1071,62 @@ async fn run_incremental_materialize(
                 commit.sequence_number,
             );
         }
+        if targets.counter_rollups {
+            watermarks.insert(
+                cfg.clickhouse_counter_rollups_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.gauge_rollups {
+            watermarks.insert(
+                cfg.clickhouse_gauge_rollups_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.histogram_rollups {
+            watermarks.insert(
+                cfg.clickhouse_histogram_rollups_table.clone(),
+                commit.sequence_number,
+            );
+        }
         if targets.entity_state_updates {
             watermarks.insert(
                 cfg.clickhouse_entity_state_updates_table.clone(),
                 commit.sequence_number,
             );
         }
+        if targets.report_results {
+            watermarks.insert(
+                cfg.clickhouse_report_results_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.sequence_report_results {
+            watermarks.insert(
+                cfg.clickhouse_sequence_report_results_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.cohort_memberships {
+            watermarks.insert(
+                cfg.clickhouse_cohort_memberships_table.clone(),
+                commit.sequence_number,
+            );
+        }
         println!(
-            "materialized snapshot={} sequence={} scanned_rows={} field_index_rows={} event_measure_rows={} entity_state_update_rows={}",
+            "materialized snapshot={} sequence={} scanned_rows={} field_index_rows={} event_measure_rows={} counter_rollup_rows={} gauge_rollup_rows={} histogram_rollup_rows={} entity_state_update_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
             commit.snapshot_id,
             commit.sequence_number,
             commit_scanned_rows,
             materialized.field_index,
             materialized.event_measures,
-            materialized.entity_state_updates
+            materialized.counter_rollups,
+            materialized.gauge_rollups,
+            materialized.histogram_rollups,
+            materialized.entity_state_updates,
+            materialized.report_results,
+            materialized.sequence_report_results,
+            materialized.cohort_memberships
         );
     }
     Ok(scanned_rows)
@@ -723,10 +1177,15 @@ async fn run_materializer_pass(
         .await
         .context("load active materialization definitions")?;
     println!(
-        "materialization_definitions fields={} measures={} states={}",
+        "materialization_definitions fields={} measures={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
         definitions.fields.len(),
         definitions.measures.len(),
-        definitions.states.len()
+        definitions.states.len(),
+        definitions.reports.len(),
+        definitions.trace_reports.len(),
+        definitions.retentions.len(),
+        definitions.sequences.len(),
+        definitions.cohorts.len()
     );
     run_incremental_materialize(client, lakehouse_reader, cfg, &commits, &definitions).await
 }
@@ -747,8 +1206,38 @@ fn materialize_targets_for_commit(
             .copied()
             .unwrap_or(0)
             < sequence_number,
+        counter_rollups: watermarks
+            .get(&cfg.clickhouse_counter_rollups_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        gauge_rollups: watermarks
+            .get(&cfg.clickhouse_gauge_rollups_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        histogram_rollups: watermarks
+            .get(&cfg.clickhouse_histogram_rollups_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
         entity_state_updates: watermarks
             .get(&cfg.clickhouse_entity_state_updates_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        report_results: watermarks
+            .get(&cfg.clickhouse_report_results_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        sequence_report_results: watermarks
+            .get(&cfg.clickhouse_sequence_report_results_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        cohort_memberships: watermarks
+            .get(&cfg.clickhouse_cohort_memberships_table)
             .copied()
             .unwrap_or(0)
             < sequence_number,
@@ -765,7 +1254,13 @@ async fn materialize_rows(
 ) -> Result<MaterializedCounts> {
     let mut field_index = Vec::new();
     let mut event_measures = Vec::new();
+    let mut counter_rollups = Vec::new();
+    let mut gauge_rollups = Vec::new();
+    let mut histogram_rollups = Vec::new();
     let mut entity_state_updates = Vec::new();
+    let mut report_results = Vec::new();
+    let mut sequence_report_results = Vec::new();
+    let mut cohort_memberships = Vec::new();
 
     for row in rows {
         if options.targets.field_index {
@@ -774,15 +1269,51 @@ async fn materialize_rows(
         if options.targets.event_measures {
             event_measures.extend(event_measure_rows(row, definitions));
         }
+        let metric_rows = metric_rollup_rows(row, definitions);
+        if options.targets.counter_rollups {
+            counter_rollups.extend(metric_rows.counters);
+        }
+        if options.targets.gauge_rollups {
+            gauge_rollups.extend(metric_rows.gauges);
+        }
+        if options.targets.histogram_rollups {
+            histogram_rollups.extend(metric_rows.histograms);
+        }
         if options.targets.entity_state_updates {
             entity_state_updates.extend(entity_state_update_rows(row, definitions));
         }
+    }
+    if options.targets.report_results {
+        report_results.extend(report_result_rows(rows, definitions));
+        report_results.extend(trace_report_result_rows(rows, definitions));
+    }
+    if options.targets.cohort_memberships {
+        cohort_memberships.extend(cohort_membership_rows(rows, definitions));
+    }
+    if options.targets.report_results {
+        let retention_memberships =
+            retention_memberships_for_rows(client, cfg, rows, definitions, &cohort_memberships)
+                .await?;
+        report_results.extend(retention_report_result_rows(
+            rows,
+            definitions,
+            &retention_memberships,
+        ));
+    }
+    if options.targets.sequence_report_results {
+        sequence_report_results.extend(sequence_report_result_rows(rows, definitions));
     }
 
     let counts = MaterializedCounts {
         field_index: field_index.len(),
         event_measures: event_measures.len(),
+        counter_rollups: counter_rollups.len(),
+        gauge_rollups: gauge_rollups.len(),
+        histogram_rollups: histogram_rollups.len(),
         entity_state_updates: entity_state_updates.len(),
+        report_results: report_results.len(),
+        sequence_report_results: sequence_report_results.len(),
+        cohort_memberships: cohort_memberships.len(),
     };
     let token_prefix = format!(
         "{}:{}:{}:{}",
@@ -813,6 +1344,42 @@ async fn materialize_rows(
         .await
         .context("insert materialized event measure rows")?;
     }
+    if !counter_rollups.is_empty() {
+        let body = rows_to_ndjson(&counter_rollups)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_counter_rollups_table(),
+            &body,
+            &format!("{token_prefix}:counter_rollups"),
+        )
+        .await
+        .context("insert materialized counter rollup rows")?;
+    }
+    if !gauge_rollups.is_empty() {
+        let body = rows_to_ndjson(&gauge_rollups)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_gauge_rollups_table(),
+            &body,
+            &format!("{token_prefix}:gauge_rollups"),
+        )
+        .await
+        .context("insert materialized gauge rollup rows")?;
+    }
+    if !histogram_rollups.is_empty() {
+        let body = rows_to_ndjson(&histogram_rollups)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_histogram_rollups_table(),
+            &body,
+            &format!("{token_prefix}:histogram_rollups"),
+        )
+        .await
+        .context("insert materialized histogram rollup rows")?;
+    }
     if !entity_state_updates.is_empty() {
         let body = rows_to_ndjson(&entity_state_updates)?;
         insert_clickhouse(
@@ -824,6 +1391,42 @@ async fn materialize_rows(
         )
         .await
         .context("insert materialized entity state rows")?;
+    }
+    if !report_results.is_empty() {
+        let body = rows_to_ndjson(&report_results)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_report_results_table(),
+            &body,
+            &format!("{token_prefix}:report_results"),
+        )
+        .await
+        .context("insert materialized report result rows")?;
+    }
+    if !sequence_report_results.is_empty() {
+        let body = rows_to_ndjson(&sequence_report_results)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_sequence_report_results_table(),
+            &body,
+            &format!("{token_prefix}:sequence_report_results"),
+        )
+        .await
+        .context("insert materialized sequence report result rows")?;
+    }
+    if !cohort_memberships.is_empty() {
+        let body = rows_to_ndjson(&cohort_memberships)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_cohort_memberships_table(),
+            &body,
+            &format!("{token_prefix}:cohort_memberships"),
+        )
+        .await
+        .context("insert materialized cohort membership rows")?;
     }
 
     Ok(counts)
@@ -869,7 +1472,13 @@ async fn insert_commit_metadata(
             "materialized_enabled": materialized_enabled,
             "field_index_rows": materialized.field_index,
             "event_measure_rows": materialized.event_measures,
+            "counter_rollup_rows": materialized.counter_rollups,
+            "gauge_rollup_rows": materialized.gauge_rollups,
+            "histogram_rollup_rows": materialized.histogram_rollups,
             "entity_state_update_rows": materialized.entity_state_updates,
+            "report_result_rows": materialized.report_results,
+            "sequence_report_result_rows": materialized.sequence_report_results,
+            "cohort_membership_rows": materialized.cohort_memberships,
         }),
     };
 
@@ -974,10 +1583,46 @@ fn materialized_watermarks<'a>(
             targets.event_measures,
         ),
         (
+            cfg.clickhouse_counter_rollups_table.as_str(),
+            "counter_rollup_rows",
+            materialized.counter_rollups,
+            targets.counter_rollups,
+        ),
+        (
+            cfg.clickhouse_gauge_rollups_table.as_str(),
+            "gauge_rollup_rows",
+            materialized.gauge_rollups,
+            targets.gauge_rollups,
+        ),
+        (
+            cfg.clickhouse_histogram_rollups_table.as_str(),
+            "histogram_rollup_rows",
+            materialized.histogram_rollups,
+            targets.histogram_rollups,
+        ),
+        (
             cfg.clickhouse_entity_state_updates_table.as_str(),
             "entity_state_update_rows",
             materialized.entity_state_updates,
             targets.entity_state_updates,
+        ),
+        (
+            cfg.clickhouse_report_results_table.as_str(),
+            "report_result_rows",
+            materialized.report_results,
+            targets.report_results,
+        ),
+        (
+            cfg.clickhouse_sequence_report_results_table.as_str(),
+            "sequence_report_result_rows",
+            materialized.sequence_report_results,
+            targets.sequence_report_results,
+        ),
+        (
+            cfg.clickhouse_cohort_memberships_table.as_str(),
+            "cohort_membership_rows",
+            materialized.cohort_memberships,
+            targets.cohort_memberships,
         ),
     ]
     .into_iter()
@@ -1094,7 +1739,7 @@ fn commit_record_to_commit(row: LakehouseCommitRecord) -> LakehouseCommit {
 
 async fn active_definitions(client: &Client, cfg: &Config) -> Result<ExtractionDefinitions> {
     let query = format!(
-        "SELECT tenant_id, definition_id, name, kind, mode, config, version FROM {} FINAL WHERE enabled = 1 AND isNull(deleted_at) AND kind IN ('field', 'measure', 'rollup', 'state') FORMAT JSON",
+        "SELECT tenant_id, definition_id, name, kind, mode, config, version FROM {} FINAL WHERE enabled = 1 AND isNull(deleted_at) AND kind IN ('field', 'measure', 'rollup', 'metric_rollup', 'state', 'report', 'sequence', 'cohort') FORMAT JSON",
         cfg.qualified_definitions_table()
     );
     let body = clickhouse_query(client, cfg, &query).await?;
@@ -1107,60 +1752,41 @@ impl ExtractionDefinitions {
     fn from_records(records: Vec<DefinitionRecord>) -> Self {
         let mut fields = Vec::new();
         let mut measures = Vec::new();
+        let mut metric_rollups = Vec::new();
         let mut states = Vec::new();
+        let mut reports = Vec::new();
+        let mut trace_reports = Vec::new();
+        let mut retentions = Vec::new();
+        let mut sequences = Vec::new();
+        let mut cohorts = Vec::new();
         for record in records {
             match record.kind.as_str() {
                 "field" => {
-                    let path = config_string(&record.config, "path");
-                    if path.is_empty() {
-                        continue;
-                    }
-                    fields.push(FieldDefinition {
-                        tenant_id: record.tenant_id,
-                        definition_id: record.definition_id,
-                        definition_version: record.version,
-                        name: record.name,
-                        mode: if record.mode == "lookup" {
-                            "lookup".to_string()
-                        } else {
-                            "facet".to_string()
-                        },
-                        path,
-                        value_type: config_string_default(&record.config, "value_type", "string"),
-                    });
+                    fields.extend(field_rules_from_record(&record));
                 }
                 "measure" | "rollup" => {
-                    let path = config_string(&record.config, "path");
-                    if path.is_empty() {
-                        continue;
-                    }
-                    measures.push(MeasureDefinition {
-                        tenant_id: record.tenant_id,
-                        definition_id: record.definition_id,
-                        definition_version: record.version,
-                        name: record.name,
-                        path,
-                        unit: config_string_default(&record.config, "unit", ""),
-                        dimension: config_string_default(&record.config, "dimension", ""),
-                    });
+                    measures.extend(measure_rules_from_record(&record));
+                }
+                "metric_rollup" => {
+                    metric_rollups.extend(metric_rollup_rules_from_record(&record));
                 }
                 "state" => {
-                    let path = config_string(&record.config, "path");
-                    let entity_type = config_string(&record.config, "entity_type");
-                    let entity_id_path = config_string(&record.config, "entity_id_path");
-                    if path.is_empty() || entity_type.is_empty() || entity_id_path.is_empty() {
-                        continue;
+                    states.extend(state_rules_from_record(&record));
+                }
+                "report" => {
+                    if record.mode == "trace_summary" {
+                        trace_reports.extend(trace_report_rules_from_record(&record));
+                    } else if record.mode == "retention" {
+                        retentions.extend(retention_rules_from_record(&record));
+                    } else {
+                        reports.extend(report_rules_from_record(&record));
                     }
-                    states.push(StateDefinition {
-                        tenant_id: record.tenant_id,
-                        definition_id: record.definition_id,
-                        definition_version: record.version,
-                        name: record.name,
-                        path,
-                        value_type: config_string_default(&record.config, "value_type", "string"),
-                        entity_type,
-                        entity_id_path,
-                    });
+                }
+                "sequence" => {
+                    sequences.extend(sequence_rules_from_record(&record));
+                }
+                "cohort" => {
+                    cohorts.extend(cohort_rules_from_record(&record));
                 }
                 _ => {}
             }
@@ -1168,8 +1794,584 @@ impl ExtractionDefinitions {
         Self {
             fields,
             measures,
+            metric_rollups,
             states,
+            reports,
+            trace_reports,
+            retentions,
+            sequences,
+            cohorts,
         }
+    }
+}
+
+fn field_rules_from_record(record: &DefinitionRecord) -> Vec<FieldRule> {
+    let matcher = matcher_from_config(&record.config);
+    let mut rules = generalized_outputs(&record.config, "field_index")
+        .filter_map(|output| {
+            let field_name = string_expr_from_value(output.get("field_name"))
+                .unwrap_or_else(|| StringExpr::Literal(record.name.clone()));
+            let value = value_expr_from_value(output.get("value"))?;
+            Some(FieldRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: FieldOutput {
+                    field_name,
+                    mode: normalize_field_mode(
+                        output
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or(record.mode.as_str()),
+                    ),
+                    value,
+                    value_type: output
+                        .get("value_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string")
+                        .to_string(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rules.is_empty() {
+        return rules;
+    }
+
+    let path = config_string(&record.config, "path");
+    if path.is_empty() {
+        return Vec::new();
+    }
+    rules.push(FieldRule {
+        tenant_id: record.tenant_id.clone(),
+        definition_id: record.definition_id.clone(),
+        definition_version: record.version,
+        matcher,
+        output: FieldOutput {
+            field_name: StringExpr::Literal(record.name.clone()),
+            mode: normalize_field_mode(&record.mode),
+            value: ValueExpr::Path { path },
+            value_type: config_string_default(&record.config, "value_type", "string"),
+        },
+    });
+    rules
+}
+
+fn measure_rules_from_record(record: &DefinitionRecord) -> Vec<MeasureRule> {
+    let matcher = matcher_from_config(&record.config);
+    let mut rules = generalized_outputs(&record.config, "event_measures")
+        .filter_map(|output| {
+            let measure_name = string_expr_from_value(output.get("measure_name"))
+                .unwrap_or_else(|| StringExpr::Literal(record.name.clone()));
+            let value = number_expr_from_value(output.get("value"))?;
+            Some(MeasureRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: MeasureOutput {
+                    measure_name,
+                    value,
+                    unit: string_expr_from_value(output.get("unit"))
+                        .unwrap_or_else(|| StringExpr::Literal(String::new())),
+                    dimensions: dimensions_from_output(output),
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(300),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rules.is_empty() {
+        return rules;
+    }
+
+    let path = config_string(&record.config, "path");
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let dimension = config_string_default(&record.config, "dimension", "");
+    rules.push(MeasureRule {
+        tenant_id: record.tenant_id.clone(),
+        definition_id: record.definition_id.clone(),
+        definition_version: record.version,
+        matcher,
+        output: MeasureOutput {
+            measure_name: StringExpr::Literal(record.name.clone()),
+            value: NumberExpr::Path { path },
+            unit: StringExpr::Literal(config_string_default(&record.config, "unit", "")),
+            dimensions: if dimension.is_empty() {
+                Vec::new()
+            } else {
+                vec![DimensionOutput {
+                    name: dimension.clone(),
+                    value: StringExpr::Path {
+                        path: dimension,
+                        default: String::new(),
+                    },
+                }]
+            },
+            bucket_seconds: 300,
+        },
+    });
+    rules
+}
+
+fn metric_rollup_rules_from_record(record: &DefinitionRecord) -> Vec<MetricRollupRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "metric_rollups")
+        .filter_map(|output| {
+            let metric_name = string_expr_from_value(output.get("metric_name"))
+                .or_else(|| string_expr_from_value(output.get("measure_name")))
+                .unwrap_or_else(|| StringExpr::Literal(record.name.clone()));
+            let metric_kind =
+                string_expr_from_value(output.get("metric_kind")).unwrap_or_else(|| {
+                    StringExpr::Path {
+                        path: "metric_type".to_string(),
+                        default: "counter".to_string(),
+                    }
+                });
+            let value = number_expr_from_value(output.get("value"))?;
+            Some(MetricRollupRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: MetricRollupOutput {
+                    metric_name,
+                    metric_kind,
+                    value,
+                    unit: string_expr_from_value(output.get("unit"))
+                        .unwrap_or_else(|| StringExpr::Literal(String::new())),
+                    dimensions: dimensions_from_output(output),
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(60),
+                },
+            })
+        })
+        .collect()
+}
+
+fn state_rules_from_record(record: &DefinitionRecord) -> Vec<StateRule> {
+    let matcher = matcher_from_config(&record.config);
+    let mut rules = generalized_outputs(&record.config, "entity_state_updates")
+        .filter_map(|output| {
+            Some(StateRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: StateOutput {
+                    entity_type: string_expr_from_value(output.get("entity_type"))?,
+                    entity_id: string_expr_from_value(output.get("entity_id"))?,
+                    state_name: string_expr_from_value(output.get("state_name"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    value: string_expr_from_value(output.get("value"))?,
+                    value_type: output
+                        .get("value_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string")
+                        .to_string(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rules.is_empty() {
+        return rules;
+    }
+
+    let path = config_string(&record.config, "path");
+    let entity_type = config_string(&record.config, "entity_type");
+    let entity_id_path = config_string(&record.config, "entity_id_path");
+    if path.is_empty() || entity_type.is_empty() || entity_id_path.is_empty() {
+        return Vec::new();
+    }
+    rules.push(StateRule {
+        tenant_id: record.tenant_id.clone(),
+        definition_id: record.definition_id.clone(),
+        definition_version: record.version,
+        matcher,
+        output: StateOutput {
+            entity_type: StringExpr::Literal(entity_type),
+            entity_id: StringExpr::Path {
+                path: entity_id_path,
+                default: String::new(),
+            },
+            state_name: StringExpr::Literal(record.name.clone()),
+            value: StringExpr::Path {
+                path,
+                default: String::new(),
+            },
+            value_type: config_string_default(&record.config, "value_type", "string"),
+        },
+    });
+    rules
+}
+
+fn report_rules_from_record(record: &DefinitionRecord) -> Vec<ReportRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "report_results")
+        .filter_map(|output| {
+            Some(ReportRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: ReportOutput {
+                    report_id: string_expr_from_value(output.get("report_id"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    dimensions: dimensions_from_output(output),
+                    metrics: report_metrics_from_output(output),
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(60),
+                },
+            })
+        })
+        .collect()
+}
+
+fn trace_report_rules_from_record(record: &DefinitionRecord) -> Vec<TraceReportRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "report_results")
+        .filter_map(|output| {
+            Some(TraceReportRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: TraceReportOutput {
+                    report_id: string_expr_from_value(output.get("report_id"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    dimensions: dimensions_from_output(output),
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(60),
+                },
+            })
+        })
+        .collect()
+}
+
+fn retention_rules_from_record(record: &DefinitionRecord) -> Vec<RetentionRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "report_results")
+        .filter_map(|output| {
+            Some(RetentionRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: RetentionOutput {
+                    report_id: string_expr_from_value(output.get("report_id"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    cohort_id: string_expr_from_value(output.get("cohort_id"))?,
+                    entity_type: string_expr_from_value(output.get("entity_type"))?,
+                    entity_id: string_expr_from_value(output.get("entity_id"))?,
+                    dimensions: dimensions_from_output(output),
+                    retention_bucket_seconds: output
+                        .get("retention_bucket_seconds")
+                        .or_else(|| output.get("bucket_seconds"))
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(86_400),
+                },
+            })
+        })
+        .collect()
+}
+
+fn cohort_rules_from_record(record: &DefinitionRecord) -> Vec<CohortRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "cohort_memberships")
+        .filter_map(|output| {
+            Some(CohortRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: CohortOutput {
+                    cohort_id: string_expr_from_value(output.get("cohort_id"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    entity_type: string_expr_from_value(output.get("entity_type"))?,
+                    entity_id: string_expr_from_value(output.get("entity_id"))?,
+                },
+            })
+        })
+        .collect()
+}
+
+fn sequence_rules_from_record(record: &DefinitionRecord) -> Vec<SequenceRule> {
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "sequence_report_results")
+        .filter_map(|output| {
+            let steps = sequence_steps_from_output(output);
+            if steps.is_empty() {
+                return None;
+            }
+            Some(SequenceRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: SequenceOutput {
+                    report_id: string_expr_from_value(output.get("report_id"))
+                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                    entity_id: string_expr_from_value(output.get("entity_id"))?,
+                    segment: dimensions_from_output(output),
+                    steps,
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(60),
+                },
+            })
+        })
+        .collect()
+}
+
+fn generalized_outputs<'a>(
+    config: &'a Value,
+    target: &'static str,
+) -> impl Iterator<Item = &'a Map<String, Value>> {
+    config
+        .get("outputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|outputs| outputs.iter())
+        .filter_map(Value::as_object)
+        .filter(move |output| {
+            output
+                .get("target")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value == target)
+        })
+}
+
+fn matcher_from_config(config: &Value) -> Matcher {
+    matcher_from_match_value(config.get("match"))
+}
+
+fn matcher_from_match_value(value: Option<&Value>) -> Matcher {
+    let predicates = value
+        .and_then(Value::as_object)
+        .and_then(|matcher| matcher.get("all"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|predicates| predicates.iter())
+        .filter_map(predicate_from_value)
+        .collect();
+    Matcher { predicates }
+}
+
+fn predicate_from_value(value: &Value) -> Option<Predicate> {
+    let object = value.as_object()?;
+    let path = object.get("path")?.as_str()?.trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let op = match object.get("op").and_then(Value::as_str).unwrap_or("eq") {
+        "exists" => PredicateOp::Exists,
+        "eq" => PredicateOp::Eq,
+        "neq" => PredicateOp::Neq,
+        "is_number" => PredicateOp::IsNumber,
+        "in" => PredicateOp::In,
+        _ => return None,
+    };
+    Some(Predicate {
+        path,
+        op,
+        value: object.get("value").cloned(),
+    })
+}
+
+fn string_expr_from_value(value: Option<&Value>) -> Option<StringExpr> {
+    match value {
+        Some(Value::String(value)) => Some(StringExpr::Literal(value.clone())),
+        Some(Value::Number(value)) => Some(StringExpr::Literal(value.to_string())),
+        Some(Value::Bool(value)) => Some(StringExpr::Literal(if *value {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        })),
+        Some(Value::Object(object)) => {
+            let path = object.get("path")?.as_str()?.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            let default = object
+                .get("default")
+                .map(|value| scalar_value_to_string(value))
+                .unwrap_or_default();
+            Some(StringExpr::Path { path, default })
+        }
+        _ => None,
+    }
+}
+
+fn value_expr_from_value(value: Option<&Value>) -> Option<ValueExpr> {
+    match value {
+        Some(Value::Object(object)) => {
+            let path = object.get("path")?.as_str()?.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(ValueExpr::Path { path })
+        }
+        Some(value) => Some(ValueExpr::Literal(value.clone())),
+        None => None,
+    }
+}
+
+fn number_expr_from_value(value: Option<&Value>) -> Option<NumberExpr> {
+    match value {
+        Some(Value::Object(object)) => {
+            let path = object.get("path")?.as_str()?.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(NumberExpr::Path { path })
+        }
+        Some(Value::Number(value)) => value.as_f64().map(NumberExpr::Literal),
+        Some(Value::String(value)) => value.parse().ok().map(NumberExpr::Literal),
+        _ => None,
+    }
+}
+
+fn dimensions_from_output(output: &Map<String, Value>) -> Vec<DimensionOutput> {
+    output
+        .get("dimensions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|dimensions| dimensions.iter())
+        .filter_map(|dimension| {
+            let object = dimension.as_object()?;
+            let name = object.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let value = string_expr_from_value(object.get("value"))?;
+            Some(DimensionOutput { name, value })
+        })
+        .collect()
+}
+
+fn report_metrics_from_output(output: &Map<String, Value>) -> Vec<ReportMetricOutput> {
+    let metrics = output
+        .get("metrics")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|metrics| metrics.iter())
+        .filter_map(|metric| {
+            let object = metric.as_object()?;
+            let name = object.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let op = match object.get("op").and_then(Value::as_str).unwrap_or("count") {
+                "count" => ReportMetricOp::Count,
+                "error_count" | "count_errors" => ReportMetricOp::ErrorCount,
+                "sum" => ReportMetricOp::Sum,
+                _ => return None,
+            };
+            Some(ReportMetricOutput {
+                name,
+                op,
+                value: number_expr_from_value(object.get("value")),
+            })
+        })
+        .collect::<Vec<_>>();
+    if metrics.is_empty() {
+        vec![
+            ReportMetricOutput {
+                name: "events".to_string(),
+                op: ReportMetricOp::Count,
+                value: None,
+            },
+            ReportMetricOutput {
+                name: "errors".to_string(),
+                op: ReportMetricOp::ErrorCount,
+                value: None,
+            },
+        ]
+    } else {
+        metrics
+    }
+}
+
+fn sequence_steps_from_output(output: &Map<String, Value>) -> Vec<SequenceStep> {
+    output
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|steps| steps.iter())
+        .filter_map(|step| {
+            let object = step.as_object()?;
+            let name = object.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SequenceStep {
+                name,
+                matcher: matcher_from_match_value(object.get("match")),
+            })
+        })
+        .collect()
+}
+
+fn normalize_field_mode(mode: &str) -> String {
+    if mode == "lookup" {
+        "lookup".to_string()
+    } else {
+        "facet".to_string()
+    }
+}
+
+#[cfg(test)]
+fn sdk_metric_managed_definition_record(tenant_id: &str) -> DefinitionRecord {
+    DefinitionRecord {
+        tenant_id: tenant_id.to_string(),
+        definition_id: "sdk_metric_default_v1".to_string(),
+        name: "sdk.metrics".to_string(),
+        kind: "metric_rollup".to_string(),
+        mode: "managed".to_string(),
+        version: 1,
+        config: serde_json::json!({
+            "managed_by": "sdk",
+            "sdk_surface": "metric",
+            "match": {
+                "all": [
+                    { "path": "event_type", "op": "eq", "value": "metric" },
+                    { "path": "metric_name", "op": "exists" },
+                    { "path": "metric_value", "op": "is_number" }
+                ]
+            },
+            "outputs": [
+                {
+                    "target": "metric_rollups",
+                    "metric_name": { "path": "metric_name" },
+                    "metric_kind": { "path": "metric_type", "default": "counter" },
+                    "value": { "path": "metric_value" },
+                    "unit": { "path": "metric_unit", "default": "" },
+                    "dimensions": [
+                        { "name": "service", "value": { "path": "service" } },
+                        { "name": "environment", "value": { "path": "environment" } },
+                        { "name": "signal", "value": { "path": "signal" } },
+                        { "name": "metric_type", "value": { "path": "metric_type" } },
+                        { "name": "llm.model", "value": { "path": "llm.model" } },
+                        { "name": "llm.provider", "value": { "path": "llm.provider" } },
+                        { "name": "loadtest_run_id", "value": { "path": "_loadtest.run_id" } }
+                    ],
+                    "bucket_seconds": 60
+                }
+            ]
+        }),
     }
 }
 
@@ -1183,20 +2385,21 @@ fn field_index_rows(
     let context = EventContext::from_event(row, data);
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
-    for definition in &definitions.fields {
-        if definition.tenant_id != context.tenant_id {
+    for rule in &definitions.fields {
+        if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
             continue;
         }
-        if let Some(value) = value_at_path(data, &definition.path).cloned() {
+        if let Some(value) = eval_value_expr(data, &rule.output.value) {
+            let field_name = eval_string_expr(data, &rule.output.field_name);
             collect_field_index_rows(
                 &context,
                 row,
                 BuiltFieldIndex {
-                    mode: &definition.mode,
-                    field_name: &definition.name,
-                    value_type: Some(&definition.value_type),
-                    definition_id: &definition.definition_id,
-                    definition_version: definition.definition_version,
+                    mode: &rule.output.mode,
+                    field_name: &field_name,
+                    value_type: Some(&rule.output.value_type),
+                    definition_id: &rule.definition_id,
+                    definition_version: rule.definition_version,
                 },
                 &value,
                 &mut seen,
@@ -1314,36 +2517,172 @@ fn event_measure_rows(
     };
     let context = EventContext::from_event(row, data);
     let mut rows = Vec::new();
-    for definition in &definitions.measures {
-        if definition.tenant_id != context.tenant_id {
+    for rule in &definitions.measures {
+        if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
             continue;
         }
-        let Some(value) = optional_number_value(value_at_path(data, &definition.path)) else {
+        let Some(value) = eval_number_expr(data, &rule.output.value) else {
             continue;
         };
-        let dimension_value = if definition.dimension.is_empty() {
-            String::new()
-        } else {
-            string_value(value_at_path(data, &definition.dimension))
-        };
-        rows.push(EventMeasureRow {
-            tenant_id: context.tenant_id.clone(),
-            definition_id: definition.definition_id.clone(),
-            definition_version: definition.definition_version,
-            measure_name: definition.name.clone(),
-            value,
-            unit: definition.unit.clone(),
-            timestamp: context.timestamp.clone(),
-            bucket_time: context.bucket_time.clone(),
-            bucket_seconds: 300,
-            event_id: context.event_id.clone(),
-            event_type: context.event_type.clone(),
-            signal: context.signal.clone(),
-            dimension_name: definition.dimension.clone(),
-            dimension_value,
-        });
+        let measure_name = eval_string_expr(data, &rule.output.measure_name);
+        if measure_name.is_empty() {
+            continue;
+        }
+        let unit = eval_string_expr(data, &rule.output.unit);
+        let dimensions = non_empty_dimensions(data, &rule.output.dimensions);
+        if dimensions.is_empty() {
+            rows.push(EventMeasureRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                measure_name: measure_name.clone(),
+                value,
+                unit: unit.clone(),
+                timestamp: context.timestamp.clone(),
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                event_id: context.event_id.clone(),
+                event_type: context.event_type.clone(),
+                signal: context.signal.clone(),
+                dimension_name: String::new(),
+                dimension_value: String::new(),
+            });
+            continue;
+        }
+        for (dimension_name, dimension_value) in dimensions {
+            rows.push(EventMeasureRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                measure_name: measure_name.clone(),
+                value,
+                unit: unit.clone(),
+                timestamp: context.timestamp.clone(),
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                event_id: context.event_id.clone(),
+                event_type: context.event_type.clone(),
+                signal: context.signal.clone(),
+                dimension_name,
+                dimension_value,
+            });
+        }
     }
     rows
+}
+
+#[derive(Default)]
+struct MetricRollupRows {
+    counters: Vec<CounterRollupRow>,
+    gauges: Vec<GaugeRollupRow>,
+    histograms: Vec<HistogramRollupRow>,
+}
+
+fn metric_rollup_rows(
+    row: &EventInsertRow,
+    definitions: &ExtractionDefinitions,
+) -> MetricRollupRows {
+    let Some(data) = row.data.as_object() else {
+        return MetricRollupRows::default();
+    };
+    let context = EventContext::from_event(row, data);
+    let mut rows = MetricRollupRows::default();
+    for rule in &definitions.metric_rollups {
+        if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+            continue;
+        }
+        let Some(value) = eval_number_expr(data, &rule.output.value) else {
+            continue;
+        };
+        let metric_name = eval_string_expr(data, &rule.output.metric_name);
+        if metric_name.is_empty() {
+            continue;
+        }
+        let metric_kind = normalize_metric_kind(&eval_string_expr(data, &rule.output.metric_kind));
+        let unit = eval_string_expr(data, &rule.output.unit);
+        let dimensions = dimension_object(data, &rule.output.dimensions);
+        match metric_kind.as_str() {
+            "gauge" => rows.gauges.push(GaugeRollupRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                metric_name,
+                unit,
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                dimensions,
+                count: 1,
+                sum: value,
+                min: value,
+                max: value,
+                last: value,
+            }),
+            "histogram" | "timing" => rows.histograms.push(HistogramRollupRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                metric_name,
+                unit,
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                dimensions,
+                count: 1,
+                sum: value,
+                min: value,
+                max: value,
+            }),
+            _ => rows.counters.push(CounterRollupRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                metric_name,
+                unit,
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                dimensions,
+                count: 1,
+                sum: value,
+            }),
+        }
+    }
+    rows
+}
+
+fn normalize_metric_kind(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "gauge" => "gauge".to_string(),
+        "histogram" => "histogram".to_string(),
+        "timing" => "timing".to_string(),
+        _ => "counter".to_string(),
+    }
+}
+
+fn dimension_object(data: &Map<String, Value>, dimensions: &[DimensionOutput]) -> Value {
+    let mut object = Map::new();
+    for dimension in dimensions {
+        let value = eval_string_expr(data, &dimension.value);
+        if !value.is_empty() {
+            object.insert(dimension.name.clone(), Value::String(value));
+        }
+    }
+    Value::Object(object)
+}
+
+fn non_empty_dimensions(
+    data: &Map<String, Value>,
+    dimensions: &[DimensionOutput],
+) -> Vec<(String, String)> {
+    dimensions
+        .iter()
+        .filter_map(|dimension| {
+            let value = eval_string_expr(data, &dimension.value);
+            if value.is_empty() {
+                None
+            } else {
+                Some((dimension.name.clone(), value))
+            }
+        })
+        .collect()
 }
 
 fn entity_state_update_rows(
@@ -1355,30 +2694,774 @@ fn entity_state_update_rows(
     };
     let context = EventContext::from_event(row, data);
     let mut rows = Vec::new();
-    for definition in &definitions.states {
-        if definition.tenant_id != context.tenant_id {
+    for rule in &definitions.states {
+        if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
             continue;
         }
-        let entity_id = string_value(value_at_path(data, &definition.entity_id_path));
-        let value = string_value(value_at_path(data, &definition.path));
-        if entity_id.is_empty() || value.is_empty() {
+        let entity_type = eval_string_expr(data, &rule.output.entity_type);
+        let entity_id = eval_string_expr(data, &rule.output.entity_id);
+        let state_name = eval_string_expr(data, &rule.output.state_name);
+        let value = eval_string_expr(data, &rule.output.value);
+        if entity_type.is_empty()
+            || entity_id.is_empty()
+            || state_name.is_empty()
+            || value.is_empty()
+        {
             continue;
         }
         rows.push(EntityStateUpdateRow {
             tenant_id: context.tenant_id.clone(),
-            definition_id: definition.definition_id.clone(),
-            definition_version: definition.definition_version,
-            entity_type: definition.entity_type.clone(),
+            definition_id: rule.definition_id.clone(),
+            definition_version: rule.definition_version,
+            entity_type,
             entity_id,
-            state_name: definition.name.clone(),
+            state_name,
             value,
-            value_type: definition.value_type.clone(),
+            value_type: rule.output.value_type.clone(),
             timestamp: context.timestamp.clone(),
             event_id: context.event_id.clone(),
             event_type: context.event_type.clone(),
             signal: context.signal.clone(),
         });
     }
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReportAggregateKey {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    dimensions_json: String,
+}
+
+struct ReportAggregate {
+    dimensions: Value,
+    metrics: HashMap<String, f64>,
+}
+
+fn report_result_rows(
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+) -> Vec<ReportResultRow> {
+    let mut aggregates: HashMap<ReportAggregateKey, ReportAggregate> = HashMap::new();
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        for rule in &definitions.reports {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let report_id = eval_string_expr(data, &rule.output.report_id);
+            if report_id.is_empty() {
+                continue;
+            }
+            let dimensions = dimension_object(data, &rule.output.dimensions);
+            let dimensions_json =
+                serde_json::to_string(&dimensions).unwrap_or_else(|_| "{}".to_string());
+            let key = ReportAggregateKey {
+                tenant_id: context.tenant_id.clone(),
+                report_id,
+                report_version: rule.definition_version,
+                bucket_time: context.bucket_time.clone(),
+                dimensions_json,
+            };
+            let aggregate = aggregates.entry(key).or_insert_with(|| ReportAggregate {
+                dimensions,
+                metrics: HashMap::new(),
+            });
+            for metric in &rule.output.metrics {
+                let increment = match metric.op {
+                    ReportMetricOp::Count => Some(1.0),
+                    ReportMetricOp::ErrorCount => Some(if is_error_row(row) { 1.0 } else { 0.0 }),
+                    ReportMetricOp::Sum => metric
+                        .value
+                        .as_ref()
+                        .and_then(|expr| eval_number_expr(data, expr)),
+                };
+                if let Some(increment) = increment {
+                    *aggregate.metrics.entry(metric.name.clone()).or_default() += increment;
+                }
+            }
+            aggregate
+                .metrics
+                .entry("source_events".to_string())
+                .and_modify(|value| *value += 1.0)
+                .or_insert(1.0);
+            aggregate
+                .metrics
+                .entry("bucket_seconds".to_string())
+                .or_insert(f64::from(rule.output.bucket_seconds));
+        }
+    }
+
+    let mut rows = aggregates
+        .into_iter()
+        .map(|(key, aggregate)| {
+            let mut metrics = Map::new();
+            for (name, value) in aggregate.metrics {
+                metrics.insert(name, json_number(value));
+            }
+            ReportResultRow {
+                tenant_id: key.tenant_id,
+                report_id: key.report_id,
+                report_version: key.report_version,
+                bucket_time: key.bucket_time,
+                dimensions: aggregate.dimensions,
+                metrics: Value::Object(metrics),
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.report_id.cmp(&right.report_id))
+            .then(left.bucket_time.cmp(&right.bucket_time))
+            .then(
+                left.dimensions
+                    .to_string()
+                    .cmp(&right.dimensions.to_string()),
+            )
+    });
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TraceAggregateKey {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    trace_id: String,
+    bucket_seconds: u32,
+}
+
+struct TraceAggregate {
+    dimensions: Map<String, Value>,
+    event_count: u64,
+    error_count: u64,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+}
+
+fn trace_report_result_rows(
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+) -> Vec<ReportResultRow> {
+    let mut aggregates: HashMap<TraceAggregateKey, TraceAggregate> = HashMap::new();
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        if context.trace_id.is_empty() {
+            continue;
+        }
+        for rule in &definitions.trace_reports {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let report_id = eval_string_expr(data, &rule.output.report_id);
+            if report_id.is_empty() {
+                continue;
+            }
+            let key = TraceAggregateKey {
+                tenant_id: context.tenant_id.clone(),
+                report_id,
+                report_version: rule.definition_version,
+                bucket_time: context.bucket_time.clone(),
+                trace_id: context.trace_id.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+            };
+            let aggregate = aggregates.entry(key).or_insert_with(|| {
+                let mut dimensions = dimension_object(data, &rule.output.dimensions)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                dimensions.insert(
+                    "trace_id".to_string(),
+                    Value::String(context.trace_id.clone()),
+                );
+                TraceAggregate {
+                    dimensions,
+                    event_count: 0,
+                    error_count: 0,
+                    started_at: None,
+                    ended_at: None,
+                }
+            });
+            aggregate.event_count += 1;
+            if is_error_row(row) {
+                aggregate.error_count += 1;
+            }
+            if context.parent_span_id.is_empty() {
+                if !context.name.is_empty() {
+                    aggregate
+                        .dimensions
+                        .entry("root_name".to_string())
+                        .or_insert_with(|| Value::String(context.name.clone()));
+                }
+                if let Some(service) = data.get("service").map(scalar_value_to_string) {
+                    if !service.is_empty() {
+                        aggregate
+                            .dimensions
+                            .entry("root_service".to_string())
+                            .or_insert(Value::String(service));
+                    }
+                }
+            }
+            let start = context
+                .start_time
+                .as_deref()
+                .and_then(parse_event_timestamp)
+                .or_else(|| parse_event_timestamp(&context.timestamp));
+            let end = context
+                .end_time
+                .as_deref()
+                .and_then(parse_event_timestamp)
+                .or_else(|| parse_event_timestamp(&context.timestamp));
+            if let Some(start) = start {
+                if aggregate.started_at.is_none_or(|current| start < current) {
+                    aggregate.started_at = Some(start);
+                }
+            }
+            if let Some(end) = end {
+                if aggregate.ended_at.is_none_or(|current| end > current) {
+                    aggregate.ended_at = Some(end);
+                }
+            }
+        }
+    }
+
+    let mut rows = aggregates
+        .into_iter()
+        .map(|(key, aggregate)| {
+            let duration_ms = aggregate
+                .started_at
+                .zip(aggregate.ended_at)
+                .map(|(start, end)| end.signed_duration_since(start).num_milliseconds().max(0))
+                .unwrap_or_default();
+            ReportResultRow {
+                tenant_id: key.tenant_id,
+                report_id: key.report_id,
+                report_version: key.report_version,
+                bucket_time: key.bucket_time,
+                dimensions: Value::Object(aggregate.dimensions),
+                metrics: serde_json::json!({
+                    "duration_ms": duration_ms,
+                    "event_count": aggregate.event_count,
+                    "errors": aggregate.error_count,
+                    "source_events": aggregate.event_count,
+                    "bucket_seconds": key.bucket_seconds
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.report_id.cmp(&right.report_id))
+            .then(left.bucket_time.cmp(&right.bucket_time))
+            .then(
+                left.dimensions
+                    .to_string()
+                    .cmp(&right.dimensions.to_string()),
+            )
+    });
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SequenceEntityKey {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    segment_json: String,
+    entity_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SequenceEventMatch {
+    timestamp: String,
+    step_index: usize,
+    segment: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SequenceAggregateKey {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    segment_json: String,
+}
+
+fn sequence_report_result_rows(
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+) -> Vec<SequenceReportResultRow> {
+    let mut entity_events: HashMap<SequenceEntityKey, Vec<SequenceEventMatch>> = HashMap::new();
+
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        for rule in &definitions.sequences {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let _bucket_seconds = rule.output.bucket_seconds;
+            let report_id = eval_string_expr(data, &rule.output.report_id);
+            let entity_id = eval_string_expr(data, &rule.output.entity_id);
+            if report_id.is_empty() || entity_id.is_empty() {
+                continue;
+            }
+            let segment = dimension_object(data, &rule.output.segment);
+            let segment_json = serde_json::to_string(&segment).unwrap_or_else(|_| "{}".to_string());
+            for (step_index, step) in rule.output.steps.iter().enumerate() {
+                if !step.matcher.matches(data) {
+                    continue;
+                }
+                let key = SequenceEntityKey {
+                    tenant_id: context.tenant_id.clone(),
+                    report_id: report_id.clone(),
+                    report_version: rule.definition_version,
+                    bucket_time: context.bucket_time.clone(),
+                    segment_json: segment_json.clone(),
+                    entity_id: entity_id.clone(),
+                };
+                entity_events
+                    .entry(key)
+                    .or_default()
+                    .push(SequenceEventMatch {
+                        timestamp: context.timestamp.clone(),
+                        step_index,
+                        segment: segment.clone(),
+                    });
+            }
+        }
+    }
+
+    let mut aggregates: HashMap<SequenceAggregateKey, (Value, Vec<u64>)> = HashMap::new();
+    let mut step_names: HashMap<(String, u64), Vec<String>> = HashMap::new();
+    for rule in &definitions.sequences {
+        step_names.insert(
+            (
+                eval_string_expr(&Map::new(), &rule.output.report_id),
+                rule.definition_version,
+            ),
+            rule.output
+                .steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect(),
+        );
+    }
+
+    for (key, mut matches) in entity_events {
+        matches.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.step_index.cmp(&right.step_index))
+        });
+        let mut reached = 0usize;
+        for matched in &matches {
+            if matched.step_index == reached {
+                reached += 1;
+            }
+        }
+        if reached == 0 {
+            continue;
+        }
+        let aggregate_key = SequenceAggregateKey {
+            tenant_id: key.tenant_id,
+            report_id: key.report_id,
+            report_version: key.report_version,
+            bucket_time: key.bucket_time,
+            segment_json: key.segment_json,
+        };
+        let segment = matches
+            .first()
+            .map(|matched| matched.segment.clone())
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let (_, counts) = aggregates
+            .entry(aggregate_key)
+            .or_insert_with(|| (segment, vec![0; reached]));
+        if counts.len() < reached {
+            counts.resize(reached, 0);
+        }
+        for count in counts.iter_mut().take(reached) {
+            *count += 1;
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (key, (segment, counts)) in aggregates {
+        let names = step_names
+            .get(&(key.report_id.clone(), key.report_version))
+            .cloned()
+            .unwrap_or_default();
+        for (step_index, entity_count) in counts.iter().copied().enumerate() {
+            let conversion_count = counts.get(step_index + 1).copied().unwrap_or(entity_count);
+            rows.push(SequenceReportResultRow {
+                tenant_id: key.tenant_id.clone(),
+                report_id: key.report_id.clone(),
+                report_version: key.report_version,
+                bucket_time: key.bucket_time.clone(),
+                segment: segment.clone(),
+                step_index: step_index.try_into().unwrap_or(u16::MAX),
+                step_name: names
+                    .get(step_index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("step_{step_index}")),
+                entity_count,
+                conversion_count,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.report_id.cmp(&right.report_id))
+            .then(left.bucket_time.cmp(&right.bucket_time))
+            .then(left.step_index.cmp(&right.step_index))
+    });
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetentionMembershipKey {
+    tenant_id: String,
+    cohort_id: String,
+    entity_type: String,
+    entity_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetentionAggregateKey {
+    tenant_id: String,
+    report_id: String,
+    report_version: u64,
+    bucket_time: String,
+    dimensions_json: String,
+}
+
+struct RetentionAggregate {
+    dimensions: Value,
+    retained_entities: BTreeSet<String>,
+    cohort_entities: BTreeSet<String>,
+}
+
+fn retention_report_result_rows(
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+    current_memberships: &[CohortMembershipRow],
+) -> Vec<ReportResultRow> {
+    if definitions.retentions.is_empty() {
+        return Vec::new();
+    }
+    let mut memberships = HashMap::new();
+    let mut cohort_sizes: HashMap<(String, String, String), BTreeSet<String>> = HashMap::new();
+    for membership in current_memberships {
+        let key = RetentionMembershipKey {
+            tenant_id: membership.tenant_id.clone(),
+            cohort_id: membership.cohort_id.clone(),
+            entity_type: membership.entity_type.clone(),
+            entity_id: membership.entity_id.clone(),
+        };
+        cohort_sizes
+            .entry((
+                membership.tenant_id.clone(),
+                membership.cohort_id.clone(),
+                membership.entity_type.clone(),
+            ))
+            .or_default()
+            .insert(membership.entity_id.clone());
+        memberships.insert(key, membership.first_seen.clone());
+    }
+
+    let mut aggregates: HashMap<RetentionAggregateKey, RetentionAggregate> = HashMap::new();
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        let Some(activity_at) = parse_event_timestamp(&context.timestamp) else {
+            continue;
+        };
+        for rule in &definitions.retentions {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let report_id = eval_string_expr(data, &rule.output.report_id);
+            let cohort_id = eval_string_expr(data, &rule.output.cohort_id);
+            let entity_type = eval_string_expr(data, &rule.output.entity_type);
+            let entity_id = eval_string_expr(data, &rule.output.entity_id);
+            if report_id.is_empty()
+                || cohort_id.is_empty()
+                || entity_type.is_empty()
+                || entity_id.is_empty()
+            {
+                continue;
+            }
+            let membership_key = RetentionMembershipKey {
+                tenant_id: context.tenant_id.clone(),
+                cohort_id: cohort_id.clone(),
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone(),
+            };
+            let Some(first_seen) = memberships.get(&membership_key) else {
+                continue;
+            };
+            let Some(joined_at) = parse_event_timestamp(first_seen) else {
+                continue;
+            };
+            let elapsed = activity_at.signed_duration_since(joined_at).num_seconds();
+            if elapsed < 0 {
+                continue;
+            }
+            let retention_bucket = elapsed / i64::from(rule.output.retention_bucket_seconds.max(1));
+            let mut dimensions = dimension_object(data, &rule.output.dimensions);
+            if let Some(object) = dimensions.as_object_mut() {
+                object.insert(
+                    "retention_bucket".to_string(),
+                    Value::String(retention_bucket.to_string()),
+                );
+            }
+            let dimensions_json =
+                serde_json::to_string(&dimensions).unwrap_or_else(|_| "{}".to_string());
+            let aggregate_key = RetentionAggregateKey {
+                tenant_id: context.tenant_id.clone(),
+                report_id,
+                report_version: rule.definition_version,
+                bucket_time: context.bucket_time.clone(),
+                dimensions_json,
+            };
+            let cohort_entities = cohort_sizes
+                .get(&(
+                    context.tenant_id.clone(),
+                    cohort_id.clone(),
+                    entity_type.clone(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            let aggregate = aggregates
+                .entry(aggregate_key)
+                .or_insert_with(|| RetentionAggregate {
+                    dimensions,
+                    retained_entities: BTreeSet::new(),
+                    cohort_entities,
+                });
+            aggregate.retained_entities.insert(entity_id);
+        }
+    }
+
+    let mut rows = aggregates
+        .into_iter()
+        .map(|(key, aggregate)| {
+            let retained_users = aggregate.retained_entities.len() as f64;
+            let cohort_size = aggregate.cohort_entities.len() as f64;
+            let retention_rate = if cohort_size > 0.0 {
+                retained_users / cohort_size
+            } else {
+                0.0
+            };
+            ReportResultRow {
+                tenant_id: key.tenant_id,
+                report_id: key.report_id,
+                report_version: key.report_version,
+                bucket_time: key.bucket_time,
+                dimensions: aggregate.dimensions,
+                metrics: serde_json::json!({
+                    "retained_users": retained_users as u64,
+                    "cohort_size": cohort_size as u64,
+                    "retention_rate": retention_rate,
+                    "source_events": retained_users as u64
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.report_id.cmp(&right.report_id))
+            .then(left.bucket_time.cmp(&right.bucket_time))
+            .then(
+                left.dimensions
+                    .to_string()
+                    .cmp(&right.dimensions.to_string()),
+            )
+    });
+    rows
+}
+
+async fn retention_memberships_for_rows(
+    client: &Client,
+    cfg: &Config,
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+    current_memberships: &[CohortMembershipRow],
+) -> Result<Vec<CohortMembershipRow>> {
+    if definitions.retentions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut memberships = current_memberships.to_vec();
+    let mut existing = BTreeSet::new();
+    for membership in current_memberships {
+        existing.insert((
+            membership.tenant_id.clone(),
+            membership.cohort_id.clone(),
+            membership.entity_type.clone(),
+            membership.entity_id.clone(),
+        ));
+    }
+
+    let mut wanted = BTreeSet::new();
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        for rule in &definitions.retentions {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let cohort_id = eval_string_expr(data, &rule.output.cohort_id);
+            let entity_type = eval_string_expr(data, &rule.output.entity_type);
+            let entity_id = eval_string_expr(data, &rule.output.entity_id);
+            if cohort_id.is_empty() || entity_type.is_empty() || entity_id.is_empty() {
+                continue;
+            }
+            let key = (context.tenant_id.clone(), cohort_id, entity_type, entity_id);
+            if !existing.contains(&key) {
+                wanted.insert(key);
+            }
+        }
+    }
+
+    if wanted.is_empty() {
+        return Ok(memberships);
+    }
+
+    let clauses = wanted
+        .into_iter()
+        .map(|(tenant_id, cohort_id, entity_type, entity_id)| {
+            format!(
+                "(tenant_id = {} AND cohort_id = {} AND entity_type = {} AND entity_id = {})",
+                quote_sql_string(&tenant_id),
+                quote_sql_string(&cohort_id),
+                quote_sql_string(&entity_type),
+                quote_sql_string(&entity_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let query = format!(
+        "SELECT tenant_id, cohort_id, cohort_version, entity_type, entity_id, toString(first_seen) AS first_seen, toString(last_seen) AS last_seen FROM {} FINAL WHERE {} FORMAT JSON",
+        cfg.qualified_cohort_memberships_table(),
+        clauses
+    );
+    let body = clickhouse_query(client, cfg, &query)
+        .await
+        .context("query retention cohort memberships")?;
+    let response: ClickHouseJson<CohortMembershipRow> =
+        serde_json::from_str(&body).context("parse retention cohort memberships")?;
+    memberships.extend(response.data);
+    Ok(memberships)
+}
+
+fn json_number(value: f64) -> Value {
+    if value.is_finite() && value.fract() == 0.0 && value >= 0.0 {
+        return Value::Number(serde_json::Number::from(value as u64));
+    }
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CohortMembershipKey {
+    tenant_id: String,
+    cohort_id: String,
+    cohort_version: u64,
+    entity_type: String,
+    entity_id: String,
+}
+
+struct CohortMembershipAggregate {
+    first_seen: String,
+    last_seen: String,
+}
+
+fn cohort_membership_rows(
+    rows: &[EventInsertRow],
+    definitions: &ExtractionDefinitions,
+) -> Vec<CohortMembershipRow> {
+    let mut memberships: HashMap<CohortMembershipKey, CohortMembershipAggregate> = HashMap::new();
+    for row in rows {
+        let Some(data) = row.data.as_object() else {
+            continue;
+        };
+        let context = EventContext::from_event(row, data);
+        for rule in &definitions.cohorts {
+            if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+                continue;
+            }
+            let cohort_id = eval_string_expr(data, &rule.output.cohort_id);
+            let entity_type = eval_string_expr(data, &rule.output.entity_type);
+            let entity_id = eval_string_expr(data, &rule.output.entity_id);
+            if cohort_id.is_empty() || entity_type.is_empty() || entity_id.is_empty() {
+                continue;
+            }
+            let key = CohortMembershipKey {
+                tenant_id: context.tenant_id.clone(),
+                cohort_id,
+                cohort_version: rule.definition_version,
+                entity_type,
+                entity_id,
+            };
+            memberships
+                .entry(key)
+                .and_modify(|membership| {
+                    if context.timestamp < membership.first_seen {
+                        membership.first_seen = context.timestamp.clone();
+                    }
+                    if context.timestamp > membership.last_seen {
+                        membership.last_seen = context.timestamp.clone();
+                    }
+                })
+                .or_insert_with(|| CohortMembershipAggregate {
+                    first_seen: context.timestamp.clone(),
+                    last_seen: context.timestamp.clone(),
+                });
+        }
+    }
+
+    let mut rows = memberships
+        .into_iter()
+        .map(|(key, membership)| CohortMembershipRow {
+            tenant_id: key.tenant_id,
+            cohort_id: key.cohort_id,
+            cohort_version: key.cohort_version,
+            entity_type: key.entity_type,
+            entity_id: key.entity_id,
+            first_seen: membership.first_seen,
+            last_seen: membership.last_seen,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.cohort_id.cmp(&right.cohort_id))
+            .then(left.entity_type.cmp(&right.entity_type))
+            .then(left.entity_id.cmp(&right.entity_id))
+    });
     rows
 }
 
@@ -1584,7 +3667,13 @@ async fn derived_watermark_sequences(
     let serving_tables = [
         cfg.clickhouse_field_index_table.as_str(),
         cfg.clickhouse_event_measures_table.as_str(),
+        cfg.clickhouse_counter_rollups_table.as_str(),
+        cfg.clickhouse_gauge_rollups_table.as_str(),
+        cfg.clickhouse_histogram_rollups_table.as_str(),
         cfg.clickhouse_entity_state_updates_table.as_str(),
+        cfg.clickhouse_report_results_table.as_str(),
+        cfg.clickhouse_sequence_report_results_table.as_str(),
+        cfg.clickhouse_cohort_memberships_table.as_str(),
     ]
     .into_iter()
     .map(|table| format!("'{}'", table.replace('\'', "''")))
@@ -1726,6 +3815,16 @@ fn minute_bucket(timestamp: &str) -> Option<String> {
     Some(format!("{prefix}:00.000"))
 }
 
+fn parse_event_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|value| value.and_utc())
+        })
+        .ok()
+}
+
 fn string_value(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(value)) => value.clone(),
@@ -1739,6 +3838,74 @@ fn string_value(value: Option<&Value>) -> String {
         }
         _ => String::new(),
     }
+}
+
+fn scalar_value_to_string(value: &Value) -> String {
+    string_value(Some(value))
+}
+
+fn eval_string_expr(data: &Map<String, Value>, expr: &StringExpr) -> String {
+    match expr {
+        StringExpr::Literal(value) => value.clone(),
+        StringExpr::Path { path, default } => {
+            let value = string_value(value_at_path(data, path));
+            if value.is_empty() {
+                default.clone()
+            } else {
+                value
+            }
+        }
+    }
+}
+
+fn eval_value_expr(data: &Map<String, Value>, expr: &ValueExpr) -> Option<Value> {
+    match expr {
+        ValueExpr::Literal(value) => Some(value.clone()),
+        ValueExpr::Path { path } => value_at_path(data, path).cloned(),
+    }
+}
+
+fn eval_number_expr(data: &Map<String, Value>, expr: &NumberExpr) -> Option<f64> {
+    match expr {
+        NumberExpr::Literal(value) => Some(*value),
+        NumberExpr::Path { path } => optional_number_value(value_at_path(data, path)),
+    }
+}
+
+impl Matcher {
+    fn matches(&self, data: &Map<String, Value>) -> bool {
+        self.predicates
+            .iter()
+            .all(|predicate| predicate.matches(data))
+    }
+}
+
+impl Predicate {
+    fn matches(&self, data: &Map<String, Value>) -> bool {
+        let actual = value_at_path(data, &self.path);
+        match self.op {
+            PredicateOp::Exists => actual.is_some_and(|value| !value.is_null()),
+            PredicateOp::Eq => actual
+                .zip(self.value.as_ref())
+                .is_some_and(|(actual, expected)| json_values_equal(actual, expected)),
+            PredicateOp::Neq => actual
+                .zip(self.value.as_ref())
+                .is_some_and(|(actual, expected)| !json_values_equal(actual, expected)),
+            PredicateOp::IsNumber => optional_number_value(actual).is_some(),
+            PredicateOp::In => match self.value.as_ref() {
+                Some(Value::Array(values)) => actual.is_some_and(|actual| {
+                    values
+                        .iter()
+                        .any(|expected| json_values_equal(actual, expected))
+                }),
+                _ => false,
+            },
+        }
+    }
+}
+
+fn json_values_equal(actual: &Value, expected: &Value) -> bool {
+    actual == expected || string_value(Some(actual)) == string_value(Some(expected))
 }
 
 fn config_string(config: &Value, key: &str) -> String {
@@ -1953,6 +4120,10 @@ fn validate_identifier(key: &'static str, value: &str) -> Result<()> {
     }
 }
 
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, path::PathBuf, time::Duration};
@@ -1960,10 +4131,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommitSource, Config, DataFileLocation, EventInsertRow, ExtractionDefinitions,
-        FieldDefinition, LakehouseCommitRecord, MeasureDefinition, StateDefinition,
+        CommitSource, Config, DataFileLocation, DefinitionRecord, EventInsertRow,
+        ExtractionDefinitions, LakehouseCommitRecord, cohort_membership_rows,
         commit_record_to_commit, data_file_location, entity_state_update_rows, event_measure_rows,
-        field_index_rows, format_timestamp_us, materialize_targets_for_commit, ndjson_chunks,
+        field_index_rows, format_timestamp_us, materialize_targets_for_commit, metric_rollup_rows,
+        ndjson_chunks, report_result_rows, retention_report_result_rows,
+        sdk_metric_managed_definition_record, sequence_report_result_rows,
+        trace_report_result_rows,
     };
 
     #[test]
@@ -2006,36 +4180,47 @@ mod tests {
                 "plan": "pro"
             }),
         };
-        let definitions = ExtractionDefinitions {
-            fields: vec![FieldDefinition {
+        let definitions = ExtractionDefinitions::from_records(vec![
+            DefinitionRecord {
                 tenant_id: "org_1".to_string(),
                 definition_id: "def_country".to_string(),
-                definition_version: 7,
                 name: "country".to_string(),
+                kind: "field".to_string(),
                 mode: "facet".to_string(),
-                path: "country".to_string(),
-                value_type: "string".to_string(),
-            }],
-            measures: vec![MeasureDefinition {
+                config: json!({
+                    "path": "country",
+                    "value_type": "string"
+                }),
+                version: 7,
+            },
+            DefinitionRecord {
                 tenant_id: "org_1".to_string(),
                 definition_id: "def_revenue".to_string(),
-                definition_version: 8,
                 name: "revenue".to_string(),
-                path: "revenue".to_string(),
-                unit: "usd".to_string(),
-                dimension: "currency".to_string(),
-            }],
-            states: vec![StateDefinition {
+                kind: "measure".to_string(),
+                mode: String::new(),
+                config: json!({
+                    "path": "revenue",
+                    "unit": "usd",
+                    "dimension": "currency"
+                }),
+                version: 8,
+            },
+            DefinitionRecord {
                 tenant_id: "org_1".to_string(),
                 definition_id: "def_plan".to_string(),
-                definition_version: 9,
                 name: "plan".to_string(),
-                path: "plan".to_string(),
-                value_type: "string".to_string(),
-                entity_type: "user".to_string(),
-                entity_id_path: "user_id".to_string(),
-            }],
-        };
+                kind: "state".to_string(),
+                mode: String::new(),
+                config: json!({
+                    "path": "plan",
+                    "value_type": "string",
+                    "entity_type": "user",
+                    "entity_id_path": "user_id"
+                }),
+                version: 9,
+            },
+        ]);
 
         let fields = field_index_rows(&row, &definitions);
         let measures = event_measure_rows(&row, &definitions);
@@ -2050,6 +4235,489 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].entity_id, "user_1");
         assert_eq!(states[0].value, "pro");
+    }
+
+    #[test]
+    fn sdk_metric_definition_materializes_metric_rollup_fixtures() {
+        let definitions =
+            ExtractionDefinitions::from_records(vec![sdk_metric_managed_definition_record(
+                "fixture",
+            )]);
+
+        for (fixture, expected_name, expected_value, expected_unit, expected_kind) in [
+            ("metric_counter.json", "llm.requests", 1.0, "1", "counter"),
+            (
+                "metric_gauge.json",
+                "process.memory.usage",
+                734003200.0,
+                "By",
+                "gauge",
+            ),
+            (
+                "metric_histogram.json",
+                "tool.duration",
+                245.0,
+                "ms",
+                "histogram",
+            ),
+        ] {
+            let row = fixture_row(fixture);
+            let rollups = metric_rollup_rows(&row, &definitions);
+            match expected_kind {
+                "counter" => {
+                    assert_eq!(rollups.counters.len(), 1);
+                    let row = &rollups.counters[0];
+                    assert_eq!(row.definition_id, "sdk_metric_default_v1");
+                    assert_eq!(row.metric_name, expected_name);
+                    assert_eq!(row.sum, expected_value);
+                    assert_eq!(row.unit, expected_unit);
+                    assert_eq!(row.bucket_seconds, 60);
+                    assert!(row.dimensions.get("service").is_some());
+                    assert!(row.dimensions.get("environment").is_some());
+                    assert!(row.dimensions.get("signal").is_some());
+                    assert!(row.dimensions.get("metric_type").is_some());
+                }
+                "gauge" => {
+                    assert_eq!(rollups.gauges.len(), 1);
+                    let row = &rollups.gauges[0];
+                    assert_eq!(row.metric_name, expected_name);
+                    assert_eq!(row.sum, expected_value);
+                    assert_eq!(row.min, expected_value);
+                    assert_eq!(row.max, expected_value);
+                    assert_eq!(row.last, expected_value);
+                    assert_eq!(row.unit, expected_unit);
+                }
+                "histogram" => {
+                    assert_eq!(rollups.histograms.len(), 1);
+                    let row = &rollups.histograms[0];
+                    assert_eq!(row.metric_name, expected_name);
+                    assert_eq!(row.sum, expected_value);
+                    assert_eq!(row.min, expected_value);
+                    assert_eq!(row.max, expected_value);
+                    assert_eq!(row.unit, expected_unit);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn generalized_field_definition_materializes_nested_llm_paths() {
+        let row = fixture_row("llm_call.json");
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_llm_fields".to_string(),
+            name: "llm fields".to_string(),
+            kind: "field".to_string(),
+            mode: "facet".to_string(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "event_type", "op": "eq", "value": "llm.call" }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "field_index",
+                        "field_name": "llm.model",
+                        "value": { "path": "llm.model" },
+                        "value_type": "string",
+                        "mode": "facet"
+                    },
+                    {
+                        "target": "field_index",
+                        "field_name": "llm.provider",
+                        "value": { "path": "llm.provider" },
+                        "value_type": "string",
+                        "mode": "facet"
+                    }
+                ]
+            }),
+            version: 11,
+        }]);
+
+        let fields = field_index_rows(&row, &definitions);
+
+        assert_eq!(fields.len(), 2);
+        assert!(
+            fields
+                .iter()
+                .any(|row| row.field_name == "llm.model" && row.value == "gpt-5.5")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|row| row.field_name == "llm.provider" && row.value == "openai")
+        );
+        assert!(fields.iter().all(|row| row.definition_version == 11));
+    }
+
+    #[test]
+    fn generalized_state_definition_materializes_nested_account_state() {
+        let row = fixture_row("state_account_plan_changed.json");
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_account_plan".to_string(),
+            name: "account.plan".to_string(),
+            kind: "state".to_string(),
+            mode: String::new(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "event_type", "op": "eq", "value": "account.plan_changed" }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "entity_state_updates",
+                        "entity_type": "account",
+                        "entity_id": { "path": "account.id" },
+                        "state_name": "account.plan",
+                        "value": { "path": "account.plan" },
+                        "value_type": "string"
+                    }
+                ]
+            }),
+            version: 12,
+        }]);
+
+        let states = entity_state_update_rows(&row, &definitions);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].entity_type, "account");
+        assert_eq!(states[0].entity_id, "acct_fixture");
+        assert_eq!(states[0].state_name, "account.plan");
+        assert_eq!(states[0].value, "enterprise");
+    }
+
+    #[test]
+    fn generalized_measure_definition_materializes_product_revenue() {
+        let row = fixture_row("product_order_filled.json");
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_product_revenue".to_string(),
+            name: "revenue".to_string(),
+            kind: "measure".to_string(),
+            mode: String::new(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "event_type", "op": "in", "value": ["order.filled", "checkout.completed"] }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "event_measures",
+                        "measure_name": "revenue",
+                        "value": { "path": "revenue" },
+                        "unit": "usd",
+                        "dimensions": [
+                            { "name": "account.plan", "value": { "path": "account.plan" } },
+                            { "name": "order.symbol", "value": { "path": "order.symbol" } }
+                        ],
+                        "bucket_seconds": 300
+                    }
+                ]
+            }),
+            version: 13,
+        }]);
+
+        let measures = event_measure_rows(&row, &definitions);
+
+        assert_eq!(measures.len(), 2);
+        assert!(measures.iter().all(|row| row.measure_name == "revenue"));
+        assert!(measures.iter().all(|row| row.value == 0.42));
+        assert!(
+            measures
+                .iter()
+                .any(|row| row.dimension_name == "account.plan" && row.dimension_value == "pro")
+        );
+        assert!(
+            measures
+                .iter()
+                .any(|row| row.dimension_name == "order.symbol" && row.dimension_value == "NVDA")
+        );
+    }
+
+    #[test]
+    fn generalized_report_definition_materializes_summary_rows() {
+        let rows = vec![
+            fixture_row("metric_counter.json"),
+            fixture_row("metric_gauge.json"),
+            fixture_row("metric_histogram.json"),
+        ];
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_metric_report".to_string(),
+            name: "metrics.by_type".to_string(),
+            kind: "report".to_string(),
+            mode: "summary".to_string(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "event_type", "op": "eq", "value": "metric" }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "report_results",
+                        "report_id": "metrics_by_type",
+                        "dimensions": [
+                            { "name": "metric_type", "value": { "path": "metric_type" } }
+                        ],
+                        "metrics": [
+                            { "name": "events", "op": "count" },
+                            { "name": "value_sum", "op": "sum", "value": { "path": "metric_value" } }
+                        ],
+                        "bucket_seconds": 60
+                    }
+                ]
+            }),
+            version: 14,
+        }]);
+
+        let reports = report_result_rows(&rows, &definitions);
+
+        assert_eq!(reports.len(), 3);
+        assert!(reports.iter().all(|row| row.report_id == "metrics_by_type"));
+        assert!(reports.iter().all(|row| row.report_version == 14));
+        let counter = reports
+            .iter()
+            .find(|row| row.dimensions["metric_type"] == "counter")
+            .expect("counter report row");
+        assert_eq!(counter.metrics["events"], 1);
+        assert_eq!(counter.metrics["value_sum"], 1);
+    }
+
+    #[test]
+    fn generalized_trace_report_materializes_trace_summary_rows() {
+        let rows = vec![fixture_row("span_start.json"), fixture_row("span_end.json")];
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_trace_summary".to_string(),
+            name: "top_slow_traces".to_string(),
+            kind: "report".to_string(),
+            mode: "trace_summary".to_string(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "trace_id", "op": "exists" }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "report_results",
+                        "report_id": "top_slow_traces",
+                        "dimensions": [
+                            { "name": "service", "value": { "path": "service" } }
+                        ]
+                    }
+                ]
+            }),
+            version: 18,
+        }]);
+
+        let reports = trace_report_result_rows(&rows, &definitions);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].report_id, "top_slow_traces");
+        assert_eq!(reports[0].report_version, 18);
+        assert_eq!(
+            reports[0].dimensions["trace_id"],
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(reports[0].dimensions["root_service"], "codex-orchestrator");
+        assert_eq!(reports[0].dimensions["root_name"], "POST /v1/responses");
+        assert_eq!(reports[0].metrics["duration_ms"], 231);
+        assert_eq!(reports[0].metrics["event_count"], 2);
+        assert_eq!(reports[0].metrics["errors"], 1);
+    }
+
+    #[test]
+    fn generalized_cohort_definition_materializes_memberships() {
+        let rows = vec![
+            fixture_row("product_checkout_completed.json"),
+            fixture_row("product_order_filled.json"),
+            fixture_row("state_account_plan_changed.json"),
+        ];
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_pro_accounts".to_string(),
+            name: "pro_accounts".to_string(),
+            kind: "cohort".to_string(),
+            mode: "membership".to_string(),
+            config: json!({
+                "match": {
+                    "all": [
+                        { "path": "account.plan", "op": "eq", "value": "pro" }
+                    ]
+                },
+                "outputs": [
+                    {
+                        "target": "cohort_memberships",
+                        "cohort_id": "pro_accounts",
+                        "entity_type": "account",
+                        "entity_id": { "path": "account.id" }
+                    }
+                ]
+            }),
+            version: 15,
+        }]);
+
+        let memberships = cohort_membership_rows(&rows, &definitions);
+
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].cohort_id, "pro_accounts");
+        assert_eq!(memberships[0].cohort_version, 15);
+        assert_eq!(memberships[0].entity_type, "account");
+        assert_eq!(memberships[0].entity_id, "acct_fixture");
+        assert!(memberships[0].first_seen <= memberships[0].last_seen);
+    }
+
+    #[test]
+    fn generalized_retention_report_materializes_from_cohort_memberships() {
+        let rows = vec![
+            fixture_row("metric_gauge.json"),
+            fixture_row("metric_runtime.json"),
+        ];
+        let definitions = ExtractionDefinitions::from_records(vec![
+            DefinitionRecord {
+                tenant_id: "fixture".to_string(),
+                definition_id: "def_metric_gauge_cohort".to_string(),
+                name: "metric_gauge_names".to_string(),
+                kind: "cohort".to_string(),
+                mode: "membership".to_string(),
+                config: json!({
+                    "match": {
+                        "all": [
+                            { "path": "event_type", "op": "eq", "value": "metric" },
+                            { "path": "metric_type", "op": "eq", "value": "gauge" }
+                        ]
+                    },
+                    "outputs": [
+                        {
+                            "target": "cohort_memberships",
+                            "cohort_id": "metric_gauge_names",
+                            "entity_type": "metric_name",
+                            "entity_id": { "path": "metric_name" }
+                        }
+                    ]
+                }),
+                version: 16,
+            },
+            DefinitionRecord {
+                tenant_id: "fixture".to_string(),
+                definition_id: "def_metric_retention".to_string(),
+                name: "metric_gauge_retention".to_string(),
+                kind: "report".to_string(),
+                mode: "retention".to_string(),
+                config: json!({
+                    "match": {
+                        "all": [
+                            { "path": "event_type", "op": "eq", "value": "metric" },
+                            { "path": "metric_type", "op": "eq", "value": "gauge" }
+                        ]
+                    },
+                    "outputs": [
+                        {
+                            "target": "report_results",
+                            "report_id": "metric_gauge_retention",
+                            "cohort_id": "metric_gauge_names",
+                            "entity_type": "metric_name",
+                            "entity_id": { "path": "metric_name" },
+                            "retention_bucket_seconds": 60
+                        }
+                    ]
+                }),
+                version: 17,
+            },
+        ]);
+        let memberships = cohort_membership_rows(&rows, &definitions);
+        let reports = retention_report_result_rows(&rows, &definitions, &memberships);
+
+        assert_eq!(memberships.len(), 2);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].report_id, "metric_gauge_retention");
+        assert_eq!(reports[0].report_version, 17);
+        assert_eq!(reports[0].dimensions["retention_bucket"], "0");
+        assert_eq!(reports[0].metrics["retained_users"], 2);
+        assert_eq!(reports[0].metrics["cohort_size"], 2);
+        assert_eq!(reports[0].metrics["retention_rate"], 1.0);
+    }
+
+    #[test]
+    fn generalized_sequence_definition_materializes_funnel_steps() {
+        let rows = vec![
+            fixture_row("metric_counter.json"),
+            fixture_row("metric_gauge.json"),
+        ];
+        let definitions = ExtractionDefinitions::from_records(vec![DefinitionRecord {
+            tenant_id: "fixture".to_string(),
+            definition_id: "def_metric_sequence".to_string(),
+            name: "metrics.counter_to_gauge".to_string(),
+            kind: "sequence".to_string(),
+            mode: "funnel".to_string(),
+            config: json!({
+                "outputs": [
+                    {
+                        "target": "sequence_report_results",
+                        "report_id": "metric_counter_to_gauge",
+                        "entity_id": "fixture_run",
+                        "segment": [
+                            { "name": "service", "value": { "path": "service" } }
+                        ],
+                        "steps": [
+                            {
+                                "name": "counter",
+                                "match": { "all": [
+                                    { "path": "metric_type", "op": "eq", "value": "counter" }
+                                ] }
+                            },
+                            {
+                                "name": "gauge",
+                                "match": { "all": [
+                                    { "path": "metric_type", "op": "eq", "value": "gauge" }
+                                ] }
+                            }
+                        ]
+                    }
+                ]
+            }),
+            version: 21,
+        }]);
+
+        let rows = sequence_report_result_rows(&rows, &definitions);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].report_id, "metric_counter_to_gauge");
+        assert_eq!(rows[0].report_version, 21);
+        assert_eq!(rows[0].step_index, 0);
+        assert_eq!(rows[0].step_name, "counter");
+        assert_eq!(rows[0].entity_count, 1);
+        assert_eq!(rows[0].conversion_count, 1);
+        assert_eq!(rows[1].step_index, 1);
+        assert_eq!(rows[1].step_name, "gauge");
+        assert_eq!(rows[1].entity_count, 1);
+    }
+
+    #[test]
+    fn generalized_measure_definition_skips_match_and_type_failures() {
+        let definitions =
+            ExtractionDefinitions::from_records(vec![sdk_metric_managed_definition_record(
+                "fixture",
+            )]);
+        let non_metric = fixture_row("llm_call.json");
+        let rollups = metric_rollup_rows(&non_metric, &definitions);
+        assert!(rollups.counters.is_empty());
+        assert!(rollups.gauges.is_empty());
+        assert!(rollups.histograms.is_empty());
+
+        let mut bad_metric = fixture_row("metric_counter.json");
+        bad_metric.data["metric_value"] = json!("not-a-number");
+        let rollups = metric_rollup_rows(&bad_metric, &definitions);
+        assert!(rollups.counters.is_empty());
+        assert!(rollups.gauges.is_empty());
+        assert!(rollups.histograms.is_empty());
     }
 
     #[test]
@@ -2121,6 +4789,37 @@ mod tests {
         assert!(targets.any());
     }
 
+    fn fixture_row(file_name: &str) -> EventInsertRow {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/events")
+            .join(file_name);
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("read fixture {}: {error}", path.display());
+        });
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("parse fixture {}: {error}", path.display());
+        });
+        EventInsertRow {
+            event_id: value["event_id"].as_str().unwrap_or(file_name).to_string(),
+            timestamp: value["timestamp"]
+                .as_str()
+                .unwrap_or("2026-05-08T01:23:45.123Z")
+                .to_string(),
+            observed_timestamp: value["observed_timestamp"]
+                .as_str()
+                .unwrap_or("2026-05-08T01:23:45.123Z")
+                .to_string(),
+            ingested_timestamp: value["observed_timestamp"]
+                .as_str()
+                .unwrap_or("2026-05-08T01:23:45.123Z")
+                .to_string(),
+            source_file: format!("fixtures/events/{file_name}"),
+            source_offset: 0,
+            source_length: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            data: value["data"].clone(),
+        }
+    }
+
     fn test_config() -> Config {
         Config {
             warehouse_dir: PathBuf::from("/tmp/lakehouse"),
@@ -2133,7 +4832,13 @@ mod tests {
             clickhouse_events_table: "events".to_string(),
             clickhouse_field_index_table: "field_index".to_string(),
             clickhouse_event_measures_table: "event_measures".to_string(),
+            clickhouse_counter_rollups_table: "counter_rollups".to_string(),
+            clickhouse_gauge_rollups_table: "gauge_rollups".to_string(),
+            clickhouse_histogram_rollups_table: "histogram_rollups".to_string(),
             clickhouse_entity_state_updates_table: "entity_state_updates".to_string(),
+            clickhouse_report_results_table: "report_results".to_string(),
+            clickhouse_sequence_report_results_table: "sequence_report_results".to_string(),
+            clickhouse_cohort_memberships_table: "cohort_memberships".to_string(),
             clickhouse_definitions_table: "definitions".to_string(),
             truncate_events: false,
             rebuild_raw: true,

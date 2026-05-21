@@ -389,15 +389,15 @@
 
   <section id="lifecycle">
     <h2>Optimization Lifecycle</h2>
-    <p>Group 2 means the serving model is known and schema-backed. The current system already has Iceberg commit tracking, raw rebuild, serving watermarks, and a continuous materializer for promoted fields, measures, and entity states. Recommendation generation and report/cohort/sequence executors remain separate implementation work.</p>
+    <p>Group 2 means the serving model is known and schema-backed. The current system already has Iceberg commit tracking, raw rebuild, serving watermarks, and a continuous materializer for promoted fields, measures, metric rollups, summary reports, trace summary reports, retention reports, sequence reports, entity states, and cohort memberships. Full published-version report jobs remain separate implementation work.</p>
     <div class="summary-grid">
       <div class="group-card">
         <b>Observe</b>
         <p><code>query_usage</code> records raw fallback query shapes, JSON paths, scanned bytes, latency, and result size.</p>
       </div>
       <div class="group-card">
-        <b>Recommend</b>
-        <p><code>optimization_recommendations</code> stores proposed fields, measures, reports, cohorts, funnels, and alerts.</p>
+        <b>Define</b>
+        <p>SDK-managed definitions and user/admin definitions explicitly declare fields, measures, reports, cohorts, funnels, and alerts.</p>
       </div>
       <div class="group-card">
         <b>Build</b>
@@ -585,7 +585,7 @@ WHERE i.tenant_id = {tenant_id:String}
 ORDER BY i.timestamp DESC
 LIMIT 100;`,
     faster: 'Each predicate becomes an exact lookup in a narrow table keyed by tenant, field name, and value. Candidate event ids are intersected after each field is pruned independently.',
-    caveat: 'Promoting every possible dynamic path recreates write fanout. Recommend promotion after repeated use, high raw scan cost, or explicit user action.'
+    caveat: 'Promoting every possible dynamic path recreates write fanout. Promotion should happen through explicit SDK-managed defaults or user/admin action.'
   },
   {
     number: 9,
@@ -794,7 +794,7 @@ WHERE tenant_id = {tenant_id:String}
   AND bucket_time >= {from:DateTime64(3, 'UTC')}
 ORDER BY bucket_time ASC, step_index ASC;`,
     faster: 'Reads one row per report step and bucket after the materializer has already performed per-entity sequence work.',
-    caveat: 'The schema has sequence_report_results and report metadata; production needs a materialization executor to populate it.'
+    caveat: 'The materializer can populate sequence_report_results from explicit sequence definitions. Full published-version report jobs are still separate production hardening work.'
   },
   {
     number: 16,
@@ -936,7 +936,7 @@ WHERE tenant_id = {tenant_id:String}
 ORDER BY duration_ms DESC
 LIMIT 100;`,
     faster: 'Ranks per-trace summary rows instead of grouping millions or billions of raw span/log events by trace_id.',
-    caveat: 'This is optimizable with a report model, but not yet implemented as a first-class trace summary worker.'
+    caveat: 'This uses an explicit trace_summary report model; raw events remain the source of truth when opening a selected trace.'
   },
   {
     number: 20,
