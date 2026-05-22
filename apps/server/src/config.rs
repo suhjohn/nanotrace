@@ -111,7 +111,7 @@ impl Config {
                 .is_some_and(|url| url.starts_with("https://"))
         });
         let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
-        let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 10 * 60)?;
+        let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 60 * 60)?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
             bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),

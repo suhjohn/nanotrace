@@ -32,6 +32,11 @@ function RootDocument() {
       })
   )
 
+  if (typeof window !== 'undefined' && window.location.pathname === '/auth/callback') {
+    redirectAuthCallbackToApi()
+    return <AuthLoading />
+  }
+
   return (
     <QueryClientProvider client={queryClient}>
       <AuthGate>
@@ -42,6 +47,12 @@ function RootDocument() {
       <TanStackRouterDevtools position="bottom-right" />
     </QueryClientProvider>
   )
+}
+
+function redirectAuthCallbackToApi() {
+  const apiBaseUrl = nanotraceApiBaseUrl()
+  if (!apiBaseUrl) return
+  window.location.replace(`${apiBaseUrl}/auth/callback${window.location.search}`)
 }
 
 function AuthGate({ children }: { children: ReactNode }) {

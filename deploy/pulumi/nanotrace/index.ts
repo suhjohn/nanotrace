@@ -300,6 +300,9 @@ const sessionSameSite =
   cfg.get('sessionSameSite') ??
   process.env.NANOTRACE_SESSION_SAME_SITE ??
   'Lax'
+const magicLinkTtlSecs =
+  cfg.getNumber('magicLinkTtlSecs') ??
+  numberEnv('NANOTRACE_MAGIC_LINK_TTL_SECS', 60 * 60)
 const imageUriOverride = cfg.get('imageUri')
 const buildImage = cfg.getBoolean('buildImage') ?? !imageUriOverride
 const imageBuildId = cfg.get('imageBuildId') ?? cfg.get('imageTag') ?? 'latest'
@@ -1420,7 +1423,7 @@ const listener = edgeTlsMode === 'alb'
 const publicBaseUrl =
   cfg.get('publicBaseUrl') ??
   process.env.NANOTRACE_PUBLIC_BASE_URL ??
-  appBaseUrl
+  apiBaseUrl
 const databaseUrl = database
   ? pulumi.interpolate`postgres://${databaseUsername}:${databasePassword}@${database.address}:5432/${databaseName}`
   : externalPostgresUrl ?? pulumi.output('')
@@ -1547,7 +1550,8 @@ const userData = pulumi
         processorPrefix,
         publicBaseUrl: resolvedPublicBaseUrl,
         sessionSecure,
-        sessionSameSite
+        sessionSameSite,
+        magicLinkTtlSecs
       })
   )
 
@@ -1573,7 +1577,8 @@ const queryUserData = pulumi
       publicBaseUrl: resolvedPublicBaseUrl,
       corsAllowedOrigins,
       sessionSecure,
-      sessionSameSite
+      sessionSameSite,
+      magicLinkTtlSecs
     })
   )
 
@@ -1790,6 +1795,7 @@ interface UserDataArgs {
   publicBaseUrl: string
   sessionSecure: boolean
   sessionSameSite: string
+  magicLinkTtlSecs: number
   uploadPollIntervalMs: number
   writerFlushBytes: number
   writerFlushIntervalMs: number
@@ -1831,6 +1837,7 @@ interface QueryUserDataArgs {
   corsAllowedOrigins: string
   sessionSecure: boolean
   sessionSameSite: string
+  magicLinkTtlSecs: number
 }
 
 function renderUserData (args: UserDataArgs): string {
@@ -1928,6 +1935,7 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
   -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
+  -e NANOTRACE_MAGIC_LINK_TTL_SECS=${args.magicLinkTtlSecs} \\
   -e NANOTRACE_EMAIL_FROM=${shellQuote(args.emailFrom)} \\
   -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
   -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
@@ -2063,6 +2071,7 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
   -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
+  -e NANOTRACE_MAGIC_LINK_TTL_SECS=${args.magicLinkTtlSecs} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
