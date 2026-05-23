@@ -87,19 +87,25 @@ type LogGroupPage = {
   nextOffset?: number
 }
 
+type EventCursor = {
+  createdAt: string
+  eventId: string
+}
+
 type LogEventsPage = {
   anchorIndex?: number
   events: TraceEvent[]
   fields: LogField[]
   group?: LogGroupSummary
-  nextCursor?: string
-  prevCursor?: string
+  nextCursor?: EventCursor
+  prevCursor?: EventCursor
 }
 
 type EventPageParam = {
   after?: string
   around?: string
   before?: string
+  eventId?: string
 }
 
 type LogEventPayload = {
@@ -154,7 +160,7 @@ type GroupOption = {
   cardinality: number
   capped: boolean
   displayName?: string
-  lookupEnabled?: boolean
+  indexEnabled?: boolean
   path: string
   removable?: boolean
   servingMode?: string
@@ -313,7 +319,7 @@ function parseTimeRangeKey(value: string): TimeRangeKey {
 }
 
 function parseEventSortDirection(value: string): EventSortDirection {
-  return value === 'asc' ? 'asc' : 'desc'
+  return value === 'desc' ? 'desc' : 'asc'
 }
 
 function formatDateTimeLocalInput(date: Date) {
@@ -447,8 +453,8 @@ export function ObservatoryHome({
     initialValue: 'flamegraph'
   })
   const [eventSortDirection, setEventSortDirection] = useCookieState<EventSortDirection>({
-    cookieName: 'observatory-ui-event-sort-direction',
-    initialValue: 'desc',
+    cookieName: 'observatory-ui-event-sort-direction-v2',
+    initialValue: 'asc',
     parse: parseEventSortDirection
   })
   const [timeRangeKey, setTimeRangeKey] = useCookieState<TimeRangeKey>({
@@ -475,7 +481,7 @@ export function ObservatoryHome({
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
-  const [eventAnchorOverride, setEventAnchorOverride] = useState<{ key: string; timestamp: string } | null>(null)
+  const [eventAnchorOverride, setEventAnchorOverride] = useState<{ eventId: string; key: string; timestamp: string } | null>(null)
   const [inspectorQuery, setInspectorQuery] = useState('')
 
   const [selectedEventColumns, setSelectedEventColumns] = useIndexedDbState<string[]>({
@@ -619,6 +625,7 @@ export function ObservatoryHome({
     selectedTimeRangeCacheKey
   ].join('\u0000')
   const eventAnchorTimestamp = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.timestamp : ''
+  const eventAnchorEventId = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.eventId : ''
   const summaryQuery = useQuery({
     enabled: Boolean(hasEventQuery),
     queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
@@ -637,8 +644,8 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventSortDirection],
-    initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp } : {}) as EventPageParam,
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventAnchorEventId, eventSortDirection],
+    initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp, eventId: eventAnchorEventId } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
         apiBaseUrl: observatoryUrl,
@@ -650,18 +657,20 @@ export function ObservatoryHome({
         sortDirection: eventSortDirection,
         timeRange: selectedTimeRange
       }),
-    getNextPageParam: lastPage =>
-      lastPage.nextCursor
-        ? eventSortDirection === 'desc'
-          ? { before: lastPage.nextCursor }
-          : { after: lastPage.nextCursor }
-        : undefined,
-    getPreviousPageParam: firstPage =>
-      firstPage.prevCursor
-        ? eventSortDirection === 'desc'
-          ? { after: firstPage.prevCursor }
-          : { before: firstPage.prevCursor }
-        : undefined,
+    getNextPageParam: lastPage => {
+      const cursor = lastPage.nextCursor
+      if (!cursor) return undefined
+      return eventSortDirection === 'desc'
+        ? { before: cursor.createdAt, eventId: cursor.eventId }
+        : { after: cursor.createdAt, eventId: cursor.eventId }
+    },
+    getPreviousPageParam: firstPage => {
+      const cursor = firstPage.prevCursor
+      if (!cursor) return undefined
+      return eventSortDirection === 'desc'
+        ? { after: cursor.createdAt, eventId: cursor.eventId }
+        : { before: cursor.createdAt, eventId: cursor.eventId }
+    },
     placeholderData: keepPreviousData,
     refetchInterval: liveRefetchInterval,
     retry: false
@@ -888,9 +897,6 @@ export function ObservatoryHome({
 
   function selectTimeRange(key: TimeRangeKey) {
     setTimeRangeKey(key)
-    if (key === 'live') {
-      setEventSortDirection('desc')
-    }
     setTimeRangeSearch(key, key === 'custom' ? effectiveCustomRangeStart : undefined, key === 'custom' ? effectiveCustomRangeEnd : undefined)
     clearFilterTimeBounds()
     setEventAnchorOverride(null)
@@ -998,12 +1004,6 @@ export function ObservatoryHome({
     setFilterSearch('')
   }, [eventFilterSearchText, eventScopeKey])
 
-  useEffect(() => {
-    if (liveMode && eventSortDirection !== 'desc') {
-      setEventSortDirection('desc')
-    }
-  }, [eventSortDirection, liveMode, setEventSortDirection])
-
   const filteredTraces = traceList
   const emptyFilter = !loadingList && !listError && Boolean(groupSearch) && traceList.length === 0
 
@@ -1018,9 +1018,10 @@ export function ObservatoryHome({
         eventTableFilterKey,
         selectedTimeRangeCacheKey,
         eventSortDirection,
-        eventAnchorTimestamp
+        eventAnchorTimestamp,
+        eventAnchorEventId
       ].join('\u0000'),
-    [eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
+    [eventAnchorEventId, eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
     if (!eventDetail) return selectedEventColumns
@@ -1079,7 +1080,7 @@ export function ObservatoryHome({
     setHighlightedEventIds(nextHighlightedEventIds)
     setSelectedCanvasSpanId(span.id)
     const anchorTimestamp = flamegraph.eventCreatedAt[nextEventId] || (Number.isFinite(span.startMs) ? new Date(span.startMs).toISOString() : '')
-    setEventAnchorOverride(nextEventId && anchorTimestamp ? { key: eventDataKey, timestamp: anchorTimestamp } : null)
+    setEventAnchorOverride(nextEventId && anchorTimestamp ? { eventId: nextEventId, key: eventDataKey, timestamp: anchorTimestamp } : null)
   }
 
   useEffect(() => {
@@ -1099,9 +1100,11 @@ export function ObservatoryHome({
         const anchorTimestamp = eventPayloadQuery.data.event.createdAt
         if (
           anchorTimestamp &&
-          (eventAnchorOverride?.key !== eventDataKey || eventAnchorOverride.timestamp !== anchorTimestamp)
+          (eventAnchorOverride?.key !== eventDataKey ||
+            eventAnchorOverride.eventId !== selectedEventId ||
+            eventAnchorOverride.timestamp !== anchorTimestamp)
         ) {
-          setEventAnchorOverride({ key: eventDataKey, timestamp: anchorTimestamp })
+          setEventAnchorOverride({ eventId: selectedEventId, key: eventDataKey, timestamp: anchorTimestamp })
         }
       }
       return
@@ -1119,17 +1122,6 @@ export function ObservatoryHome({
       document.body.style.userSelect = ''
     }
   }, [dragging])
-
-  useEffect(() => {
-    if (!selectedEventId) {
-      return
-    }
-
-    const element = document.querySelector<HTMLElement>(`[data-trace-event-id="${CSS.escape(selectedEventId)}"]`)
-    element?.scrollIntoView({
-      block: 'nearest'
-    })
-  }, [selectedEventId])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1526,7 +1518,6 @@ export function ObservatoryHome({
               hasMore={eventsQuery.hasNextPage}
               hasPrevious={eventsQuery.hasPreviousPage}
               highlightedEventIds={highlightedEventIds}
-              liveMode={liveMode}
               loading={loadingTableDetail}
               loadingAnchor={loadingAnchoredEvents}
               loadingMore={eventsQuery.isFetchingNextPage}
@@ -1815,10 +1806,9 @@ function groupOptionSelectLabel(option: GroupOption) {
 function groupOptionServingLabel(option: GroupOption | null) {
   switch (option?.servingMode || option?.source) {
     case 'rollup':
-    case 'core_rollup':
       return 'Rollup'
+    case 'index':
     case 'lookup':
-      return 'Lookup'
     case 'promoted':
     case 'field_index':
       return 'Index'
@@ -1832,13 +1822,12 @@ function groupOptionServingLabel(option: GroupOption | null) {
 function groupOptionServingTitle(option: GroupOption) {
   switch (option.servingMode || option.source) {
     case 'rollup':
-    case 'core_rollup':
-      return 'Grouped from the always-on core rollup.'
+      return 'Grouped from a precomputed field rollup.'
+    case 'index':
     case 'lookup':
-      return 'Grouped from the exact lookup index.'
     case 'promoted':
     case 'field_index':
-      return 'Grouped from a promoted field index.'
+      return 'Grouped from an event-level field index.'
     case 'raw':
       return 'Grouped directly from raw events.'
     default:
@@ -3027,7 +3016,6 @@ function EventPanel({
   hasMore,
   hasPrevious,
   highlightedEventIds,
-  liveMode,
   loading,
   loadingAnchor,
   loadingMore,
@@ -3052,7 +3040,6 @@ function EventPanel({
   hasMore: boolean
   hasPrevious: boolean
   highlightedEventIds: string[]
-  liveMode: boolean
   loading: boolean
   loadingAnchor: boolean
   loadingMore: boolean
@@ -3080,6 +3067,7 @@ function EventPanel({
   const loadPreviousEventCountRef = useRef(0)
   const anchoredScrollKeyRef = useRef('')
   const currentScrollStateKeyRef = useRef(scrollStateKey)
+  const selectedSurroundingLoadKeyRef = useRef({ more: '', previous: '' })
   const selectedScrollKeyRef = useRef('')
   const lastScrollTopRef = useRef(0)
   const suppressScrollPaginationRef = useRef(false)
@@ -3121,7 +3109,7 @@ function EventPanel({
     if (index === -1) {
       return
     }
-    const key = `${scrollStateKey}\u0000${selectedEventId}\u0000${selectedEventAlign}`
+    const key = `${scrollStateKey}\u0000${selectedEventId}\u0000${selectedEventAlign}\u0000${index}`
     if (selectedScrollKeyRef.current === key) {
       return
     }
@@ -3129,6 +3117,43 @@ function EventPanel({
     suppressScrollPaginationForProgrammaticScroll()
     virtualizer.scrollToIndex(index, { align: selectedEventAlign })
   }, [events, scrollStateKey, selectedEventAlign, selectedEventId, virtualizer])
+
+  useEffect(() => {
+    if (selectedEventAlign !== 'center' || !selectedEventId) {
+      return
+    }
+    const index = events.findIndex(event => event.id === selectedEventId)
+    if (index === -1) {
+      return
+    }
+    const desiredSurroundingRows = 30
+    const loadKey = `${scrollStateKey}\u0000${selectedEventId}\u0000${events.length}`
+    if (index < desiredSurroundingRows && hasPrevious && !loadingPrevious) {
+      const previousKey = `${loadKey}\u0000previous`
+      if (selectedSurroundingLoadKeyRef.current.previous !== previousKey) {
+        selectedSurroundingLoadKeyRef.current.previous = previousKey
+        void onLoadPrevious()
+      }
+    }
+    if (events.length - index - 1 < desiredSurroundingRows && hasMore && !loadingMore) {
+      const moreKey = `${loadKey}\u0000more`
+      if (selectedSurroundingLoadKeyRef.current.more !== moreKey) {
+        selectedSurroundingLoadKeyRef.current.more = moreKey
+        onLoadMore()
+      }
+    }
+  }, [
+    events,
+    hasMore,
+    hasPrevious,
+    loadingMore,
+    loadingPrevious,
+    onLoadMore,
+    onLoadPrevious,
+    scrollStateKey,
+    selectedEventAlign,
+    selectedEventId
+  ])
 
   function loadMoreIfNeeded(element: HTMLElement | null, options: { fillOnly?: boolean } = {}) {
     if (!element || !hasMore || loadingMore || loadMoreEventCountRef.current === events.length) {
@@ -3276,10 +3301,9 @@ function EventPanel({
               path === 'timestamp' ? (
                 <button
                   key={path}
-                  aria-label={liveMode ? 'Live mode uses newest first' : `Sort timestamp ${sortDirection === 'desc' ? 'ascending' : 'descending'}`}
+                  aria-label={`Sort timestamp ${sortDirection === 'desc' ? 'ascending' : 'descending'}`}
                   className="inline-flex min-w-0 items-center gap-1 text-left uppercase text-neutral-400 outline-none hover:text-white focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-600 disabled:cursor-not-allowed disabled:text-neutral-600 disabled:hover:text-neutral-600"
-                  disabled={liveMode}
-                  title={liveMode ? 'Live mode uses newest first' : `Timestamp ${sortDirection === 'desc' ? 'descending' : 'ascending'}`}
+                  title={`Timestamp ${sortDirection === 'desc' ? 'descending' : 'ascending'}`}
                   type="button"
                   onClick={onToggleSortDirection}
                 >
@@ -3830,14 +3854,16 @@ type ClickHouseResponse<T> = {
   data?: T[]
 }
 
-type QueryParameters = Record<string, string | number | boolean>
-
 type EventsQueryRequest = {
   buckets?: number
   filter?: ParsedEventFilter
   groupBy?: string
   limit?: number
   offset?: number
+  orderBy?: {
+    direction?: EventSortDirection
+    group?: GroupSortKey
+  }
   page?: EventPageParam & { eventId?: string }
   search?: string
   selectedGroupValue?: string
@@ -3885,10 +3911,6 @@ type FlamegraphEventRow = {
   trace_id?: string
 }
 
-const defaultTableName = 'observatory.events'
-const defaultDensityRollupsTableName = 'observatory.event_density_1s'
-const defaultFieldIndexTableName = 'observatory.field_index'
-const defaultFieldValuesTableName = 'observatory.field_values'
 const groupableFields = [
   'traceId',
   'spanId',
@@ -3922,7 +3944,7 @@ async function fetchGroupOptions({
     aggregateEnabled?: boolean
     capped: boolean
     cardinality: number
-    lookupEnabled?: boolean
+    indexEnabled?: boolean
     path: string
     servingMode?: string
     source?: string
@@ -3935,7 +3957,7 @@ async function fetchGroupOptions({
     cardinality: Number(field.cardinality) || 0,
     capped: Boolean(field.capped),
     aggregateEnabled: Boolean(field.aggregateEnabled),
-    lookupEnabled: Boolean(field.lookupEnabled),
+    indexEnabled: Boolean(field.indexEnabled),
     path: displayFacetPath(field.path),
     servingMode: field.servingMode,
     source: field.source,
@@ -3985,8 +4007,8 @@ async function fetchGroups({
       groupBy,
       limit,
       offset,
+      orderBy: { group: sortKey },
       search,
-      sort: { group: sortKey },
       timeRange,
       view: 'groups'
     }
@@ -4115,54 +4137,6 @@ async function fetchSummary({
   return { capped: false, count, limit: count }
 }
 
-async function fetchSummaryFromDensityRollup({
-  apiBaseUrl,
-  eventFilter
-}: {
-  apiBaseUrl: string
-  eventFilter: ParsedEventFilter
-}): Promise<LogSummary> {
-  const response = await postQuery<{ count: number }>({
-    apiBaseUrl,
-    parameters: densityRollupParameters(eventFilter),
-    query: [
-      'SELECT sum(count) AS count',
-      `FROM ${densityRollupsTable()} AS d`,
-      densityRollupTimePrewhere(eventFilter)
-        ? `PREWHERE ${densityRollupTimePrewhere(eventFilter)}`
-        : ''
-    ].join(' ')
-  })
-  const count = Number(response.data?.[0]?.count) || 0
-  return { capped: false, count, limit: count }
-}
-
-async function fetchSummaryFromFieldIndex({
-  apiBaseUrl,
-  eventFilter,
-  groupBy,
-  selectedGroupValue
-}: {
-  apiBaseUrl: string
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  selectedGroupValue: string
-}): Promise<LogSummary> {
-  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true })
-  const response = await postQuery<{ count: number }>({
-    apiBaseUrl,
-    parameters: eventQueryParameters({ eventFilter, groupBy, selectedGroupValue }),
-    query: [
-      'SELECT uniqExact(i.event_id) AS count',
-      `FROM ${fieldIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
-      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i' })
-    ].join(' ')
-  })
-  const count = Number(response.data?.[0]?.count) || 0
-  return { capped: false, count, limit: count }
-}
-
 async function fetchEvents({
   apiBaseUrl,
   eventFilter,
@@ -4182,108 +4156,37 @@ async function fetchEvents({
   sortDirection: EventSortDirection
   timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  const queryOrder = sortDirection === 'desc'
-    ? pageParam.after ? 'ASC' : 'DESC'
-    : pageParam.before ? 'DESC' : 'ASC'
-  const tableOrder = sortDirection === 'desc' ? 'DESC' : 'ASC'
   const response = await postEventsQuery<FlamegraphEventRow>({
     apiBaseUrl,
     request: {
       filter: eventFilter,
       groupBy,
       limit,
+      orderBy: { direction: sortDirection },
       page: pageParam,
       selectedGroupValue,
-      sort: { direction: sortDirection },
       timeRange,
       view: 'events'
     }
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  if (queryOrder !== tableOrder) events.reverse()
   const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
 
   return {
     events,
     fields: orderLogFields(inferLogFields(events)),
     group: pageGroupSummary({ events, groupBy, selectedGroupValue }),
-    nextCursor: events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
+    nextCursor: events.length >= limit ? eventCursor(events[events.length - 1]) : undefined,
     prevCursor: loadedTowardTop
-      ? events.length >= limit ? events[0]?.createdAt : undefined
+      ? events.length >= limit ? eventCursor(events[0]) : undefined
       : pageParam.around
-        ? events[0]?.createdAt
+        ? eventCursor(events[0])
         : undefined
   }
 }
 
-async function fetchEventsFromFieldIndex({
-  apiBaseUrl,
-  eventFilter,
-  groupBy,
-  limit,
-  pageParam,
-  selectedGroupValue,
-  sortDirection,
-  timeRange
-}: {
-  apiBaseUrl: string
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  limit: number
-  pageParam: EventPageParam
-  selectedGroupValue: string
-  sortDirection: EventSortDirection
-  timeRange?: ResolvedTimeRange
-}): Promise<LogEventsPage> {
-  const queryOrder = sortDirection === 'desc'
-    ? pageParam.after ? 'ASC' : 'DESC'
-    : pageParam.before ? 'DESC' : 'ASC'
-  const tableOrder = sortDirection === 'desc' ? 'DESC' : 'ASC'
-  const cursorFilter = pageParam.before
-    ? "i.timestamp < {cursor:DateTime64(3, 'UTC')}"
-    : pageParam.after
-      ? "i.timestamp > {cursor:DateTime64(3, 'UTC')}"
-      : pageParam.around
-        ? "i.timestamp <= {cursor:DateTime64(3, 'UTC')}"
-        : ''
-  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, includeCursor: cursorFilter, timeRange })
-  const parameters = {
-    ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
-    limit,
-    ...(pageParam.before || pageParam.after || pageParam.around
-      ? { cursor: clickHouseDateTime64(pageParam.before || pageParam.after || pageParam.around || '') }
-      : {})
-  }
-  const response = await postQuery<FlamegraphEventRow>({
-    apiBaseUrl,
-    parameters,
-    query: [
-      'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
-      ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
-      ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
-      `FROM ${fieldIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
-      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
-      'GROUP BY i.event_id, i.timestamp',
-      `ORDER BY i.timestamp ${queryOrder}, i.event_id ${queryOrder}`,
-      'LIMIT {limit:UInt64}'
-    ].join(' ')
-  })
-  const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  if (queryOrder !== tableOrder) events.reverse()
-  const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
-
-  return {
-    events,
-    fields: orderLogFields(inferLogFields(events)),
-    group: pageGroupSummary({ events, groupBy, selectedGroupValue }),
-    nextCursor: events.length >= limit ? events[events.length - 1]?.createdAt : undefined,
-    prevCursor: loadedTowardTop
-      ? events.length >= limit ? events[0]?.createdAt : undefined
-      : pageParam.around
-        ? events[0]?.createdAt
-        : undefined
-  }
+function eventCursor(event: TraceEvent | undefined): EventCursor | undefined {
+  return event ? { createdAt: event.createdAt, eventId: event.id } : undefined
 }
 
 async function fetchFlamegraph({
@@ -4311,50 +4214,6 @@ async function fetchFlamegraph({
       timeRange,
       view: 'flamegraph'
     }
-  })
-  const events = (response.data ?? []).map(rowToFlamegraphEvent)
-  const domain = queryTimeDomain({ eventFilter, fallbackFrom: events[0]?.createdAt, fallbackTo: events[events.length - 1]?.createdAt, timeRange })
-  const flamegraph = buildFlamegraph(events, domain)
-  return {
-    ...flamegraph,
-    capped: events.length >= maxSpans,
-    spanCount: flamegraph.rows.reduce((count, row) => count + row.length, 0)
-  }
-}
-
-async function fetchFlamegraphFromFieldIndex({
-  apiBaseUrl,
-  eventFilter,
-  groupBy,
-  maxSpans,
-  selectedGroupValue,
-  timeRange
-}: {
-  apiBaseUrl: string
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  maxSpans: number
-  selectedGroupValue: string
-  timeRange: ResolvedTimeRange
-}): Promise<LogFlamegraph> {
-  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
-  const response = await postQuery<FlamegraphEventRow>({
-    apiBaseUrl,
-    parameters: {
-      ...eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange }),
-      limit: maxSpans
-    },
-    query: [
-      'SELECT i.event_id AS event_id, i.timestamp AS timestamp',
-      ', anyLast(i.event_type) AS event_type, anyLast(i.signal) AS signal, anyLast(i.trace_id) AS trace_id, anyLast(i.span_id) AS span_id',
-      ', anyLast(i.parent_span_id) AS parent_span_id, anyLast(i.name) AS name, anyLast(i.start_time) AS start_time, anyLast(i.end_time) AS end_time, anyLast(i.duration_ms) AS duration_ms',
-      `FROM ${fieldIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
-      fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange }),
-      'GROUP BY i.event_id, i.timestamp',
-      'ORDER BY i.timestamp ASC, i.event_id ASC',
-      'LIMIT {limit:UInt64}'
-    ].join(' ')
   })
   const events = (response.data ?? []).map(rowToFlamegraphEvent)
   const domain = queryTimeDomain({ eventFilter, fallbackFrom: events[0]?.createdAt, fallbackTo: events[events.length - 1]?.createdAt, timeRange })
@@ -4414,126 +4273,6 @@ async function fetchDensity({
   }
 }
 
-async function fetchDensityFromRollup({
-  apiBaseUrl,
-  buckets,
-  eventFilter,
-  timeRange
-}: {
-  apiBaseUrl: string
-  buckets: number
-  eventFilter: ParsedEventFilter
-  timeRange: ResolvedTimeRange
-}): Promise<LogDensity> {
-  const prewhere = densityRollupTimePrewhere(eventFilter, timeRange)
-  const parameters = densityRollupParameters(eventFilter, timeRange)
-  const range = await postQuery<{ count: number; from: string; to: string }>({
-    apiBaseUrl,
-    parameters,
-    query: [
-      'SELECT min(d.bucket_time) AS from, max(d.bucket_time) AS to, sum(d.count) AS count',
-      `FROM ${densityRollupsTable()} AS d`,
-      prewhere ? `PREWHERE ${prewhere}` : ''
-    ].join(' ')
-  })
-  const row = range.data?.[0]
-  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
-  if (!Number(row?.count) || !domain) {
-    return { bucketMs: 1, buckets: [], from: '', to: '' }
-  }
-  const fromMs = Date.parse(domain.from)
-  const toMs = Date.parse(domain.to)
-
-  const bucketMs = Math.max(1_000, niceTimeInterval(Math.max(1_000, (toMs - fromMs) / buckets)))
-  const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
-    apiBaseUrl,
-    parameters: { ...parameters, bucket_ms: bucketMs },
-    query: [
-      'WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
-      'SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount',
-      `FROM ${densityRollupsTable()} AS d`,
-      prewhere ? `PREWHERE ${prewhere}` : '',
-      'GROUP BY bucket',
-      'ORDER BY bucket ASC'
-    ].join(' ')
-  })
-
-  return {
-    bucketMs,
-    buckets: (density.data ?? []).map(bucket => ({
-      count: Number(bucket.count) || 0,
-      errorCount: Number(bucket.errorCount) || 0,
-      start: new Date(Number(bucket.bucket)).toISOString()
-    })),
-    from: domain.from,
-    to: domain.to
-  }
-}
-
-async function fetchDensityFromFieldIndex({
-  apiBaseUrl,
-  buckets,
-  eventFilter,
-  groupBy,
-  selectedGroupValue,
-  timeRange
-}: {
-  apiBaseUrl: string
-  buckets: number
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  selectedGroupValue: string
-  timeRange: ResolvedTimeRange
-}): Promise<LogDensity> {
-  const parameters = eventQueryParameters({ eventFilter, groupBy, selectedGroupValue, timeRange })
-  const fieldIndexPrewhereClause = fieldIndexPrewhere({ eventFilter, includeAlias: true, timeRange })
-  const fieldIndexWhere = fieldIndexFacetWhere({ eventFilter, outerAlias: 'i', timeRange })
-  const range = await postQuery<{ count: number; from: string; to: string }>({
-    apiBaseUrl,
-    parameters,
-    query: [
-      'SELECT min(i.timestamp) AS from, max(i.timestamp) AS to, uniqExact(i.event_id) AS count',
-      `FROM ${fieldIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
-      fieldIndexWhere
-    ].join(' ')
-  })
-  const row = range.data?.[0]
-  const domain = queryTimeDomain({ eventFilter, fallbackFrom: row?.from, fallbackTo: row?.to, timeRange })
-  if (!Number(row?.count) || !domain) {
-    return { bucketMs: 1, buckets: [], from: '', to: '' }
-  }
-  const fromMs = Date.parse(domain.from)
-  const toMs = Date.parse(domain.to)
-
-  const bucketMs = niceTimeInterval(Math.max(1, (toMs - fromMs) / buckets))
-  const density = await postQuery<{ bucket: number; count: number; errorCount: number }>({
-    apiBaseUrl,
-    parameters: { ...parameters, bucket_ms: bucketMs },
-    query: [
-      'WITH intDiv(toUnixTimestamp64Milli(i.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket',
-      'SELECT bucket, uniqExact(i.event_id) AS count',
-      ", uniqExactIf(i.event_id, endsWith(lowerUTF8(i.event_type), '_error')) AS errorCount",
-      `FROM ${fieldIndexTable()} AS i`,
-      `PREWHERE i.field_name = {group_key:String} AND i.value = {group_value:String}${fieldIndexPrewhereClause ? ` AND ${fieldIndexPrewhereClause}` : ''}`,
-      fieldIndexWhere,
-      'GROUP BY bucket',
-      'ORDER BY bucket ASC'
-    ].join(' ')
-  })
-
-  return {
-    bucketMs,
-    buckets: (density.data ?? []).map(bucket => ({
-      count: Number(bucket.count) || 0,
-      errorCount: Number(bucket.errorCount) || 0,
-      start: new Date(Number(bucket.bucket)).toISOString()
-    })),
-    from: domain.from,
-    to: domain.to
-  }
-}
-
 async function fetchEvent({
   apiBaseUrl,
   eventId
@@ -4565,31 +4304,6 @@ async function fetchEvent({
   const row = response.data?.[0]
   if (!row) throw new HTTPError({ message: 'event not found', status: 404 })
   return { event: rowToTraceEvent(row) }
-}
-
-async function postQuery<T>({
-  apiBaseUrl,
-  parameters = {},
-  query
-}: {
-  apiBaseUrl: string
-  parameters?: QueryParameters
-  query: string
-}): Promise<ClickHouseResponse<T>> {
-  const response = await fetch(queryUrl(apiBaseUrl), {
-    body: JSON.stringify({ parameters, query }),
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'POST'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({
-      message: text || response.statusText,
-      status: response.status
-    })
-  }
-  return (await response.json()) as ClickHouseResponse<T>
 }
 
 async function postEventsQuery<T>({
@@ -4708,11 +4422,6 @@ async function revokeApiKey({
   return body.api_key
 }
 
-function queryUrl(apiBaseUrl: string) {
-  const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/v1/query` : '/v1/query'
-}
-
 function eventsQueryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/v1/events/query` : '/v1/events/query'
@@ -4732,64 +4441,6 @@ function authUrl(apiBaseUrl: string, path: string) {
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/api-keys` : '/api-keys'
-}
-
-function eventsTable() {
-  const table = String(import.meta.env.VITE_NANOTRACE_TABLE || defaultTableName).trim()
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(table)
-    ? table
-    : defaultTableName
-}
-
-function densityRollupsTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_EVENT_DENSITY_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.event_density_1s` : 'event_density_1s'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultDensityRollupsTableName
-}
-
-function fieldIndexTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_INDEX_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.field_index` : 'field_index'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultFieldIndexTableName
-}
-
-function fieldValuesTable() {
-  const configured = String(import.meta.env.VITE_NANOTRACE_FIELD_VALUES_TABLE || '').trim()
-  if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(configured)) {
-    return configured
-  }
-  const table = eventsTable()
-  const database = table.includes('.') ? table.split('.')[0] : ''
-  const derived = database ? `${database}.field_values` : 'field_values'
-  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(derived)
-    ? derived
-    : defaultFieldValuesTableName
-}
-
-function eventMetadataSelect(alias: string) {
-  return [
-    `SELECT ${alias}.event_id AS event_id, ${alias}.timestamp AS timestamp`,
-    `, ${alias}.event_type AS event_type, ${alias}.signal AS signal, ${alias}.trace_id AS trace_id, ${alias}.span_id AS span_id`,
-    `, ifNull(toString(${alias}.data.parent_span_id), '') AS parent_span_id`,
-    `, ifNull(toString(${alias}.data.name), '') AS name`,
-    `, ifNull(toString(${alias}.data.start_time), '') AS start_time`,
-    `, ifNull(toString(${alias}.data.end_time), '') AS end_time`,
-    `, toFloat64OrZero(ifNull(toString(${alias}.data.duration_ms), '0')) AS duration_ms`
-  ].join('')
 }
 
 function resolveTimeRange({
@@ -4815,25 +4466,6 @@ function resolveTimeRange({
   return {
     key: option.key,
     lookbackMinutes: option.minutes
-  }
-}
-
-function timeRangeWhereClause(range: ResolvedTimeRange, column = 'timestamp') {
-  if (range.lookbackMinutes) {
-    return `${column} >= now64(3) - toIntervalMinute({lookback_minutes:UInt64})`
-  }
-
-  return [
-    range.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
-    range.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : ''
-  ].filter(Boolean).join(' AND ')
-}
-
-function timeRangeParameters(range: ResolvedTimeRange): QueryParameters {
-  return {
-    ...(range.lookbackMinutes ? { lookback_minutes: range.lookbackMinutes } : {}),
-    ...(range.createdAfter ? { created_after: clickHouseDateTime64(range.createdAfter) } : {}),
-    ...(range.createdBefore ? { created_before: clickHouseDateTime64(range.createdBefore) } : {})
   }
 }
 
@@ -4872,73 +4504,6 @@ function queryTimeDomain({
   const fromMs = Date.parse(from)
   const toMs = Date.parse(to)
   return Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs ? { from, to } : null
-}
-
-function fieldIndexPrewhere({
-  eventFilter,
-  includeAlias,
-  includeCursor = '',
-  timeRange
-}: {
-  eventFilter: ParsedEventFilter
-  includeAlias: boolean
-  includeCursor?: string
-  timeRange?: ResolvedTimeRange
-}) {
-  const column = includeAlias ? 'i.timestamp' : 'timestamp'
-  const useTimeRange = !eventFilter.createdAfter && !eventFilter.createdBefore
-  return [
-    includeCursor,
-    eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
-    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : '',
-    useTimeRange && timeRange ? timeRangeWhereClause(timeRange, column) : ''
-  ].filter(Boolean).join(' AND ')
-}
-
-function fieldIndexTimePrewhere(eventFilter: ParsedEventFilter, alias: string, timeRange?: ResolvedTimeRange) {
-  const column = `${alias}.timestamp`
-  const useTimeRange = !eventFilter.createdAfter && !eventFilter.createdBefore
-  return [
-    eventFilter.createdAfter ? `${column} >= {created_after:DateTime64(3, 'UTC')}` : '',
-    eventFilter.createdBefore ? `${column} <= {created_before:DateTime64(3, 'UTC')}` : '',
-    useTimeRange && timeRange ? timeRangeWhereClause(timeRange, column) : ''
-  ].filter(Boolean).join(' AND ')
-}
-
-function fieldIndexFacetWhere({
-  eventFilter,
-  outerAlias,
-  timeRange
-}: {
-  eventFilter: ParsedEventFilter
-  outerAlias: string
-  timeRange?: ResolvedTimeRange
-}) {
-  const clauses = (eventFilter.facets ?? []).map((_filter, index) => {
-      const alias = `f${index}`
-      const timePrewhere = fieldIndexTimePrewhere(eventFilter, alias, timeRange)
-      return [
-        `${outerAlias}.event_id IN (`,
-        `SELECT ${alias}.event_id FROM ${fieldIndexTable()} AS ${alias}`,
-        `PREWHERE ${alias}.field_name = {facet_filter_${index}_key:String} AND ${alias}.value = {facet_filter_${index}_value:String}${timePrewhere ? ` AND ${timePrewhere}` : ''}`,
-        ')'
-      ].join(' ')
-    })
-  return clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
-}
-
-function nullableStringExpression(path: string) {
-  const column = promotedStringColumn(path)
-  if (column) return `ifNull(toString(nullIf(${column}, '')), '')`
-  return `ifNull(toString(${jsonFieldExpression(path)}), '')`
-}
-
-function jsonFieldExpression(path: string, alias = '') {
-  const normalized = nanotracePath(path)
-  if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(normalized)) {
-    throw new Error(`Unsupported field path: ${path}`)
-  }
-  return `${alias ? `${alias}.` : ''}data.${normalized}`
 }
 
 function nanotracePath(path: string) {
@@ -4993,170 +4558,6 @@ function mergeGroupOptions(fields: GroupOption[], limit: number) {
     if (merged.length >= limit) break
   }
   return merged
-}
-
-function eventFilterClauses({
-  eventFilter,
-  groupBy,
-  selectedGroupValue,
-  timeRange,
-  prewhere = []
-}: {
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  selectedGroupValue?: string
-  timeRange?: ResolvedTimeRange
-  prewhere?: string[]
-}) {
-  const clauses = {
-    prewhere: [...prewhere],
-    where: [] as string[]
-  }
-  if (groupBy && selectedGroupValue) {
-    const exactColumn = promotedStringColumn(groupBy, 'e')
-    const valueExpression = exactColumn ? '' : eventValueExpression(groupBy)
-    if (exactColumn) {
-      clauses.prewhere.unshift(`${exactColumn} = {group_value:String}`)
-    } else {
-      clauses.prewhere.unshift(`${valueExpression} = {group_value:String}`)
-    }
-  }
-  if (eventFilter.createdAfter) clauses.prewhere.push("e.timestamp >= {created_after:DateTime64(3, 'UTC')}")
-  if (eventFilter.createdBefore) clauses.prewhere.push("e.timestamp <= {created_before:DateTime64(3, 'UTC')}")
-  if (!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange) {
-    clauses.prewhere.push(timeRangeWhereClause(timeRange, 'e.timestamp'))
-  }
-  const facets = eventFilter.facets ?? []
-  if (facets.length > 0 && facets.every(isSimpleFacetFilter)) {
-    for (const [index, filter] of facets.entries()) {
-      clauses.prewhere.push(`${eventValueExpression(filter.path)} = {facet_filter_${index}_value:String}`)
-    }
-  } else if (facets.length > 0) {
-    const facetWhere = eventFacetWhereClause(facets)
-    if (facetWhere) clauses.where.push(facetWhere)
-  }
-  const textFilter = eventTextWhereClause(eventFilter)
-  if (textFilter) clauses.where.push(textFilter)
-  return clauses
-}
-
-function isSimpleFacetFilter(filter: ParsedFacetFilter) {
-  return (filter.operator ?? 'eq') === 'eq' && !filter.negated && filter.join !== 'or'
-}
-
-function eventFacetWhereClause(filters: ParsedFacetFilter[]) {
-  const clauses = filters.map((filter, index) => {
-    const expression = eventValueExpression(filter.path)
-    const operator = filter.operator ?? 'eq'
-    const parameter = `facet_filter_${index}_value`
-    let clause = ''
-    if (operator === 'contains') {
-      clause = `positionCaseInsensitive(${expression}, {${parameter}:String}) > 0`
-    } else if (operator === 'in') {
-      const placeholders = (filter.values ?? [])
-        .map((_value, valueIndex) => `{facet_filter_${index}_value_${valueIndex}:String}`)
-        .join(', ')
-      clause = placeholders ? `${expression} IN (${placeholders})` : '0'
-    } else {
-      clause = `${expression} = {${parameter}:String}`
-    }
-    if (filter.negated) clause = `NOT (${clause})`
-    const join = index > 0 && filter.join === 'or' ? 'OR' : 'AND'
-    return `${index > 0 ? `${join} ` : ''}(${clause})`
-  })
-  return clauses.length ? `(${clauses.join(' ')})` : ''
-}
-
-function eventValueExpression(path: string) {
-  const column = promotedStringColumn(path, 'e')
-  if (column) return `ifNull(toString(nullIf(${column}, '')), '')`
-  return `ifNull(toString(${jsonFieldExpression(path, 'e')}), '')`
-}
-
-function promotedStringColumn(path: string, alias = '') {
-  const prefix = alias ? `${alias}.` : ''
-  switch (nanotracePath(path)) {
-    case 'tenant_id':
-      return `${prefix}tenant_id`
-    case 'trace_id':
-      return `${prefix}trace_id`
-    case 'span_id':
-      return `${prefix}span_id`
-    case 'event_type':
-      return `${prefix}event_type`
-    case 'signal':
-      return `${prefix}signal`
-    default:
-      return ''
-  }
-}
-
-function eventTextWhereClause(eventFilter: ParsedEventFilter) {
-  return eventFilter.text
-    ? "(positionCaseInsensitive(toJSONString(e.data), {event_filter:String}) > 0 OR positionCaseInsensitive(e.event_id, {event_filter:String}) > 0)"
-    : ''
-}
-
-function eventQueryParameters({
-  eventFilter,
-  groupBy,
-  selectedGroupValue,
-  timeRange
-}: {
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  selectedGroupValue: string
-  timeRange?: ResolvedTimeRange
-}): QueryParameters {
-  const facetParameterEntries: [string, string][] = []
-  for (const [index, filter] of (eventFilter.facets ?? []).entries()) {
-    facetParameterEntries.push([`facet_filter_${index}_key`, facetKey(filter.path)])
-    if (filter.operator === 'in') {
-      for (const [valueIndex, value] of (filter.values ?? []).entries()) {
-        facetParameterEntries.push([`facet_filter_${index}_value_${valueIndex}`, value])
-      }
-    } else {
-      facetParameterEntries.push([`facet_filter_${index}_value`, filter.value])
-    }
-  }
-  const facetParameters = Object.fromEntries(facetParameterEntries)
-  return {
-    group_key: facetKey(groupBy),
-    group_value: selectedGroupValue,
-    ...(!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange ? timeRangeParameters(timeRange) : {}),
-    ...(eventFilter.createdAfter ? { created_after: clickHouseDateTime64(eventFilter.createdAfter) } : {}),
-    ...(eventFilter.createdBefore ? { created_before: clickHouseDateTime64(eventFilter.createdBefore) } : {}),
-    ...(eventFilter.text ? { event_filter: eventFilter.text } : {}),
-    ...facetParameters
-  }
-}
-
-function clickHouseDateTime64(value: string) {
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return value
-  return [
-    date.getUTCFullYear(),
-    '-',
-    pad2(date.getUTCMonth() + 1),
-    '-',
-    pad2(date.getUTCDate()),
-    ' ',
-    pad2(date.getUTCHours()),
-    ':',
-    pad2(date.getUTCMinutes()),
-    ':',
-    pad2(date.getUTCSeconds()),
-    '.',
-    String(date.getUTCMilliseconds()).padStart(3, '0')
-  ].join('')
-}
-
-function errorExpression() {
-  return [
-    "lowerUTF8(ifNull(toString(e.data.is_error), '')) IN ('1', 'true')",
-    "lowerUTF8(ifNull(toString(e.data.span_status_code), '')) = 'error'",
-    "endsWith(lowerUTF8(ifNull(toString(e.data.event_type), '')), '_error')"
-  ].join(' OR ')
 }
 
 function rowToTraceEvent(row: EventRow): TraceEvent {
@@ -5484,48 +4885,6 @@ function serializeEventFilter(filter: ParsedEventFilter) {
 
 function hasAppliedEventFilter(filter: ParsedEventFilter) {
   return filter.text !== '' || Boolean(filter.createdAfter) || Boolean(filter.createdBefore) || Boolean(filter.facets?.length)
-}
-
-function canUseFieldIndex(filter: ParsedEventFilter) {
-  return filter.text === '' && (filter.facets ?? []).every(facet => facet.indexed && isSimpleFacetFilter(facet))
-}
-
-function canUseDensityRollup({
-  eventFilter,
-  groupBy,
-  selectedGroupValue
-}: {
-  eventFilter: ParsedEventFilter
-  groupBy: string
-  selectedGroupValue: string
-}) {
-  return !groupBy && !selectedGroupValue && eventFilter.text === '' && !(eventFilter.facets?.length)
-}
-
-function densityRollupParameters(eventFilter: ParsedEventFilter, timeRange?: ResolvedTimeRange): QueryParameters {
-  return {
-    ...(!eventFilter.createdAfter && !eventFilter.createdBefore && timeRange ? timeRangeParameters(timeRange) : {}),
-    ...(eventFilter.createdAfter ? { created_after: clickHouseDateTime64(eventFilter.createdAfter) } : {}),
-    ...(eventFilter.createdBefore ? { created_before: clickHouseDateTime64(eventFilter.createdBefore) } : {})
-  }
-}
-
-function densityRollupTimePrewhere(
-  eventFilter: ParsedEventFilter,
-  timeRange?: ResolvedTimeRange,
-  column = 'd.bucket_time'
-) {
-  return [
-    eventFilter.createdAfter
-      ? `${column} >= toStartOfInterval({created_after:DateTime64(3, 'UTC')}, INTERVAL 1 SECOND)`
-      : '',
-    eventFilter.createdBefore
-      ? `${column} <= toStartOfInterval({created_before:DateTime64(3, 'UTC')}, INTERVAL 1 SECOND)`
-      : '',
-    !eventFilter.createdAfter && !eventFilter.createdBefore && timeRange
-      ? timeRangeWhereClause(timeRange, column)
-      : ''
-  ].filter(Boolean).join(' AND ')
 }
 
 function parseEventFilter({

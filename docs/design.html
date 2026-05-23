@@ -530,8 +530,7 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
       <tr><td><code>definitions</code></td><td>ReplacingMergeTree</td><td>Enabled field, measure, rollup, state, cohort, and report definitions.</td></tr>
       <tr><td><code>field_index</code></td><td>ReplacingMergeTree</td><td>Definition-backed field value to event lookup for promoted filters/group-bys.</td></tr>
       <tr><td><code>field_values</code></td><td>MergeTree</td><td>Default exact lookup index for core ids such as trace, span, request, user, account, session, organization, thread, and conversation.</td></tr>
-      <tr><td><code>field_density_1s</code></td><td>SummingMergeTree</td><td>Default grouped histogram rollup for core group-by fields at one-second granularity.</td></tr>
-      <tr><td><code>field_topk_1m</code></td><td>SummingMergeTree</td><td>Default top-value rollup for core group-by fields at one-minute granularity.</td></tr>
+      <tr><td><code>field_rollups</code></td><td>SummingMergeTree</td><td>Default grouped rollup for core fields, with bucket granularity recorded in <code>bucket_seconds</code>.</td></tr>
       <tr><td><code>flamegraph_rollups_1m</code></td><td>SummingMergeTree</td><td>Default hierarchical rollups for core flamegraph paths such as service/name and signal/service/name.</td></tr>
       <tr><td><code>event_measures</code></td><td>ReplacingMergeTree</td><td>Definition-backed numeric observations extracted from events.</td></tr>
       <tr><td><code>measure_rollups</code></td><td>AggregatingMergeTree</td><td>Aggregate states over <code>event_measures</code>, populated by <code>mv_measure_rollups</code>.</td></tr>
@@ -594,14 +593,14 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
 
     <h3>Group-by and filters</h3>
     <p>
-      Core group lists read <code>field_topk_1m</code>, grouped histograms read <code>field_density_1s</code>, and core flamegraphs read <code>flamegraph_rollups_1m</code>. Exact id lookups can use <code>field_values</code> or the native event indexes. Non-core fields still require promotion/materialization before they are treated as guaranteed-fast group-bys.
+      Core group lists and grouped histograms read <code>field_rollups</code> at the bucket size appropriate for the query. Exact id lookups can use <code>field_values</code> or the native event indexes. Non-core fields still require promotion/materialization before they are treated as guaranteed-fast group-bys.
     </p>
 
     <table>
       <tr><th>Query shape</th><th>Preferred path</th><th>Fallback</th></tr>
       <tr><td>No group, recent density</td><td><code>event_density_1s</code></td><td><code>events</code></td></tr>
-      <tr><td>Core group-by list</td><td><code>field_topk_1m</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
-      <tr><td>Core grouped histogram</td><td><code>field_density_1s</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
+      <tr><td>Core group-by list</td><td><code>field_rollups</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
+      <tr><td>Core grouped histogram</td><td><code>field_rollups</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
       <tr><td>Core flamegraph</td><td><code>flamegraph_rollups_1m</code></td><td><code>events</code> raw aggregation</td></tr>
       <tr><td>Group by promoted field</td><td><code>field_index</code> or a report-specific rollup</td><td><code>events.data.&lt;path&gt;</code></td></tr>
       <tr><td>Multi-field promoted filters</td><td><code>field_index</code> semi-joins by <code>event_id</code></td><td><code>events</code> raw predicates</td></tr>
@@ -640,7 +639,7 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
     <h3>Query sandbox</h3>
     <ul>
       <li>Only read-only SQL is accepted; multi-statement DDL/DML paths are rejected.</li>
-      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code>, <code>field_index</code>, <code>field_values</code>, <code>field_density_1s</code>, <code>field_topk_1m</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
+      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code>, <code>field_index</code>, <code>field_values</code>, <code>field_rollups</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
       <li>User values are passed as ClickHouse parameters; identifier-like names are validated.</li>
       <li>ClickHouse requests are sent with readonly and bounded execution/result settings.</li>
     </ul>

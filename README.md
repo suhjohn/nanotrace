@@ -133,8 +133,8 @@ system of record. Query planning follows this ladder:
   Time-window and tenant predicates use the table order key for pruning.
 - `event_density_1s`: global histogram rollup used when the UI has no selected
   group and no restrictive filter.
-- `field_density_1s` and `field_topk_1m`: always-on grouped histograms and
-  top-value lists for core fields such as `signal`, `event_type`, `service`,
+- `field_rollups`: always-on grouped histograms and top-value lists for core
+  fields such as `signal`, `event_type`, `service`,
   `environment`, `name`, HTTP route/status/method, severity, model/provider,
   tool, processor, plan, country/region, user group, `user_id`, and
   `account_id`.

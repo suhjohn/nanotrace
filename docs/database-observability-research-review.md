@@ -13,7 +13,7 @@ Scope: recent database and observability storage work, roughly 2021-2026, applie
 
 The high-level direction is right: keep a raw append-first lakehouse record, keep ClickHouse rebuildable, and use explicit serving projections for repeated query shapes. This matches the strongest ideas from recent work on ClickHouse, lakehouses, observability metrics/log stores, and semi-structured columnar analytics.
 
-The main correction is write fanout discipline. Recent observability systems optimize first for append throughput, loose coordination, tenant isolation, immutable batches, and recent-query acceleration. Our definition-backed materializer fits that. Some current always-on ClickHouse materialized views do not: at 10k requests/sec and 100 events/request, or 1M events/sec, the fixed `field_density_1s`, `field_topk_1m`, `field_values`, and `flamegraph_rollups_1m` pack can become the real ingestion limiter even when user definitions are async.
+The main correction is write fanout discipline. Recent observability systems optimize first for append throughput, loose coordination, tenant isolation, immutable batches, and recent-query acceleration. Our definition-backed materializer fits that. Some always-on ClickHouse materialized views can still become the real ingestion limiter at 10k requests/sec and 100 events/request, or 1M events/sec, so the fixed `field_rollups`, `field_values`, and `flamegraph_rollups_1m` pack must stay small even when user definitions are async.
 
 Recommended stance:
 
@@ -134,7 +134,7 @@ This is better than one huge wide events table because:
 ### What Needs Guardrails
 
 1. Always-on MV fanout may dominate ingestion.
-   - Current `mv_field_density_1s` and `mv_field_topk_1m` each `ARRAY JOIN` roughly 20 built-in dimensions when present.
+   - The default field rollup MV `ARRAY JOIN`s built-in dimensions when present.
    - `mv_flamegraph_rollups_1m` emits multiple hierarchy rows across service/name, service/route/method, signal/service/name, environment/service/name, plan/service/name, country/service/name, llm model/provider/name, and tool/event/name.
    - At 1M events/sec, even a "small" default pack can mean tens of millions of transform candidates/sec before user definitions.
    - This conflicts with Mach and LogStore's append-first lesson.
@@ -205,8 +205,7 @@ Keep:
 
 Reconsider as default-on:
 
-- broad `field_density_1s`
-- broad `field_topk_1m`
+- broad `field_rollups`
 - `flamegraph_rollups_1m`
 
 These can still exist, but they should be treated as a "core explorer pack" with a measurable row/CPU budget, not as free schema. A safer path is:
@@ -327,7 +326,7 @@ To be:
 
 As is:
 
-- `http.method`, `http.route`, and status are in always-on `field_density_1s` and `field_topk_1m`.
+- `http.method`, `http.route`, and status are candidates for always-on `field_rollups` only when their cardinality is bounded and normalized.
 
 To be:
 

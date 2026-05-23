@@ -52,7 +52,7 @@ pub struct EventsQueryRequest {
     pub offset: u64,
     #[serde(default = "default_events_query_buckets")]
     pub buckets: u64,
-    #[serde(default)]
+    #[serde(default, alias = "orderBy")]
     pub sort: EventsQuerySort,
     #[serde(default)]
     pub search: String,
@@ -156,8 +156,8 @@ pub struct EventsQuerySort {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSortDirection {
-    Asc,
     #[default]
+    Asc,
     Desc,
 }
 
@@ -523,6 +523,47 @@ impl ReadStore {
                 .await;
         }
 
+        if request.filter.facets.is_empty()
+            && request.filter.text.trim().is_empty()
+            && !request.group_by.is_empty()
+            && !request.selected_group_value.is_empty()
+        {
+            let group_by = facet_key(&request.group_by)?;
+            if catalog.core_rollup_contains(&group_by) {
+                let (time_clause, mut parameters) = time_where_clause(
+                    &request.filter,
+                    request.time_range.as_ref(),
+                    "d.bucket_time",
+                );
+                parameters.insert("group_key".to_string(), Value::from(group_by));
+                parameters.insert(
+                    "group_value".to_string(),
+                    Value::from(request.selected_group_value.clone()),
+                );
+                return self
+                    .run_events_query_sql(
+                        [
+                            "SELECT sum(d.count) AS count".to_string(),
+                            "FROM field_rollups AS d".to_string(),
+                            where_keyword(join_clauses(vec![
+                                "d.field_name = {group_key:String}".to_string(),
+                                "d.value = {group_value:String}".to_string(),
+                                "d.bucket_seconds = 1".to_string(),
+                                time_clause,
+                            ])),
+                        ]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                        parameters,
+                        request,
+                        tenant_id,
+                    )
+                    .await;
+            }
+        }
+
         let plan = EventPredicatePlan::new(request, catalog, "e")?;
         self.run_events_query_sql(
             [
@@ -553,6 +594,7 @@ impl ReadStore {
             plan.clauses.push(page_filter);
         }
         let query_order = event_query_order(request);
+        let table_order = event_table_order(request);
         let query = [
             event_metadata_select("e"),
             "FROM events AS e".to_string(),
@@ -565,7 +607,7 @@ impl ReadStore {
             "LIMIT {limit:UInt64}".to_string(),
             ")".to_string(),
             ")".to_string(),
-            format!("ORDER BY e.timestamp {query_order}, e.event_id {query_order}"),
+            format!("ORDER BY e.timestamp {table_order}, e.event_id {table_order}"),
         ]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -650,10 +692,11 @@ impl ReadStore {
                     Value::from(request.selected_group_value.clone()),
                 );
                 let base = [
-                    "FROM field_density_1s AS d".to_string(),
+                    "FROM field_rollups AS d".to_string(),
                     where_keyword(join_clauses(vec![
                         "d.field_name = {group_key:String}".to_string(),
                         "d.value = {group_value:String}".to_string(),
+                        "d.bucket_seconds = 1".to_string(),
                         time_clause.clone(),
                     ])),
                 ]
@@ -1159,8 +1202,7 @@ impl ReadStore {
         const ANALYTICS_TABLES: &[&str] = &[
             "field_index",
             "field_values",
-            "field_density_1s",
-            "field_topk_1m",
+            "field_rollups",
             "flamegraph_rollups_1m",
             "event_density_1s",
             "definitions",
@@ -1603,7 +1645,7 @@ fn group_options_query() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT path, max(cardinality) AS cardinality, argMin(valueType, priority) AS valueType, toBool(0) AS capped, argMin(source, priority) AS source, argMin(servingMode, priority) AS servingMode, max(aggregateEnabled) AS aggregateEnabled, max(lookupEnabled) AS lookupEnabled FROM (SELECT arrayJoin([{core_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'core_rollup' AS source, 'rollup' AS servingMode, toBool(1) AS aggregateEnabled, toBool(0) AS lookupEnabled, toUInt8(1) AS priority UNION ALL SELECT arrayJoin([{lookup_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'lookup' AS source, 'lookup' AS servingMode, toBool(0) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(2) AS priority UNION ALL SELECT name AS path, toUInt64(0) AS cardinality, ifNull(toString(config.value_type), 'string') AS valueType, 'promoted' AS source, 'promoted' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(3) AS priority FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at) UNION ALL SELECT JSONExtractString(output, 'field_name') AS path, toUInt64(0) AS cardinality, ifNull(JSONExtractString(output, 'value_type'), 'string') AS valueType, 'promoted' AS source, 'promoted' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS lookupEnabled, toUInt8(3) AS priority FROM (SELECT arrayJoin(JSONExtractArrayRaw(ifNull(toJSONString(config.outputs), '[]'))) AS output FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)) WHERE path != '' UNION ALL SELECT arrayJoin([{raw_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'raw' AS source, 'raw' AS servingMode, toBool(0) AS aggregateEnabled, toBool(0) AS lookupEnabled, toUInt8(4) AS priority) GROUP BY path ORDER BY cardinality DESC, path ASC LIMIT {{limit:UInt64}}"
+        "SELECT path, max(cardinality) AS cardinality, argMin(valueType, priority) AS valueType, toBool(0) AS capped, argMin(source, priority) AS source, argMin(servingMode, priority) AS servingMode, max(aggregateEnabled) AS aggregateEnabled, max(indexEnabled) AS indexEnabled FROM (SELECT arrayJoin([{core_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'builtin' AS source, 'rollup' AS servingMode, toBool(1) AS aggregateEnabled, toBool(0) AS indexEnabled, toUInt8(1) AS priority UNION ALL SELECT arrayJoin([{lookup_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'builtin' AS source, 'index' AS servingMode, toBool(0) AS aggregateEnabled, toBool(1) AS indexEnabled, toUInt8(2) AS priority UNION ALL SELECT name AS path, toUInt64(0) AS cardinality, ifNull(toString(config.value_type), 'string') AS valueType, 'definition' AS source, 'index' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS indexEnabled, toUInt8(3) AS priority FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at) UNION ALL SELECT JSONExtractString(output, 'field_name') AS path, toUInt64(0) AS cardinality, ifNull(JSONExtractString(output, 'value_type'), 'string') AS valueType, 'definition' AS source, 'index' AS servingMode, toBool(1) AS aggregateEnabled, toBool(1) AS indexEnabled, toUInt8(3) AS priority FROM (SELECT arrayJoin(JSONExtractArrayRaw(ifNull(toJSONString(config.outputs), '[]'))) AS output FROM definitions WHERE kind = 'field' AND enabled = 1 AND isNull(deleted_at)) WHERE path != '' UNION ALL SELECT arrayJoin([{raw_fields}]) AS path, toUInt64(0) AS cardinality, 'string' AS valueType, 'raw' AS source, 'raw' AS servingMode, toBool(0) AS aggregateEnabled, toBool(0) AS indexEnabled, toUInt8(4) AS priority) GROUP BY path ORDER BY cardinality DESC, path ASC LIMIT {{limit:UInt64}}"
     )
 }
 
@@ -1617,6 +1659,7 @@ fn grouped_rollup_query(
     parameters.insert("offset".to_string(), Value::from(request.offset));
     let mut clauses = vec![
         "field_name = {group_key:String}".to_string(),
+        "bucket_seconds = 60".to_string(),
         time_range_clause(request.time_range.as_ref(), "bucket_time"),
     ];
     if !request.search.is_empty() {
@@ -1633,7 +1676,7 @@ fn grouped_rollup_query(
             ", dateDiff('millisecond', min(bucket_time), max(bucket_time)) AS durationMs"
                 .to_string(),
             ", sum(count) AS count, sum(error_count) AS errorCount".to_string(),
-            "FROM field_topk_1m".to_string(),
+            "FROM field_rollups".to_string(),
             where_keyword(join_clauses(clauses)),
             "GROUP BY value".to_string(),
             group_order_by_clause(group_by, true, request.sort.group),
@@ -1711,12 +1754,13 @@ fn latest_grouped_rollup_query(
     let clauses = vec![
         "field_name = {group_key:String}".to_string(),
         "value = {group_value:String}".to_string(),
+        "bucket_seconds = 60".to_string(),
         time_range_clause(request.time_range.as_ref(), "bucket_time"),
     ];
     (
         [
             "SELECT max(bucket_time) AS lastCreatedAt".to_string(),
-            "FROM field_topk_1m".to_string(),
+            "FROM field_rollups".to_string(),
             where_keyword(join_clauses(clauses)),
         ]
         .into_iter()
@@ -1812,7 +1856,13 @@ fn event_page_filter(
     } else if !request.page.after.is_empty() {
         Some((">", request.page.after.as_str()))
     } else if !request.page.around.is_empty() {
-        Some(("<=", request.page.around.as_str()))
+        Some((
+            match request.sort.direction {
+                EventSortDirection::Asc => ">=",
+                EventSortDirection::Desc => "<=",
+            },
+            request.page.around.as_str(),
+        ))
     } else {
         None
     };
@@ -1823,7 +1873,17 @@ fn event_page_filter(
         "cursor".to_string(),
         Value::from(clickhouse_datetime64(value)),
     );
-    format!("{alias}.timestamp {operator} {{cursor:DateTime64(3, 'UTC')}}")
+    let cursor_event_id = request.page.event_id.trim();
+    if cursor_event_id.is_empty() {
+        return format!("{alias}.timestamp {operator} {{cursor:DateTime64(3, 'UTC')}}");
+    }
+    parameters.insert(
+        "cursor_event_id".to_string(),
+        Value::from(cursor_event_id.to_string()),
+    );
+    format!(
+        "({alias}.timestamp, {alias}.event_id) {operator} ({{cursor:DateTime64(3, 'UTC')}}, {{cursor_event_id:String}})"
+    )
 }
 
 fn event_query_order(request: &EventsQueryRequest) -> &'static str {
@@ -1832,6 +1892,13 @@ fn event_query_order(request: &EventsQueryRequest) -> &'static str {
         EventSortDirection::Desc => "DESC",
         EventSortDirection::Asc if !request.page.before.is_empty() => "DESC",
         EventSortDirection::Asc => "ASC",
+    }
+}
+
+fn event_table_order(request: &EventsQueryRequest) -> &'static str {
+    match request.sort.direction {
+        EventSortDirection::Asc => "ASC",
+        EventSortDirection::Desc => "DESC",
     }
 }
 
@@ -2931,13 +2998,66 @@ fn validate_event_bytes(event_id: &str, bytes: &[u8]) -> Result<(), ReadError> {
 mod tests {
     use super::{
         CORE_ROLLUP_FIELD_NAMES, EventFacetFilter, EventFacetOperator, EventFieldCatalog,
-        EventFilter, EventPredicatePlan, EventTimeRange, EventsQueryRequest,
-        RAW_GROUPABLE_FIELD_NAMES, ReadError, checked_select_query, event_value_expression,
+        EventFilter, EventPage, EventPredicatePlan, EventSortDirection, EventTimeRange,
+        EventsQueryRequest, EventsQuerySort, RAW_GROUPABLE_FIELD_NAMES, ReadError,
+        checked_select_query, event_page_filter, event_table_order, event_value_expression,
         group_options_query, grouped_index_query, grouped_rollup_query, latest_grouped_index_query,
         latest_grouped_rollup_query, normalize_prewhere, query_sources, query_usage_shape,
         raw_groups_query, validate_parameter_name, validate_query_sources,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn events_query_request_accepts_order_by_alias() {
+        let request: EventsQueryRequest = serde_json::from_value(serde_json::json!({
+            "view": "events",
+            "filter": { "text": "timeout" },
+            "groupBy": "trace_id",
+            "orderBy": { "direction": "asc" }
+        }))
+        .unwrap();
+
+        assert_eq!(request.sort.direction, EventSortDirection::Asc);
+        assert_eq!(request.group_by, "trace_id");
+        assert_eq!(request.filter.text, "timeout");
+    }
+
+    #[test]
+    fn events_query_request_defaults_to_ascending_timestamp() {
+        let request: EventsQueryRequest = serde_json::from_value(serde_json::json!({
+            "view": "events"
+        }))
+        .unwrap();
+
+        assert_eq!(request.sort.direction, EventSortDirection::Asc);
+    }
+
+    #[test]
+    fn event_page_filter_uses_tuple_cursor_for_selected_event() {
+        let request = EventsQueryRequest {
+            page: EventPage {
+                around: "2026-05-22T00:00:00.000Z".to_string(),
+                event_id: "evt_123".to_string(),
+                ..Default::default()
+            },
+            sort: EventsQuerySort {
+                direction: EventSortDirection::Asc,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut parameters = serde_json::Map::new();
+        let filter = event_page_filter(&request, "e", &mut parameters);
+
+        assert!(filter.contains("(e.timestamp, e.event_id) >= "));
+        assert_eq!(event_table_order(&request), "ASC");
+        assert_eq!(
+            parameters
+                .get("cursor_event_id")
+                .and_then(|value| value.as_str()),
+            Some("evt_123")
+        );
+    }
 
     #[test]
     fn accepts_select_and_with_queries() {
@@ -3125,7 +3245,7 @@ mod tests {
     }
 
     #[test]
-    fn group2_case_7_core_grouping_prefers_always_on_topk_rollup() {
+    fn group2_case_7_core_grouping_prefers_field_rollup() {
         let request = EventsQueryRequest {
             limit: 50,
             time_range: Some(EventTimeRange {
@@ -3137,7 +3257,8 @@ mod tests {
 
         let (query, parameters) = grouped_rollup_query(&request, "service");
 
-        assert!(query.contains("FROM field_topk_1m"));
+        assert!(query.contains("FROM field_rollups"));
+        assert!(query.contains("bucket_seconds = 60"));
         assert!(query.contains("sum(count) AS count"));
         assert!(!query.contains("FROM events"));
         assert_eq!(
@@ -3182,7 +3303,8 @@ mod tests {
         };
 
         let (rollup_query, rollup_parameters) = latest_grouped_rollup_query(&request, "service");
-        assert!(rollup_query.contains("FROM field_topk_1m"));
+        assert!(rollup_query.contains("FROM field_rollups"));
+        assert!(rollup_query.contains("bucket_seconds = 60"));
         assert!(rollup_query.contains("max(bucket_time) AS lastCreatedAt"));
         assert!(!rollup_query.contains("FROM events"));
         assert_eq!(
@@ -3440,8 +3562,9 @@ mod tests {
         assert!(query.contains("JSONExtractString(output, 'field_name')"));
         assert!(query.contains("argMin(source, priority) AS source"));
         assert!(query.contains("argMin(servingMode, priority) AS servingMode"));
-        assert!(query.contains("'core_rollup' AS source"));
-        assert!(query.contains("'lookup' AS source"));
+        assert!(query.contains("'builtin' AS source"));
+        assert!(query.contains("'rollup' AS servingMode"));
+        assert!(query.contains("'index' AS servingMode"));
         assert!(query.contains("'raw' AS source"));
         assert!(!query.contains("FROM field_values"));
         assert!(!query.contains("any(value_type) AS valueType FROM field_values"));

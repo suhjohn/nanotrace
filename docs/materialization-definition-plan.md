@@ -16,7 +16,7 @@ The current write path is:
 1. SDK or HTTP caller posts events to `/v1/events`.
 2. The server validates and queues raw event batches.
 3. The loader commits the raw rows to Iceberg and writes them to ClickHouse `observatory.events`.
-4. ClickHouse materialized views populate the small always-on rollup pack, currently `event_density_1s`, `field_density_1s`, `field_topk_1m`, and `field_values`.
+4. ClickHouse materialized views populate the small always-on rollup/index pack, currently `event_density_1s`, `field_rollups`, and `field_values`.
 5. `nanotrace-lakehouse-rebuild` can run an incremental materializer that reads `lakehouse_commits`, loads active `observatory.definitions`, reads committed Iceberg data files, and writes:
    - `field_index`
    - `event_measures`

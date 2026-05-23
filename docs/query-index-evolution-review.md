@@ -22,8 +22,7 @@ Files inspected:
 | --- | --- | --- | --- |
 | `events` | Loader raw insert from accepted batches after Iceberg commit; rebuild tool can replay Iceberg files | `/v1/events/query` for events, summaries with filters, raw groups, density fallback, flamegraph, event lookup; `/v1/query` sandbox | Core raw serving table and correctness fallback |
 | `event_density_1s` | `mv_event_density_1s` from `events` | server density/summary when no group/filter; some old UI direct SQL helpers | Active always-on rollup |
-| `field_density_1s` | `mv_field_density_1s` from `events` | server density when selected group is a core rollup field and no extra filter | Active always-on grouped histogram |
-| `field_topk_1m` | `mv_field_topk_1m` from `events` | server groups/latest for core rollup fields | Active always-on group list/top-value rollup |
+| `field_rollups` | `mv_field_rollups` from `events` | server groups/latest/summary/density for core rollup fields | Active always-on grouped rollup |
 | `field_values` | `mv_field_values` from `events` | server groups/latest and filter semi-joins for built-in lookup ids | Active exact lookup index |
 | `flamegraph_rollups_1m` | `mv_flamegraph_rollups_1m` from `events` | sandbox allowlist only | Built and documented, but not consumed by the current UI/server flamegraph path |
 | `definitions` | schema APIs and definition backfills | server loads promoted field catalog; definition backfill code reads/writes it | Active control table for field/measure/state definitions |
@@ -49,11 +48,11 @@ Files inspected:
 The current `/v1/events/query` planner follows this ladder:
 
 1. `group_options`: reads `definitions` plus hardcoded core/lookup fields.
-2. `groups`: core field -> `field_topk_1m`; lookup id -> `field_values`; promoted field -> `field_index`; otherwise raw `events`.
-3. `latest`: core field -> `field_topk_1m`; lookup/promoted -> `field_values`/`field_index`; otherwise raw `events`.
-4. `summary`: no group/filter -> `event_density_1s`; anything restrictive -> raw `events` with an `EventPredicatePlan`.
+2. `groups`: core field -> `field_rollups`; lookup id -> `field_values`; promoted field -> `field_index`; otherwise raw `events`.
+3. `latest`: core field -> `field_rollups`; lookup/promoted -> `field_values`/`field_index`; otherwise raw `events`.
+4. `summary`: no group/filter -> `event_density_1s`; selected core group with no extra filter -> `field_rollups`; otherwise raw `events` with an `EventPredicatePlan`.
 5. `events`: raw `events`, with simple indexed equality filters converted into `field_values`/`field_index` event-id semi-joins where possible.
-6. `density`: no group/filter -> `event_density_1s`; selected core group with no extra filter -> `field_density_1s`; otherwise raw `events`.
+6. `density`: no group/filter -> `event_density_1s`; selected core group with no extra filter -> `field_rollups`; otherwise raw `events`.
 7. `flamegraph`: raw `events` only, then the UI builds the span hierarchy client-side.
 8. `event`: raw `events` by `event_id`; `/v1/events/:id` first tries S3 byte-range lookup from the source pointer and falls back to ClickHouse.
 
@@ -68,7 +67,7 @@ The hot ingest path is intentionally narrow:
 3. Writer lanes append NDJSON parts locally and rotate them through the object-store handoff lifecycle.
 4. `nanotrace-loader` consumes object notifications, optionally runs processors, and prepares a deterministic batch.
 5. With lakehouse enabled, the loader commits canonical event rows to Iceberg before writing ClickHouse serving rows.
-6. In default `LOADER_DERIVATION_MODE=raw`, the loader writes only `events`, `lakehouse_commits`, and `serving_watermarks`. Attached ClickHouse MVs populate `event_density_1s`, `field_density_1s`, `field_topk_1m`, `field_values`, and `flamegraph_rollups_1m`.
+6. In default `LOADER_DERIVATION_MODE=raw`, the loader writes only `events`, `lakehouse_commits`, and `serving_watermarks`. Attached ClickHouse MVs populate `event_density_1s`, `field_rollups`, `field_values`, and `flamegraph_rollups_1m`.
 7. In `promoted` mode, the loader can also write `field_index`, `event_measures`, and `entity_state_updates`, but the documented production model prefers the separate lakehouse materializer.
 8. `nanotrace-lakehouse-rebuild` can rebuild raw rows from Iceberg data files and run the incremental materializer. It reads `lakehouse_commits`, compares `serving_watermarks`, materializes `field_index`, `event_measures`, metric rollups, `entity_state_updates`, summary/trace/retention `report_results`, `sequence_report_results`, and `cohort_memberships`, then advances watermarks per target table.
 
@@ -104,8 +103,7 @@ These are always-on because they cover the default event explorer at bounded wri
 
 - `events`
 - `event_density_1s`
-- `field_density_1s`
-- `field_topk_1m`
+- `field_rollups`
 - `field_values`
 - `lakehouse_commits`
 - `serving_watermarks`
@@ -146,8 +144,8 @@ The serving planner should make these choices in order:
 
 1. Point event lookup: `events` and then S3 source byte range when raw bytes are needed.
 2. No-group density/summary: `event_density_1s`.
-3. Core group lists: `field_topk_1m`.
-4. Core grouped histograms: `field_density_1s`.
+3. Core group lists: `field_rollups`.
+4. Core grouped histograms: `field_rollups`.
 5. Core lookup ids: `field_values`.
 6. Promoted exact filters/group-bys: `field_index`.
 7. Promoted numeric aggregates: `measure_rollups`, or `event_measures` for event-level drilldown.

@@ -14,6 +14,7 @@ DROP VIEW IF EXISTS observatory.mv_field_counts_5m;
 DROP VIEW IF EXISTS observatory.mv_event_rollups_5m;
 DROP VIEW IF EXISTS observatory.mv_field_density_1s;
 DROP VIEW IF EXISTS observatory.mv_field_topk_1m;
+DROP VIEW IF EXISTS observatory.mv_field_rollups;
 DROP VIEW IF EXISTS observatory.mv_field_values;
 DROP VIEW IF EXISTS observatory.mv_flamegraph_rollups_1m;
 
@@ -23,6 +24,8 @@ DROP TABLE IF EXISTS observatory.spans;
 DROP TABLE IF EXISTS observatory.trace_summaries;
 DROP TABLE IF EXISTS observatory.field_counts_5m;
 DROP TABLE IF EXISTS observatory.event_rollups_5m;
+DROP TABLE IF EXISTS observatory.field_density_1s;
+DROP TABLE IF EXISTS observatory.field_topk_1m;
 
 CREATE TABLE
     IF NOT EXISTS observatory.events (
@@ -137,12 +140,13 @@ GROUP BY
     bucket_time;
 
 CREATE TABLE
-    IF NOT EXISTS observatory.field_density_1s (
+    IF NOT EXISTS observatory.field_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         field_name LowCardinality (String),
         value String CODEC (ZSTD (1)),
         value_hash UInt64 MATERIALIZED cityHash64 (value),
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 60,
         count UInt64 CODEC (Delta, ZSTD (1)),
         error_count UInt64 CODEC (Delta, ZSTD (1)),
         trace_count UInt64 CODEC (Delta, ZSTD (1)),
@@ -155,21 +159,33 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, field_name, value_hash, value, bucket_time);
+    (tenant_id, field_name, bucket_seconds, bucket_time, value_hash, value);
 
 CREATE MATERIALIZED VIEW
-    IF NOT EXISTS observatory.mv_field_density_1s TO observatory.field_density_1s AS
+    IF NOT EXISTS observatory.mv_field_rollups TO observatory.field_rollups AS
 WITH
     toString (ifNull (data.service, '')) AS service_value,
     toString (ifNull (data.environment, '')) AS environment_value,
     toString (ifNull (data.name, '')) AS name_value,
     toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value,
-    toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value
+    toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value,
+    arrayFilter (
+        dimension -> tupleElement (dimension, 2) != '',
+        [
+            ('signal', signal),
+            ('event_type', event_type),
+            ('name', name_value),
+            ('service', service_value),
+            ('environment', environment_value),
+            ('is_error', toString (error_value))
+        ]
+    ) AS dimensions
 SELECT
     tenant_id,
-    tupleElement (dimension, 1) AS field_name,
-    tupleElement (dimension, 2) AS value,
-    toStartOfInterval (timestamp, INTERVAL 1 SECOND) AS bucket_time,
+    tupleElement (rollup, 1) AS field_name,
+    tupleElement (rollup, 2) AS value,
+    tupleElement (rollup, 3) AS bucket_time,
+    tupleElement (rollup, 4) AS bucket_seconds,
     count () AS count,
     sum (error_value) AS error_count,
     countIf (signal = 'trace') AS trace_count,
@@ -181,84 +197,32 @@ SELECT
 FROM
     observatory.events
 ARRAY JOIN
-    arrayFilter (
-        dimension -> tupleElement (dimension, 2) != '',
-        [
-            ('signal', signal),
-            ('event_type', event_type),
-            ('name', name_value),
-            ('service', service_value),
-            ('environment', environment_value),
-            ('is_error', toString (error_value))
-        ]
-    ) AS dimension
+    arrayConcat (
+        arrayMap (
+            dimension -> (
+                tupleElement (dimension, 1),
+                tupleElement (dimension, 2),
+                toStartOfInterval (timestamp, INTERVAL 1 SECOND),
+                toUInt32 (1)
+            ),
+            dimensions
+        ),
+        arrayMap (
+            dimension -> (
+                tupleElement (dimension, 1),
+                tupleElement (dimension, 2),
+                toStartOfInterval (timestamp, INTERVAL 1 MINUTE),
+                toUInt32 (60)
+            ),
+            dimensions
+        )
+    ) AS rollup
 GROUP BY
     tenant_id,
     field_name,
     value,
-    bucket_time;
-
-CREATE TABLE
-    IF NOT EXISTS observatory.field_topk_1m (
-        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
-        field_name LowCardinality (String),
-        value String CODEC (ZSTD (1)),
-        value_hash UInt64 MATERIALIZED cityHash64 (value),
-        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
-        count UInt64 CODEC (Delta, ZSTD (1)),
-        error_count UInt64 CODEC (Delta, ZSTD (1)),
-        trace_count UInt64 CODEC (Delta, ZSTD (1)),
-        log_count UInt64 CODEC (Delta, ZSTD (1)),
-        metric_count UInt64 CODEC (Delta, ZSTD (1)),
-        analytics_count UInt64 CODEC (Delta, ZSTD (1)),
-        duration_count UInt64 CODEC (Delta, ZSTD (1)),
-        duration_sum Float64 CODEC (ZSTD (1))
-    ) ENGINE = SummingMergeTree
-PARTITION BY
-    toYYYYMM (bucket_time)
-ORDER BY
-    (tenant_id, field_name, bucket_time, value_hash, value);
-
-CREATE MATERIALIZED VIEW
-    IF NOT EXISTS observatory.mv_field_topk_1m TO observatory.field_topk_1m AS
-WITH
-    toString (ifNull (data.service, '')) AS service_value,
-    toString (ifNull (data.environment, '')) AS environment_value,
-    toString (ifNull (data.name, '')) AS name_value,
-    toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value,
-    toFloat64 (ifNull (data.duration_ms, 0)) AS duration_value
-SELECT
-    tenant_id,
-    tupleElement (dimension, 1) AS field_name,
-    tupleElement (dimension, 2) AS value,
-    toStartOfInterval (timestamp, INTERVAL 1 MINUTE) AS bucket_time,
-    count () AS count,
-    sum (error_value) AS error_count,
-    countIf (signal = 'trace') AS trace_count,
-    countIf (signal = 'log') AS log_count,
-    countIf (signal = 'metric') AS metric_count,
-    countIf (signal = 'analytics') AS analytics_count,
-    countIf (ifNull (data.duration_ms, 0) > 0) AS duration_count,
-    sum (duration_value) AS duration_sum
-FROM
-    observatory.events
-ARRAY JOIN
-    arrayFilter (
-        dimension -> tupleElement (dimension, 2) != '',
-        [
-            ('signal', signal),
-            ('event_type', event_type),
-            ('name', name_value),
-            ('service', service_value),
-            ('environment', environment_value),
-            ('is_error', toString (error_value))
-        ]
-    ) AS dimension
-GROUP BY
-    tenant_id,
-    field_name,
-    value,
-    bucket_time;
+    bucket_time,
+    bucket_seconds;
 
 CREATE TABLE
     IF NOT EXISTS observatory.field_values (
