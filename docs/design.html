@@ -586,6 +586,56 @@ ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
   <section id="queries">
     <h2>7. Query and UI Behavior</h2>
 
+    <h3>Controls and performance</h3>
+    <p>
+      The product exposes raw data first, then lets humans and systems choose where to spend extra write or materialization work for faster reads. Query usage can show that a path is expensive, but it should not silently create new serving tables or promote arbitrary fields.
+    </p>
+
+    <table>
+      <tr><th>Control</th><th>Who controls it</th><th>Concrete example</th><th>Write/materialization impact</th><th>Read impact</th></tr>
+      <tr><td>Send arbitrary event JSON</td><td>Application or SDK caller</td><td>Add <code>{"browser":"Chrome","cart_value":123}</code> to event data.</td><td>No schema work. One raw event row is written, plus the small always-on baseline views.</td><td>Correct immediately, but broad filters or groups on <code>browser</code> and <code>cart_value</code> scan raw event JSON until promoted.</td></tr>
+      <tr><td>Always-on global density</td><td>System schema</td><td>The default histogram for "all events in the last 7 days".</td><td>Every event contributes one small count row to <code>event_density_1s</code>.</td><td>No-group histograms read count buckets instead of scanning raw events.</td></tr>
+      <tr><td>Always-on core dimensions</td><td>System schema</td><td>Group by <code>service</code>, filter to <code>service=api</code>, then draw a grouped histogram.</td><td>Each event fans out only across the core fields <code>signal</code>, <code>event_type</code>, <code>name</code>, <code>service</code>, <code>environment</code>, and <code>is_error</code> into <code>field_rollups</code>.</td><td>Common group lists and grouped histograms read pre-aggregated buckets. Adding more core fields makes reads faster for those fields but increases write fanout for every event.</td></tr>
+      <tr><td>Always-on identifier lookup</td><td>System schema</td><td>Open <code>trace_id=abc</code>, <code>request_id=req_123</code>, or <code>session_id=s_123</code>.</td><td>Events with built-in identifiers write rows to <code>field_values</code>. This is event-level indexing, not aggregation.</td><td>Exact id lookups avoid broad JSON scans, but high-cardinality ids are not treated as useful group-by dimensions.</td></tr>
+      <tr><td>Promote a bounded field</td><td>User/admin definition</td><td>Create a field definition for <code>browser</code> with <code>mode: "facet"</code>.</td><td>Historical data needs a backfill. Future matching events write one <code>field_index</code> row per promoted value.</td><td>Filters like <code>browser=Chrome</code>, value lists, and group-bys can use the promoted index instead of raw JSON scans.</td></tr>
+      <tr><td>Promote a high-cardinality lookup</td><td>User/admin definition</td><td>Create a field definition for <code>customer_request_id</code> with <code>mode: "lookup"</code>.</td><td>Historical data needs a backfill if old ids must resolve. Future events write exact-match index rows.</td><td>Point lookups become fast. The UI should not encourage top-N value lists or broad group-bys on this field.</td></tr>
+      <tr><td>Materialize a repeated report</td><td>User/admin definition plus materializer</td><td>Daily active accounts by plan, retention by cohort, or p95 latency by service and route.</td><td>Backfill and incremental jobs compute result rows into report, sequence, cohort, or measure tables. This is more expensive than a field index but scoped to an explicit analytical question.</td><td>Dashboard cards and alerts read compact result rows instead of recomputing large aggregations on every page load.</td></tr>
+      <tr><td>Accept or reject stale serving data</td><td>Query caller and system watermarks</td><td>A dashboard waits for fresh <code>field_index</code>; a diagnostic query sets <code>allow_stale_serving=true</code>.</td><td>Loaders and materializers advance watermarks as they catch up to lakehouse commits.</td><td>Freshness checks prevent mixing current raw rows with stale derived rows unless the caller explicitly accepts that tradeoff.</td></tr>
+    </table>
+
+    <p>
+      The default answer to "can this field be queried?" is yes, through raw events. The default answer to "will this field be fast for a broad dashboard?" is no, unless it is a built-in dimension, a built-in identifier, or an explicit definition/report has been materialized.
+    </p>
+
+    <p>
+      Example: <code>service</code> is a system-controlled core dimension, so <code>service=commonlearning-agent</code> histograms read <code>field_rollups</code>. <code>request_id</code> is a system-controlled identifier, so exact request drilldown reads an index. <code>browser</code> starts as raw JSON; it becomes fast for filtering and grouping only after a user/admin creates a field definition and backfills it. A query like "weekly conversion by browser and plan" should become a report if it is a repeated dashboard, because the expensive aggregation should be paid once by the materializer rather than on every read.
+    </p>
+
+    <p>
+      Example custom field promotion:
+    </p>
+
+    <pre>curl -X POST "$NANOTRACE_API_URL/v1/definitions" \
+  -H "Authorization: Bearer $NANOTRACE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "browser",
+    "kind": "field",
+    "mode": "facet",
+    "config": {
+      "path": "browser",
+      "value_type": "string"
+    },
+    "backfill": {
+      "from": "2026-05-01T00:00:00Z",
+      "to": "2026-05-22T00:00:00Z"
+    }
+  }'</pre>
+
+    <p>
+      The operational rule is simple: keep the automatic write path narrow, promote fields only when users need repeated fast filtering or grouping, and use reports for repeated broad aggregations.
+    </p>
+
     <h3>Default logs view</h3>
     <p>
       With no grouping and no restrictive filter, the UI uses <code>event_density_1s</code> for the histogram and <code>events</code> for the event table. The flamegraph area is still present, but without a selected group it shows histogram-only density.

@@ -133,11 +133,9 @@ system of record. Query planning follows this ladder:
   Time-window and tenant predicates use the table order key for pruning.
 - `event_density_1s`: global histogram rollup used when the UI has no selected
   group and no restrictive filter.
-- `field_rollups`: always-on grouped histograms and top-value lists for core
-  fields such as `signal`, `event_type`, `service`,
-  `environment`, `name`, HTTP route/status/method, severity, model/provider,
-  tool, processor, plan, country/region, user group, `user_id`, and
-  `account_id`.
+- `field_rollups`: always-on grouped histograms and top-value lists for the
+  small core dimension set: `signal`, `event_type`, `name`, `service`,
+  `environment`, and `is_error`.
 - `field_values`: exact lookup index for common identifiers such as `trace_id`,
   `span_id`, `request_id`, `user_id`, `anonymous_id`, `account_id`,
   `session_id`, `group_id`, `organization_id`, `thread_id`, and
@@ -161,6 +159,9 @@ Advanced boolean filters, `CONTAINS`, and unpromoted JSON paths fall back to raw
 `events` predicates so the result stays correct. Repeated broad queries should
 become a promoted field, measure, report, cohort, or another materialized output
 rather than repeatedly scanning arbitrary JSON.
+
+The canonical serving terminology and enablement rules live in
+`docs/design.html` under "Query and UI Behavior".
 
 ## Toolchains
 
