@@ -32,6 +32,7 @@ type DragState =
       originY: number
       pointerX: number
       pointerY: number
+      visualization: DashboardVisualization
     }
   | null
 
@@ -104,9 +105,6 @@ function DashboardRoute() {
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [visualizations, setVisualizations] = useState<DashboardVisualization[]>([])
   const [selectedId, setSelectedId] = useState('')
-  const [draftTitle, setDraftTitle] = useState('')
-  const [draftSource, setDraftSource] = useState('')
-  const [draftBindings, setDraftBindings] = useState<DashboardParameterKey[]>([])
   const [editorOpen, setEditorOpen] = useState(false)
   const [timeRangeKey, setTimeRangeKey] = useState<TimeRangeKey>('24h')
   const [customRangeStart, setCustomRangeStart] = useState(() => formatDateTimeLocalInput(new Date(Date.now() - 60 * 60 * 1000)))
@@ -115,11 +113,8 @@ function DashboardRoute() {
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
   const [groupBy, setGroupBy] = useState('service')
   const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [deleting, setDeleting] = useState(false)
   const [dragging, setDragging] = useState<DragState>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
-  const visualizationsRef = useRef<DashboardVisualization[]>([])
   const [viewportWidth, setViewportWidth] = useState(960)
   const selected = visualizations.find(item => item.id === selectedId) ?? null
   const selectedTimeRange = useMemo(
@@ -142,10 +137,6 @@ function DashboardRoute() {
   }, [canvasPixelWidth, visualizations])
 
   useEffect(() => {
-    visualizationsRef.current = visualizations
-  }, [visualizations])
-
-  useEffect(() => {
     let cancelled = false
     dashboardApi.listVisualizations(observatoryUrl, dashboardId).then(items => {
       if (cancelled) return
@@ -157,13 +148,6 @@ function DashboardRoute() {
       cancelled = true
     }
   }, [observatoryUrl])
-
-  useEffect(() => {
-    if (!selected) return
-    setDraftTitle(selected.title)
-    setDraftSource(selected.sourceCode)
-    setDraftBindings(selected.parameterBindings)
-  }, [selected])
 
   useEffect(() => {
     const element = viewportRef.current
@@ -205,31 +189,19 @@ function DashboardRoute() {
     const activeDrag = dragging
 
     function onPointerMove(event: PointerEvent) {
-      const dx = Math.round((event.clientX - activeDrag.pointerX) / columnWidth)
-      const dy = Math.round((event.clientY - activeDrag.pointerY) / rowHeight)
       setVisualizations(items =>
         items.map(item => {
           if (item.id !== activeDrag.id) return item
-          if (activeDrag.kind === 'resize') {
-            return {
-              ...item,
-              height: Math.max(minBlockHeight, activeDrag.originHeight + dy),
-              width: clamp(activeDrag.originWidth + dx, minBlockWidth, gridColumns - item.x)
-            }
-          }
-          return {
-            ...item,
-            x: clamp(activeDrag.originX + dx, 0, gridColumns - item.width),
-            y: Math.max(0, activeDrag.originY + dy)
-          }
+          return updateDraggingVisualization(item, activeDrag, event, columnWidth)
         })
       )
     }
 
-    function onPointerUp() {
-      const item = visualizationsRef.current.find(candidate => candidate.id === activeDrag.id)
+    function onPointerUp(event: PointerEvent) {
+      const item = updateDraggingVisualization(activeDrag.visualization, activeDrag, event, columnWidth)
       setDragging(null)
-      if (item) void persistVisualization(item)
+      setVisualizations(items => items.map(candidate => candidate.id === item.id ? item : candidate))
+      void persistVisualization(item)
     }
 
     document.body.style.cursor = activeDrag.kind === 'resize' ? 'nwse-resize' : 'grabbing'
@@ -244,42 +216,9 @@ function DashboardRoute() {
     }
   }, [columnWidth, dragging])
 
-  async function saveSelected() {
-    if (!selected) return
-    setSaving(true)
-    try {
-      const updated = await dashboardApi.updateVisualization(observatoryUrl, {
-        ...selected,
-        parameterBindings: draftBindings,
-        sourceCode: draftSource,
-        title: draftTitle.trim() || 'Untitled visualization'
-      })
-      setVisualizations(items => items.map(item => item.id === updated.id ? updated : item))
-    } finally {
-      setSaving(false)
-    }
-  }
-
   async function persistVisualization(item: DashboardVisualization) {
     const updated = await dashboardApi.updateVisualization(observatoryUrl, item)
     setVisualizations(items => items.map(candidate => candidate.id === updated.id ? updated : candidate))
-  }
-
-  async function deleteSelected() {
-    if (!selected || deleting) return
-    const deletedId = selected.id
-    setDeleting(true)
-    try {
-      await dashboardApi.deleteVisualization(observatoryUrl, selected)
-      setVisualizations(items => {
-        const remaining = items.filter(item => item.id !== deletedId)
-        setSelectedId(remaining[0]?.id ?? '')
-        if (remaining.length === 0) setEditorOpen(false)
-        return remaining
-      })
-    } finally {
-      setDeleting(false)
-    }
   }
 
   function applyFilter() {
@@ -456,7 +395,8 @@ function DashboardRoute() {
                     originX: item.x,
                     originY: item.y,
                     pointerX: event.clientX,
-                    pointerY: event.clientY
+                    pointerY: event.clientY,
+                    visualization: item
                   })
                 }}
                 onSelect={() => setSelectedId(item.id)}
@@ -469,109 +409,197 @@ function DashboardRoute() {
           </div>
         </div>
         {editorOpen ? (
-        <aside className="flex min-h-0 min-w-0 flex-col border-l border-neutral-800 bg-neutral-950">
-          {selected ? (
-            <>
-              <div className="flex h-10 shrink-0 items-center justify-between border-b border-neutral-800 px-3">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Code2 size={14} strokeWidth={1.8} />
-                  <span className="truncate text-[12px] font-medium text-white">Visualization code</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    className="inline-flex h-7 items-center gap-1.5 border border-red-950 bg-black px-2 text-[12px] font-medium text-red-300 hover:bg-red-950/30 hover:text-red-200 disabled:text-neutral-700"
-                    disabled={deleting}
-                    type="button"
-                    onClick={() => void deleteSelected()}
-                  >
-                    <Trash2 size={13} strokeWidth={1.8} />
-                    {deleting ? 'Deleting' : 'Delete'}
-                  </button>
-                  <button
-                    className="inline-flex h-7 items-center gap-1.5 border border-neutral-700 bg-white px-2 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:bg-neutral-900 disabled:text-neutral-600"
-                    disabled={saving}
-                    type="button"
-                    onClick={() => void saveSelected()}
-                  >
-                    <Save size={13} strokeWidth={2} />
-                    {saving ? 'Saving' : 'Save'}
-                  </button>
-                  <button
-                    aria-label="Close editor"
-                    className="inline-flex h-7 w-7 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
-                    title="Close editor"
-                    type="button"
-                    onClick={() => setEditorOpen(false)}
-                  >
-                    <X size={13} strokeWidth={1.8} />
-                  </button>
-                </div>
-              </div>
-              <div className="grid shrink-0 gap-2 border-b border-neutral-800 p-3">
-                <label className="grid gap-1">
-                  <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Title</span>
-                  <input
-                    className="h-8 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none focus:border-neutral-600"
-                    value={draftTitle}
-                    onChange={event => setDraftTitle(event.target.value)}
-                  />
-                </label>
-                <div className="grid grid-cols-4 gap-1.5 text-[11px] text-neutral-500">
-                  <Metric label="X" value={selected.x} />
-                  <Metric label="Y" value={selected.y} />
-                  <Metric label="W" value={selected.width} />
-                  <Metric label="H" value={selected.height} />
-                </div>
-                <div className="grid gap-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Uses dashboard params</span>
-                    <ParameterChips bindings={draftBindings} />
-                  </div>
-                  <div className="grid grid-cols-3 gap-1.5">
-                    {dashboardParameterKeys.map(key => (
-                      <label
-                        key={key}
-                        className={cn(
-                          'flex h-7 cursor-pointer items-center justify-center border px-1.5 text-[11px]',
-                          draftBindings.includes(key)
-                            ? 'border-neutral-600 bg-neutral-800 text-white'
-                            : 'border-neutral-800 bg-black text-neutral-500 hover:text-neutral-300'
-                        )}
-                      >
-                        <input
-                          className="sr-only"
-                          checked={draftBindings.includes(key)}
-                          type="checkbox"
-                          onChange={event => {
-                            setDraftBindings(bindings =>
-                              event.target.checked
-                                ? normalizeParameterBindings([...bindings, key])
-                                : bindings.filter(binding => binding !== key)
-                            )
-                          }}
-                        />
-                        {parameterLabel(key)}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              </div>
-              <textarea
-                className="min-h-0 flex-1 resize-none bg-black p-3 font-mono text-[12px] leading-5 text-neutral-100 outline-none"
-                spellCheck={false}
-                value={draftSource}
-                onChange={event => setDraftSource(event.target.value)}
-              />
-            </>
-          ) : (
-            <div className="flex h-full items-center justify-center px-8 text-center text-[12px] text-neutral-600">
-              Select a visualization to edit its saved React module.
-            </div>
-          )}
-        </aside>
+          <DashboardEditor
+            key={selected?.id ?? 'empty'}
+            observatoryUrl={observatoryUrl}
+            selected={selected}
+            onClose={() => setEditorOpen(false)}
+            onDeleted={deletedId => {
+              const remaining = visualizations.filter(item => item.id !== deletedId)
+              setVisualizations(remaining)
+              setSelectedId(remaining[0]?.id ?? '')
+              if (remaining.length === 0) setEditorOpen(false)
+            }}
+            onSaved={updated => {
+              setVisualizations(items => items.map(item => item.id === updated.id ? updated : item))
+            }}
+          />
         ) : null}
       </section>
     </main>
+  )
+}
+
+function updateDraggingVisualization(
+  item: DashboardVisualization,
+  activeDrag: NonNullable<DragState>,
+  event: PointerEvent,
+  columnWidth: number
+) {
+  const dx = Math.round((event.clientX - activeDrag.pointerX) / columnWidth)
+  const dy = Math.round((event.clientY - activeDrag.pointerY) / rowHeight)
+  if (activeDrag.kind === 'resize') {
+    return {
+      ...item,
+      height: Math.max(minBlockHeight, activeDrag.originHeight + dy),
+      width: clamp(activeDrag.originWidth + dx, minBlockWidth, gridColumns - activeDrag.originX)
+    }
+  }
+  return {
+    ...item,
+    x: clamp(activeDrag.originX + dx, 0, gridColumns - activeDrag.originWidth),
+    y: Math.max(0, activeDrag.originY + dy)
+  }
+}
+
+function DashboardEditor({
+  observatoryUrl,
+  selected,
+  onClose,
+  onDeleted,
+  onSaved
+}: {
+  observatoryUrl: string
+  selected: DashboardVisualization | null
+  onClose: () => void
+  onDeleted: (deletedId: string) => void
+  onSaved: (updated: DashboardVisualization) => void
+}) {
+  const [draftTitle, setDraftTitle] = useState(selected?.title ?? '')
+  const [draftSource, setDraftSource] = useState(selected?.sourceCode ?? '')
+  const [draftBindings, setDraftBindings] = useState<DashboardParameterKey[]>(selected?.parameterBindings ?? [])
+  const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  async function saveSelected() {
+    if (!selected) return
+    setSaving(true)
+    try {
+      const updated = await dashboardApi.updateVisualization(observatoryUrl, {
+        ...selected,
+        parameterBindings: draftBindings,
+        sourceCode: draftSource,
+        title: draftTitle.trim() || 'Untitled visualization'
+      })
+      onSaved(updated)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function deleteSelected() {
+    if (!selected || deleting) return
+    const deletedId = selected.id
+    setDeleting(true)
+    try {
+      await dashboardApi.deleteVisualization(observatoryUrl, selected)
+      onDeleted(deletedId)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <aside className="flex min-h-0 min-w-0 flex-col border-l border-neutral-800 bg-neutral-950">
+      {selected ? (
+        <>
+          <div className="flex h-10 shrink-0 items-center justify-between border-b border-neutral-800 px-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <Code2 size={14} strokeWidth={1.8} />
+              <span className="truncate text-[12px] font-medium text-white">Visualization code</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                className="inline-flex h-7 items-center gap-1.5 border border-red-950 bg-black px-2 text-[12px] font-medium text-red-300 hover:bg-red-950/30 hover:text-red-200 disabled:text-neutral-700"
+                disabled={deleting}
+                type="button"
+                onClick={() => void deleteSelected()}
+              >
+                <Trash2 size={13} strokeWidth={1.8} />
+                {deleting ? 'Deleting' : 'Delete'}
+              </button>
+              <button
+                className="inline-flex h-7 items-center gap-1.5 border border-neutral-700 bg-white px-2 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:bg-neutral-900 disabled:text-neutral-600"
+                disabled={saving}
+                type="button"
+                onClick={() => void saveSelected()}
+              >
+                <Save size={13} strokeWidth={2} />
+                {saving ? 'Saving' : 'Save'}
+              </button>
+              <button
+                aria-label="Close editor"
+                className="inline-flex h-7 w-7 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:bg-white/[0.04] hover:text-white"
+                title="Close editor"
+                type="button"
+                onClick={onClose}
+              >
+                <X size={13} strokeWidth={1.8} />
+              </button>
+            </div>
+          </div>
+          <div className="grid shrink-0 gap-2 border-b border-neutral-800 p-3">
+            <label className="grid gap-1">
+              <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Title</span>
+              <input
+                className="h-8 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none focus:border-neutral-600"
+                value={draftTitle}
+                onChange={event => setDraftTitle(event.target.value)}
+              />
+            </label>
+            <div className="grid grid-cols-4 gap-1.5 text-[11px] text-neutral-500">
+              <Metric label="X" value={selected.x} />
+              <Metric label="Y" value={selected.y} />
+              <Metric label="W" value={selected.width} />
+              <Metric label="H" value={selected.height} />
+            </div>
+            <div className="grid gap-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Uses dashboard params</span>
+                <ParameterChips bindings={draftBindings} />
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {dashboardParameterKeys.map(key => (
+                  <label
+                    key={key}
+                    className={cn(
+                      'flex h-7 cursor-pointer items-center justify-center border px-1.5 text-[11px]',
+                      draftBindings.includes(key)
+                        ? 'border-neutral-600 bg-neutral-800 text-white'
+                        : 'border-neutral-800 bg-black text-neutral-500 hover:text-neutral-300'
+                    )}
+                  >
+                    <input
+                      className="sr-only"
+                      checked={draftBindings.includes(key)}
+                      type="checkbox"
+                      onChange={event => {
+                        setDraftBindings(bindings =>
+                          event.target.checked
+                            ? normalizeParameterBindings([...bindings, key])
+                            : bindings.filter(binding => binding !== key)
+                        )
+                      }}
+                    />
+                    {parameterLabel(key)}
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+          <textarea
+            className="min-h-0 flex-1 resize-none bg-black p-3 font-mono text-[12px] leading-5 text-neutral-100 outline-none"
+            spellCheck={false}
+            value={draftSource}
+            onChange={event => setDraftSource(event.target.value)}
+          />
+        </>
+      ) : (
+        <div className="flex h-full items-center justify-center px-8 text-center text-[12px] text-neutral-600">
+          Select a visualization to edit its saved React module.
+        </div>
+      )}
+    </aside>
   )
 }
 

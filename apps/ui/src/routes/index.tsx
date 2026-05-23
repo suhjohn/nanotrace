@@ -27,19 +27,6 @@ export const Route = createFileRoute('/')({
 
 function IndexRoute() {
   const search = Route.useSearch()
-  const navigate = useNavigate()
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    if (params.get('groupBy') !== noGroupValue) return
-    void navigate({
-      replace: true,
-      search: (current: ObservatorySearch) => {
-        const { groupBy: _groupBy, ...next } = current
-        return next
-      },
-      to: '/'
-    } as never)
-  }, [navigate])
   return (
     <ObservatoryHome
       eventFilterSearchText={search.filter}
@@ -1198,7 +1185,7 @@ export function ObservatoryHome({
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('pointerup', onPointerUp)
     }
-  }, [dragging, flamegraphHeight, inspectorWidth, runsOpen, runsWidth, setFlamegraphHeight, setInspectorWidth, setRunsWidth])
+  }, [dragging, inspectorWidth, runsOpen, runsWidth, setFlamegraphHeight, setInspectorWidth, setRunsWidth])
 
   return (
     <main className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-black text-[13px] text-neutral-100">
@@ -1903,8 +1890,10 @@ function CustomTimeRangePicker({
   const [draftStartTime, setDraftStartTime] = useState(() => timePartFromLocalInput(start))
   const [draftEndTime, setDraftEndTime] = useState(() => timePartFromLocalInput(end))
 
-  useEffect(() => {
-    if (!open) return
+  const rangeLabel = customRangeLabel(start, end)
+  const canApply = Boolean(draftStartDate && draftEndDate && draftStartTime && draftEndTime)
+
+  function resetDraftRange() {
     const nextStartDate = localDateOnly(start)
     const nextEndDate = localDateOnly(end)
     setDraftStartDate(nextStartDate)
@@ -1913,10 +1902,12 @@ function CustomTimeRangePicker({
     setDraftEndMonth(localMonthOnly(end) ?? nextEndDate ?? new Date())
     setDraftStartTime(timePartFromLocalInput(start))
     setDraftEndTime(timePartFromLocalInput(end))
-  }, [end, open, start])
+  }
 
-  const rangeLabel = customRangeLabel(start, end)
-  const canApply = Boolean(draftStartDate && draftEndDate && draftStartTime && draftEndTime)
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen)
+    if (nextOpen) resetDraftRange()
+  }
 
   function applyDraft() {
     if (!draftStartDate || !draftEndDate) return
@@ -1927,7 +1918,7 @@ function CustomTimeRangePicker({
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <button
           className={cn(
@@ -1956,7 +1947,7 @@ function CustomTimeRangePicker({
                 onSelect={setDraftStartDate}
               />
               <div className="border-t border-neutral-800 p-3">
-                <TimeField label="Time" value={draftStartTime} onChange={setDraftStartTime} />
+                <TimeField key={draftStartTime} label="Time" value={draftStartTime} onChange={setDraftStartTime} />
               </div>
             </div>
             <div className="w-[276px]">
@@ -1972,7 +1963,7 @@ function CustomTimeRangePicker({
                 onSelect={setDraftEndDate}
               />
               <div className="border-t border-neutral-800 p-3">
-                <TimeField label="Time" value={draftEndTime} onChange={setDraftEndTime} />
+                <TimeField key={draftEndTime} label="Time" value={draftEndTime} onChange={setDraftEndTime} />
               </div>
             </div>
           </div>
@@ -2011,11 +2002,6 @@ function TimeField({
   const parts = timePartsFromLocalTime(value)
   const [draftHour, setDraftHour] = useState(parts.hour)
   const [draftMinute, setDraftMinute] = useState(parts.minute)
-
-  useEffect(() => {
-    setDraftHour(parts.hour)
-    setDraftMinute(parts.minute)
-  }, [parts.hour, parts.minute])
 
   function update(next: Partial<typeof parts>) {
     onChange(localTimeFromParts(next.hour ?? parts.hour, next.minute ?? parts.minute, next.period ?? parts.period))
@@ -3184,15 +3170,13 @@ function EventPanel({
   }, [events.length, hasMore, hasPrevious, loadingMore, loadingPrevious])
 
   useEffect(() => {
-    if (currentScrollStateKeyRef.current === scrollStateKey) return
-    currentScrollStateKeyRef.current = scrollStateKey
-    lastScrollTopRef.current = 0
-    userScrolledRef.current = false
-  }, [scrollStateKey])
-
-  useEffect(() => {
     const element = scrollRef.current
     if (!element) return
+    if (currentScrollStateKeyRef.current !== scrollStateKey) {
+      currentScrollStateKeyRef.current = scrollStateKey
+      lastScrollTopRef.current = 0
+      userScrolledRef.current = false
+    }
     if (selectedEventAlign === 'center') return
     if (userScrolledRef.current) return
     suppressScrollPaginationForProgrammaticScroll()
