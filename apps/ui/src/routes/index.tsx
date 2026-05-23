@@ -984,12 +984,6 @@ export function ObservatoryHome({
   }, [activeFacetPaths, eventDetail?.group.startedAt, eventFilterSearchText, eventScopeKey, latestCreatedAt])
 
   useEffect(() => {
-    if (flamegraphDisabled && selectedGraphMode !== 'histogram') {
-      setSelectedGraphMode('histogram')
-    }
-  }, [flamegraphDisabled, selectedGraphMode, setSelectedGraphMode])
-
-  useEffect(() => {
     if (
       eventFilterSearchText !== undefined ||
       filterTouchedRef.current ||
