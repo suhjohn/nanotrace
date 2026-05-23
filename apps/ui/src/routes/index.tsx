@@ -220,6 +220,7 @@ type FlameSpan = {
   id: string
   label: string
   kind: FlameKind
+  marker: boolean
   parentSpanId?: string
   startMs: number
   endMs: number
@@ -2460,7 +2461,7 @@ function FlamegraphCanvas({
 
     return spans.filter(span => {
       const left = scenePaddingX + (span.startMs - flamegraph.minStart) * msToPx
-      const width = span.kind === 'event' ? eventMarkerWidth : Math.max((span.endMs - span.startMs) * msToPx, 3)
+      const width = span.marker ? eventMarkerWidth : Math.max((span.endMs - span.startMs) * msToPx, 3)
       const top = axisHeight + scenePaddingY + span.lane * (rowHeight + rowGap)
       return left + width >= x0 && left <= x1 && top + rowHeight >= y0 && top <= y1
     })
@@ -2539,7 +2540,7 @@ function FlamegraphCanvas({
     for (const span of spans) {
       const left = ((span.startMs - flamegraph.minStart) / flamegraph.totalDuration) * rect.width
       const width = Math.max(
-        span.kind === 'event'
+        span.marker
           ? rect.width * 0.005
           : ((span.endMs - span.startMs) / flamegraph.totalDuration) * rect.width,
         rect.width * 0.0035
@@ -2637,8 +2638,8 @@ function FlamegraphCanvas({
 
     for (const span of visibleSpans) {
       const baseLeft = scenePaddingX + (span.startMs - flamegraph.minStart) * msToPx
-      const spanWidth = span.kind === 'event' ? eventMarkerWidth : Math.max((span.endMs - span.startMs) * msToPx, 3)
-      const left = span.kind === 'event' ? baseLeft - spanWidth / 2 : baseLeft
+      const spanWidth = span.marker ? eventMarkerWidth : Math.max((span.endMs - span.startMs) * msToPx, 3)
+      const left = span.marker ? baseLeft - spanWidth / 2 : baseLeft
       const x = left - viewport.scrollLeft
       const y = axisHeight + scenePaddingY + span.lane * (rowHeight + rowGap) - viewport.scrollTop
       const selected = span.id === selectedCanvasSpanId
@@ -2650,7 +2651,7 @@ function FlamegraphCanvas({
       ctx.fillRect(x, y, spanWidth, rowHeight)
       ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, spanWidth - 1), rowHeight - 1)
 
-      if (span.kind !== 'event' && spanWidth > 54) {
+      if (!span.marker && spanWidth > 54) {
         ctx.save()
         ctx.beginPath()
         ctx.rect(x + 4, y, Math.max(0, spanWidth - 8), rowHeight)
@@ -3721,6 +3722,7 @@ function buildFlamegraph(events: TraceEvent[], domain?: TimeDomain | null): Flam
       id: event.id,
       label: eventName(event.data),
       kind: 'event',
+      marker: true,
       parentSpanId: stringField(event.data.parentSpanId),
       startMs: at,
       endMs: at + 1,
@@ -3786,6 +3788,7 @@ function pushSpan(
     id: candidate.id,
     label: candidate.label,
     kind: candidate.kind,
+    marker: false,
     parentSpanId: candidate.parentSpanId,
     startMs,
     endMs,
