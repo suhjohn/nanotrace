@@ -4,6 +4,7 @@ mod definitions;
 mod event;
 mod event_log;
 mod http;
+mod openapi;
 mod processors;
 mod read;
 mod reports;

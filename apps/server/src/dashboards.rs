@@ -13,7 +13,7 @@ pub struct DashboardStore {
     ready: Arc<OnceCell<()>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateVisualizationRequest {
     pub id: String,
     pub height: i32,
@@ -27,7 +27,7 @@ pub struct CreateVisualizationRequest {
     pub y: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateVisualizationRequest {
     pub height: i32,
     #[serde(default, rename = "parameterBindings")]
@@ -40,7 +40,7 @@ pub struct UpdateVisualizationRequest {
     pub y: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DashboardVisualization {
     #[serde(rename = "dashboardId")]
     pub dashboard_id: String,
@@ -58,7 +58,7 @@ pub struct DashboardVisualization {
     pub y: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DashboardVisualizationsResponse {
     pub visualizations: Vec<DashboardVisualization>,
 }

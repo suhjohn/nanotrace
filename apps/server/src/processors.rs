@@ -16,7 +16,7 @@ pub struct ProcessorStore {
     s3: S3Client,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PutProcessorRequest {
     #[serde(default)]
     pub upload: Option<ProcessorStageRequest>,
@@ -24,15 +24,16 @@ pub struct PutProcessorRequest {
     pub loader: Option<ProcessorStageRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ProcessorStageRequest {
     pub code: String,
     #[serde(default)]
     pub config: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProcessorListResponse {
+    #[schema(value_type = Vec<serde_json::Value>)]
     pub processors: Vec<ProcessorManifest>,
 }
 

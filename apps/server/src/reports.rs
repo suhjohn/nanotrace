@@ -14,7 +14,7 @@ pub struct ReportStore {
     ready: Arc<OnceCell<()>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateReportRequest {
     pub name: String,
     pub kind: String,
@@ -24,7 +24,7 @@ pub struct CreateReportRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ReportRecord {
     pub report_id: String,
     pub name: String,
@@ -36,7 +36,7 @@ pub struct ReportRecord {
     pub version: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ReportListResponse {
     pub reports: Vec<ReportRecord>,
 }

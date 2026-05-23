@@ -41,6 +41,8 @@ use crate::{
     reports::{CreateReportRequest, ReportListResponse, ReportStore, ReportStoreError},
 };
 
+use utoipa::ToSchema;
+
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
@@ -95,6 +97,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(auth_me))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", delete(revoke_api_key))
+        .route("/openapi.json", get(openapi_json))
         .route("/healthz", get(healthz))
         .route("/v1/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -141,7 +144,15 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
     )
 }
 
-async fn post_events(
+#[utoipa::path(
+    post,
+    path = "/v1/events",
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Accepted event receipt.", body = PostEventsResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Events"
+)]
+pub(crate) async fn post_events(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Result<Response, ApiError> {
@@ -175,7 +186,15 @@ async fn post_events(
     Ok(Json(response).into_response())
 }
 
-async fn post_query(
+#[utoipa::path(
+    post,
+    path = "/v1/query",
+    request_body = QueryRequest,
+    responses((status = 200, description = "ClickHouse JSON response.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Query"
+)]
+pub(crate) async fn post_query(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
@@ -185,7 +204,15 @@ async fn post_query(
     Ok(Json(response).into_response())
 }
 
-async fn post_events_query(
+#[utoipa::path(
+    post,
+    path = "/v1/events/query",
+    request_body = EventsQueryRequest,
+    responses((status = 200, description = "Structured events query response.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Events"
+)]
+pub(crate) async fn post_events_query(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<EventsQueryRequest>,
@@ -198,7 +225,14 @@ async fn post_events_query(
     Ok(Json(response).into_response())
 }
 
-async fn list_processors(
+#[utoipa::path(
+    get,
+    path = "/v1/processors",
+    responses((status = 200, description = "Processor list.", body = ProcessorListResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Processors"
+)]
+pub(crate) async fn list_processors(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ProcessorListResponse>, ApiError> {
@@ -207,7 +241,16 @@ async fn list_processors(
     Ok(Json(ProcessorListResponse { processors }))
 }
 
-async fn put_processor(
+#[utoipa::path(
+    put,
+    path = "/v1/processors/{name}",
+    params(("name" = String, Path, description = "Processor name.")),
+    request_body = PutProcessorRequest,
+    responses((status = 200, description = "Processor envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Processors"
+)]
+pub(crate) async fn put_processor(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -221,7 +264,15 @@ async fn put_processor(
     Ok(Json(serde_json::json!({ "processor": manifest })))
 }
 
-async fn delete_processor(
+#[utoipa::path(
+    delete,
+    path = "/v1/processors/{name}",
+    params(("name" = String, Path, description = "Processor name.")),
+    responses((status = 200, description = "Processor envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Processors"
+)]
+pub(crate) async fn delete_processor(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -231,7 +282,14 @@ async fn delete_processor(
     Ok(Json(serde_json::json!({ "processor": manifest })))
 }
 
-async fn list_definitions(
+#[utoipa::path(
+    get,
+    path = "/v1/definitions",
+    responses((status = 200, description = "Definition list.", body = DefinitionListResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn list_definitions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<DefinitionListResponse>, ApiError> {
@@ -240,7 +298,15 @@ async fn list_definitions(
     Ok(Json(DefinitionListResponse { definitions }))
 }
 
-async fn create_definition(
+#[utoipa::path(
+    post,
+    path = "/v1/definitions",
+    request_body = CreateDefinitionRequest,
+    responses((status = 200, description = "Created definition.", body = crate::definitions::DefinitionMutationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn create_definition(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateDefinitionRequest>,
@@ -255,7 +321,14 @@ async fn create_definition(
     ))
 }
 
-async fn seed_sdk_definitions(
+#[utoipa::path(
+    post,
+    path = "/v1/definitions/sdk-defaults",
+    responses((status = 200, description = "Seeded SDK definitions.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn seed_sdk_definitions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -267,7 +340,15 @@ async fn seed_sdk_definitions(
     Ok(Json(serde_json::json!({ "definitions": definitions })))
 }
 
-async fn delete_definition(
+#[utoipa::path(
+    delete,
+    path = "/v1/definitions/{definition_id}",
+    params(("definition_id" = String, Path, description = "Definition id.")),
+    responses((status = 200, description = "Deleted definition envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn delete_definition(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(definition_id): Path<String>,
@@ -280,7 +361,16 @@ async fn delete_definition(
     Ok(Json(serde_json::json!({ "definition": definition })))
 }
 
-async fn backfill_definition(
+#[utoipa::path(
+    post,
+    path = "/v1/definitions/{definition_id}/backfill",
+    params(("definition_id" = String, Path, description = "Definition id.")),
+    request_body = BackfillRequest,
+    responses((status = 200, description = "Backfill response envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn backfill_definition(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(definition_id): Path<String>,
@@ -294,7 +384,14 @@ async fn backfill_definition(
     Ok(Json(serde_json::json!({ "backfill": backfill })))
 }
 
-async fn list_reports(
+#[utoipa::path(
+    get,
+    path = "/v1/reports",
+    responses((status = 200, description = "Report list.", body = ReportListResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Reports"
+)]
+pub(crate) async fn list_reports(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ReportListResponse>, ApiError> {
@@ -303,7 +400,15 @@ async fn list_reports(
     Ok(Json(ReportListResponse { reports }))
 }
 
-async fn create_report(
+#[utoipa::path(
+    post,
+    path = "/v1/reports",
+    request_body = CreateReportRequest,
+    responses((status = 200, description = "Report envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Reports"
+)]
+pub(crate) async fn create_report(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateReportRequest>,
@@ -313,7 +418,15 @@ async fn create_report(
     Ok(Json(serde_json::json!({ "report": report })))
 }
 
-async fn delete_report(
+#[utoipa::path(
+    delete,
+    path = "/v1/reports/{report_id}",
+    params(("report_id" = String, Path, description = "Report id.")),
+    responses((status = 200, description = "Report envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Reports"
+)]
+pub(crate) async fn delete_report(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(report_id): Path<String>,
@@ -326,7 +439,15 @@ async fn delete_report(
     Ok(Json(serde_json::json!({ "report": report })))
 }
 
-async fn list_dashboard_visualizations(
+#[utoipa::path(
+    get,
+    path = "/dashboards/{dashboard_id}/visualizations",
+    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
+    responses((status = 200, description = "Dashboard visualizations.", body = DashboardVisualizationsResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Dashboards"
+)]
+pub(crate) async fn list_dashboard_visualizations(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(dashboard_id): Path<String>,
@@ -339,7 +460,16 @@ async fn list_dashboard_visualizations(
     Ok(Json(DashboardVisualizationsResponse { visualizations }))
 }
 
-async fn create_dashboard_visualization(
+#[utoipa::path(
+    post,
+    path = "/dashboards/{dashboard_id}/visualizations",
+    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
+    request_body = CreateVisualizationRequest,
+    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Dashboards"
+)]
+pub(crate) async fn create_dashboard_visualization(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(dashboard_id): Path<String>,
@@ -353,7 +483,15 @@ async fn create_dashboard_visualization(
     Ok(Json(serde_json::json!({ "visualization": visualization })))
 }
 
-async fn clear_dashboard_visualizations(
+#[utoipa::path(
+    delete,
+    path = "/dashboards/{dashboard_id}/visualizations",
+    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
+    responses((status = 200, description = "Ok.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Dashboards"
+)]
+pub(crate) async fn clear_dashboard_visualizations(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(dashboard_id): Path<String>,
@@ -366,7 +504,19 @@ async fn clear_dashboard_visualizations(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn update_dashboard_visualization(
+#[utoipa::path(
+    put,
+    path = "/dashboards/{dashboard_id}/visualizations/{id}",
+    params(
+        ("dashboard_id" = String, Path, description = "Dashboard id."),
+        ("id" = String, Path, description = "Visualization id.")
+    ),
+    request_body = UpdateVisualizationRequest,
+    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Dashboards"
+)]
+pub(crate) async fn update_dashboard_visualization(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((dashboard_id, id)): Path<(String, String)>,
@@ -380,7 +530,18 @@ async fn update_dashboard_visualization(
     Ok(Json(serde_json::json!({ "visualization": visualization })))
 }
 
-async fn delete_dashboard_visualization(
+#[utoipa::path(
+    delete,
+    path = "/dashboards/{dashboard_id}/visualizations/{id}",
+    params(
+        ("dashboard_id" = String, Path, description = "Dashboard id."),
+        ("id" = String, Path, description = "Visualization id.")
+    ),
+    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Dashboards"
+)]
+pub(crate) async fn delete_dashboard_visualization(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((dashboard_id, id)): Path<(String, String)>,
@@ -393,7 +554,15 @@ async fn delete_dashboard_visualization(
     Ok(Json(serde_json::json!({ "visualization": visualization })))
 }
 
-async fn get_event(
+#[utoipa::path(
+    get,
+    path = "/v1/events/{event_id}",
+    params(("event_id" = String, Path, description = "Event id.")),
+    responses((status = 200, description = "Raw event JSON.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Events"
+)]
+pub(crate) async fn get_event(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(event_id): Path<String>,
@@ -406,7 +575,13 @@ async fn get_event(
     Ok(([("content-type", "application/json")], Body::from(bytes)).into_response())
 }
 
-async fn metrics(State(state): State<AppState>) -> Response {
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses((status = 200, description = "Prometheus text exposition.", content_type = "text/plain", body = String)),
+    tag = "Health"
+)]
+pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         state.writer.metrics_text(),
@@ -414,11 +589,35 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn healthz() -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses((status = 200, description = "Liveness response.", body = serde_json::Value)),
+    tag = "Health"
+)]
+pub(crate) async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-async fn readyz(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/openapi.json",
+    responses((status = 200, description = "OpenAPI document.", body = serde_json::Value)),
+    tag = "OpenAPI"
+)]
+pub(crate) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(crate::openapi::spec())
+}
+
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses((status = 200, description = "Readiness response.", body = serde_json::Value)),
+    tag = "Health"
+)]
+pub(crate) async fn readyz(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if state.cfg.s3_bucket.is_none() {
         return Err(ApiError::Unavailable(
             "S3 bucket is not configured".to_string(),
@@ -432,14 +631,14 @@ struct LoginParams {
     return_to: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct LoginRequest {
     email: String,
     return_to: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct LoginResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct LoginResponse {
     ok: bool,
 }
 
@@ -448,8 +647,8 @@ struct CallbackParams {
     token: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateApiKeyRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateApiKeyRequest {
     name: String,
     role: Option<String>,
     #[serde(default)]
@@ -457,8 +656,9 @@ struct CreateApiKeyRequest {
     expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
-struct ApiKeysResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ApiKeysResponse {
+    #[schema(value_type = Vec<serde_json::Value>)]
     api_keys: Vec<nanotrace_auth::ApiKeyRecord>,
 }
 
@@ -486,7 +686,14 @@ async fn auth_login_form(Query(params): Query<LoginParams>) -> Html<String> {
     ))
 }
 
-async fn auth_login(
+#[utoipa::path(
+    post,
+    path = "/auth/login",
+    request_body = LoginRequest,
+    responses((status = 200, description = "Login started.", body = LoginResponse)),
+    tag = "Auth"
+)]
+pub(crate) async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
@@ -593,7 +800,14 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-async fn auth_logout(
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    responses((status = 200, description = "Logout response.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Auth"
+)]
+pub(crate) async fn auth_logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -611,14 +825,28 @@ async fn auth_logout(
     Ok(response)
 }
 
-async fn auth_me(
+#[utoipa::path(
+    get,
+    path = "/auth/me",
+    responses((status = 200, description = "Authenticated identity.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "Auth"
+)]
+pub(crate) async fn auth_me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthIdentity>, ApiError> {
     Ok(Json(authorize_any(&state, &headers).await?))
 }
 
-async fn list_api_keys(
+#[utoipa::path(
+    get,
+    path = "/api-keys",
+    responses((status = 200, description = "API key list.", body = ApiKeysResponse)),
+    security(("bearerAuth" = [])),
+    tag = "API Keys"
+)]
+pub(crate) async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ApiKeysResponse>, ApiError> {
@@ -629,7 +857,15 @@ async fn list_api_keys(
     Ok(Json(ApiKeysResponse { api_keys }))
 }
 
-async fn create_api_key(
+#[utoipa::path(
+    post,
+    path = "/api-keys",
+    request_body = CreateApiKeyRequest,
+    responses((status = 200, description = "Created API key.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "API Keys"
+)]
+pub(crate) async fn create_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateApiKeyRequest>,
@@ -649,7 +885,15 @@ async fn create_api_key(
     Ok(Json(created))
 }
 
-async fn revoke_api_key(
+#[utoipa::path(
+    delete,
+    path = "/api-keys/{id}",
+    params(("id" = i64, Path, description = "API key id.")),
+    responses((status = 200, description = "Revoked API key envelope.", body = serde_json::Value)),
+    security(("bearerAuth" = [])),
+    tag = "API Keys"
+)]
+pub(crate) async fn revoke_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
@@ -754,16 +998,16 @@ pub enum ApiError {
     Auth(AuthError),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
-enum PostEventsResponse {
+pub(crate) enum PostEventsResponse {
     Single(WriteReceipt),
     Batch(Vec<WriteReceipt>),
     CompactBatch(CompactBatchReceipt),
 }
 
-#[derive(Debug, Serialize)]
-struct CompactBatchReceipt {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CompactBatchReceipt {
     accepted: usize,
     source_file: Option<String>,
     source_offset: Option<u64>,

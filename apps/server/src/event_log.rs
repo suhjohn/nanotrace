@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{config::Config, event};
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct WriteReceipt {
     pub event_id: String,
     pub source_file: String,

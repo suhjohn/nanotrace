@@ -163,6 +163,9 @@ rather than repeatedly scanning arbitrary JSON.
 The canonical serving terminology and enablement rules live in
 `docs/design.html` under "Query and UI Behavior".
 
+The API server generates its OpenAPI document from annotated Axum handlers and
+`ToSchema` request/response types, then publishes it at `/openapi.json`.
+
 ## Toolchains
 
 - Rust 1.85 or newer.

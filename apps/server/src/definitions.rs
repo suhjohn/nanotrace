@@ -13,7 +13,7 @@ pub struct DefinitionStore {
     http: reqwest::Client,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateDefinitionRequest {
     pub name: String,
     pub kind: String,
@@ -27,7 +27,7 @@ pub struct CreateDefinitionRequest {
     pub backfill: Option<BackfillRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BackfillRequest {
     #[serde(default)]
     pub from: Option<String>,
@@ -35,7 +35,7 @@ pub struct BackfillRequest {
     pub to: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub struct DefinitionRecord {
     pub tenant_id: String,
     pub definition_id: String,
@@ -53,19 +53,19 @@ pub struct DefinitionRecord {
     pub backfill: Option<DefinitionBackfillStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DefinitionListResponse {
     pub definitions: Vec<DefinitionRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DefinitionMutationResponse {
     pub definition: DefinitionRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backfill: Option<BackfillResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BackfillResponse {
     pub definition_id: String,
     pub kind: String,
@@ -77,7 +77,7 @@ pub struct BackfillResponse {
     pub status: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub struct DefinitionBackfillStatus {
     pub status: String,
     pub from: String,

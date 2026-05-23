@@ -22,7 +22,7 @@ pub struct ReadStore {
     s3: S3Client,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct QueryRequest {
     pub query: String,
     #[serde(default)]
@@ -31,7 +31,7 @@ pub struct QueryRequest {
     pub allow_stale_serving: bool,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsQueryRequest {
     #[serde(default)]
@@ -60,7 +60,7 @@ pub struct EventsQueryRequest {
     pub allow_stale_serving: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventsQueryView {
     GroupOptions,
@@ -74,7 +74,7 @@ pub enum EventsQueryView {
     Event,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventFilter {
     #[serde(default)]
@@ -87,7 +87,7 @@ pub struct EventFilter {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventFacetFilter {
     #[serde(default)]
@@ -103,7 +103,7 @@ pub struct EventFacetFilter {
     pub values: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventFacetJoin {
     #[default]
@@ -111,7 +111,7 @@ pub enum EventFacetJoin {
     Or,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventFacetOperator {
     Contains,
@@ -120,7 +120,7 @@ pub enum EventFacetOperator {
     In,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventTimeRange {
     #[serde(default)]
@@ -131,7 +131,7 @@ pub struct EventTimeRange {
     pub lookback_minutes: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventPage {
     #[serde(default)]
@@ -144,7 +144,7 @@ pub struct EventPage {
     pub event_id: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsQuerySort {
     #[serde(default)]
@@ -153,7 +153,7 @@ pub struct EventsQuerySort {
     pub group: GroupSortKey,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSortDirection {
     #[default]
@@ -161,7 +161,7 @@ pub enum EventSortDirection {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupSortKey {
     #[default]
