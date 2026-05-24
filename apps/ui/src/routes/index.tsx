@@ -445,6 +445,11 @@ export function ObservatoryHome({
     initialValue: 'asc',
     parse: parseEventSortDirection
   })
+  const [liveEventSortDirection, setLiveEventSortDirection] = useCookieState<EventSortDirection>({
+    cookieName: 'observatory-ui-live-event-sort-direction-v1',
+    initialValue: 'desc',
+    parse: parseEventSortDirection
+  })
   const [timeRangeKey, setTimeRangeKey] = useCookieState<TimeRangeKey>({
     cookieName: 'observatory-ui-time-range',
     initialValue: '24h',
@@ -534,6 +539,8 @@ export function ObservatoryHome({
   )
   const selectedTimeRangeCacheKey = timeRangeCacheKey(selectedTimeRange)
   const liveMode = effectiveTimeRangeKey === 'live'
+  const effectiveEventSortDirection = liveMode ? liveEventSortDirection : eventSortDirection
+  const setEffectiveEventSortDirection = liveMode ? setLiveEventSortDirection : setEventSortDirection
   const liveRefetchInterval = liveMode ? 3000 : false
   const selectedGroupKey = groupBy && selectedGroupValue ? `${groupBy}\u0000${selectedGroupValue}` : ''
   const viewingGroupedEvents = Boolean(selectedGroupKey)
@@ -633,7 +640,7 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventAnchorEventId, eventSortDirection],
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventAnchorEventId, effectiveEventSortDirection],
     initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp, eventId: eventAnchorEventId } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
@@ -643,20 +650,20 @@ export function ObservatoryHome({
         limit: 100,
         pageParam,
         selectedGroupValue,
-        sortDirection: eventSortDirection,
+        sortDirection: effectiveEventSortDirection,
         timeRange: selectedTimeRange
       }),
     getNextPageParam: lastPage => {
       const cursor = lastPage.nextCursor
       if (!cursor) return undefined
-      return eventSortDirection === 'desc'
+      return effectiveEventSortDirection === 'desc'
         ? { before: cursor.createdAt, eventId: cursor.eventId }
         : { after: cursor.createdAt, eventId: cursor.eventId }
     },
     getPreviousPageParam: firstPage => {
       const cursor = firstPage.prevCursor
       if (!cursor) return undefined
-      return eventSortDirection === 'desc'
+      return effectiveEventSortDirection === 'desc'
         ? { after: cursor.createdAt, eventId: cursor.eventId }
         : { before: cursor.createdAt, eventId: cursor.eventId }
     },
@@ -703,7 +710,7 @@ export function ObservatoryHome({
   )
   const liveFreshScopeKey = [
     eventDataKey,
-    eventSortDirection
+    effectiveEventSortDirection
   ].join('\u0000')
   useEffect(() => {
     if (!liveMode) {
@@ -1037,11 +1044,11 @@ export function ObservatoryHome({
           : '/events',
         eventTableFilterKey,
         selectedTimeRangeCacheKey,
-        eventSortDirection,
+        effectiveEventSortDirection,
         eventAnchorTimestamp,
         eventAnchorEventId
       ].join('\u0000'),
-    [eventAnchorEventId, eventAnchorTimestamp, eventSortDirection, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
+    [effectiveEventSortDirection, eventAnchorEventId, eventAnchorTimestamp, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
     if (!eventDetail) return selectedEventColumns
@@ -1539,14 +1546,14 @@ export function ObservatoryHome({
               selectedColumns={selectedEventColumnsForTrace}
               selectedEventAlign={eventAnchorOverride?.key === eventDataKey ? 'center' : 'auto'}
               selectedEventId={selectedEventId}
-              sortDirection={eventSortDirection}
+              sortDirection={effectiveEventSortDirection}
               onLoadMore={() => {
                 void eventsQuery.fetchNextPage()
               }}
               onLoadPrevious={() => eventsQuery.fetchPreviousPage().then(() => undefined)}
               onInspect={selectEvent}
               onSetColumns={setSelectedEventColumns}
-              onToggleSortDirection={() => setEventSortDirection(current => current === 'desc' ? 'asc' : 'desc')}
+              onToggleSortDirection={() => setEffectiveEventSortDirection(current => current === 'desc' ? 'asc' : 'desc')}
               onToggleColumn={path =>
                 setSelectedEventColumns(current =>
                   current.includes(path) ? current.filter(value => value !== path) : [...current, path]
