@@ -2,7 +2,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, ChevronDown, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
 import { format } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -466,6 +466,7 @@ export function ObservatoryHome({
   const [freshEventIds, setFreshEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
+  const [groupSelectOpen, setGroupSelectOpen] = useState(false)
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
@@ -800,10 +801,10 @@ export function ObservatoryHome({
   const waitingForSummary = Boolean(hasEventQuery && summaryQuery.isPending)
   const loadingGraph =
     graphMode === 'histogram'
-      ? densityQuery.isPending || densityQuery.isFetching
-      : flamegraphQuery.isPending || flamegraphQuery.isFetching
+      ? densityQuery.isPending
+      : flamegraphQuery.isPending
   const loadingDetail = hasEventQuery && (waitingForLatest || waitingForSummary || loadingGraph)
-  const loadingTableDetail = hasEventQuery && (eventsQuery.isPending || eventsQuery.isFetching)
+  const loadingTableDetail = hasEventQuery && eventsQuery.isPending
   const loadingAnchoredEvents = Boolean(
     eventAnchorOverride?.key === eventDataKey &&
     eventsQuery.isFetching &&
@@ -829,24 +830,61 @@ export function ObservatoryHome({
     Boolean(eventFilterParams.createdBefore) ||
     Boolean(eventFilterParams.facets?.length) ||
     eventFilterDraft !== ''
-  function setFilterSearch(value: string) {
+
+  function updateSearch(patch: Partial<ObservatorySearch>) {
     void navigate({
       search: (current: ObservatorySearch) => ({
         ...current,
-        filter: value || undefined
+        ...patch
       })
     } as never)
   }
 
-  function setTimeRangeSearch(key: TimeRangeKey, start?: string, end?: string) {
+  function navigateRootSearch(patch: Partial<ObservatorySearch>) {
     void navigate({
+      to: '/',
       search: (current: ObservatorySearch) => ({
         ...current,
-        rangeEnd: key === 'custom' ? end || undefined : undefined,
-        rangeStart: key === 'custom' ? start || undefined : undefined,
-        timeRange: key
+        ...patch
       })
     } as never)
+  }
+
+  function navigateSelectedGroup(value: string) {
+    void navigate({
+      to: '/$field/$value',
+      params: {
+        field: groupBy,
+        value
+      },
+      search: (current: ObservatorySearch) => ({
+        ...current,
+        eventId: undefined,
+        groupBy: undefined
+      })
+    } as never)
+  }
+
+  function selectGroupBySearch(nextGroupBy: string) {
+    resetEventScope('all-events', { force: true })
+    setFilter('')
+    setGroupSelectOpen(false)
+    navigateRootSearch({
+      eventId: undefined,
+      groupBy: nextGroupBy || undefined
+    })
+  }
+
+  function setFilterSearch(value: string) {
+    updateSearch({ filter: value || undefined })
+  }
+
+  function setTimeRangeSearch(key: TimeRangeKey, start?: string, end?: string) {
+    updateSearch({
+      rangeEnd: key === 'custom' ? end || undefined : undefined,
+      rangeStart: key === 'custom' ? start || undefined : undefined,
+      timeRange: key
+    })
   }
 
   function commitEventFilter(nextFilter: ParsedEventFilter, { syncUrl = true }: { syncUrl?: boolean } = {}) {
@@ -1041,12 +1079,7 @@ export function ObservatoryHome({
   const hasInspectorFilter = inspectorFilter !== ''
 
   function setEventSearch(eventId: string) {
-    void navigate({
-      search: (current: ObservatorySearch) => ({
-        ...current,
-        eventId: eventId || undefined
-      })
-    } as never)
+    updateSearch({ eventId: eventId || undefined })
   }
 
   function selectEvent(event: TraceEvent) {
@@ -1079,6 +1112,9 @@ export function ObservatoryHome({
         setEventSearch('')
       } else if (eventPayloadQuery.data?.event) {
         setHighlightedEventIds([selectedEventId])
+        if (liveMode) {
+          return
+        }
         const anchorTimestamp = eventPayloadQuery.data.event.createdAt
         if (
           anchorTimestamp &&
@@ -1094,7 +1130,7 @@ export function ObservatoryHome({
 
     setHighlightedEventIds([selectedEventId])
     setSelectedCanvasSpanId(flamegraph.eventSpanIds[selectedEventId] ?? selectedEventId)
-  }, [eventAnchorOverride, eventDataKey, eventPayloadQuery.data, eventPayloadQuery.error, flamegraph.eventSpanIds, selectedEvent, selectedEventId])
+  }, [eventAnchorOverride, eventDataKey, eventPayloadQuery.data, eventPayloadQuery.error, flamegraph.eventSpanIds, liveMode, selectedEvent, selectedEventId])
 
   useEffect(() => {
     document.body.style.cursor = dragging ? (dragging === 'flamegraph' ? 'row-resize' : 'col-resize') : ''
@@ -1237,38 +1273,40 @@ export function ObservatoryHome({
             </button>
           ) : null}
         </form>
-        <label className="flex shrink-0 items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
           <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Group</span>
-          <select
-            aria-label="Group by"
-            className="h-7 w-[150px] border border-neutral-800 bg-black px-2 text-[12px] text-neutral-200 outline-none hover:bg-white/[0.04] focus:border-neutral-600"
-            value={groupBy || noGroupValue}
-            onChange={event => {
-              const value = event.target.value
-              resetEventScope('all-events', { force: true })
-              setFilter('')
-              void navigate({
-                search: value === noGroupValue ? {} : { groupBy: value },
-                to: '/'
-              })
-            }}
-          >
-            <option value={noGroupValue}>No grouping</option>
-            {displayedGroupOptions.map(option => (
-              <option key={option.path} value={option.path}>
-                {groupOptionSelectLabel(option)}
-              </option>
-            ))}
-          </select>
-          {selectedGroupOption ? (
-            <span
-              className="hidden h-5 max-w-[86px] shrink-0 items-center border border-neutral-800 px-1.5 text-[10px] uppercase tracking-[0.08em] text-neutral-500 sm:inline-flex"
-              title={groupOptionServingTitle(selectedGroupOption)}
-            >
-              {groupOptionServingLabel(selectedGroupOption)}
-            </span>
-          ) : null}
-        </label>
+          <Popover open={groupSelectOpen} onOpenChange={setGroupSelectOpen}>
+            <PopoverTrigger asChild>
+              <button
+                aria-expanded={groupSelectOpen}
+                aria-label="Group by"
+                className="flex h-7 w-[190px] items-center justify-between gap-2 border border-neutral-800 bg-black px-2 text-left text-[12px] text-neutral-200 outline-none hover:bg-white/[0.04] focus:border-neutral-600"
+                role="combobox"
+                type="button"
+              >
+                <span className="min-w-0 truncate">{groupByLabel || 'No grouping'}</span>
+                <ChevronDown size={13} strokeWidth={1.8} className="shrink-0 text-neutral-500" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-[190px] p-1">
+              <div className="max-h-[360px] overflow-y-auto" role="listbox">
+                <GroupSelectItem
+                  selected={!groupBy}
+                  value="No grouping"
+                  onSelect={() => selectGroupBySearch('')}
+                />
+                {displayedGroupOptions.map(option => (
+                  <GroupSelectItem
+                    key={option.path}
+                    selected={option.path === groupBy}
+                    value={groupOptionLabel(option)}
+                    onSelect={() => selectGroupBySearch(option.path)}
+                  />
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
         <div className="ml-auto flex shrink-0 items-center justify-end gap-1.5">
           <div className="flex overflow-hidden border border-neutral-800 bg-black">
             {timeRangeOptions.map(option => (
@@ -1338,14 +1376,7 @@ export function ObservatoryHome({
                   type="button"
                   onClick={() => {
                     resetEventScope(`${groupBy}\u0000${trace.value}`, { force: true })
-                    void navigate({
-                      to: '/$field/$value',
-                      params: {
-                        field: groupBy,
-                        value: trace.value
-                      },
-                      search: {}
-                    })
+                    navigateSelectedGroup(trace.value)
                   }}
                 >
                   <div
@@ -1779,42 +1810,34 @@ function groupOptionLabel(option: GroupOption) {
   return option.displayName || displayFacetPath(option.path)
 }
 
-function groupOptionSelectLabel(option: GroupOption) {
-  const label = groupOptionLabel(option)
-  const servingLabel = groupOptionServingLabel(option)
-  return servingLabel ? `${label} - ${servingLabel}` : label
-}
-
-function groupOptionServingLabel(option: GroupOption | null) {
-  switch (option?.servingMode || option?.source) {
-    case 'rollup':
-      return 'Rollup'
-    case 'index':
-    case 'lookup':
-    case 'promoted':
-    case 'field_index':
-      return 'Index'
-    case 'raw':
-      return 'Raw'
-    default:
-      return ''
-  }
-}
-
-function groupOptionServingTitle(option: GroupOption) {
-  switch (option.servingMode || option.source) {
-    case 'rollup':
-      return 'Grouped from a precomputed field rollup.'
-    case 'index':
-    case 'lookup':
-    case 'promoted':
-    case 'field_index':
-      return 'Grouped from an event-level field index.'
-    case 'raw':
-      return 'Grouped directly from raw events.'
-    default:
-      return 'Group serving source.'
-  }
+function GroupSelectItem({
+  onSelect,
+  selected,
+  value
+}: {
+  onSelect: () => void
+  selected: boolean
+  value: string
+}) {
+  return (
+    <button
+      aria-selected={selected}
+      className={cn(
+        'relative flex h-7 w-full items-center px-2 pr-7 text-left text-[12px] text-neutral-300 outline-none hover:bg-white/[0.07] hover:text-white',
+        selected && 'text-white'
+      )}
+      role="option"
+      type="button"
+      onClick={onSelect}
+    >
+      <span className="min-w-0 truncate">{value}</span>
+      {selected ? (
+        <span className="absolute right-2 inline-flex items-center justify-center">
+          <Check size={12} strokeWidth={1.8} />
+        </span>
+      ) : null}
+    </button>
+  )
 }
 
 function isKnownGroupOption(path: string, options: GroupOption[]) {
