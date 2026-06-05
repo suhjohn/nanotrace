@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::config::Config;
 
@@ -13,13 +13,125 @@ pub struct DefinitionStore {
     http: reqwest::Client,
 }
 
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionKind {
+    Field,
+    Measure,
+    Rollup,
+    MetricRollup,
+    State,
+    Search,
+    Report,
+    Sequence,
+    Cohort,
+    Alert,
+}
+
+impl DefinitionKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Field => "field",
+            Self::Measure => "measure",
+            Self::Rollup => "rollup",
+            Self::MetricRollup => "metric_rollup",
+            Self::State => "state",
+            Self::Search => "search",
+            Self::Report => "report",
+            Self::Sequence => "sequence",
+            Self::Cohort => "cohort",
+            Self::Alert => "alert",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionMode {
+    Facet,
+    Lookup,
+    Measure,
+    Cube,
+    MeasureRollup,
+    Managed,
+    StateTransition,
+    Saved,
+    Summary,
+    Retention,
+    TraceSummary,
+    Funnel,
+    Membership,
+    EventMatch,
+}
+
+impl DefinitionMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Facet => "facet",
+            Self::Lookup => "lookup",
+            Self::Measure => "measure",
+            Self::Cube => "cube",
+            Self::MeasureRollup => "measure_rollup",
+            Self::Managed => "managed",
+            Self::StateTransition => "state_transition",
+            Self::Saved => "saved",
+            Self::Summary => "summary",
+            Self::Retention => "retention",
+            Self::TraceSummary => "trace_summary",
+            Self::Funnel => "funnel",
+            Self::Membership => "membership",
+            Self::EventMatch => "event_match",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "facet" => Some(Self::Facet),
+            "lookup" => Some(Self::Lookup),
+            "measure" => Some(Self::Measure),
+            "cube" => Some(Self::Cube),
+            "measure_rollup" => Some(Self::MeasureRollup),
+            "managed" => Some(Self::Managed),
+            "state_transition" => Some(Self::StateTransition),
+            "saved" => Some(Self::Saved),
+            "summary" => Some(Self::Summary),
+            "retention" => Some(Self::Retention),
+            "trace_summary" => Some(Self::TraceSummary),
+            "funnel" => Some(Self::Funnel),
+            "membership" => Some(Self::Membership),
+            "event_match" => Some(Self::EventMatch),
+            _ => None,
+        }
+    }
+}
+
+fn deserialize_optional_definition_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<DefinitionMode>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    DefinitionMode::from_str(value)
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom(format!("invalid definition mode: {value}")))
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateDefinitionRequest {
     pub name: String,
-    pub kind: String,
+    pub kind: DefinitionKind,
+    #[serde(default, deserialize_with = "deserialize_optional_definition_mode")]
+    pub mode: Option<DefinitionMode>,
     #[serde(default)]
-    pub mode: String,
-    #[serde(default)]
+    #[schema(example = json!({"path": "account.plan", "value_type": "string"}))]
     pub config: Value,
     #[serde(default)]
     pub capabilities: Value,
@@ -56,6 +168,11 @@ pub struct DefinitionRecord {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DefinitionListResponse {
     pub definitions: Vec<DefinitionRecord>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct DefinitionGetResponse {
+    pub definition: DefinitionRecord,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -101,6 +218,10 @@ pub enum DefinitionStoreError {
     InvalidPath,
     #[error("invalid JSON config")]
     InvalidConfig,
+    #[error(
+        "definition kind '{kind}' uses queued /v1/definitions/{{definition_id}}/backfills instead of synchronous /backfill"
+    )]
+    UnsupportedSynchronousBackfillKind { kind: String },
     #[error("definition not found")]
     NotFound,
     #[error("ClickHouse request failed: {0}")]
@@ -124,7 +245,7 @@ impl DefinitionStore {
         tenant_id: &str,
     ) -> Result<Vec<DefinitionRecord>, DefinitionStoreError> {
         let query = format!(
-            "SELECT tenant_id, definition_id, name, kind, mode, enabled, config, capabilities, created_at, updated_at, deleted_at, version FROM {} FINAL WHERE tenant_id = {{tenant_id:String}} AND kind IN ('field', 'measure', 'rollup', 'metric_rollup', 'state', 'report', 'sequence', 'cohort') AND isNull(deleted_at) ORDER BY updated_at DESC",
+            "SELECT tenant_id, definition_id, name, kind, mode, enabled, config, capabilities, created_at, updated_at, deleted_at, version FROM {} FINAL WHERE tenant_id = {{tenant_id:String}} AND kind IN ('field', 'measure', 'rollup', 'metric_rollup', 'state', 'search', 'report', 'sequence', 'cohort', 'alert') AND isNull(deleted_at) ORDER BY updated_at DESC",
             self.table("definitions")
         );
         let response: ClickHouseResponse<DefinitionRecord> = self
@@ -133,17 +254,7 @@ impl DefinitionStore {
         let mut definitions = response.data;
         let backfills = self.latest_backfills(tenant_id).await?;
         for definition in &mut definitions {
-            definition.backfill = backfills
-                .iter()
-                .find(|backfill| backfill.definition_id == definition.definition_id)
-                .map(|backfill| DefinitionBackfillStatus {
-                    status: backfill.status.clone(),
-                    from: backfill.from.clone(),
-                    to: backfill.to.clone(),
-                    rows_matched: backfill.rows_matched,
-                    distinct_values: backfill.distinct_values,
-                    updated_at: backfill.updated_at.clone(),
-                });
+            attach_latest_backfill(definition, &backfills);
         }
         Ok(definitions)
     }
@@ -154,8 +265,13 @@ impl DefinitionStore {
         request: CreateDefinitionRequest,
     ) -> Result<DefinitionMutationResponse, DefinitionStoreError> {
         let name = normalized_name(&request.name)?;
-        let kind = normalized_kind(&request.kind)?;
-        let mode = normalized_mode(&kind, &request.mode);
+        let kind = normalized_kind(request.kind.as_str())?;
+        let requested_mode = request
+            .mode
+            .as_ref()
+            .map(DefinitionMode::as_str)
+            .unwrap_or_default();
+        let mode = normalized_mode(&kind, requested_mode);
         validate_mode(&kind, &mode)?;
         let config = normalize_config(&kind, &mode, request.config)?;
         let capabilities = normalize_capabilities(&kind, &mode, request.capabilities);
@@ -189,12 +305,23 @@ impl DefinitionStore {
         })
     }
 
+    pub async fn get(
+        &self,
+        tenant_id: &str,
+        definition_id: &str,
+    ) -> Result<DefinitionRecord, DefinitionStoreError> {
+        let mut definition = self.get_record(tenant_id, definition_id).await?;
+        let backfills = self.latest_backfills(tenant_id).await?;
+        attach_latest_backfill(&mut definition, &backfills);
+        Ok(definition)
+    }
+
     pub async fn seed_sdk_defaults(
         &self,
         tenant_id: &str,
     ) -> Result<Vec<DefinitionRecord>, DefinitionStoreError> {
         let desired = sdk_metric_definition(tenant_id);
-        match self.get(tenant_id, &desired.definition_id).await {
+        match self.get_record(tenant_id, &desired.definition_id).await {
             Ok(existing)
                 if existing.enabled == 1
                     && existing.config == desired.config
@@ -223,7 +350,7 @@ impl DefinitionStore {
         tenant_id: &str,
         definition_id: &str,
     ) -> Result<DefinitionRecord, DefinitionStoreError> {
-        let mut definition = self.get(tenant_id, definition_id).await?;
+        let mut definition = self.get_record(tenant_id, definition_id).await?;
         let now = clickhouse_now();
         definition.enabled = 0;
         definition.updated_at = now.clone();
@@ -240,17 +367,17 @@ impl DefinitionStore {
         definition_id: &str,
         request: BackfillRequest,
     ) -> Result<BackfillResponse, DefinitionStoreError> {
-        let definition = self.get(tenant_id, definition_id).await?;
+        let definition = self.get_record(tenant_id, definition_id).await?;
         self.backfill_definition(&definition, request).await
     }
 
-    async fn get(
+    async fn get_record(
         &self,
         tenant_id: &str,
         definition_id: &str,
     ) -> Result<DefinitionRecord, DefinitionStoreError> {
         let query = format!(
-            "SELECT tenant_id, definition_id, name, kind, mode, enabled, config, capabilities, created_at, updated_at, deleted_at, version FROM {} FINAL WHERE tenant_id = {{tenant_id:String}} AND definition_id = {{definition_id:String}} AND kind IN ('field', 'measure', 'rollup', 'metric_rollup', 'state', 'report', 'sequence', 'cohort') AND isNull(deleted_at) ORDER BY updated_at DESC LIMIT 1",
+            "SELECT tenant_id, definition_id, name, kind, mode, enabled, config, capabilities, created_at, updated_at, deleted_at, version FROM {} FINAL WHERE tenant_id = {{tenant_id:String}} AND definition_id = {{definition_id:String}} AND kind IN ('field', 'measure', 'rollup', 'metric_rollup', 'state', 'search', 'report', 'sequence', 'cohort', 'alert') AND isNull(deleted_at) ORDER BY updated_at DESC LIMIT 1",
             self.table("definitions")
         );
         let response: ClickHouseResponse<DefinitionRecord> = self
@@ -302,7 +429,9 @@ impl DefinitionStore {
             "measure" => self.backfill_measure(definition, &from, &to).await,
             "rollup" => self.backfill_measure(definition, &from, &to).await,
             "state" => self.backfill_state(definition, &from, &to).await,
-            _ => Err(DefinitionStoreError::InvalidKind),
+            kind => Err(DefinitionStoreError::UnsupportedSynchronousBackfillKind {
+                kind: kind.to_string(),
+            }),
         }
     }
 
@@ -388,6 +517,29 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
         );
         self.execute(
             &query,
+            &[
+                ("tenant_id", definition.tenant_id.clone()),
+                ("definition_id", definition.definition_id.clone()),
+                ("definition_version", definition.version.to_string()),
+                ("entity_type", entity_type.clone()),
+                ("state_name", definition.name.clone()),
+                ("value_type", value_type.clone()),
+                ("from", from.to_string()),
+                ("to", to.to_string()),
+            ],
+        )
+        .await?;
+        let current_query = format!(
+            "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{entity_type:String}}, {entity_expr}, {{state_name:String}}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
+FROM {}
+WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}
+GROUP BY tenant_id, {entity_expr}",
+            self.table("entity_state_current"),
+            self.events_table()
+        );
+        self.execute(
+            &current_query,
             &[
                 ("tenant_id", definition.tenant_id.clone()),
                 ("definition_id", definition.definition_id.clone()),
@@ -514,7 +666,7 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
                     ("tenant_id", definition.tenant_id.clone()),
                     ("mode", mode),
                     ("field_name", field_name),
-                    ("value_type", value_type),
+                    ("value_type", value_type.clone()),
                     ("definition_id", definition.definition_id.clone()),
                     ("definition_version", definition.version.to_string()),
                     ("from", from.to_string()),
@@ -536,6 +688,20 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
     ) -> Result<BackfillResponse, DefinitionStoreError> {
         let matcher_clause = matcher_where_clause(&definition.config)?;
         let mut stats = BackfillStats::default();
+        for output in generalized_outputs(&definition.config, "measure_cube_rollups")?
+            .into_iter()
+            .filter(|output| {
+                output
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| target == "measure_cube_rollups")
+            })
+        {
+            let output_stats = self
+                .backfill_measure_cube_output(definition, output, &matcher_clause, from, to)
+                .await?;
+            stats.add(output_stats);
+        }
         for output in generalized_outputs(&definition.config, "event_measures")? {
             let measure_name_expr = string_sql_expr(
                 output
@@ -639,6 +805,83 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
         Ok(backfill_response(definition, from, to, &stats))
     }
 
+    async fn backfill_measure_cube_output(
+        &self,
+        definition: &DefinitionRecord,
+        output: &Map<String, Value>,
+        matcher_clause: &Option<String>,
+        from: &str,
+        to: &str,
+    ) -> Result<BackfillStats, DefinitionStoreError> {
+        let measure_name_expr = string_sql_expr(
+            output
+                .get("measure_name")
+                .ok_or(DefinitionStoreError::InvalidConfig)?,
+        )?;
+        let value_expr = number_sql_expr(
+            output
+                .get("value")
+                .ok_or(DefinitionStoreError::InvalidConfig)?,
+        )?;
+        let unit_expr = output
+            .get("unit")
+            .map(string_sql_expr)
+            .transpose()?
+            .unwrap_or_else(|| "''".to_string());
+        let bucket_seconds = json_u32_default(output, "bucket_seconds", 300);
+        let mut stats = BackfillStats::default();
+        for dimension_set in dimension_set_sql_outputs(output)? {
+            let names_sql = clickhouse_string_array(&dimension_set.dimension_names);
+            let values_sql = format!(
+                "[{}]",
+                dimension_set
+                    .dimension_value_exprs
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let nonempty_dimensions = dimension_set
+                .dimension_value_exprs
+                .iter()
+                .map(|expr| format!("{expr} != ''"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let where_value = join_sql_clauses([
+                Some(format!("{value_expr} IS NOT NULL")),
+                Some(format!("{measure_name_expr} != ''")),
+                Some(nonempty_dimensions),
+                matcher_clause.clone(),
+            ]);
+            let output_stats = self
+                .field_stats(&definition.tenant_id, &value_expr, &where_value, from, to)
+                .await?;
+            stats.add(output_stats);
+            let query = format!(
+                "INSERT INTO {} (tenant_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_set_id, dimension_names, dimension_values)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {measure_name_expr}, {value_expr}, {unit_expr}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), {{bucket_seconds:UInt32}}, event_id, event_type, signal, {{dimension_set_id:String}}, {names_sql}, {values_sql}
+FROM {}
+WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
+                self.table("measure_cube_points"),
+                self.events_table()
+            );
+            self.execute(
+                &query,
+                &[
+                    ("tenant_id", definition.tenant_id.clone()),
+                    ("definition_id", definition.definition_id.clone()),
+                    ("definition_version", definition.version.to_string()),
+                    ("bucket_seconds", bucket_seconds.to_string()),
+                    ("dimension_set_id", dimension_set.id),
+                    ("from", from.to_string()),
+                    ("to", to.to_string()),
+                ],
+            )
+            .await?;
+        }
+        Ok(stats)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_measure_backfill(
         &self,
@@ -730,6 +973,27 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
                     ("tenant_id", definition.tenant_id.clone()),
                     ("definition_id", definition.definition_id.clone()),
                     ("definition_version", definition.version.to_string()),
+                    ("value_type", value_type.clone()),
+                    ("from", from.to_string()),
+                    ("to", to.to_string()),
+                ],
+            )
+            .await?;
+            let current_query = format!(
+                "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {entity_type_expr}, {entity_id_expr}, {state_name_expr}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
+FROM {}
+WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}
+GROUP BY tenant_id, {entity_type_expr}, {entity_id_expr}, {state_name_expr}",
+                self.table("entity_state_current"),
+                self.events_table()
+            );
+            self.execute(
+                &current_query,
+                &[
+                    ("tenant_id", definition.tenant_id.clone()),
+                    ("definition_id", definition.definition_id.clone()),
+                    ("definition_version", definition.version.to_string()),
                     ("value_type", value_type),
                     ("from", from.to_string()),
                     ("to", to.to_string()),
@@ -796,7 +1060,44 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
             distinct_values: stats.distinct_values,
             decision: decision.to_string(),
         };
-        self.insert_json_each_row("definition_stats", &[&row]).await
+        self.insert_json_each_row("definition_stats", &[&row])
+            .await?;
+        self.insert_materialization_watermark(definition, from, to, stats, decision)
+            .await
+    }
+
+    async fn insert_materialization_watermark(
+        &self,
+        definition: &DefinitionRecord,
+        from: &str,
+        to: &str,
+        stats: &BackfillStats,
+        decision: &str,
+    ) -> Result<(), DefinitionStoreError> {
+        let row = MaterializationWatermarkRow {
+            tenant_id: definition.tenant_id.clone(),
+            target_type: materialization_target_type(definition),
+            target_id: definition.definition_id.clone(),
+            target_version: definition.version,
+            source_table: "events".to_string(),
+            low_watermark: Some(clickhouse_datetime(from)),
+            high_watermark: Some(clickhouse_datetime(to)),
+            status: if decision == "completed" {
+                "active".to_string()
+            } else {
+                decision.to_string()
+            },
+            lag_ms: 0,
+            attributes: serde_json::json!({
+                "definition_name": definition.name,
+                "definition_kind": definition.kind,
+                "definition_mode": definition.mode,
+                "rows_matched": stats.rows_matched,
+                "distinct_values": stats.distinct_values,
+            }),
+        };
+        self.insert_json_each_row("materialization_watermarks", &[&row])
+            .await
     }
 
     async fn query_json<T: for<'de> Deserialize<'de>>(
@@ -883,6 +1184,25 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
     }
 }
 
+fn materialization_target_type(definition: &DefinitionRecord) -> String {
+    if definition.kind == "measure"
+        && generalized_outputs(&definition.config, "measure_cube_rollups")
+            .map(|outputs| {
+                outputs.into_iter().any(|output| {
+                    output
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .is_some_and(|target| target == "measure_cube_rollups")
+                })
+            })
+            .unwrap_or(false)
+    {
+        "measure_cube_rollups".to_string()
+    } else {
+        definition.kind.clone()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ClickHouseResponse<T> {
     data: Vec<T>,
@@ -908,6 +1228,12 @@ struct DimensionSqlOutput {
     value_expr: String,
 }
 
+struct DimensionSetSqlOutput {
+    id: String,
+    dimension_names: Vec<String>,
+    dimension_value_exprs: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LatestBackfillRow {
     definition_id: String,
@@ -917,6 +1243,20 @@ struct LatestBackfillRow {
     rows_matched: u64,
     distinct_values: u64,
     updated_at: String,
+}
+
+fn attach_latest_backfill(definition: &mut DefinitionRecord, backfills: &[LatestBackfillRow]) {
+    definition.backfill = backfills
+        .iter()
+        .find(|backfill| backfill.definition_id == definition.definition_id)
+        .map(|backfill| DefinitionBackfillStatus {
+            status: backfill.status.clone(),
+            from: backfill.from.clone(),
+            to: backfill.to.clone(),
+            rows_matched: backfill.rows_matched,
+            distinct_values: backfill.distinct_values,
+            updated_at: backfill.updated_at.clone(),
+        });
 }
 
 #[derive(Debug, Serialize)]
@@ -930,6 +1270,20 @@ struct DefinitionStatsRow {
     rows_matched: u64,
     distinct_values: u64,
     decision: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationWatermarkRow {
+    tenant_id: String,
+    target_type: String,
+    target_id: String,
+    target_version: u64,
+    source_table: String,
+    low_watermark: Option<String>,
+    high_watermark: Option<String>,
+    status: String,
+    lag_ms: u64,
+    attributes: Value,
 }
 
 fn normalize_config(
@@ -1022,10 +1376,234 @@ fn normalize_config(
                 "string",
             ))?);
         }
+        "search" => {
+            normalize_search_config(&mut config)?;
+        }
+        "alert" => normalize_alert_config(&mut config)?,
         "report" | "sequence" | "cohort" => return Err(DefinitionStoreError::InvalidConfig),
         _ => return Err(DefinitionStoreError::InvalidKind),
     }
     Ok(config)
+}
+
+fn normalize_search_config(config: &mut Value) -> Result<(), DefinitionStoreError> {
+    let object = config
+        .as_object_mut()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    let query = object
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or(DefinitionStoreError::InvalidConfig)?
+        .to_string();
+    object.insert("query".to_string(), Value::String(query));
+
+    let search_mode = object
+        .get("search_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("token")
+        .to_string();
+    if !matches!(
+        search_mode.as_str(),
+        "token" | "prefix" | "fuzzy" | "phrase"
+    ) {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    object.insert("search_mode".to_string(), Value::String(search_mode));
+
+    if let Some(path) = object.get("path").and_then(Value::as_str) {
+        validate_path(path)?;
+    }
+    object.insert(
+        "require_all_terms".to_string(),
+        Value::Bool(
+            object
+                .get("require_all_terms")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    object.insert(
+        "include_snippets".to_string(),
+        Value::Bool(
+            object
+                .get("include_snippets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    Ok(())
+}
+
+fn normalize_alert_config(config: &mut Value) -> Result<(), DefinitionStoreError> {
+    let object = config
+        .as_object_mut()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    validate_alert_matcher(object.get("match"))?;
+    if let Some(dedupe_key) = object.get("dedupe_key").and_then(Value::as_str) {
+        validate_path(dedupe_key)?;
+    }
+    if let Some(severity) = object.get("severity").and_then(Value::as_str)
+        && !matches!(severity, "info" | "warning" | "critical")
+    {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    if let Some(dedupe_seconds) = object.get("dedupe_seconds").and_then(Value::as_u64)
+        && dedupe_seconds > 86_400
+    {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    if object
+        .get("text")
+        .is_some_and(|value| value.as_str().is_none_or(|text| text.trim().is_empty()))
+    {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    if object
+        .get("regex")
+        .is_some_and(|value| value.as_str().is_none_or(|regex| regex.trim().is_empty()))
+    {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    if let Some(webhook_url) = object.get("webhook_url").and_then(Value::as_str)
+        && !valid_webhook_url(webhook_url)
+    {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    validate_alert_notifications(object.get("notifications"))?;
+    object
+        .entry("severity".to_string())
+        .or_insert_with(|| Value::String("warning".to_string()));
+    object
+        .entry("dedupe_seconds".to_string())
+        .or_insert_with(|| Value::Number(serde_json::Number::from(60)));
+    Ok(())
+}
+
+fn validate_alert_notifications(value: Option<&Value>) -> Result<(), DefinitionStoreError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let object = value
+        .as_object()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    let Some(webhooks) = object.get("webhooks") else {
+        return Ok(());
+    };
+    let webhooks = webhooks
+        .as_array()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    for webhook in webhooks {
+        let webhook = webhook
+            .as_object()
+            .ok_or(DefinitionStoreError::InvalidConfig)?;
+        let url = webhook
+            .get("url")
+            .or_else(|| webhook.get("target"))
+            .and_then(Value::as_str)
+            .ok_or(DefinitionStoreError::InvalidConfig)?;
+        if !valid_webhook_url(url) {
+            return Err(DefinitionStoreError::InvalidConfig);
+        }
+        if let Some(id) = webhook.get("id").and_then(Value::as_str)
+            && !valid_alert_notification_id(id)
+        {
+            return Err(DefinitionStoreError::InvalidConfig);
+        }
+        if let Some(max_attempts) = webhook.get("max_attempts").and_then(Value::as_u64)
+            && !(1..=20).contains(&max_attempts)
+        {
+            return Err(DefinitionStoreError::InvalidConfig);
+        }
+        if let Some(headers) = webhook.get("headers") {
+            let headers = headers
+                .as_object()
+                .ok_or(DefinitionStoreError::InvalidConfig)?;
+            for (name, value) in headers {
+                if name.is_empty()
+                    || name.len() > 128
+                    || value.as_str().is_none_or(|value| value.len() > 2048)
+                {
+                    return Err(DefinitionStoreError::InvalidConfig);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_webhook_url(value: &str) -> bool {
+    let value = value.trim();
+    value.len() <= 2048 && (value.starts_with("https://") || value.starts_with("http://"))
+}
+
+fn valid_alert_notification_id(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn validate_alert_matcher(matcher: Option<&Value>) -> Result<(), DefinitionStoreError> {
+    let Some(matcher) = matcher else {
+        return Ok(());
+    };
+    let object = matcher
+        .as_object()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    for key in ["all", "any"] {
+        let Some(predicates) = object.get(key) else {
+            continue;
+        };
+        let predicates = predicates
+            .as_array()
+            .ok_or(DefinitionStoreError::InvalidConfig)?;
+        for predicate in predicates {
+            validate_alert_condition(predicate)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_alert_condition(predicate: &Value) -> Result<(), DefinitionStoreError> {
+    let object = predicate
+        .as_object()
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    validate_path(path.strip_prefix("data.").unwrap_or(path))?;
+    let op = object
+        .get("op")
+        .or_else(|| object.get("operator"))
+        .and_then(Value::as_str)
+        .unwrap_or("eq");
+    match op {
+        "exists" | "not_exists" | "is_number" | "is_error" => {}
+        "eq" | "ne" | "neq" | "contains" | "gt" | "gte" | "lt" | "lte" => {
+            if !object.contains_key("value") {
+                return Err(DefinitionStoreError::InvalidConfig);
+            }
+        }
+        "regex" => {
+            if object
+                .get("regex")
+                .or_else(|| object.get("pattern"))
+                .and_then(Value::as_str)
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            {
+                return Err(DefinitionStoreError::InvalidConfig);
+            }
+        }
+        _ => return Err(DefinitionStoreError::InvalidConfig),
+    }
+    Ok(())
 }
 
 fn backfill_response(
@@ -1183,6 +1761,55 @@ fn dimension_sql_outputs(
         .collect()
 }
 
+fn dimension_set_sql_outputs(
+    output: &serde_json::Map<String, Value>,
+) -> Result<Vec<DimensionSetSqlOutput>, DefinitionStoreError> {
+    output
+        .get("dimension_sets")
+        .and_then(Value::as_array)
+        .ok_or(DefinitionStoreError::InvalidConfig)?
+        .iter()
+        .map(|dimension_set| {
+            let dimension_set = dimension_set
+                .as_object()
+                .ok_or(DefinitionStoreError::InvalidConfig)?;
+            let dimensions = dimension_set
+                .get("dimensions")
+                .and_then(Value::as_array)
+                .ok_or(DefinitionStoreError::InvalidConfig)?;
+            let mut dimension_names = Vec::new();
+            let mut dimension_value_exprs = Vec::new();
+            for dimension in dimensions {
+                let dimension = dimension
+                    .as_object()
+                    .ok_or(DefinitionStoreError::InvalidConfig)?;
+                dimension_names.push(json_string(dimension, "name")?);
+                dimension_value_exprs.push(string_sql_expr(
+                    dimension
+                        .get("value")
+                        .ok_or(DefinitionStoreError::InvalidConfig)?,
+                )?);
+            }
+            Ok(DimensionSetSqlOutput {
+                id: json_string(dimension_set, "id")?,
+                dimension_names,
+                dimension_value_exprs,
+            })
+        })
+        .collect()
+}
+
+fn clickhouse_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| quote_sql_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn join_sql_clauses<const N: usize>(clauses: [Option<String>; N]) -> String {
     clauses
         .into_iter()
@@ -1291,10 +1918,10 @@ fn validate_matcher(matcher: Option<&Value>) -> Result<(), DefinitionStoreError>
                 }
             }
             "in" => {
-                if !object
+                if object
                     .get("value")
                     .and_then(Value::as_array)
-                    .is_some_and(|values| !values.is_empty())
+                    .is_none_or(|values| values.is_empty())
                 {
                     return Err(DefinitionStoreError::InvalidConfig);
                 }
@@ -1346,15 +1973,20 @@ fn validate_generalized_output(
                 .get("target")
                 .and_then(Value::as_str)
                 .unwrap_or("event_measures");
-            if target != "event_measures" {
+            if target != "event_measures" && target != "measure_cube_rollups" {
                 return Err(DefinitionStoreError::InvalidConfig);
+            }
+            if target == "measure_cube_rollups" && (kind != "measure" || mode != "cube") {
+                return Err(DefinitionStoreError::InvalidMode);
             }
             validate_string_expr(object.get("measure_name"))?;
             validate_number_expr(object.get("value"))?;
             if let Some(unit) = object.get("unit") {
                 validate_string_expr(Some(unit))?;
             }
-            if let Some(dimensions) = object.get("dimensions") {
+            if target == "measure_cube_rollups" {
+                validate_dimension_sets(object.get("dimension_sets"))?;
+            } else if let Some(dimensions) = object.get("dimensions") {
                 let dimensions = dimensions
                     .as_array()
                     .ok_or(DefinitionStoreError::InvalidConfig)?;
@@ -1573,6 +2205,54 @@ fn validate_dimensions(value: Option<&Value>) -> Result<(), DefinitionStoreError
     Ok(())
 }
 
+fn validate_dimension_sets(value: Option<&Value>) -> Result<(), DefinitionStoreError> {
+    let dimension_sets = value
+        .and_then(Value::as_array)
+        .ok_or(DefinitionStoreError::InvalidConfig)?;
+    if dimension_sets.is_empty() || dimension_sets.len() > 8 {
+        return Err(DefinitionStoreError::InvalidConfig);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for dimension_set in dimension_sets {
+        let dimension_set = dimension_set
+            .as_object()
+            .ok_or(DefinitionStoreError::InvalidConfig)?;
+        let id = dimension_set
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(DefinitionStoreError::InvalidConfig)?
+            .trim();
+        if id.is_empty() || !ids.insert(id.to_string()) {
+            return Err(DefinitionStoreError::InvalidConfig);
+        }
+        validate_path(id)?;
+        let dimensions = dimension_set
+            .get("dimensions")
+            .and_then(Value::as_array)
+            .ok_or(DefinitionStoreError::InvalidConfig)?;
+        if dimensions.is_empty() || dimensions.len() > 6 {
+            return Err(DefinitionStoreError::InvalidConfig);
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for dimension in dimensions {
+            let dimension = dimension
+                .as_object()
+                .ok_or(DefinitionStoreError::InvalidConfig)?;
+            let name = dimension
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or(DefinitionStoreError::InvalidConfig)?
+                .trim();
+            if name.is_empty() || !names.insert(name.to_string()) {
+                return Err(DefinitionStoreError::InvalidConfig);
+            }
+            validate_path(name)?;
+            validate_string_expr(dimension.get("value"))?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_string_expr(value: Option<&Value>) -> Result<(), DefinitionStoreError> {
     match value {
         Some(Value::String(value)) if !value.trim().is_empty() => Ok(()),
@@ -1648,6 +2328,11 @@ fn normalize_capabilities(kind: &str, mode: &str, capabilities: Value) -> Value 
             "as_of": true,
             "filter": true
         }),
+        ("search", _) => serde_json::json!({
+            "saved_search": true,
+            "event_search_terms": true,
+            "event_text_index": true
+        }),
         ("report", _) => serde_json::json!({
             "report_results": true,
             "aggregate": true,
@@ -1660,6 +2345,11 @@ fn normalize_capabilities(kind: &str, mode: &str, capabilities: Value) -> Value 
         ("cohort", _) => serde_json::json!({
             "cohort_memberships": true,
             "materialized": true
+        }),
+        ("alert", _) => serde_json::json!({
+            "hot_alert": true,
+            "streaming": true,
+            "alert_events": true
         }),
         _ => Value::Object(serde_json::Map::new()),
     }
@@ -1732,11 +2422,10 @@ fn normalized_name(value: &str) -> Result<String, DefinitionStoreError> {
 }
 
 fn normalized_kind(value: &str) -> Result<String, DefinitionStoreError> {
-    match value.trim() {
-        "field" | "measure" | "rollup" | "metric_rollup" | "state" | "report" | "sequence"
-        | "cohort" => Ok(value.trim().to_string()),
-        _ => Err(DefinitionStoreError::InvalidKind),
-    }
+    let value = value.trim();
+    definition_mode_spec(value)
+        .map(|_| value.to_string())
+        .ok_or(DefinitionStoreError::InvalidKind)
 }
 
 fn normalized_mode(kind: &str, value: &str) -> String {
@@ -1744,39 +2433,80 @@ fn normalized_mode(kind: &str, value: &str) -> String {
     if !value.is_empty() {
         return value.to_string();
     }
-    match kind {
-        "field" => "facet".to_string(),
-        "measure" => "measure".to_string(),
-        "rollup" => "measure_rollup".to_string(),
-        "metric_rollup" => "managed".to_string(),
-        "state" => "state_transition".to_string(),
-        "report" => "summary".to_string(),
-        "sequence" => "funnel".to_string(),
-        "cohort" => "membership".to_string(),
-        _ => String::new(),
-    }
+    definition_mode_spec(kind)
+        .map(|spec| spec.default_mode.to_string())
+        .unwrap_or_default()
 }
 
 fn validate_mode(kind: &str, mode: &str) -> Result<(), DefinitionStoreError> {
-    let valid = matches!(
-        (kind, mode),
-        ("field", "facet")
-            | ("field", "lookup")
-            | ("measure", "measure")
-            | ("rollup", "measure_rollup")
-            | ("metric_rollup", "managed")
-            | ("state", "state_transition")
-            | ("report", "summary")
-            | ("report", "retention")
-            | ("report", "trace_summary")
-            | ("sequence", "funnel")
-            | ("cohort", "membership")
-    );
-    if valid {
+    if definition_mode_spec(kind).is_some_and(|spec| spec.modes.contains(&mode)) {
         Ok(())
     } else {
         Err(DefinitionStoreError::InvalidMode)
     }
+}
+
+struct DefinitionModeSpec {
+    kind: &'static str,
+    default_mode: &'static str,
+    modes: &'static [&'static str],
+}
+
+const DEFINITION_MODE_SPECS: &[DefinitionModeSpec] = &[
+    DefinitionModeSpec {
+        kind: "field",
+        default_mode: "facet",
+        modes: &["facet", "lookup"],
+    },
+    DefinitionModeSpec {
+        kind: "measure",
+        default_mode: "measure",
+        modes: &["measure", "cube"],
+    },
+    DefinitionModeSpec {
+        kind: "rollup",
+        default_mode: "measure_rollup",
+        modes: &["measure_rollup"],
+    },
+    DefinitionModeSpec {
+        kind: "metric_rollup",
+        default_mode: "managed",
+        modes: &["managed"],
+    },
+    DefinitionModeSpec {
+        kind: "state",
+        default_mode: "state_transition",
+        modes: &["state_transition"],
+    },
+    DefinitionModeSpec {
+        kind: "search",
+        default_mode: "saved",
+        modes: &["saved"],
+    },
+    DefinitionModeSpec {
+        kind: "report",
+        default_mode: "summary",
+        modes: &["summary", "retention", "trace_summary"],
+    },
+    DefinitionModeSpec {
+        kind: "sequence",
+        default_mode: "funnel",
+        modes: &["funnel"],
+    },
+    DefinitionModeSpec {
+        kind: "cohort",
+        default_mode: "membership",
+        modes: &["membership"],
+    },
+    DefinitionModeSpec {
+        kind: "alert",
+        default_mode: "event_match",
+        modes: &["event_match"],
+    },
+];
+
+fn definition_mode_spec(kind: &str) -> Option<&'static DefinitionModeSpec> {
+    DEFINITION_MODE_SPECS.iter().find(|spec| spec.kind == kind)
 }
 
 fn config_string(config: &Value, key: &str) -> Result<String, DefinitionStoreError> {
@@ -1897,9 +2627,48 @@ mod tests {
 
     use super::{
         BackfillStats, ClickHouseResponse, dimension_sql_outputs, matcher_where_clause,
-        normalize_config, number_sql_expr, numeric_expression, sdk_metric_definition,
-        string_sql_expr, value_expression,
+        normalize_config, normalized_kind, normalized_mode, number_sql_expr, numeric_expression,
+        sdk_metric_definition, string_sql_expr, validate_mode, value_expression,
     };
+
+    #[test]
+    fn definition_mode_specs_cover_defaults_and_alternates() {
+        assert_eq!(normalized_kind(" report ").unwrap(), "report");
+        assert_eq!(normalized_mode("report", ""), "summary");
+        assert!(validate_mode("report", "retention").is_ok());
+        assert!(validate_mode("field", "lookup").is_ok());
+        assert_eq!(
+            validate_mode("field", "retention").unwrap_err().to_string(),
+            "invalid definition mode"
+        );
+        assert!(normalized_kind("unknown").is_err());
+    }
+
+    #[test]
+    fn create_definition_request_accepts_omitted_or_empty_mode() {
+        let omitted: super::CreateDefinitionRequest = serde_json::from_value(json!({
+            "name": "Account plan",
+            "kind": "field"
+        }))
+        .expect("omitted mode should use the kind default");
+        assert_eq!(omitted.kind.as_str(), "field");
+        assert!(omitted.mode.is_none());
+
+        let empty: super::CreateDefinitionRequest = serde_json::from_value(json!({
+            "name": "Account plan",
+            "kind": "field",
+            "mode": ""
+        }))
+        .expect("empty mode should use the kind default");
+        assert!(empty.mode.is_none());
+
+        let invalid = serde_json::from_value::<super::CreateDefinitionRequest>(json!({
+            "name": "Account plan",
+            "kind": "field",
+            "mode": "not_a_mode"
+        }));
+        assert!(invalid.is_err());
+    }
 
     #[test]
     fn backfill_stats_treats_null_distinct_values_as_zero() {
@@ -1965,6 +2734,65 @@ mod tests {
         assert_eq!(config["outputs"][0]["metric_name"]["path"], "metric_name");
         assert_eq!(config["outputs"][0]["metric_kind"]["path"], "metric_type");
         assert_eq!(config["outputs"][0]["value"]["path"], "metric_value");
+    }
+
+    #[test]
+    fn alert_config_validates_event_match_definition() {
+        let config = normalize_config(
+            "alert",
+            "event_match",
+            json!({
+                "severity": "critical",
+                "dedupe_key": "account_id",
+                "notifications": {
+                    "webhooks": [
+                        {
+                            "id": "pager",
+                            "url": "https://alerts.example.com/nanotrace",
+                            "headers": { "x-alert-source": "nanotrace" },
+                            "max_attempts": 3
+                        }
+                    ]
+                },
+                "match": {
+                    "all": [
+                        { "path": "event_type", "op": "eq", "value": "Payment Failed" },
+                        { "path": "duration_ms", "op": "gte", "value": 1000 },
+                        { "path": "llm.model", "op": "regex", "pattern": "^gpt-" }
+                    ],
+                    "any": [
+                        { "path": "severity", "op": "eq", "value": "critical" },
+                        { "path": "is_error", "op": "is_error" }
+                    ]
+                }
+            }),
+        )
+        .expect("alert config");
+
+        assert_eq!(config["severity"], "critical");
+        assert_eq!(config["dedupe_seconds"], 60);
+    }
+
+    #[test]
+    fn saved_search_config_validates_bounded_search_definition() {
+        let config = normalize_config(
+            "search",
+            "saved",
+            json!({
+                "query": " checkout failed ",
+                "search_mode": "fuzzy",
+                "path": "message",
+                "require_all_terms": true,
+                "include_snippets": true
+            }),
+        )
+        .expect("saved search config");
+
+        assert_eq!(config["query"], "checkout failed");
+        assert_eq!(config["search_mode"], "fuzzy");
+        assert_eq!(config["path"], "message");
+        assert_eq!(config["require_all_terms"], true);
+        assert_eq!(config["include_snippets"], true);
     }
 
     #[test]

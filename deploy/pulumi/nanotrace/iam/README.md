@@ -1,6 +1,6 @@
 # Nanotrace IAM Policies
 
-These policies support the Pulumi EC2/EBS/S3/SQS/ECR/RDS/KMS deployment in
+These policies support the Pulumi EC2/S3/ECR/RDS/KMS deployment in
 `deploy/pulumi/nanotrace`. ClickHouse Cloud is expected to exist before deploy;
 Pulumi only applies the Nanotrace schema to it.
 
@@ -10,10 +10,14 @@ Pulumi only applies the Nanotrace schema to it.
   `deploy-iam.json`: attach all four to the user or CI role that runs
   `pulumi up` and pushes the server image to ECR. These are split because AWS
   managed policies have a 6144 non-whitespace character limit.
-- `observe.json`: read-only inspection plus S3/SQS/SSM access to run
+- `observe.json`: read-only inspection plus S3/SSM access to run
   deploy-aware E2E and live diagnostics on Nanotrace instances.
 - `cleanup.json`: for `pulumi destroy` and cleanup of partially-created
   Nanotrace resources.
+
+The deployed app no longer uses object notifications as an ingest path. S3
+access that remains is for the Iceberg warehouse, static UI hosting, debug
+artifacts, and deployment operations.
 
 The resource scope intentionally uses `nanotrace-*` names because this stack
 creates unique physical names with Pulumi suffixes, for example
@@ -37,7 +41,6 @@ refresh:
 - EC2, Auto Scaling, and ELB `Describe*`
 - ACM certificate read/list APIs
 - Route 53 hosted zone and record discovery APIs
-- SQS `ListQueues`
 - ECR `GetAuthorizationToken`
 - KMS read/list APIs
 - account/caller identity reads

@@ -7,14 +7,19 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 arrow-array = "57.3"
+arrow-json = "57.3"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["clock"] }
+datafusion = { version = "52.0.0", default-features = false, features = ["parquet", "sql"] }
+nanotrace-ingest = { path = "../../crates/ingest" }
 nanotrace-lakehouse = { path = "../../crates/lakehouse" }
 parquet = { version = "57.3", default-features = false, features = ["arrow", "zstd"] }
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

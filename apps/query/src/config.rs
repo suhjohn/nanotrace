@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
-    pub s3_bucket: Option<String>,
     pub clickhouse_url: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
@@ -68,10 +67,16 @@ impl Config {
         ensure_nonzero("NANOTRACE_SESSION_TTL_SECS", session_ttl_secs)?;
         let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 60 * 60)?;
         ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
+        let api_key_cache_refresh_secs: u64 = parse_env("NANOTRACE_API_KEY_CACHE_REFRESH_SECS", 5)?;
+        ensure_nonzero(
+            "NANOTRACE_API_KEY_CACHE_REFRESH_SECS",
+            api_key_cache_refresh_secs,
+        )?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
             bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),
             public_base_url,
+            api_key_cache_refresh_interval: Duration::from_secs(api_key_cache_refresh_secs),
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
                 .unwrap_or_else(|_| "nanotrace_session".to_string())
                 .trim()
@@ -86,8 +91,6 @@ impl Config {
 
         Ok(Self {
             port: parse_env("PORT", 18_473)?,
-            s3_bucket: optional_string("NANOTRACE_S3_BUCKET")
-                .or_else(|| optional_string("S3_BUCKET")),
             clickhouse_url: optional_string("CLICKHOUSE_URL"),
             clickhouse_user: optional_string("CLICKHOUSE_USER")
                 .or_else(|| optional_string("CLICKHOUSE_USERNAME")),

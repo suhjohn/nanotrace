@@ -11,10 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiKeysRouteImport } from './routes/api-keys'
-import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as SchemaRouteImport } from './routes/schema'
-import { Route as ReportsRouteImport } from './routes/reports'
-import { Route as ProcessorsRouteImport } from './routes/processors'
 import { Route as FieldValueRouteImport } from './routes/$field/$value'
 
 const IndexRoute = IndexRouteImport.update({
@@ -27,24 +24,9 @@ const ApiKeysRoute = ApiKeysRouteImport.update({
   path: '/settings/api-keys',
   getParentRoute: () => rootRouteImport,
 } as any)
-const DashboardRoute = DashboardRouteImport.update({
-  id: '/dashboard',
-  path: '/dashboard',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const SchemaRoute = SchemaRouteImport.update({
   id: '/schema',
   path: '/schema',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ReportsRoute = ReportsRouteImport.update({
-  id: '/reports',
-  path: '/reports',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ProcessorsRoute = ProcessorsRouteImport.update({
-  id: '/processors',
-  path: '/processors',
   getParentRoute: () => rootRouteImport,
 } as any)
 const FieldValueRoute = FieldValueRouteImport.update({
@@ -56,46 +38,34 @@ const FieldValueRoute = FieldValueRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/dashboard': typeof DashboardRoute
   '/schema': typeof SchemaRoute
-  '/reports': typeof ReportsRoute
-  '/processors': typeof ProcessorsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/dashboard': typeof DashboardRoute
   '/schema': typeof SchemaRoute
-  '/reports': typeof ReportsRoute
-  '/processors': typeof ProcessorsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
-  '/dashboard': typeof DashboardRoute
   '/schema': typeof SchemaRoute
-  '/reports': typeof ReportsRoute
-  '/processors': typeof ProcessorsRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/settings/api-keys' | '/dashboard' | '/schema' | '/reports' | '/processors' | '/$field/$value'
+  fullPaths: '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/settings/api-keys' | '/dashboard' | '/schema' | '/reports' | '/processors' | '/$field/$value'
-  id: '__root__' | '/' | '/settings/api-keys' | '/dashboard' | '/schema' | '/reports' | '/processors' | '/$field/$value'
+  to: '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
+  id: '__root__' | '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiKeysRoute: typeof ApiKeysRoute
-  DashboardRoute: typeof DashboardRoute
   SchemaRoute: typeof SchemaRoute
-  ReportsRoute: typeof ReportsRoute
-  ProcessorsRoute: typeof ProcessorsRoute
   FieldValueRoute: typeof FieldValueRoute
 }
 
@@ -115,32 +85,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiKeysRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/dashboard': {
-      id: '/dashboard'
-      path: '/dashboard'
-      fullPath: '/dashboard'
-      preLoaderRoute: typeof DashboardRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/schema': {
       id: '/schema'
       path: '/schema'
       fullPath: '/schema'
       preLoaderRoute: typeof SchemaRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/reports': {
-      id: '/reports'
-      path: '/reports'
-      fullPath: '/reports'
-      preLoaderRoute: typeof ReportsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/processors': {
-      id: '/processors'
-      path: '/processors'
-      fullPath: '/processors'
-      preLoaderRoute: typeof ProcessorsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/$field/$value': {
@@ -156,10 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiKeysRoute: ApiKeysRoute,
-  DashboardRoute: DashboardRoute,
   SchemaRoute: SchemaRoute,
-  ReportsRoute: ReportsRoute,
-  ProcessorsRoute: ProcessorsRoute,
   FieldValueRoute: FieldValueRoute,
 }
 export const routeTree = rootRouteImport

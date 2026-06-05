@@ -13,30 +13,23 @@ Build visualization modules that feel like the body of a dashboard card, not a f
 
 Use the Nanotrace API surface:
 
-- Dashboard iframe runtime: call `nanotrace.query({ query, parameters })` from visualization modules. The host forwards this to `POST /v1/query`.
-- Read API: `POST /v1/query` for SQL over Nanotrace read models.
+- Dashboard iframe runtime: call `nanotrace.query(payload)` from visualization modules with the same structured payload accepted by `POST /v1/query`.
+- Product read API: `POST /v1/query` with a structured `type` field for events, search, measures, funnels, cohorts, reports, state, and alerts.
 - Event hydration API: `GET /v1/events/{event_id}` when an external workflow needs one raw event payload.
-- Definition discovery API: `GET /v1/definitions` when an external workflow needs active fields, measures, rollups, or state definitions.
-- Report discovery API: `GET /v1/reports` when an external workflow needs saved report specs.
-- Dashboard visualization API:
-  - `GET /dashboards/{dashboard_id}/visualizations`
-  - `POST /dashboards/{dashboard_id}/visualizations`
-  - `PUT /dashboards/{dashboard_id}/visualizations/{id}`
-  - `DELETE /dashboards/{dashboard_id}/visualizations/{id}`
+- Definition discovery API: `GET /v1/definitions` when an external workflow needs active fields, measures, rollups, states, reports, sequences, or cohorts.
+- Dashboard visualization persistence is product-owned. Use the current app surface or local UI state for saved modules; do not assume a public dashboard-visualization HTTP route exists.
 
 Authentication:
 
 - Inside dashboard iframe modules, do not read environment variables. Use the injected `nanotrace` runtime object.
 - Outside the iframe, use `NANOTRACE_API_KEY` as `Authorization: Bearer $NANOTRACE_API_KEY` when calling Nanotrace HTTP APIs from scripts or terminal commands.
 
-The `observatory.*` names used below are Nanotrace read models addressed through `POST /v1/query`.
+The `observatory.*` names used below are physical read-model references for planning and debugging. Dashboard iframe modules should read them through structured `POST /v1/query` helpers, not by sending SQL payloads.
 
 ## Scale Assumption
 
 Assume production read models are massive by default:
 
-- Baseline planning size: 1M requests/sec and at least 10 events/request, or roughly 10M events/sec.
-- That is roughly 864B events/day and 25.92T events/30 days.
 - Raw/per-event read models such as `events`, `field_index`, `field_values`, and `event_measures` can be extremely large even for a single tenant.
 - A dashboard card is an interactive surface. It must not casually scan days or months of raw/high-cardinality event-level rows.
 - Prefer precomputed or reduced read models first: `report_results`, `sequence_report_results`, `cohort_memberships`, `measure_rollups`, `event_density_1s`, `field_density_1s`, and `field_topk_1m`.
@@ -50,11 +43,10 @@ Concrete rule: a dashboard visualization may use raw/per-event read models for r
    - Use the dashboard visualization API or local UI state to read the visualization `title`, `parameterBindings`, layout, and `sourceCode`.
 
 2. Discover what data is actually available in the target production tenant before choosing a query.
-   - Use `GET /v1/definitions` to see promoted fields, measures, rollups, and state definitions.
-   - Use `POST /v1/query` for small discovery reads against `definition_stats` when backfill/range evidence is needed.
-   - Use `GET /v1/reports` to see saved report specs.
-   - Use `POST /v1/query` against materialized report/cohort read models to see whether relevant results exist.
-   - Use `POST /v1/query` against recent `pipeline_metrics` if expected derived data is missing; the loader or report worker may be behind.
+   - Use `GET /v1/definitions` to see promoted fields, measures, rollups, states, reports, sequences, and cohorts.
+   - Use structured `POST /v1/query` reads to check whether relevant materialized results exist.
+   - Treat definitions with kind `report`, `sequence`, or `cohort` as saved report specs.
+   - Use internal ClickHouse access, not a public HTTP SQL API, if you are debugging low-level metadata such as `definition_stats` or `pipeline_metrics`.
    - Do not assume a read model contains useful rows just because it exists.
 
 3. Decide what the host owns versus what the iframe owns.
@@ -64,7 +56,7 @@ Concrete rule: a dashboard visualization may use raw/per-event read models for r
 
 4. Keep the module small and predictable.
    - Export one default React component.
-   - Use TanStack Query for async state and call `nanotrace.query({ query, parameters })` inside `queryFn`.
+   - Use TanStack Query for async state and call `nanotrace.query(payload)` with a structured query payload inside `queryFn`.
    - Use dashboard params only when the visualization lists the matching binding.
    - Handle loading, empty, and error states.
    - Keep styles local, but follow the existing dark, dense, operational UI.
@@ -108,28 +100,23 @@ rows: {
 
 - Import TanStack Query from `https://esm.sh/@tanstack/react-query@5.100.10?deps=react@19.2.1`.
 - Each standalone iframe module that uses `useQuery` must create a `QueryClient` and wrap its body in `QueryClientProvider`.
-- Always pass `parameters: params.sql.parameters` when using `params.sql.where`.
-- Reuse `params.sql.where` for global time/filter clauses.
-- If the module supports grouping, use `params.sql.groupByExpression` and `params.sql.groupByLabel`.
+- Prefer the injected typed helpers over handwritten payloads: `nanotrace.events`, `nanotrace.measure`, `nanotrace.report`, `nanotrace.funnel`, `nanotrace.cohort`, `nanotrace.state`, and `nanotrace.alerts`.
+- The typed helpers automatically apply bound dashboard params when relevant: `nanotrace.events` uses the card's time/filter/group bindings, and `nanotrace.measure` uses the card's time range plus bound group as a default `groupBy`.
+- Use `params.query.timeRange`, `params.query.eventFilter`, and `params.query.groupBy` for query keys and labels. `params.sql` is legacy compatibility data; do not build dashboard SQL from it.
 - Keep limits explicit for tabular widgets and event lists.
 - Prefer query output names that map directly to rendered fields.
-- Use `/v1/query` through `nanotrace.query({ query, parameters })` for dashboard reads. Do not call write/control-plane endpoints such as `/v1/definitions` or `/v1/reports` from iframe visualizations.
-- Treat `/v1/reports` as the saved report-spec API. Dashboard widgets should usually read materialized report output through `/v1/query`, not fetch report specs at render time.
-- Use `observatory.events` only when the visualization needs raw JSON payloads or a bespoke calculation over a tightly bounded time range.
-- Use `observatory.event_density_1s` for global event volume and error-count trends when no group/filter is selected.
-- Use `observatory.field_topk_1m` for top values on core fields such as service, event_type, http.method, http.route, status, model, provider, plan, country, user_group, user_id, and account_id.
-- Use `observatory.field_density_1s` for grouped histograms over those same core fields.
-- Use `observatory.field_values` for exact lookup identifiers such as trace_id, span_id, request_id, user_id, account_id, session_id, thread_id, and conversation_id.
-- Use `observatory.field_index` for definition-backed promoted field drilldowns. Filter by `field_name`, `value`, `mode`, and time whenever possible.
-- Use `observatory.event_measures` for short-window ad hoc numeric aggregations when no rollup exists.
-- Use `observatory.measure_rollups` for precomputed rollup charts. Finalize aggregate states with `sumMerge`, `minMerge`, `maxMerge`, `avgMerge`, and `quantilesTDigestMerge`.
-- Use `observatory.entity_state_updates` for longitudinal state-transition analytics such as plan changes, risk-tier changes, or state before/after a key event.
-- Use `observatory.report_results`, `observatory.sequence_report_results`, and `observatory.cohort_memberships` for saved reports that have been materialized by report workers.
-- Do not use `FINAL` in dashboard visualizations unless there is no grouped alternative; prefer explicit aggregation so the query remains fast under load.
+- Use structured `/v1/query` payloads through the typed helpers or `nanotrace.query(payload)` for dashboard reads. Do not call write/control-plane endpoints such as `/v1/definitions` from iframe visualizations.
+- Treat report, sequence, and cohort definitions as saved specs. Dashboard widgets should usually read materialized output through `/v1/query`, not fetch control-plane specs at render time.
+- Use `nanotrace.events` only when the visualization needs raw event rows or a tightly bounded exploratory summary.
+- Use `nanotrace.measure` for numeric rollup charts backed by explicit measure definitions.
+- Use `nanotrace.state` for latest/as-of entity state widgets.
+- Use `nanotrace.alerts` for hot alert match history and webhook notification/outbox status.
+- Use `nanotrace.report`, `nanotrace.funnel`, and `nanotrace.cohort` for saved reports that have been materialized by report workers.
+- Dashboard SQL payloads are rejected by the runtime. If a desired widget cannot be expressed as a structured query, state the missing definition/report/read model instead of embedding SQL.
 
 ## Production Discovery
 
-Before creating a dashboard for a real tenant, run small discovery queries through `/v1/query`. The goal is to learn what is promoted and populated, then select the cheapest correct model.
+Before creating a dashboard for a real tenant, use structured `/v1/query` reads to learn what materialized outputs are populated, then select the cheapest correct model.
 
 Active definitions:
 
@@ -300,7 +287,9 @@ If discovery shows no materialized report, no rollup, and no relevant definition
 - `cohort_memberships`: materialized reusable entity sets.
 - `pipeline_metrics`: operational freshness and pipeline-health metrics.
 
-## Concrete Query Patterns
+## Physical Read-Model Reference
+
+These SQL snippets explain what each serving model contains. Do not paste them into dashboard iframe modules; the dashboard runtime rejects SQL payloads. Use the typed helper that maps to the same model, or create the missing definition/report first.
 
 Global event count over time from `event_density_1s`:
 
@@ -366,7 +355,8 @@ INNER JOIN observatory.events e
   ON e.event_id = f.event_id
 WHERE f.field_name = 'request_id'
   AND f.value = {request_id:String}
-  AND ${params.sql.where}
+  AND timestamp >= {created_after:DateTime64(3, 'UTC')}
+  AND timestamp <= {created_before:DateTime64(3, 'UTC')}
 ORDER BY e.timestamp DESC
 LIMIT 200
 ```
@@ -380,7 +370,8 @@ SELECT
   quantileTDigest(0.95)(value) AS p95
 FROM observatory.event_measures
 WHERE measure_name = 'duration_ms'
-  AND ${params.sql.where}
+  AND timestamp >= {created_after:DateTime64(3, 'UTC')}
+  AND timestamp <= {created_before:DateTime64(3, 'UTC')}
 GROUP BY bucket
 ORDER BY bucket
 ```
@@ -397,7 +388,8 @@ SELECT
 FROM observatory.measure_rollups
 WHERE measure_name = 'duration_ms'
   AND dimension_name = 'service'
-  AND ${params.sql.where}
+  AND bucket_time >= {created_after:DateTime64(3, 'UTC')}
+  AND bucket_time <= {created_before:DateTime64(3, 'UTC')}
 GROUP BY bucket_time, dimension_value
 ORDER BY bucket_time, count DESC
 ```
@@ -413,7 +405,8 @@ SELECT
 FROM observatory.entity_state_updates
 WHERE state_name = 'account.plan'
   AND entity_type = 'account'
-  AND ${params.sql.where}
+  AND timestamp >= {created_after:DateTime64(3, 'UTC')}
+  AND timestamp <= {created_before:DateTime64(3, 'UTC')}
 GROUP BY week, value
 ORDER BY week, value
 ```
@@ -431,7 +424,8 @@ SELECT
   source_offset,
   source_length
 FROM observatory.events
-WHERE ${params.sql.where}
+WHERE timestamp >= {created_after:DateTime64(3, 'UTC')}
+  AND timestamp <= {created_before:DateTime64(3, 'UTC')}
 ORDER BY timestamp DESC
 LIMIT 200
 ```
@@ -450,17 +444,10 @@ Generic report result example:
 
 ```js
 const reportQuery = useQuery({
-  queryKey: ['report-results', 'rep_weekly_revenue', params.sql.where, params.sql.parameters],
-  queryFn: () => nanotrace.query({
-    parameters: params.sql.parameters,
-    query: `SELECT
-              bucket_time,
-              JSONExtractString(dimensions, 'account.plan') AS plan,
-              JSONExtractFloat(metrics, 'revenue') AS revenue
-            FROM observatory.report_results
-            WHERE report_id = 'rep_weekly_revenue'
-              AND ${params.sql.where}
-            ORDER BY bucket_time, plan`
+  queryKey: ['report-results', 'rep_weekly_revenue', params.query.timeRange],
+  queryFn: () => nanotrace.report({
+    reportId: 'rep_weekly_revenue',
+    limit: 500
   })
 });
 ```
@@ -469,19 +456,9 @@ Sequence/funnel report example:
 
 ```js
 const funnelQuery = useQuery({
-  queryKey: ['sequence-report', 'rep_activation_funnel', params.sql.where, params.sql.parameters],
-  queryFn: () => nanotrace.query({
-    parameters: params.sql.parameters,
-    query: `SELECT
-              bucket_time,
-              step_index,
-              step_name,
-              entity_count,
-              conversion_count
-            FROM observatory.sequence_report_results
-            WHERE report_id = 'rep_activation_funnel'
-              AND ${params.sql.where}
-            ORDER BY bucket_time, step_index`
+  queryKey: ['sequence-report', 'rep_activation_funnel', params.query.timeRange],
+  queryFn: () => nanotrace.funnel({
+    reportId: 'rep_activation_funnel'
   })
 });
 ```
@@ -490,15 +467,10 @@ Cohort-backed widget example:
 
 ```js
 const cohortQuery = useQuery({
-  queryKey: ['cohort-members', 'cohort_power_users', params.sql.where, params.sql.parameters],
-  queryFn: () => nanotrace.query({
-    parameters: params.sql.parameters,
-    query: `SELECT toStartOfDay(first_seen) AS day, count() AS members
-            FROM observatory.cohort_memberships
-            WHERE cohort_id = 'cohort_power_users'
-              AND ${params.sql.where}
-            GROUP BY day
-            ORDER BY day`
+  queryKey: ['cohort-members', 'cohort_power_users'],
+  queryFn: () => nanotrace.cohort({
+    cohortId: 'cohort_power_users',
+    limit: 1000
   })
 });
 ```
@@ -568,7 +540,7 @@ Chart with contextual subtitle:
 ```js
 React.createElement('div', { style: styles.header },
   React.createElement('div', { style: styles.subtitle },
-    params.sql.groupByLabel ? 'Grouped by ' + params.sql.groupByLabel : 'Total'
+    params.query.groupBy ? 'Grouped by ' + params.query.groupBy : 'Total'
   )
 )
 ```
@@ -594,17 +566,14 @@ function EventsOverTimeBody({ nanotrace, params }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
   const eventsQuery = useQuery({
-    queryKey: ['events-over-time', params.sql.where, params.sql.parameters],
-    queryFn: () => nanotrace.query({
-      parameters: params.sql.parameters,
-      query: `SELECT toStartOfMinute(timestamp) AS t, count() AS c
-              FROM observatory.events
-              WHERE ${params.sql.where}
-              GROUP BY t ORDER BY t`
+    queryKey: ['events-over-time', params.query.timeRange, params.query.eventFilter],
+    queryFn: () => nanotrace.events({
+      view: 'density',
+      buckets: 120
     })
   });
 
-  const rows = eventsQuery.data?.data || EMPTY_ROWS;
+  const rows = eventsQuery.data?.data || eventsQuery.data?.buckets || EMPTY_ROWS;
 
   useEffect(() => {
     if (!canvasRef.current || eventsQuery.isLoading || eventsQuery.error) return;
@@ -652,10 +621,10 @@ function ServiceFlowBody({ nanotrace, params }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const flowQuery = useQuery({
-    queryKey: ['service-flow', params.sql.where, params.sql.parameters],
-    queryFn: () => nanotrace.query({ parameters: params.sql.parameters, query: `...` })
+    queryKey: ['service-flow', params.query.timeRange, params.query.groupBy],
+    queryFn: () => nanotrace.report({ reportId: 'service_flow_summary', limit: 500 })
   });
-  const rows = flowQuery.data?.data || EMPTY_ROWS;
+  const rows = flowQuery.data?.rows || flowQuery.data?.data || EMPTY_ROWS;
 
   useEffect(() => {
     if (!containerRef.current) return;

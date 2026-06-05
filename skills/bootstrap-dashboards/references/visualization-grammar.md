@@ -166,14 +166,14 @@ Best read models:
 
 Counters and gauges should not be visualized the same way. Identify the metric kind before choosing the chart.
 
-## Pipeline / Processor Data
+## Pipeline / Materializer Data
 
-When ingestion, processor, backfill, or report-worker events exist:
+When ingestion, materializer, backfill, or report-worker events exist:
 
 - Rows scanned/written.
 - Backfill progress.
 - Processing lag.
-- Error count by processor.
+- Error count by materializer or report worker.
 - Materialization freshness.
 
 Best read models:

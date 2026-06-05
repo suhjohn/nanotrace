@@ -23,7 +23,7 @@ const sequenceId = `metric_counter_to_gauge_${runId.replace(/[^A-Za-z0-9_]/g, '_
 const cohortId = `metric_gauge_names_${runId.replace(/[^A-Za-z0-9_]/g, '_')}`
 const retentionId = `metric_gauge_retention_${runId.replace(/[^A-Za-z0-9_]/g, '_')}`
 
-await seedSdkDefinitions()
+await verifySdkDefinitions()
 await seedReportDefinition()
 await seedTraceReportDefinition()
 await seedSequenceDefinition()
@@ -34,19 +34,23 @@ await waitForMaterialization()
 
 console.log(`materializationValidation=ok runId=${runId} profile=${profile} totalEvents=${totalEvents}`)
 
-async function seedSdkDefinitions () {
-  const response = await fetch(`${ingestUrl}/v1/definitions/sdk-defaults`, {
-    method: 'POST',
+async function verifySdkDefinitions () {
+  const response = await fetch(`${ingestUrl}/v1/definitions`, {
+    method: 'GET',
     headers: {
-      authorization: `Bearer ${apiKey}`,
-      'content-type': 'application/json'
+      authorization: `Bearer ${apiKey}`
     }
   })
   const text = await response.text()
   if (!response.ok) {
-    throw new Error(`POST /v1/definitions/sdk-defaults failed: ${response.status} ${text}`)
+    throw new Error(`GET /v1/definitions failed while checking SDK defaults: ${response.status} ${text}`)
   }
-  console.log(`seedSdkDefinitions=ok ${compact(text)}`)
+  const body = parseJson(text, 'GET /v1/definitions')
+  const definition = (body.definitions ?? []).find(item => item.definition_id === 'sdk_metric_default_v1')
+  if (!definition) {
+    throw new Error('sdk_metric_default_v1 is missing; the server seeds SDK defaults at startup when ClickHouse is configured')
+  }
+  console.log(`verifySdkDefinitions=ok id=${definition.definition_id} version=${definition.version}`)
 }
 
 async function seedReportDefinition () {
@@ -444,6 +448,14 @@ function q (identifier) {
 
 function s (value) {
   return `'${String(value).replaceAll("'", "''")}'`
+}
+
+function parseJson (value, label) {
+  try {
+    return JSON.parse(value)
+  } catch (error) {
+    throw new Error(`${label} returned invalid JSON: ${error.message}; body=${compact(value)}`)
+  }
 }
 
 function compact (value) {

@@ -64,7 +64,7 @@ For a user-scoped numeric aggregation, create a measure definition:
 }
 ```
 
-This is enough for backend materialization when the measured field is numeric, `user_id` exists on relevant events, historical data is backfilled, and the loader/materializer is running with definitions enabled. Product/UI work may still be needed to query and present `measure_rollups`.
+This is enough for backend materialization when the measured field is numeric, `user_id` exists on relevant events, historical data is backfilled, and the materializer is running with definitions enabled. Product/UI work may still be needed to query and present `measure_rollups`.
 
 ## Guardrails To Prefer
 
@@ -80,7 +80,7 @@ When adding or reviewing high-cardinality aggregation:
 
 ## Review Checklist
 
-Before approving a schema, loader, SDK, or dashboard change:
+Before approving a schema, SDK, or dashboard change:
 
 - Does it make a high-cardinality field searchable, aggregatable, or both?
 - Is the field in an exact lookup table, an aggregate rollup, or a promoted definition?

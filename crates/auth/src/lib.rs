@@ -24,6 +24,7 @@ pub struct AuthConfig {
     pub postgres_url: Option<String>,
     pub bootstrap_api_key: Option<String>,
     pub public_base_url: Option<String>,
+    pub api_key_cache_refresh_interval: Duration,
     pub session_cookie_name: String,
     pub session_same_site: String,
     pub session_ttl: Duration,
@@ -95,6 +96,13 @@ pub struct AuthStore {
     api_key_cache: Arc<RwLock<ApiKeyCache>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApiKeyCacheStats {
+    pub loaded: bool,
+    pub entries: usize,
+    pub age: Option<Duration>,
+}
+
 #[derive(Debug, Default)]
 struct ApiKeyCache {
     loaded_at: Option<Instant>,
@@ -126,6 +134,8 @@ impl AuthStore {
         };
         store.ensure_schema().await?;
         store.ensure_bootstrap_api_key().await?;
+        store.refresh_api_key_cache().await?;
+        store.spawn_api_key_cache_refresher();
         Ok(Some(store))
     }
 
@@ -268,6 +278,21 @@ impl AuthStore {
         })
     }
 
+    pub fn api_key_cache_stats(&self) -> ApiKeyCacheStats {
+        let Ok(cache) = self.api_key_cache.read() else {
+            return ApiKeyCacheStats {
+                loaded: false,
+                entries: 0,
+                age: None,
+            };
+        };
+        ApiKeyCacheStats {
+            loaded: cache.loaded_at.is_some(),
+            entries: cache.keys.len(),
+            age: cache.loaded_at.map(|loaded_at| loaded_at.elapsed()),
+        }
+    }
+
     pub async fn create_api_key(
         &self,
         organization_id: &str,
@@ -304,7 +329,7 @@ impl AuthStore {
         .bind(expires_at)
         .fetch_one(&self.pool)
         .await?;
-        self.invalidate_api_key_cache();
+        self.refresh_api_key_cache().await?;
         Ok(CreatedApiKey {
             key,
             api_key: row.into_record(),
@@ -328,6 +353,15 @@ impl AuthStore {
         Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
     }
 
+    pub async fn list_organization_ids(&self) -> Result<Vec<String>, AuthError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT id FROM nanotrace_organizations ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     pub async fn revoke_api_key(
         &self,
         organization_id: &str,
@@ -344,8 +378,9 @@ impl AuthStore {
         .bind(organization_id)
         .fetch_optional(&self.pool)
         .await?;
-        self.invalidate_api_key_cache();
-        row.map(ApiKeyRow::into_record).ok_or(AuthError::NotFound)
+        let row = row.ok_or(AuthError::NotFound)?;
+        self.refresh_api_key_cache().await?;
+        Ok(row.into_record())
     }
 
     async fn ensure_schema(&self) -> Result<(), AuthError> {
@@ -451,15 +486,15 @@ impl AuthStore {
     }
 
     async fn cached_api_key(&self, key_hash: &str) -> Result<Option<CachedApiKey>, AuthError> {
-        if let Some(cached) = self.cached_api_key_if_fresh(key_hash)? {
+        if let Some(cached) = self.cached_api_key_if_loaded(key_hash)? {
             return Ok(cached);
         }
 
         self.refresh_api_key_cache().await?;
-        Ok(self.cached_api_key_if_fresh(key_hash)?.flatten())
+        Ok(self.cached_api_key_if_loaded(key_hash)?.flatten())
     }
 
-    fn cached_api_key_if_fresh(
+    fn cached_api_key_if_loaded(
         &self,
         key_hash: &str,
     ) -> Result<Option<Option<CachedApiKey>>, AuthError> {
@@ -467,12 +502,9 @@ impl AuthStore {
             .api_key_cache
             .read()
             .map_err(|_| AuthError::InvalidInput("API key cache lock poisoned".to_string()))?;
-        let Some(loaded_at) = cache.loaded_at else {
+        if cache.loaded_at.is_none() {
             return Ok(None);
         };
-        if loaded_at.elapsed() > Duration::from_secs(5) {
-            return Ok(None);
-        }
         Ok(Some(cache.keys.get(key_hash).cloned()))
     }
 
@@ -508,6 +540,19 @@ impl AuthStore {
         cache.loaded_at = Some(Instant::now());
         cache.keys = keys;
         Ok(())
+    }
+
+    fn spawn_api_key_cache_refresher(&self) {
+        let interval = self.cfg.api_key_cache_refresh_interval;
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(err) = store.refresh_api_key_cache().await {
+                    tracing::warn!(error = %err, "failed to refresh Nanotrace API key cache");
+                }
+            }
+        });
     }
 
     fn invalidate_api_key_cache(&self) {
@@ -918,12 +963,9 @@ fn default_scopes(role: AuthRole) -> Vec<String> {
         AuthRole::Admin => vec![
             "ingest:write".to_string(),
             "query:read".to_string(),
-            "dashboards:write".to_string(),
             "definitions:write".to_string(),
-            "reports:write".to_string(),
             "api_keys:write".to_string(),
             "facets:write".to_string(),
-            "processors:write".to_string(),
         ],
         AuthRole::Service => vec!["ingest:write".to_string(), "query:read".to_string()],
         AuthRole::Viewer => vec!["query:read".to_string()],

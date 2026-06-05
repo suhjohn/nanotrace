@@ -26,13 +26,9 @@ const prefix =
   cfg.get('objectPrefix') ??
   process.env.S3_PREFIX ??
   process.env.NANOTRACE_OBJECT_PREFIX ??
-  'events'
+  'ops'
 const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, '')
 const createLoginEmailResources = true
-const processorPrefix =
-  cfg.get('processorPrefix') ??
-  process.env.PROCESSOR_PREFIX ??
-  'processors'
 const region = awsCfg.get('region') ?? process.env.AWS_REGION ?? 'us-west-1'
 const expectedAwsAccountId =
   cfg.get('awsAccountId') ??
@@ -47,14 +43,6 @@ if (expectedAwsAccountId) {
   }
 }
 const port = cfg.getNumber('port') ?? 18473
-const modalTokenId =
-  cfg.getSecret('modalTokenId') ?? pulumi.secret(process.env.MODAL_TOKEN_ID ?? '')
-const modalTokenSecret =
-  cfg.getSecret('modalTokenSecret') ??
-  pulumi.secret(process.env.MODAL_TOKEN_SECRET ?? '')
-const modalServerApiKey =
-  cfg.getSecret('modalServerApiKey') ??
-  pulumi.secret(process.env.MODAL_SERVER_API_KEY ?? '')
 const clickhouseDatabase =
   process.env.CLICKHOUSE_DATABASE ??
   'observatory'
@@ -77,73 +65,106 @@ const queryMinSize = cfg.getNumber('queryMinSize') ?? 1
 const queryMaxSize = cfg.getNumber('queryMaxSize') ?? 4
 const queryDesiredCapacity =
   cfg.getNumber('queryDesiredCapacity') ?? queryMinSize
-const dataVolumeSizeGb = cfg.getNumber('dataVolumeSizeGb') ?? 64
-const dataVolumeType = cfg.get('dataVolumeType') ?? 'gp3'
-const dataVolumeIops = cfg.getNumber('dataVolumeIops') ?? 3000
-const dataVolumeThroughput = cfg.getNumber('dataVolumeThroughput') ?? 250
-const localDataDir = cfg.get('dataDir') ?? '/data/events'
-const partMaxBytes = cfg.getNumber('partMaxBytes') ?? 64 * 1024 * 1024
-const partMaxAgeSecs = cfg.getNumber('partMaxAgeSecs') ?? 5
-const loaderConcurrency = cfg.getNumber('loaderConcurrency') ?? 8
-const loaderDefinitionsRefreshSecs =
-  cfg.getNumber('loaderDefinitionsRefreshSecs') ?? 60
-const loaderDerivationMode =
-  cfg.get('loaderDerivationMode') ??
-  process.env.LOADER_DERIVATION_MODE ??
-  'raw'
-const clickhouseInsertConcurrency =
-  cfg.getNumber('clickhouseInsertConcurrency') ?? 4
-const loaderQueueResetToken = (
-  cfg.get('loaderQueueResetToken') ??
-  process.env.NANOTRACE_LOADER_QUEUE_RESET_TOKEN ??
-  ''
-)
-  .trim()
-  .replace(/[^a-zA-Z0-9-]/g, '-')
-const uploadPollIntervalMs =
-  cfg.getNumber('uploadPollIntervalMs') ??
-  numberEnv('UPLOAD_POLL_INTERVAL_MS', 500)
-const doneRetentionMins =
-  cfg.getNumber('doneRetentionMins') ??
-  nonNegativeNumberEnv('NANOTRACE_DONE_RETENTION_MINS', 60)
-const doneCleanupIntervalSecs =
-  cfg.getNumber('doneCleanupIntervalSecs') ??
-  numberEnv('NANOTRACE_DONE_CLEANUP_INTERVAL_SECS', 60)
 const maxRequestBytes = cfg.getNumber('maxRequestBytes') ?? 209_715_200
 const maxEventBytes =
   cfg.getNumber('maxEventBytes') ??
   numberEnv('MAX_EVENT_BYTES', maxRequestBytes)
-const writerLanes =
-  cfg.getNumber('writerLanes') ?? numberEnv('NANOTRACE_WRITER_LANES', 4)
-const writerQueueCapacity =
-  cfg.getNumber('writerQueueCapacity') ??
-  numberEnv('NANOTRACE_WRITER_QUEUE_CAPACITY', 8192)
-const writerFlushIntervalMs =
-  cfg.getNumber('writerFlushIntervalMs') ??
-  numberEnv('NANOTRACE_WRITER_FLUSH_INTERVAL_MS', 10)
-const writerFlushBytes =
-  cfg.getNumber('writerFlushBytes') ??
-  numberEnv('NANOTRACE_WRITER_FLUSH_BYTES', 1024 * 1024)
-const compactBatchReceipts =
-  cfg.getBoolean('compactBatchReceipts') ??
-  booleanEnv('NANOTRACE_COMPACT_BATCH_RECEIPTS', false)
+const kafkaBrokers = (
+  cfg.get('kafkaBrokers') ??
+  process.env.NANOTRACE_KAFKA_BROKERS ??
+  ''
+).trim()
+if (!kafkaBrokers) {
+  throw new Error('kafkaBrokers or NANOTRACE_KAFKA_BROKERS is required')
+}
+const kafkaIngestTopic =
+  cfg.get('kafkaIngestTopic') ??
+  process.env.NANOTRACE_KAFKA_INGEST_TOPIC ??
+  'events.ingest.v1'
+const kafkaNormalizedTopic =
+  cfg.get('kafkaNormalizedTopic') ??
+  process.env.NANOTRACE_KAFKA_NORMALIZED_TOPIC ??
+  'events.normalized.v1'
+const kafkaInvalidTopic =
+  cfg.get('kafkaInvalidTopic') ??
+  process.env.NANOTRACE_KAFKA_INVALID_TOPIC ??
+  'events.invalid.v1'
+const kafkaServerClientId =
+  cfg.get('kafkaServerClientId') ??
+  process.env.NANOTRACE_KAFKA_CLIENT_ID ??
+  `${name}-server`
+const kafkaSecurityProtocol =
+  cfg.get('kafkaSecurityProtocol') ??
+  process.env.NANOTRACE_KAFKA_SECURITY_PROTOCOL ??
+  ''
+const kafkaSaslMechanism =
+  cfg.get('kafkaSaslMechanism') ??
+  process.env.NANOTRACE_KAFKA_SASL_MECHANISM ??
+  ''
+const kafkaSaslUsername =
+  cfg.getSecret('kafkaSaslUsername') ??
+  (process.env.NANOTRACE_KAFKA_SASL_USERNAME
+    ? pulumi.secret(process.env.NANOTRACE_KAFKA_SASL_USERNAME)
+    : pulumi.secret(''))
+const kafkaSaslPassword =
+  cfg.getSecret('kafkaSaslPassword') ??
+  (process.env.NANOTRACE_KAFKA_SASL_PASSWORD
+    ? pulumi.secret(process.env.NANOTRACE_KAFKA_SASL_PASSWORD)
+    : pulumi.secret(''))
+const normalizerGroupId =
+  cfg.get('normalizerGroupId') ??
+  process.env.NANOTRACE_NORMALIZER_GROUP_ID ??
+  `${name}-normalizer`
+const normalizerClientId =
+  cfg.get('normalizerClientId') ??
+  process.env.NANOTRACE_NORMALIZER_CLIENT_ID ??
+  `${name}-normalizer`
 const lakehouseEnabled =
   cfg.getBoolean('lakehouseEnabled') ??
   booleanEnv('NANOTRACE_LAKEHOUSE_ENABLED', true)
 const lakehouseWarehouseDir =
   cfg.get('lakehouseWarehouseDir') ??
   process.env.NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR ??
-  '/data/lakehouse'
+  '/var/lib/nanotrace/lakehouse'
+const lakehouseNamespace =
+  cfg.get('lakehouseNamespace') ??
+  process.env.NANOTRACE_LAKEHOUSE_NAMESPACE ??
+  'nanotrace'
+const lakehouseTable =
+  cfg.get('lakehouseTable') ??
+  process.env.NANOTRACE_LAKEHOUSE_TABLE ??
+  'events'
 const icebergRestUri =
-  cfg.get('icebergRestUri') ?? process.env.NANOTRACE_ICEBERG_REST_URI ?? ''
-const icebergWarehouse =
+  cfg.get('icebergRestUri') ??
+  process.env.NANOTRACE_ICEBERG_REST_URI ??
+  ''
+if (lakehouseEnabled && !icebergRestUri) {
+  throw new Error('icebergRestUri or NANOTRACE_ICEBERG_REST_URI is required for deployed shared Iceberg object storage')
+}
+const configuredIcebergWarehouse =
   cfg.get('icebergWarehouse') ??
   process.env.NANOTRACE_ICEBERG_WAREHOUSE ??
   ''
+const icebergWarehousePrefix =
+  cfg.get('icebergWarehousePrefix') ??
+  process.env.NANOTRACE_ICEBERG_WAREHOUSE_PREFIX ??
+  'iceberg'
+const normalizedIcebergWarehousePrefix =
+  icebergWarehousePrefix.replace(/^\/+|\/+$/g, '') || 'iceberg'
+const configuredIcebergWarehouseS3 = configuredIcebergWarehouse
+  ? parseS3Uri(configuredIcebergWarehouse)
+  : undefined
+if (configuredIcebergWarehouse && !configuredIcebergWarehouseS3) {
+  throw new Error('nanotrace:icebergWarehouse / NANOTRACE_ICEBERG_WAREHOUSE must be an s3:// or s3a:// URI in this Pulumi stack')
+}
 const icebergCatalogName =
   cfg.get('icebergCatalogName') ??
   process.env.NANOTRACE_ICEBERG_CATALOG_NAME ??
   'nanotrace'
+const icebergRestPrefix =
+  cfg.get('icebergRestPrefix') ??
+  process.env.NANOTRACE_ICEBERG_REST_PREFIX ??
+  ''
 const icebergTargetFileSizeBytes =
   cfg.getNumber('icebergTargetFileSizeBytes') ??
   numberEnv('NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES', 512 * 1024 * 1024)
@@ -156,12 +177,6 @@ const icebergMaxSnapshotAgeMs =
 const icebergMetadataPreviousVersionsMax =
   cfg.getNumber('icebergMetadataPreviousVersionsMax') ??
   numberEnv('NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX', 100)
-const ingestLedgerEnabled =
-  cfg.getBoolean('ingestLedgerEnabled') ??
-  booleanEnv('NANOTRACE_INGEST_LEDGER_ENABLED', true)
-const ingestLedgerStaleSecs =
-  cfg.getNumber('ingestLedgerStaleSecs') ??
-  numberEnv('NANOTRACE_INGEST_LEDGER_STALE_SECS', 3600)
 const materializePollSecs =
   cfg.getNumber('materializePollSecs') ??
   numberEnv('NANOTRACE_MATERIALIZE_POLL_SECS', 5)
@@ -461,57 +476,18 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
   versioningConfiguration: { status: 'Enabled' }
 })
 
-const loaderQueueName = loaderQueueResetToken
-  ? `${name}-loader-events-${loaderQueueResetToken}`
-  : `${name}-loader-events`
-const loaderQueue = new aws.sqs.Queue(loaderQueueName, {
-  kmsMasterKeyId: dataKmsKeyArn,
-  messageRetentionSeconds: 345_600,
-  visibilityTimeoutSeconds: 300,
-  tags
-})
-
-const loaderQueuePolicy = new aws.sqs.QueuePolicy(
-  `${name}-loader-events-policy`,
-  {
-    queueUrl: loaderQueue.url,
-    policy: pulumi
-      .all([loaderQueue.arn, bucket.arn])
-      .apply(([queueArn, bucketArn]) =>
-        JSON.stringify({
-          Version: '2012-10-17',
-          Statement: [
-            {
-              Sid: 'AllowS3EventNotifications',
-              Effect: 'Allow',
-              Principal: { Service: 's3.amazonaws.com' },
-              Action: 'sqs:SendMessage',
-              Resource: queueArn,
-              Condition: { ArnEquals: { 'aws:SourceArn': bucketArn } }
-            }
-          ]
-        })
-      )
-  }
-)
-
-new aws.s3.BucketNotification(
-  `${name}-events-notifications`,
-  {
-    bucket: bucket.id,
-    queues: [
-      {
-        queueArn: loaderQueue.arn,
-        events: ['s3:ObjectCreated:*'],
-        filterPrefix: `${normalizedPrefix}/`,
-        filterSuffix: '.ndjson'
-      }
-    ]
-  },
-  {
-    dependsOn: [loaderQueuePolicy]
-  }
-)
+const icebergWarehouse = configuredIcebergWarehouse
+  ? pulumi.output(configuredIcebergWarehouse)
+  : pulumi.interpolate`s3://${bucket.bucket}/${normalizedIcebergWarehousePrefix}`
+const icebergWarehouseBucketArn = configuredIcebergWarehouseS3
+  ? pulumi.output(configuredIcebergWarehouseS3.bucketArn)
+  : bucket.arn
+const icebergWarehouseObjectArn = configuredIcebergWarehouseS3
+  ? pulumi.output(configuredIcebergWarehouseS3.objectArn)
+  : pulumi.interpolate`${bucket.arn}/${normalizedIcebergWarehousePrefix}/*`
+const icebergWarehouseListPrefix = configuredIcebergWarehouseS3
+  ? configuredIcebergWarehouseS3.listPrefix
+  : normalizedIcebergWarehousePrefix
 
 const repository = new aws.ecr.Repository(`${name}-server`, {
   forceDelete: cfg.getBoolean('forceDeleteRepository') ?? false,
@@ -608,10 +584,11 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
     .all([
       bucket.arn,
       repository.arn,
-      loaderQueue.arn,
-      dataKmsKeyArn ?? pulumi.output('')
+      dataKmsKeyArn ?? pulumi.output(''),
+      icebergWarehouseBucketArn,
+      icebergWarehouseObjectArn
     ])
-    .apply(([bucketArn, repositoryArn, queueArn, kmsKeyArn]) =>
+    .apply(([bucketArn, repositoryArn, kmsKeyArn, warehouseBucketArn, warehouseObjectArn]) =>
       JSON.stringify(
         {
           Version: '2012-10-17',
@@ -632,32 +609,35 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
                 ]
               : []),
             {
-              Sid: 'WriteEventObjects',
+              Sid: 'ListIcebergWarehousePrefix',
               Effect: 'Allow',
-              Action: ['s3:PutObject', 's3:AbortMultipartUpload'],
-              Resource: `${bucketArn}/${normalizedPrefix}/*`
+              Action: 's3:ListBucket',
+              Resource: warehouseBucketArn,
+              Condition: {
+                StringLike: {
+                  's3:prefix': [
+                    icebergWarehouseListPrefix,
+                    `${icebergWarehouseListPrefix}/*`
+                  ]
+                }
+              }
             },
             {
-              Sid: 'ReadEventObjects',
-              Effect: 'Allow',
-              Action: 's3:GetObject',
-              Resource: `${bucketArn}/${normalizedPrefix}/*`
-            },
-            {
-              Sid: 'ReadWriteProcessorObjects',
-              Effect: 'Allow',
-              Action: ['s3:GetObject', 's3:PutObject'],
-              Resource: `${bucketArn}/${processorPrefix}/*`
-            },
-            {
-              Sid: 'ReadObjectNotifications',
+              Sid: 'ReadWriteIcebergWarehouseObjects',
               Effect: 'Allow',
               Action: [
-                'sqs:ReceiveMessage',
-                'sqs:DeleteMessage',
-                'sqs:GetQueueAttributes'
+                's3:GetObject',
+                's3:PutObject',
+                's3:DeleteObject',
+                's3:AbortMultipartUpload'
               ],
-              Resource: queueArn
+              Resource: warehouseObjectArn
+            },
+            {
+              Sid: 'WriteBootstrapDebugObjects',
+              Effect: 'Allow',
+              Action: ['s3:PutObject', 's3:AbortMultipartUpload'],
+              Resource: `${bucketArn}/${normalizedPrefix}/_debug*/*`
             },
             {
               Sid: 'SendLoginEmail',
@@ -1475,11 +1455,10 @@ const userData = pulumi
     clickhouseUrl,
     clickhousePassword,
     databaseUrl,
-    loaderQueue.url,
-    modalTokenId,
-    modalTokenSecret,
-    modalServerApiKey,
-    publicBaseUrl
+    publicBaseUrl,
+    icebergWarehouse,
+    kafkaSaslUsername,
+    kafkaSaslPassword
   ])
   .apply(
     ([
@@ -1489,16 +1468,15 @@ const userData = pulumi
       resolvedClickhouseUrl,
       resolvedClickhousePassword,
       resolvedDatabaseUrl,
-      loaderQueueUrl,
-      resolvedModalTokenId,
-      resolvedModalTokenSecret,
-      resolvedModalServerApiKey,
-      resolvedPublicBaseUrl
+      resolvedPublicBaseUrl,
+      resolvedIcebergWarehouse,
+      resolvedKafkaSaslUsername,
+      resolvedKafkaSaslPassword
     ]) =>
       renderUserData({
-      bucketName,
-      adminEmails,
-      clickhouseDatabase,
+        bucketName,
+        adminEmails,
+        clickhouseDatabase,
         clickhousePassword: resolvedClickhousePassword,
         clickhouseTable,
         clickhouseUrl: resolvedClickhouseUrl,
@@ -1506,48 +1484,40 @@ const userData = pulumi
         clickhouseMaxBytesToRead,
         imageUri: resolvedImageUri,
         imageBuildId: resolvedImageBuildId,
-        loaderQueueUrl,
-        modalServerApiKey: resolvedModalServerApiKey,
-        modalTokenId: resolvedModalTokenId,
-        modalTokenSecret: resolvedModalTokenSecret,
-        localDataDir,
-        doneCleanupIntervalSecs,
-        doneRetentionMins,
+        kafkaBrokers,
+        kafkaIngestTopic,
+        kafkaInvalidTopic,
+        kafkaSaslMechanism,
+        kafkaSaslPassword: resolvedKafkaSaslPassword,
+        kafkaSaslUsername: resolvedKafkaSaslUsername,
+        kafkaSecurityProtocol,
+        icebergCatalogName,
+        icebergMaxSnapshotAgeMs,
+        icebergMetadataPreviousVersionsMax,
+        icebergMinSnapshotsToKeep,
+        icebergRestPrefix,
+        icebergRestUri,
+        icebergTargetFileSizeBytes,
+        icebergWarehouse: resolvedIcebergWarehouse,
+        kafkaNormalizedTopic,
+        kafkaServerClientId,
+        lakehouseEnabled,
+        lakehouseNamespace,
+        lakehouseTable,
+        lakehouseWarehouseDir,
+        normalizerGroupId,
+        normalizerClientId,
         maxEventBytes,
         maxRequestBytes,
-        partMaxAgeSecs,
-        partMaxBytes,
-        clickhouseInsertConcurrency,
-        loaderConcurrency,
-        loaderDerivationMode,
-        loaderDefinitionsRefreshSecs,
+        materializePollSecs,
         port,
         prefix,
         region,
-        uploadPollIntervalMs,
-        writerFlushBytes,
-        writerFlushIntervalMs,
-        writerLanes,
-        writerQueueCapacity,
-        compactBatchReceipts,
-        lakehouseEnabled,
-        lakehouseWarehouseDir,
-        icebergRestUri,
-        icebergWarehouse,
-        icebergCatalogName,
-        icebergTargetFileSizeBytes,
-        icebergMinSnapshotsToKeep,
-        icebergMaxSnapshotAgeMs,
-        icebergMetadataPreviousVersionsMax,
-        ingestLedgerEnabled,
-        ingestLedgerStaleSecs,
-        materializePollSecs,
         databaseUrl: resolvedDatabaseUrl,
         allowedEmails,
         appBaseUrl,
         corsAllowedOrigins,
         emailFrom,
-        processorPrefix,
         publicBaseUrl: resolvedPublicBaseUrl,
         sessionSecure,
         sessionSameSite,
@@ -1601,19 +1571,6 @@ const launchTemplate = new aws.ec2.LaunchTemplate(
         ebs: {
           volumeSize: cfg.getNumber('rootVolumeSizeGb') ?? 16,
           volumeType: 'gp3',
-          deleteOnTermination: 'true',
-          encrypted: 'true',
-          kmsKeyId: dataKmsKeyArn
-        }
-      },
-      {
-        deviceName: '/dev/xvdb',
-        ebs: {
-          volumeSize: dataVolumeSizeGb,
-          volumeType: dataVolumeType,
-          iops: dataVolumeType === 'gp3' ? dataVolumeIops : undefined,
-          throughput:
-            dataVolumeType === 'gp3' ? dataVolumeThroughput : undefined,
           deleteOnTermination: 'true',
           encrypted: 'true',
           kmsKeyId: dataKmsKeyArn
@@ -1712,7 +1669,6 @@ export const apiDomainNameOutput = apiDomainName
 export const appBaseUrlOutput = appBaseUrl
 export const apiBaseUrlOutput = apiBaseUrl
 export const dataKmsKeyArnOutput = dataKmsKeyArn ?? ''
-export const processorPrefixOutput = processorPrefix
 export const dnsProviderOutput = dnsProvider
 export const edgeTlsModeOutput = edgeTlsMode
 export const hostedZoneNameOutput = hostedZoneName
@@ -1730,8 +1686,14 @@ export const ingestAutoScalingGroupName = asg.name
 export const queryAutoScalingGroupName = queryAsg.name
 export const bucketName = bucket.bucket
 export const objectPrefix = prefix
-export const loaderSqsQueueUrl = loaderQueue.url
-export const loaderSqsQueueArn = loaderQueue.arn
+export const kafkaBrokersOutput = kafkaBrokers
+export const kafkaIngestTopicOutput = kafkaIngestTopic
+export const kafkaNormalizedTopicOutput = kafkaNormalizedTopic
+export const kafkaInvalidTopicOutput = kafkaInvalidTopic
+export const lakehouseEnabledOutput = lakehouseEnabled
+export const lakehouseWarehouseDirOutput = lakehouseWarehouseDir
+export const icebergRestUriOutput = icebergRestUri
+export const icebergWarehouseOutput = icebergWarehouse
 export const clickhouseUrlOutput = clickhouseUrl
 export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
@@ -1769,21 +1731,32 @@ interface UserDataArgs {
   clickhouseMaxBytesToRead: number
   imageUri: string
   imageBuildId: string
-  loaderQueueUrl: string
-  modalServerApiKey: string
-  modalTokenId: string
-  modalTokenSecret: string
-  localDataDir: string
-  doneCleanupIntervalSecs: number
-  doneRetentionMins: number
+  kafkaBrokers: string
+  kafkaIngestTopic: string
+  kafkaInvalidTopic: string
+  kafkaNormalizedTopic: string
+  kafkaSaslMechanism: string
+  kafkaSaslPassword: string
+  kafkaSaslUsername: string
+  kafkaServerClientId: string
+  kafkaSecurityProtocol: string
+  lakehouseEnabled: boolean
+  lakehouseWarehouseDir: string
+  lakehouseNamespace: string
+  lakehouseTable: string
+  icebergRestUri: string
+  icebergWarehouse: string
+  icebergCatalogName: string
+  icebergRestPrefix: string
+  icebergTargetFileSizeBytes: number
+  icebergMinSnapshotsToKeep: number
+  icebergMaxSnapshotAgeMs: number
+  icebergMetadataPreviousVersionsMax: number
+  normalizerGroupId: string
+  normalizerClientId: string
   maxEventBytes: number
   maxRequestBytes: number
-  partMaxAgeSecs: number
-  partMaxBytes: number
-  clickhouseInsertConcurrency: number
-  loaderConcurrency: number
-  loaderDerivationMode: string
-  loaderDefinitionsRefreshSecs: number
+  materializePollSecs: number
   port: number
   prefix: string
   region: string
@@ -1796,25 +1769,6 @@ interface UserDataArgs {
   sessionSecure: boolean
   sessionSameSite: string
   magicLinkTtlSecs: number
-  uploadPollIntervalMs: number
-  writerFlushBytes: number
-  writerFlushIntervalMs: number
-  writerLanes: number
-  writerQueueCapacity: number
-  compactBatchReceipts: boolean
-  processorPrefix: string
-  lakehouseEnabled: boolean
-  lakehouseWarehouseDir: string
-  icebergRestUri: string
-  icebergWarehouse: string
-  icebergCatalogName: string
-  icebergTargetFileSizeBytes: number
-  icebergMinSnapshotsToKeep: number
-  icebergMaxSnapshotAgeMs: number
-  icebergMetadataPreviousVersionsMax: number
-  ingestLedgerEnabled: boolean
-  ingestLedgerStaleSecs: number
-  materializePollSecs: number
 }
 
 interface QueryUserDataArgs {
@@ -1857,14 +1811,14 @@ upload_debug() {
   echo "=== bootstrap exit rc=$rc ==="
   (docker ps -a 2>&1 || true) > /tmp/docker-ps.txt
   (docker logs nanotrace-server 2>&1 || true) > /tmp/docker-logs.txt
-  (docker logs nanotrace-loader 2>&1 || true) > /tmp/docker-loader-logs.txt
+  (docker logs nanotrace-normalizer 2>&1 || true) > /tmp/docker-normalizer-logs.txt
   (docker logs nanotrace-materializer 2>&1 || true) > /tmp/docker-materializer-logs.txt
   (docker inspect nanotrace-server 2>&1 || true) > /tmp/docker-inspect.txt
-  (docker inspect nanotrace-loader 2>&1 || true) > /tmp/docker-loader-inspect.txt
+  (docker inspect nanotrace-normalizer 2>&1 || true) > /tmp/docker-normalizer-inspect.txt
   (docker inspect nanotrace-materializer 2>&1 || true) > /tmp/docker-materializer-inspect.txt
   (journalctl -u docker --no-pager 2>&1 || true) > /tmp/docker-journal.txt
   (cat /var/log/cloud-init-output.log 2>&1 || true) > /tmp/cloud-init-output.log
-  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-loader-logs.txt /tmp/docker-materializer-logs.txt /tmp/docker-inspect.txt /tmp/docker-loader-inspect.txt /tmp/docker-materializer-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
+  for f in "$LOG" /tmp/docker-ps.txt /tmp/docker-logs.txt /tmp/docker-normalizer-logs.txt /tmp/docker-materializer-logs.txt /tmp/docker-inspect.txt /tmp/docker-normalizer-inspect.txt /tmp/docker-materializer-inspect.txt /tmp/docker-journal.txt /tmp/cloud-init-output.log; do
     aws s3 cp "$f" "$S3_DEBUG_PREFIX/$(basename "$f")" --region ${shellQuote(
       args.region
     )} || true
@@ -1874,47 +1828,11 @@ trap upload_debug EXIT
 
 set -e
 dnf update -y
-dnf install -y docker awscli xfsprogs amazon-ssm-agent
+dnf install -y docker awscli amazon-ssm-agent
 systemctl enable --now docker
 systemctl enable --now amazon-ssm-agent || true
+mkdir -p /var/lib/nanotrace/lakehouse
 
-mkdir -p /data
-ROOT_SOURCE="$(findmnt -no SOURCE / || true)"
-ROOT_DEVICE="$(readlink -f "$ROOT_SOURCE" || true)"
-ROOT_PARENT=""
-if [ -n "$ROOT_DEVICE" ]; then
-  ROOT_PARENT="$(lsblk -no PKNAME "$ROOT_DEVICE" 2>/dev/null | head -n1 || true)"
-  if [ -z "$ROOT_PARENT" ]; then
-    ROOT_PARENT="$(basename "$ROOT_DEVICE")"
-  fi
-fi
-
-DATA_DEVICE=""
-while read -r NAME TYPE; do
-  if [ "$TYPE" != "disk" ] || [ "$NAME" = "$ROOT_PARENT" ]; then
-    continue
-  fi
-  if ! lsblk -nr "/dev/$NAME" -o MOUNTPOINT | grep -q '/'; then
-    DATA_DEVICE="/dev/$NAME"
-    break
-  fi
-done < <(lsblk -ndo NAME,TYPE)
-
-if [ -n "$DATA_DEVICE" ]; then
-  if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
-    mkfs.xfs -f "$DATA_DEVICE"
-  fi
-  if ! grep -q " /data " /proc/mounts; then
-    mount "$DATA_DEVICE" /data
-  fi
-  UUID="$(blkid -s UUID -o value "$DATA_DEVICE")"
-  if [ -n "$UUID" ] && ! grep -q "$UUID" /etc/fstab; then
-    echo "UUID=$UUID /data xfs defaults,nofail 0 2" >> /etc/fstab
-  fi
-fi
-
-mkdir -p ${shellQuote(args.localDataDir)}
-mkdir -p ${shellQuote(args.lakehouseWarehouseDir)}
 aws ecr get-login-password --region ${shellQuote(
     args.region
   )} | docker login --username AWS --password-stdin "$(echo ${shellQuote(
@@ -1922,11 +1840,11 @@ aws ecr get-login-password --region ${shellQuote(
   )} | cut -d/ -f1)"
 docker pull ${shellQuote(args.imageUri)}
 docker rm -f nanotrace-server >/dev/null 2>&1 || true
-docker rm -f nanotrace-loader >/dev/null 2>&1 || true
+docker rm -f nanotrace-normalizer >/dev/null 2>&1 || true
 docker rm -f nanotrace-materializer >/dev/null 2>&1 || true
 docker run -d --name nanotrace-server --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
-  -v ${shellQuote(args.localDataDir)}:${shellQuote(args.localDataDir)} \\
+  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e PORT=${args.port} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
@@ -1940,9 +1858,13 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
   -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
-  -e NANOTRACE_DATA_DIR=${shellQuote(args.localDataDir)} \\
-  -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
-  -e S3_PREFIX=${shellQuote(args.prefix)} \\
+  -e NANOTRACE_KAFKA_BROKERS=${shellQuote(args.kafkaBrokers)} \\
+  -e NANOTRACE_KAFKA_INGEST_TOPIC=${shellQuote(args.kafkaIngestTopic)} \\
+  -e NANOTRACE_KAFKA_CLIENT_ID=${shellQuote(args.kafkaServerClientId)} \\
+  -e NANOTRACE_KAFKA_SECURITY_PROTOCOL=${shellQuote(args.kafkaSecurityProtocol)} \\
+  -e NANOTRACE_KAFKA_SASL_MECHANISM=${shellQuote(args.kafkaSaslMechanism)} \\
+  -e NANOTRACE_KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
+  -e NANOTRACE_KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
@@ -1950,58 +1872,43 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
   -e CLICKHOUSE_MAX_BYTES_TO_READ=${args.clickhouseMaxBytesToRead} \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
-  -e MAX_EVENT_BYTES=${args.maxEventBytes} \\
-  -e NANOTRACE_PART_MAX_BYTES=${args.partMaxBytes} \\
-  -e NANOTRACE_PART_MAX_AGE_SECS=${args.partMaxAgeSecs} \\
-  -e UPLOAD_POLL_INTERVAL_MS=${args.uploadPollIntervalMs} \\
-  -e NANOTRACE_DONE_RETENTION_MINS=${args.doneRetentionMins} \\
-  -e NANOTRACE_DONE_CLEANUP_INTERVAL_SECS=${args.doneCleanupIntervalSecs} \\
-  -e NANOTRACE_WRITER_LANES=${args.writerLanes} \\
-  -e NANOTRACE_WRITER_QUEUE_CAPACITY=${args.writerQueueCapacity} \\
-  -e NANOTRACE_WRITER_FLUSH_INTERVAL_MS=${args.writerFlushIntervalMs} \\
-  -e NANOTRACE_WRITER_FLUSH_BYTES=${args.writerFlushBytes} \\
-  -e NANOTRACE_COMPACT_BATCH_RECEIPTS=${
-    args.compactBatchReceipts ? 'true' : 'false'
-  } \\
-  -e MODAL_TOKEN_ID=${shellQuote(args.modalTokenId)} \\
-  -e MODAL_TOKEN_SECRET=${shellQuote(args.modalTokenSecret)} \\
-  -e MODAL_SERVER_API_KEY=${shellQuote(args.modalServerApiKey)} \\
-  -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
-  -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
-  -e PROCESSOR_BUILDER_CMD=${shellQuote('python3 /usr/local/bin/modal_processor_builder.py')} \\
   ${shellQuote(args.imageUri)}
-docker run -d --name nanotrace-loader --restart unless-stopped \\
-  -v ${shellQuote(args.lakehouseWarehouseDir)}:${shellQuote(args.lakehouseWarehouseDir)} \\
+docker run -d --name nanotrace-normalizer --restart unless-stopped \\
+  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
-  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
-  -e NANOTRACE_INGEST_LEDGER_ENABLED=${args.ingestLedgerEnabled ? 'true' : 'false'} \\
-  -e NANOTRACE_INGEST_LEDGER_STALE_SECS=${args.ingestLedgerStaleSecs} \\
-  -e LOADER_SQS_QUEUE_URL=${shellQuote(args.loaderQueueUrl)} \\
-  -e LOADER_CONCURRENCY=${args.loaderConcurrency} \\
-  -e LOADER_DERIVATION_MODE=${shellQuote(args.loaderDerivationMode)} \\
-  -e LOADER_DEFINITIONS_REFRESH_SECS=${args.loaderDefinitionsRefreshSecs} \\
-  -e PROCESSOR_S3_BUCKET=${shellQuote(args.bucketName)} \\
-  -e PROCESSOR_PREFIX=${shellQuote(args.processorPrefix)} \\
-  -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
-  -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
-  -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
-  -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
-  -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
-  -e CLICKHOUSE_INSERT_CONCURRENCY=${args.clickhouseInsertConcurrency} \\
+  -e NANOTRACE_KAFKA_BROKERS=${shellQuote(args.kafkaBrokers)} \\
+  -e NANOTRACE_KAFKA_INGEST_TOPIC=${shellQuote(args.kafkaIngestTopic)} \\
+  -e NANOTRACE_KAFKA_NORMALIZED_TOPIC=${shellQuote(args.kafkaNormalizedTopic)} \\
+  -e NANOTRACE_KAFKA_INVALID_TOPIC=${shellQuote(args.kafkaInvalidTopic)} \\
+  -e NANOTRACE_NORMALIZER_GROUP_ID=${shellQuote(args.normalizerGroupId)} \\
+  -e NANOTRACE_NORMALIZER_CLIENT_ID=${shellQuote(args.normalizerClientId)} \\
+  -e NANOTRACE_KAFKA_SECURITY_PROTOCOL=${shellQuote(args.kafkaSecurityProtocol)} \\
+  -e NANOTRACE_KAFKA_SASL_MECHANISM=${shellQuote(args.kafkaSaslMechanism)} \\
+  -e NANOTRACE_KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
+  -e NANOTRACE_KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
   -e NANOTRACE_LAKEHOUSE_ENABLED=${args.lakehouseEnabled ? 'true' : 'false'} \\
   -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
+  -e NANOTRACE_LAKEHOUSE_NAMESPACE=${shellQuote(args.lakehouseNamespace)} \\
+  -e NANOTRACE_LAKEHOUSE_TABLE=${shellQuote(args.lakehouseTable)} \\
   -e NANOTRACE_ICEBERG_REST_URI=${shellQuote(args.icebergRestUri)} \\
   -e NANOTRACE_ICEBERG_WAREHOUSE=${shellQuote(args.icebergWarehouse)} \\
   -e NANOTRACE_ICEBERG_CATALOG_NAME=${shellQuote(args.icebergCatalogName)} \\
+  -e NANOTRACE_ICEBERG_REST_PREFIX=${shellQuote(args.icebergRestPrefix)} \\
   -e NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES=${args.icebergTargetFileSizeBytes} \\
   -e NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP=${args.icebergMinSnapshotsToKeep} \\
   -e NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS=${args.icebergMaxSnapshotAgeMs} \\
   -e NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX=${args.icebergMetadataPreviousVersionsMax} \\
+  -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
+  -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
+  -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
+  -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
+  -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
+  -e MAX_EVENT_BYTES=${args.maxEventBytes} \\
   ${shellQuote(args.imageUri)} \\
-  /usr/local/bin/nanotrace-loader
+  /usr/local/bin/nanotrace-normalizer
 docker run -d --name nanotrace-materializer --restart unless-stopped \\
-  -v ${shellQuote(args.lakehouseWarehouseDir)}:${shellQuote(args.lakehouseWarehouseDir)} \\
+  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
@@ -2010,6 +1917,8 @@ docker run -d --name nanotrace-materializer --restart unless-stopped \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
   -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
+  -e NANOTRACE_LAKEHOUSE_NAMESPACE=${shellQuote(args.lakehouseNamespace)} \\
+  -e NANOTRACE_LAKEHOUSE_TABLE=${shellQuote(args.lakehouseTable)} \\
   -e NANOTRACE_MATERIALIZE_LOOP=true \\
   -e NANOTRACE_MATERIALIZE_POLL_SECS=${args.materializePollSecs} \\
   -e NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse \\
@@ -2073,7 +1982,6 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
   -e NANOTRACE_MAGIC_LINK_TTL_SECS=${args.magicLinkTtlSecs} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
-  -e NANOTRACE_S3_BUCKET=${shellQuote(args.bucketName)} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
@@ -2088,6 +1996,26 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
 
 function shellQuote (value: unknown): string {
   return `'${String(value).replaceAll("'", "'\\''")}'`
+}
+
+function parseS3Uri (uri: string): undefined | {
+  bucketArn: string
+  objectArn: string
+  listPrefix: string
+} {
+  const match = uri.match(/^s3a?:\/\/([^/]+)\/?(.*)$/)
+  if (!match) {
+    return undefined
+  }
+  const bucket = match[1]
+  const prefix = match[2].replace(/^\/+|\/+$/g, '')
+  return {
+    bucketArn: `arn:aws:s3:::${bucket}`,
+    objectArn: prefix
+      ? `arn:aws:s3:::${bucket}/${prefix}/*`
+      : `arn:aws:s3:::${bucket}/*`,
+    listPrefix: prefix || '*'
+  }
 }
 
 function requireEnv (key: string): string {
@@ -2196,16 +2124,4 @@ function booleanEnv (key: string, fallback: boolean): boolean {
     default:
       throw new Error(`${key} must be a boolean`)
   }
-}
-
-function nonNegativeNumberEnv (key: string, fallback: number): number {
-  const value = process.env[key]
-  if (!value) {
-    return fallback
-  }
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`${key} must be a non-negative number`)
-  }
-  return parsed
 }

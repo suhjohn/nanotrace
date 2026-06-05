@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { spawn } from "node:child_process";
@@ -14,399 +12,433 @@ loadEnvFile(process.env.NANOTRACE_ENV_FILE);
 const outputs = await pulumiOutputs();
 const apiKey = requiredEnv("NANOTRACE_E2E_API_KEY");
 const ingestUrl = trimTrailingSlash(
-    process.env.NANOTRACE_E2E_INGEST_URL || requiredOutput(outputs, "ingestUrl"),
+  process.env.NANOTRACE_E2E_INGEST_URL || requiredOutput(outputs, "ingestUrl"),
 );
-const bucketName = requiredOutput(outputs, "bucketName");
-const waitMs = numberEnv("NANOTRACE_E2E_WAIT_MS", 180_000);
+const clickhouseUrl = trimTrailingSlash(
+  process.env.CLICKHOUSE_URL || requiredOutput(outputs, "clickhouseUrlOutput"),
+);
+const clickhouseUser =
+  process.env.CLICKHOUSE_USER || requiredOutput(outputs, "clickhouseUserOutput");
+const clickhousePassword = requiredEnv("CLICKHOUSE_PASSWORD");
+const clickhouseDatabase =
+  process.env.CLICKHOUSE_DATABASE ||
+  outputs.clickhouseDatabaseOutput ||
+  "observatory";
+const clickhouseTable =
+  process.env.CLICKHOUSE_TABLE || outputs.clickhouseTableOutput || "events";
+const clickhouseKvIndexTable =
+  process.env.CLICKHOUSE_EVENT_KV_INDEX_TABLE || "event_kv_index";
+const clickhouseServingWatermarksTable =
+  process.env.CLICKHOUSE_SERVING_WATERMARKS_TABLE || "serving_watermarks";
+const waitMs = numberEnv("NANOTRACE_E2E_WAIT_MS", 300_000);
 const pollMs = numberEnv("NANOTRACE_E2E_POLL_MS", 5_000);
-const clickhouseWaitMs = numberEnv("NANOTRACE_E2E_CLICKHOUSE_WAIT_MS", 300_000);
-const eventId = process.env.NANOTRACE_E2E_EVENT_ID ?? `e2e-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-const processorName =
-    process.env.NANOTRACE_E2E_PROCESSOR_NAME ??
-    `e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const suffix = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+const runId = `pulumi_e2e_${suffix}`;
+const eventId = process.env.NANOTRACE_E2E_EVENT_ID ?? `evt_${runId}`;
 const timestamp = new Date().toISOString();
 
 console.log(`ingestUrl=${ingestUrl}`);
-console.log(`bucketName=${bucketName}`);
+console.log(`clickhouseDatabase=${clickhouseDatabase}`);
 console.log(`eventId=${eventId}`);
 
 await expectUnauthorized(ingestUrl);
 
-let processorRegistered = false;
-try {
-    console.log(`registering processor=${processorName}`);
-    await putProcessor(ingestUrl, apiKey, processorName);
-    processorRegistered = true;
-    await waitForProcessorReady(ingestUrl, apiKey, processorName, clickhouseWaitMs, pollMs);
-    await sleep(numberEnv("NANOTRACE_E2E_PROCESSOR_HOTLOAD_WAIT_MS", 45_000));
-
-    const receipt = await postEvent(ingestUrl, apiKey, {
-        event_id: eventId,
-        timestamp,
-        observed_timestamp: timestamp,
-        data: {
-            tenant_id: "e2e",
-            service: "nanotrace-e2e",
-            event_type: "pulumi_e2e",
-            ok: true,
-            event_id: eventId,
-            timestamp,
+await postEvents(ingestUrl, apiKey, [
+  {
+    event_id: eventId,
+    timestamp,
+    data: {
+      event_type: "track",
+      name: "Pulumi E2E",
+      service: "nanotrace-e2e",
+      plan: "enterprise",
+      latency_ms: 175,
+      ok: true,
+      request_id: `req_${suffix}`,
+      llm: {
+        model: "gpt-4.1",
+        usage: {
+          prompt_tokens: 1200,
         },
-    });
+      },
+      tags: ["checkout", "mobile"],
+      items: [
+        { sku: "sku_1", price: 10 },
+        { sku: "sku_2", price: 20 },
+      ],
+      _pulumi_e2e: {
+        run_id: runId,
+      },
+    },
+  },
+]);
 
-    assert(receipt.event_id === eventId, `unexpected receipt event_id: ${receipt.event_id}`);
-    assert(typeof receipt.source_file === "string" && receipt.source_file.length > 0, "missing source_file");
-    assert(Number.isInteger(receipt.source_offset) && receipt.source_offset >= 0, "missing source_offset");
-    assert(Number.isInteger(receipt.source_length) && receipt.source_length > 0, "missing source_length");
-
-    console.log(`source_file=${receipt.source_file}`);
-    console.log(`waiting up to ${waitMs}ms for S3 object upload`);
-
-    const objectPath = await waitForS3Object(bucketName, receipt.source_file, waitMs, pollMs);
-    const body = await readFile(objectPath, "utf8");
-    const lines = body.trimEnd().split("\n").filter(Boolean);
-    const row = lines.map((line) => JSON.parse(line)).find((candidate) => candidate.event_id === eventId);
-
-    assert(row, `event ${eventId} not found in uploaded object`);
-    assert(row.timestamp === timestamp, `timestamp mismatch: ${row.timestamp}`);
-    assert(row.observed_timestamp === timestamp, `observed_timestamp mismatch: ${row.observed_timestamp}`);
-    assert(row.source_file === receipt.source_file, `source_file mismatch: ${row.source_file}`);
-    assert(Number.isInteger(row.source_offset) && row.source_offset >= 0, `source_offset mismatch: ${row.source_offset}`);
-    assert(Number.isInteger(row.source_length) && row.source_length > 0, `source_length mismatch: ${row.source_length}`);
-    assert(row.tenant_id === undefined, `tenant_id should live in data, got ${row.tenant_id}`);
-    assert(row.service === undefined, `service should live in data, got ${row.service}`);
-    assert(row.event_type === undefined, `event_type should live in data, got ${row.event_type}`);
-    assert(row.data?.tenant_id === "org_default", `tenant_id mismatch: ${row.data?.tenant_id}`);
-    assert(row.data?.service === "nanotrace-e2e", `service mismatch: ${row.data?.service}`);
-    assert(row.data?.event_type === "pulumi_e2e", `event_type mismatch: ${row.data?.event_type}`);
-    assert(row.data?.event_id === eventId, "data payload mismatch");
-    assert(row.data?.modal_upload_field === "upload-ok", `upload field mismatch: ${row.data?.modal_upload_field}`);
-    assert(row.data?.modal_loader_field === undefined, "raw S3 event should not include loader-only field");
-
-    const actualLength = Buffer.byteLength(lines.find((line) => JSON.parse(line).event_id === eventId) + "\n");
-    assert(actualLength === row.source_length, `source_length ${row.source_length} != actual byte length ${actualLength}`);
-
-    if (hasClickHouseQueryEnv()) {
-        console.log(`waiting up to ${clickhouseWaitMs}ms for processed ClickHouse row`);
-        await waitForClickHouseRow(
-            requiredEnv("CLICKHOUSE_URL"),
-            requiredEnv("CLICKHOUSE_USER"),
-            requiredEnv("CLICKHOUSE_PASSWORD"),
-            process.env.CLICKHOUSE_DATABASE ?? outputs.clickhouseDatabase ?? outputs.clickhouseDatabaseOutput ?? "observatory",
-            process.env.CLICKHOUSE_TABLE ?? outputs.clickhouseTable ?? outputs.clickhouseTableOutput ?? "events",
-            eventId,
-            clickhouseWaitMs,
-            pollMs,
-        );
-    }
-} finally {
-    if (processorRegistered) {
-        console.log(`deleting processor=${processorName}`);
-        await deleteProcessor(ingestUrl, apiKey, processorName);
-    }
-}
+await waitForClickHouseEvent();
+await waitForEventKvRows();
+await waitForServingWatermark(clickhouseTable);
+await waitForServingWatermark(clickhouseKvIndexTable);
+await assertQueryBehavior();
 
 console.log("E2E passed");
 
 async function expectUnauthorized(baseUrl) {
-    const response = await fetch(`${baseUrl}/v1/events`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-            event_id: "unauthorized-probe",
-            timestamp: new Date().toISOString(),
-            data: {},
-        }),
-    });
+  const response = await fetch(`${baseUrl}/v1/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      event_id: "unauthorized-probe",
+      timestamp: new Date().toISOString(),
+      data: {},
+    }),
+  });
 
-    assert(response.status === 401, `expected unauthorized probe to return 401, got ${response.status}`);
+  assert(
+    response.status === 401,
+    `expected unauthorized probe to return 401, got ${response.status}`,
+  );
 }
 
-async function postEvent(baseUrl, token, event) {
-    const response = await fetch(`${baseUrl}/v1/events`, {
-        method: "POST",
-        headers: {
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-        },
-        body: JSON.stringify(event),
-    });
-    const text = await response.text();
-    assert(response.ok, `POST /v1/events failed: ${response.status} ${text}`);
-    return JSON.parse(text);
+async function postEvents(baseUrl, token, events) {
+  const response = await fetch(`${baseUrl}/v1/events`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(events),
+  });
+  const text = await response.text();
+  assert(response.status === 202, `POST /v1/events failed: ${response.status} ${text}`);
+  const parsed = JSON.parse(text);
+  assert(parsed.mode === "kafka", `expected Kafka ingest mode, got ${text}`);
+  assert(parsed.accepted === true, `expected accepted=true, got ${text}`);
+  return parsed;
 }
 
-async function putProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/v1/processors/${encodeURIComponent(name)}`, {
-        method: "PUT",
-        headers: {
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-        },
-        body: JSON.stringify({
-            upload: {
-                code: [
-                    "use anyhow::Result;",
-                    "use serde_json::Value;",
-                    "",
-                    "pub fn transform_event(mut event: Value, _config: &Value) -> Result<Value> {",
-                    "    if let Some(data) = event.get_mut(\"data\").and_then(Value::as_object_mut) {",
-                    "        data.insert(\"modal_upload_field\".to_string(), Value::String(\"upload-ok\".to_string()));",
-                    "    }",
-                    "    Ok(event)",
-                    "}",
-                ].join("\n"),
-                config: {},
-            },
-            loader: {
-                code: [
-                    "use anyhow::Result;",
-                    "use serde_json::Value;",
-                    "",
-                    "pub fn transform_event(mut event: Value, _config: &Value) -> Result<Value> {",
-                    "    if let Some(data) = event.get_mut(\"data\").and_then(Value::as_object_mut) {",
-                    "        data.insert(\"modal_loader_field\".to_string(), Value::String(\"loader-ok\".to_string()));",
-                    "    }",
-                    "    Ok(event)",
-                    "}",
-                ].join("\n"),
-                config: {},
-            },
-        }),
-    });
-    const text = await response.text();
-    assert(response.ok, `PUT /processors/${name} failed: ${response.status} ${text}`);
-    return JSON.parse(text);
+async function waitForClickHouseEvent() {
+  await waitUntil(async () => {
+    const rows = await clickhouseJson(`
+SELECT
+  event_id,
+  event_type,
+  signal,
+  toString(getSubcolumn(data, 'service')) AS service,
+  toString(getSubcolumn(data, 'plan')) AS plan
+FROM ${ident(clickhouseDatabase)}.${ident(clickhouseTable)}
+WHERE event_id = ${s(eventId)}
+  AND getSubcolumn(data, '_pulumi_e2e.run_id') = ${s(runId)}
+FORMAT JSON
+`);
+    return rows.length > 0 ? rows : null;
+  }, "ClickHouse events row");
+
+  const rows = await clickhouseJson(`
+SELECT
+  event_id,
+  event_type,
+  signal,
+  toString(getSubcolumn(data, 'service')) AS service,
+  toString(getSubcolumn(data, 'plan')) AS plan
+FROM ${ident(clickhouseDatabase)}.${ident(clickhouseTable)}
+WHERE event_id = ${s(eventId)}
+  AND getSubcolumn(data, '_pulumi_e2e.run_id') = ${s(runId)}
+FORMAT JSON
+`);
+  assert(rows.length === 1, `expected one ClickHouse event row, got ${rows.length}`);
+  assert(rows[0].event_type === "track", `expected event_type track, got ${rows[0].event_type}`);
+  assert(rows[0].signal === "analytics", `expected analytics signal, got ${rows[0].signal}`);
+  assert(rows[0].service === "nanotrace-e2e", `service mismatch: ${rows[0].service}`);
+  assert(rows[0].plan === "enterprise", `plan mismatch: ${rows[0].plan}`);
 }
 
-async function waitForProcessorReady(baseUrl, token, name, waitMs, pollMs) {
-    const deadline = Date.now() + waitMs;
-    let lastStatus = "";
-    while (Date.now() < deadline) {
-        const manifest = await getProcessor(baseUrl, token, name);
-        if (manifest?.status === "ready" && manifest.artifacts?.upload?.key && manifest.artifacts?.loader?.key) {
-            return manifest;
-        }
-        if (manifest?.status === "failed") {
-            throw new Error(`processor ${name} failed: ${manifest.error}`);
-        }
-        lastStatus = manifest ? manifest.status : "missing";
-        await sleep(pollMs);
-    }
-    throw new Error(`timed out waiting for processor ${name} to be ready; last status=${lastStatus}`);
+async function waitForEventKvRows() {
+  await waitUntil(async () => {
+    const rows = await clickhouseJson(`
+SELECT count() AS count
+FROM ${ident(clickhouseDatabase)}.${ident(clickhouseKvIndexTable)}
+WHERE event_id = ${s(eventId)}
+FORMAT JSON
+`);
+    return Number(rows[0]?.count || 0) >= 12 ? true : null;
+  }, "event_kv_index rows");
+
+  const rows = await clickhouseJson(`
+SELECT DISTINCT path, value_type, string_value, number_value, bool_value, scope_path, scope_index
+FROM ${ident(clickhouseDatabase)}.${ident(clickhouseKvIndexTable)}
+WHERE event_id = ${s(eventId)}
+ORDER BY path, scope_index, string_value
+FORMAT JSON
+`);
+  assert(rows.some((row) => row.path === "plan" && row.string_value === "enterprise"), "missing plan KV row");
+  assert(rows.some((row) => row.path === "latency_ms" && Number(row.number_value) === 175), "missing latency_ms KV row");
+  assert(rows.some((row) => row.path === "ok" && Number(row.bool_value) === 1), "missing ok KV row");
+  assert(rows.some((row) => row.path === "llm.model" && row.string_value === "gpt-4.1"), "missing llm.model KV row");
+  assert(rows.some((row) => row.path === "llm.usage.prompt_tokens" && Number(row.number_value) === 1200), "missing prompt_tokens KV row");
+  assert(rows.some((row) => row.path === "tags" && row.string_value === "mobile"), "missing tags KV row");
+  assert(
+    rows.some(
+      (row) =>
+        row.path === "items[].sku" &&
+        row.string_value === "sku_1" &&
+        row.scope_path === "items" &&
+        Number(row.scope_index) === 0,
+    ),
+    "missing scoped sku KV row",
+  );
+  assert(
+    rows.some(
+      (row) =>
+        row.path === "items[].price" &&
+        Number(row.number_value) === 20 &&
+        row.scope_path === "items" &&
+        Number(row.scope_index) === 1,
+    ),
+    "missing scoped price KV row",
+  );
 }
 
-async function getProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/v1/processors`, {
-        headers: { authorization: `Bearer ${token}` },
-    });
-    const text = await response.text();
-    assert(response.ok, `GET /processors failed: ${response.status} ${text}`);
-    const parsed = JSON.parse(text);
-    return parsed.processors?.find((processor) => processor.name === name);
+async function waitForServingWatermark(servingTable) {
+  await waitUntil(async () => {
+    const rows = await clickhouseJson(`
+SELECT count() AS count
+FROM ${ident(clickhouseDatabase)}.${ident(clickhouseServingWatermarksTable)}
+WHERE serving_table = ${s(servingTable)}
+  AND source_namespace = 'nanotrace'
+  AND source_table = 'events'
+FORMAT JSON
+`);
+    return Number(rows[0]?.count || 0) > 0 ? true : null;
+  }, `${servingTable} serving watermark`);
 }
 
-async function deleteProcessor(baseUrl, token, name) {
-    const response = await fetch(`${baseUrl}/v1/processors/${encodeURIComponent(name)}`, {
-        method: "DELETE",
-        headers: { authorization: `Bearer ${token}` },
-    });
-    const text = await response.text();
-    assert(response.ok, `DELETE /processors/${name} failed: ${response.status} ${text}`);
-    return JSON.parse(text);
+async function assertQueryBehavior() {
+  const kvRows = await clickhouseQuery({
+    query: `
+SELECT countDistinct(event_id) AS count
+FROM event_kv_index
+WHERE event_id = {event_id:String}
+  AND path = {path:String}
+  AND value_type = 'string'
+  AND string_value = {value:String}
+`,
+    parameters: {
+      event_id: eventId,
+      path: "llm.model",
+      value: "gpt-4.1",
+    },
+  });
+  assert(Number(kvRows[0]?.count ?? 0) === 1, "direct KV query did not find event");
+
+  const structured = await postEventsQuery(apiKey, {
+    view: "summary",
+    filter: {
+      facets: [
+        { path: "llm.model", operator: "eq", value: "gpt-4.1" },
+        { path: "llm.usage.prompt_tokens", operator: "gte", value: "1000" },
+        { path: "items[].sku", operator: "eq", value: "sku_1" },
+        { path: "items[].price", operator: "eq", value: "10" },
+      ],
+    },
+    allow_stale_serving: true,
+  });
+  assert(
+    Number((structured.data || [])[0]?.count ?? 0) === 1,
+    "structured arbitrary KV query did not find event",
+  );
+
+  const mismatched = await postEventsQuery(apiKey, {
+    view: "summary",
+    filter: {
+      facets: [
+        { path: "items[].sku", operator: "eq", value: "sku_1" },
+        { path: "items[].price", operator: "eq", value: "20" },
+      ],
+    },
+    allow_stale_serving: true,
+  });
+  assert(
+    Number((mismatched.data || [])[0]?.count ?? 0) === 0,
+    "same-element array correlation accepted a mismatched item",
+  );
 }
 
-async function waitForS3Object(bucket, key, waitMs, pollMs) {
-    const deadline = Date.now() + waitMs;
-    let lastError = "";
-
-    while (Date.now() < deadline) {
-        const head = await run("aws", ["s3api", "head-object", "--bucket", bucket, "--key", key], {
-            allowFailure: true,
-        });
-        if (head.code === 0) {
-            const dir = await mkdtemp(path.join(tmpdir(), "nanotrace-e2e-"));
-            const output = path.join(dir, "object.ndjson");
-            await run("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, output]);
-            return output;
-        }
-
-        lastError = head.stderr || head.stdout;
-        await sleep(pollMs);
-    }
-
-    throw new Error(`timed out waiting for s3://${bucket}/${key}\n${lastError}`);
+async function postEventsQuery(token, body) {
+  return fetchJson(`${ingestUrl}/v1/query`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ type: "events", ...body }),
+  });
 }
 
-async function waitForClickHouseRow(url, user, password, database, table, eventId, waitMs, pollMs) {
-    const deadline = Date.now() + waitMs;
-    let lastError = "";
-
-    while (Date.now() < deadline) {
-        try {
-            const count = await clickHouseCount(url, user, password, database, table, eventId);
-            if (count > 0) {
-                return;
-            }
-            lastError = `row count is ${count}`;
-        } catch (error) {
-            lastError = error.message;
-        }
-        await sleep(pollMs);
-    }
-
-    throw new Error(`timed out waiting for ClickHouse row ${eventId}\n${lastError}`);
+async function fetchJson(url, init = {}) {
+  const response = await fetch(url, init);
+  const text = await response.text();
+  assert(response.ok, `${url} failed with ${response.status}: ${text}`);
+  return text ? JSON.parse(text) : {};
 }
 
-async function clickHouseCount(url, user, password, database, table, eventId) {
-    const sql = [
-        "SELECT countIf(JSON_VALUE(toJSONString(data), '$.modal_upload_field') = 'upload-ok' AND JSON_VALUE(toJSONString(data), '$.modal_loader_field') = 'loader-ok') AS count",
-        `FROM ${quoteIdentifier(identifier(database, "CLICKHOUSE_DATABASE"))}.${quoteIdentifier(identifier(table, "CLICKHOUSE_TABLE"))}`,
-        `WHERE event_id = '${escapeSqlString(eventId)}'`,
-        "FORMAT JSON",
-    ].join("\n");
+async function waitUntil(fn, label) {
+  const deadline = Date.now() + waitMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await fn();
+    if (last) return last;
+    await sleep(pollMs);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
 
-    const response = await fetch(url, {
-        method: "POST",
-        headers: {
-            authorization: `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`,
-            "content-type": "text/plain; charset=utf-8",
-        },
-        body: sql,
-    });
-    const text = await response.text();
-    if (!response.ok) {
-        throw new Error(`ClickHouse query failed: ${response.status} ${text}`);
-    }
-    const parsed = JSON.parse(text);
-    return Number(parsed.data?.[0]?.count ?? 0);
+async function clickhouseJson(query) {
+  const url = new URL(clickhouseUrl);
+  url.searchParams.set("database", clickhouseDatabase);
+  url.searchParams.set("date_time_input_format", "best_effort");
+  url.searchParams.set("type_json_skip_duplicated_paths", "1");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${clickhouseUser}:${clickhousePassword}`).toString("base64")}`,
+      "content-type": "text/plain; charset=utf-8",
+    },
+    body: query,
+  });
+  const text = await response.text();
+  assert(response.ok, `ClickHouse query failed ${response.status}: ${text}`);
+  return JSON.parse(text).data || [];
+}
+
+async function clickhouseQuery({ query, parameters = {} }) {
+  return clickhouseJson(renderClickHouseQuery(query, parameters));
+}
+
+function renderClickHouseQuery(query, parameters) {
+  const rendered = query.replace(/\{([A-Za-z_][A-Za-z0-9_]*):[^}]+}/g, (match, name) => {
+    assert(Object.prototype.hasOwnProperty.call(parameters, name), `missing query parameter: ${name}`);
+    const value = parameters[name];
+    if (typeof value === "number" || typeof value === "bigint") return String(value);
+    if (typeof value === "boolean") return value ? "1" : "0";
+    return s(value);
+  });
+  return /\bFORMAT\s+JSON\b/i.test(rendered) ? rendered : `${rendered}\nFORMAT JSON\n`;
 }
 
 async function pulumiOutputs() {
-    const result = await run("pulumi", ["stack", "output", "--json", "--show-secrets"], { cwd: pulumiCwd });
-    return JSON.parse(result.stdout);
+  const result = await run("pulumi", ["stack", "output", "--json", "--show-secrets"], { cwd: pulumiCwd });
+  return JSON.parse(result.stdout);
 }
 
 function requiredOutput(outputs, key) {
-    const value = outputs[key];
-    if (value === undefined || value === null || value === "") {
-        throw new Error(`Pulumi output ${key} is required`);
-    }
-    return String(value);
+  const value = outputs[key];
+  if (value === undefined || value === null || value === "") {
+    throw new Error(`Pulumi output ${key} is required`);
+  }
+  return String(value);
 }
 
 function requiredEnv(key) {
-    const value = process.env[key];
-    if (!value) {
-        throw new Error(`${key} is required`);
-    }
-    return value;
+  const value = process.env[key];
+  if (!value) {
+    throw new Error(`${key} is required`);
+  }
+  return value;
 }
 
 function numberEnv(key, fallback) {
-    const value = process.env[key];
-    if (!value) {
-        return fallback;
-    }
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-        throw new Error(`${key} must be a positive number`);
-    }
-    return parsed;
+  const value = process.env[key];
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${key} must be a positive number`);
+  }
+  return parsed;
 }
 
 function trimTrailingSlash(value) {
-    return value.replace(/\/+$/, "");
+  return value.replace(/\/+$/, "");
+}
+
+function s(value) {
+  return `'${String(value).replaceAll("\\", "\\\\").replaceAll("'", "''")}'`;
+}
+
+function ident(value) {
+  assert(/^[A-Za-z_][A-Za-z0-9_]*$/.test(value), `invalid identifier: ${value}`);
+  return `\`${value.replaceAll("`", "``")}\``;
 }
 
 function assert(condition, message) {
-    if (!condition) {
-        throw new Error(message);
-    }
-}
-
-function hasClickHouseQueryEnv() {
-    return Boolean(process.env.CLICKHOUSE_URL && process.env.CLICKHOUSE_USER && process.env.CLICKHOUSE_PASSWORD);
-}
-
-function identifier(value, key) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
-        throw new Error(`${key} must be a simple ClickHouse identifier`);
-    }
-    return value;
-}
-
-function quoteIdentifier(value) {
-    return `\`${value.replaceAll("`", "``")}\``;
-}
-
-function escapeSqlString(value) {
-    return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'");
+  if (!condition) {
+    throw new Error(message);
+  }
 }
 
 function loadEnvFile(file) {
-    if (!file) {
-        return;
+  if (!file) {
+    return;
+  }
+  const envPath = path.resolve(root, file);
+  try {
+    const text = readFileSync(envPath, "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) {
+        continue;
+      }
+      const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!match) {
+        continue;
+      }
+      const [, key, rawValue] = match;
+      if (process.env[key] !== undefined) {
+        continue;
+      }
+      process.env[key] = parseEnvValue(rawValue);
     }
-    const envPath = path.resolve(root, file);
-    try {
-        const text = readFileSync(envPath, "utf8");
-        for (const line of text.split(/\r?\n/)) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith("#")) {
-                continue;
-            }
-            const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-            if (!match) {
-                continue;
-            }
-            const [, key, rawValue] = match;
-            if (process.env[key] !== undefined) {
-                continue;
-            }
-            process.env[key] = parseEnvValue(rawValue);
-        }
-    } catch (error) {
-        if (error.code !== "ENOENT") {
-            throw error;
-        }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
     }
+  }
 }
 
 function parseEnvValue(value) {
-    const trimmed = value.trim();
-    if (
-        (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
-        (trimmed.startsWith("'") && trimmed.endsWith("'"))
-    ) {
-        return trimmed.slice(1, -1);
-    }
-    return trimmed;
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 async function run(command, args, options = {}) {
-    return new Promise((resolve, reject) => {
-        const child = spawn(command, args, {
-            cwd: options.cwd ?? root,
-            env: process.env,
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        let stdout = "";
-        let stderr = "";
-        child.stdout.on("data", (chunk) => {
-            stdout += chunk;
-        });
-        child.stderr.on("data", (chunk) => {
-            stderr += chunk;
-        });
-        child.on("error", reject);
-        child.on("close", (code) => {
-            const result = { code, stdout, stderr };
-            if (code === 0 || options.allowFailure) {
-                resolve(result);
-            } else {
-                reject(new Error(`${command} ${args.join(" ")} failed with ${code}\n${stderr || stdout}`));
-            }
-        });
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd ?? root,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const result = { code, stdout, stderr };
+      if (code === 0) {
+        resolve(result);
+      } else {
+        reject(new Error(`${command} ${args.join(" ")} failed with ${code}\n${stderr || stdout}`));
+      }
+    });
+  });
 }

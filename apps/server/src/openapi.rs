@@ -13,27 +13,18 @@ use utoipa::{
         crate::http::openapi_json,
         crate::http::healthz,
         crate::http::readyz,
-        crate::http::metrics,
         crate::http::post_events,
-        crate::http::post_events_query,
         crate::http::get_event,
         crate::http::post_query,
+        crate::http::list_query_recommendations,
         crate::http::list_definitions,
+        crate::http::get_definition,
         crate::http::create_definition,
-        crate::http::seed_sdk_definitions,
         crate::http::delete_definition,
         crate::http::backfill_definition,
-        crate::http::list_reports,
-        crate::http::create_report,
-        crate::http::delete_report,
-        crate::http::list_processors,
-        crate::http::put_processor,
-        crate::http::delete_processor,
-        crate::http::list_dashboard_visualizations,
-        crate::http::create_dashboard_visualization,
-        crate::http::clear_dashboard_visualizations,
-        crate::http::update_dashboard_visualization,
-        crate::http::delete_dashboard_visualization,
+        crate::http::list_backfill_jobs,
+        crate::http::create_definition_backfill,
+        crate::http::get_backfill_job,
         crate::http::auth_login,
         crate::http::auth_logout,
         crate::http::auth_me,
@@ -43,10 +34,15 @@ use utoipa::{
     ),
     components(schemas(
         ErrorResponse,
-        crate::event_log::WriteReceipt,
-        crate::http::PostEventsResponse,
-        crate::http::CompactBatchReceipt,
-        crate::read::QueryRequest,
+        crate::http::KafkaAcceptedResponse,
+        crate::read::MeasureQueryRequest,
+        crate::read::FunnelQueryRequest,
+        crate::read::CohortQueryRequest,
+        crate::read::ReportQueryRequest,
+        crate::read::StateQueryRequest,
+        crate::read::AlertQueryRequest,
+        crate::read::AlertQueryMode,
+        crate::read::SearchQueryRequest,
         crate::read::EventsQueryRequest,
         crate::read::EventFilter,
         crate::read::EventFacetFilter,
@@ -57,22 +53,22 @@ use utoipa::{
         crate::read::EventsQuerySort,
         crate::read::EventSortDirection,
         crate::read::GroupSortKey,
+        crate::read::QueryRecommendationRecord,
+        crate::read::QueryRecommendationListResponse,
+        crate::definitions::DefinitionKind,
+        crate::definitions::DefinitionMode,
         crate::definitions::CreateDefinitionRequest,
         crate::definitions::BackfillRequest,
         crate::definitions::DefinitionRecord,
         crate::definitions::DefinitionListResponse,
+        crate::definitions::DefinitionGetResponse,
         crate::definitions::DefinitionMutationResponse,
         crate::definitions::BackfillResponse,
-        crate::reports::CreateReportRequest,
-        crate::reports::ReportRecord,
-        crate::reports::ReportListResponse,
-        crate::processors::PutProcessorRequest,
-        crate::processors::ProcessorStageRequest,
-        crate::processors::ProcessorListResponse,
-        crate::dashboards::CreateVisualizationRequest,
-        crate::dashboards::UpdateVisualizationRequest,
-        crate::dashboards::DashboardVisualization,
-        crate::dashboards::DashboardVisualizationsResponse,
+        crate::materializations::CreateBackfillRequest,
+        crate::materializations::MaterializationJobRecord,
+        crate::materializations::MaterializationChunkRecord,
+        crate::materializations::BackfillJobResponse,
+        crate::materializations::BackfillJobListResponse,
         crate::http::LoginRequest,
         crate::http::LoginResponse,
         crate::http::CreateApiKeyRequest,
@@ -81,13 +77,11 @@ use utoipa::{
     modifiers(&SecurityAddon),
     tags(
         (name = "OpenAPI", description = "OpenAPI document"),
-        (name = "Health", description = "Health and metrics endpoints"),
+        (name = "Health", description = "Health endpoints"),
         (name = "Events", description = "Event ingest and structured event queries"),
-        (name = "Query", description = "Read-only SQL query endpoint"),
+        (name = "Query", description = "Structured read query endpoint"),
         (name = "Definitions", description = "Definition management and backfills"),
-        (name = "Reports", description = "Report definition management"),
-        (name = "Processors", description = "Processor management"),
-        (name = "Dashboards", description = "Dashboard visualization persistence"),
+        (name = "Backfills", description = "Historical processing jobs for definition outputs"),
         (name = "Auth", description = "Browser session authentication"),
         (name = "API Keys", description = "API key management")
     )
@@ -131,14 +125,31 @@ mod tests {
         let paths = spec.paths.paths;
         assert!(paths.contains_key("/openapi.json"));
         assert!(!paths.contains_key("/v1/openapi.json"));
+        assert!(!paths.contains_key("/metrics"));
         assert!(paths.contains_key("/v1/events"));
-        assert!(paths.contains_key("/v1/events/query"));
+        assert!(paths.contains_key("/v1/query"));
+        assert!(paths.contains_key("/v1/query/recommendations"));
+        assert!(!paths.contains_key("/v1/admin/query"));
+        assert!(!paths.contains_key("/v1/sql/query"));
+        assert!(!paths.contains_key("/v1/events/query"));
+        assert!(!paths.contains_key("/v1/measures/query"));
+        assert!(!paths.contains_key("/v1/funnels/query"));
+        assert!(!paths.contains_key("/v1/cohorts/query"));
         assert!(paths.contains_key("/v1/definitions"));
-        assert!(
-            spec.components
-                .unwrap()
-                .security_schemes
-                .contains_key("bearerAuth")
-        );
+        assert!(paths.contains_key("/v1/definitions/{definition_id}"));
+        assert!(paths.contains_key("/v1/definitions/{definition_id}/backfills"));
+        assert!(!paths.contains_key("/v1/definitions/sdk-defaults"));
+        assert!(paths.contains_key("/v1/backfills"));
+        assert!(paths.contains_key("/v1/backfills/{job_id}"));
+        assert!(!paths.contains_key("/v1/materializations"));
+        assert!(!paths.contains_key("/v1/materializations/{job_id}"));
+        assert!(!paths.contains_key("/v1/reports"));
+        assert!(!paths.contains_key("/dashboards/{dashboard_id}/visualizations"));
+        assert!(paths.contains_key("/v1/api-keys"));
+        assert!(!paths.contains_key("/api-keys"));
+        let components = spec.components.unwrap();
+        assert!(components.security_schemes.contains_key("bearerAuth"));
+        assert!(components.schemas.contains_key("DefinitionKind"));
+        assert!(components.schemas.contains_key("DefinitionMode"));
     }
 }

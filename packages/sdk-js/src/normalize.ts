@@ -41,8 +41,7 @@ const fieldMap: Record<string, string> = {
   featureFlag: 'feature_flag',
   llmModel: 'llm.model',
   llmProvider: 'llm.provider',
-  toolName: 'tool_name',
-  processorName: 'processor_name'
+  toolName: 'tool_name'
 }
 
 export function normalizeCommon(...items: Array<CommonFields | undefined>): JsonObject {

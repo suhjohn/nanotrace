@@ -16,7 +16,7 @@ DROP VIEW IF EXISTS observatory.mv_field_density_1s;
 DROP VIEW IF EXISTS observatory.mv_field_topk_1m;
 DROP VIEW IF EXISTS observatory.mv_field_rollups;
 DROP VIEW IF EXISTS observatory.mv_field_values;
-DROP VIEW IF EXISTS observatory.mv_flamegraph_rollups_1m;
+DROP VIEW IF EXISTS observatory.mv_measure_cube_rollups;
 
 DROP TABLE IF EXISTS observatory.event_index;
 DROP TABLE IF EXISTS observatory.span_fragments;
@@ -61,7 +61,6 @@ CREATE TABLE
             llm.model Nullable (String),
             llm.provider LowCardinality (Nullable (String)),
             tool_name Nullable (String),
-            processor_name Nullable (String),
 
             trace_id Nullable (String),
             span_id Nullable (String),
@@ -92,7 +91,7 @@ CREATE TABLE
             max_dynamic_types = 8
         ),
 
-        tenant_id LowCardinality (String) MATERIALIZED ifNull (data.tenant_id, ''),
+        tenant_id LowCardinality (String) DEFAULT ifNull (data.tenant_id, ''),
         event_type String MATERIALIZED ifNull (data.event_type, '') CODEC (ZSTD (1)),
         trace_id String MATERIALIZED ifNull (data.trace_id, '') CODEC (ZSTD (1)),
         span_id String MATERIALIZED ifNull (data.span_id, '') CODEC (ZSTD (1)),
@@ -106,6 +105,7 @@ CREATE TABLE
         ),
 
         INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_source_file source_file TYPE bloom_filter (0.01) GRANULARITY 4,
         INDEX idx_trace_id trace_id TYPE bloom_filter (0.01) GRANULARITY 4,
         INDEX idx_span_id span_id TYPE bloom_filter (0.01) GRANULARITY 4
     ) ENGINE = MergeTree
@@ -113,6 +113,110 @@ PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
     (tenant_id, timestamp, event_type, event_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.invalid_events (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        observed_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
+        reason String CODEC (ZSTD (3)),
+        raw String CODEC (ZSTD (3))
+    ) ENGINE = MergeTree
+PARTITION BY
+    toYYYYMMDD (observed_at)
+ORDER BY
+    (tenant_id, observed_at);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.alert_events (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        alert_id String CODEC (ZSTD (1)),
+        alert_version UInt64 DEFAULT 0,
+        alert_name String CODEC (ZSTD (1)),
+        severity LowCardinality (String) DEFAULT 'warning',
+        triggered_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
+        event_timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type String DEFAULT '' CODEC (ZSTD (1)),
+        dedupe_key String CODEC (ZSTD (1)),
+        source_file String DEFAULT '' CODEC (ZSTD (1)),
+        matched JSON (max_dynamic_paths = 128, max_dynamic_types = 4),
+        data JSON (max_dynamic_paths = 1024, max_dynamic_types = 8),
+
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_alert_id alert_id TYPE bloom_filter (0.01) GRANULARITY 4
+    ) ENGINE = ReplacingMergeTree (triggered_at)
+PARTITION BY
+    toYYYYMMDD (triggered_at)
+ORDER BY
+    (tenant_id, alert_id, dedupe_key, event_timestamp, event_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.alert_notifications (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        notification_id String CODEC (ZSTD (1)),
+        alert_id String CODEC (ZSTD (1)),
+        alert_version UInt64 DEFAULT 0,
+        alert_name String CODEC (ZSTD (1)),
+        channel LowCardinality (String) DEFAULT 'webhook',
+        target String CODEC (ZSTD (3)),
+        headers JSON (max_dynamic_paths = 128, max_dynamic_types = 4),
+        status LowCardinality (String) DEFAULT 'pending',
+        attempt UInt32 DEFAULT 0,
+        max_attempts UInt32 DEFAULT 5,
+        next_attempt_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
+        delivered_at Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
+        updated_at DateTime64 (3, 'UTC') DEFAULT now64 (3) CODEC (Delta (8), ZSTD (1)),
+        last_error String DEFAULT '' CODEC (ZSTD (3)),
+        event_id String CODEC (ZSTD (1)),
+        triggered_at DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        payload JSON (max_dynamic_paths = 1024, max_dynamic_types = 8)
+    ) ENGINE = ReplacingMergeTree (updated_at)
+PARTITION BY
+    toYYYYMMDD (updated_at)
+ORDER BY
+    (tenant_id, notification_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.event_text_index (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type String CODEC (ZSTD (1)),
+        signal LowCardinality (String) CODEC (ZSTD (1)),
+        trace_id String CODEC (ZSTD (1)),
+        span_id String CODEC (ZSTD (1)),
+        text String CODEC (ZSTD (3)),
+        source_file String DEFAULT '' CODEC (ZSTD (1)),
+
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_text text TYPE ngrambf_v1 (3, 10240, 3, 0) GRANULARITY 4
+    ) ENGINE = ReplacingMergeTree
+PARTITION BY
+    toYYYYMMDD (timestamp)
+ORDER BY
+    (tenant_id, timestamp, event_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.event_search_terms (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type String CODEC (ZSTD (1)),
+        signal LowCardinality (String) CODEC (ZSTD (1)),
+        term String CODEC (ZSTD (1)),
+        term_hash UInt64 MATERIALIZED cityHash64 (term),
+        path String CODEC (ZSTD (1)),
+        path_hash UInt64 MATERIALIZED cityHash64 (path),
+        weight UInt16 DEFAULT 1 CODEC (T64, ZSTD (1)),
+        source_file String DEFAULT '' CODEC (ZSTD (1)),
+
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_term term TYPE bloom_filter (0.01) GRANULARITY 4
+    ) ENGINE = ReplacingMergeTree
+PARTITION BY
+    toYYYYMMDD (timestamp)
+ORDER BY
+    (tenant_id, term_hash, term, timestamp, event_id, path_hash, path);
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_density_1s (
@@ -292,33 +396,6 @@ ARRAY JOIN
     ) AS lookup;
 
 CREATE TABLE
-    IF NOT EXISTS observatory.flamegraph_rollups_1m (
-        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
-        flamegraph_id LowCardinality (String),
-        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
-        level UInt8,
-        path String CODEC (ZSTD (1)),
-        path_hash UInt64 MATERIALIZED cityHash64 (path),
-        parent_path String DEFAULT '' CODEC (ZSTD (1)),
-        parent_path_hash UInt64 MATERIALIZED cityHash64 (parent_path),
-        count UInt64 CODEC (Delta, ZSTD (1)),
-        error_count UInt64 CODEC (Delta, ZSTD (1)),
-        duration_count UInt64 CODEC (Delta, ZSTD (1)),
-        duration_sum Float64 CODEC (ZSTD (1))
-    ) ENGINE = SummingMergeTree
-PARTITION BY
-    toYYYYMM (bucket_time)
-ORDER BY
-    (tenant_id, flamegraph_id, bucket_time, level, parent_path_hash, path_hash, path);
-
-/*
- * flamegraph_rollups_1m is retained as an explicit report/materialization
- * target. It is intentionally not populated by an always-on events MV because
- * hierarchy rollups add high insert-path fanout and do not back the trace
- * waterfall UI directly.
- */
-
-CREATE TABLE
     IF NOT EXISTS observatory.definitions (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         definition_id String CODEC (ZSTD (1)),
@@ -364,6 +441,44 @@ PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
     (tenant_id, mode, field_name, value_hash, value, timestamp, event_id, definition_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.event_kv_index (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type String DEFAULT '' CODEC (ZSTD (1)),
+        signal LowCardinality (String) DEFAULT '',
+        path String CODEC (ZSTD (1)),
+        path_hash UInt64 MATERIALIZED cityHash64 (path),
+        value_type LowCardinality (String),
+        string_value String DEFAULT '' CODEC (ZSTD (1)),
+        string_hash UInt64 MATERIALIZED cityHash64 (string_value),
+        number_value Nullable (Float64) CODEC (ZSTD (1)),
+        bool_value Nullable (UInt8) CODEC (T64, ZSTD (1)),
+        scope_path String DEFAULT '' CODEC (ZSTD (1)),
+        scope_index Int32 DEFAULT -1 CODEC (Delta, ZSTD (1)),
+        source_file String DEFAULT '' CODEC (ZSTD (1)),
+
+        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_source_file source_file TYPE bloom_filter (0.01) GRANULARITY 4,
+        INDEX idx_number_value number_value TYPE minmax GRANULARITY 4
+    ) ENGINE = ReplacingMergeTree
+PARTITION BY
+    toYYYYMMDD (timestamp)
+ORDER BY
+    (
+        tenant_id,
+        path_hash,
+        path,
+        value_type,
+        string_hash,
+        string_value,
+        timestamp,
+        event_id,
+        scope_path,
+        scope_index
+    );
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_measures (
@@ -439,6 +554,112 @@ GROUP BY
     unit,
     dimension_name,
     dimension_value;
+
+CREATE TABLE
+    IF NOT EXISTS observatory.measure_cube_points (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        measure_name LowCardinality (String),
+        value Float64 CODEC (ZSTD (1)),
+        unit LowCardinality (String) DEFAULT '',
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 300,
+        event_id String CODEC (ZSTD (1)),
+        event_type String CODEC (ZSTD (1)),
+        signal LowCardinality (String),
+        dimension_set_id LowCardinality (String),
+        dimension_names Array (String),
+        dimension_values Array (String),
+        dimensions_hash UInt64 MATERIALIZED cityHash64 (
+            dimension_set_id,
+            arrayStringConcat (dimension_names, '\x1f'),
+            arrayStringConcat (dimension_values, '\x1f')
+        )
+    ) ENGINE = ReplacingMergeTree
+PARTITION BY
+    toYYYYMMDD (timestamp)
+ORDER BY
+    (
+        tenant_id,
+        definition_id,
+        measure_name,
+        dimension_set_id,
+        dimensions_hash,
+        timestamp,
+        event_id,
+        definition_version
+    );
+
+CREATE TABLE
+    IF NOT EXISTS observatory.measure_cube_rollups (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        bucket_seconds UInt32 DEFAULT 300,
+        measure_name LowCardinality (String),
+        unit LowCardinality (String),
+        dimension_set_id LowCardinality (String),
+        dimension_names Array (String),
+        dimension_values Array (String),
+        dimensions_hash UInt64 MATERIALIZED cityHash64 (
+            dimension_set_id,
+            arrayStringConcat (dimension_names, '\x1f'),
+            arrayStringConcat (dimension_values, '\x1f')
+        ),
+        count_state AggregateFunction (sum, UInt64),
+        sum_state AggregateFunction (sum, Float64),
+        min_state AggregateFunction (min, Float64),
+        max_state AggregateFunction (max, Float64),
+        avg_state AggregateFunction (avg, Float64),
+        quantiles_state AggregateFunction (quantilesTDigest (0.5, 0.9, 0.95, 0.99), Float64)
+    ) ENGINE = AggregatingMergeTree
+PARTITION BY
+    toYYYYMM (bucket_time)
+ORDER BY
+    (
+        tenant_id,
+        definition_id,
+        measure_name,
+        bucket_seconds,
+        bucket_time,
+        dimension_set_id,
+        dimensions_hash
+    );
+
+CREATE MATERIALIZED VIEW
+    IF NOT EXISTS observatory.mv_measure_cube_rollups TO observatory.measure_cube_rollups AS
+SELECT
+    tenant_id,
+    definition_id,
+    anyLast (definition_version) AS definition_version,
+    bucket_time,
+    bucket_seconds,
+    measure_name,
+    unit,
+    dimension_set_id,
+    dimension_names,
+    dimension_values,
+    sumState (toUInt64 (1)) AS count_state,
+    sumState (value) AS sum_state,
+    minState (value) AS min_state,
+    maxState (value) AS max_state,
+    avgState (value) AS avg_state,
+    quantilesTDigestState (0.5, 0.9, 0.95, 0.99) (value) AS quantiles_state
+FROM
+    observatory.measure_cube_points
+GROUP BY
+    tenant_id,
+    definition_id,
+    bucket_time,
+    bucket_seconds,
+    measure_name,
+    unit,
+    dimension_set_id,
+    dimension_names,
+    dimension_values;
 
 CREATE TABLE
     IF NOT EXISTS observatory.counter_rollups (
@@ -522,6 +743,28 @@ PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
     (tenant_id, entity_type, entity_hash, state_name, timestamp, event_id, definition_id);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.entity_state_current (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        definition_id String DEFAULT '' CODEC (ZSTD (1)),
+        definition_version UInt64 DEFAULT 0,
+        entity_type LowCardinality (String),
+        entity_id String CODEC (ZSTD (1)),
+        entity_hash UInt64 MATERIALIZED cityHash64 (entity_id),
+        state_name LowCardinality (String),
+        value String CODEC (ZSTD (1)),
+        value_type LowCardinality (String),
+        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        event_id String CODEC (ZSTD (1)),
+        event_type String CODEC (ZSTD (1)),
+        signal LowCardinality (String),
+        refreshed_at DateTime64 (3, 'UTC') DEFAULT now64 (3)
+    ) ENGINE = ReplacingMergeTree (timestamp)
+PARTITION BY
+    cityHash64 (entity_type) % 16
+ORDER BY
+    (tenant_id, entity_type, entity_hash, state_name);
 
 CREATE TABLE
     IF NOT EXISTS observatory.cohort_memberships (
@@ -778,6 +1021,18 @@ ORDER BY
 
 ALTER TABLE observatory.report_results
     ADD COLUMN IF NOT EXISTS dimensions_hash UInt64 MATERIALIZED cityHash64 (toJSONString (dimensions)) AFTER dimensions;
+
+ALTER TABLE observatory.events
+    ADD INDEX IF NOT EXISTS idx_source_file source_file TYPE bloom_filter (0.01) GRANULARITY 4;
+
+ALTER TABLE observatory.event_kv_index
+    ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4;
+
+ALTER TABLE observatory.event_kv_index
+    ADD INDEX IF NOT EXISTS idx_source_file source_file TYPE bloom_filter (0.01) GRANULARITY 4;
+
+ALTER TABLE observatory.event_kv_index
+    ADD INDEX IF NOT EXISTS idx_number_value number_value TYPE minmax GRANULARITY 4;
 
 ALTER TABLE observatory.sequence_report_results
     ADD COLUMN IF NOT EXISTS segment JSON (max_dynamic_paths = 128, max_dynamic_types = 8) AFTER bucket_time;

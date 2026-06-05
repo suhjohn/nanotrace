@@ -51,30 +51,6 @@
       "Resource": "arn:aws:s3:::nanotrace-*/*"
     },
     {
-      "Sid": "ListQueuesForPulumiRefresh",
-      "Effect": "Allow",
-      "Action": "sqs:ListQueues",
-      "Resource": "*"
-    },
-    {
-      "Sid": "ManageNanotraceQueues",
-      "Effect": "Allow",
-      "Action": [
-        "sqs:AddPermission",
-        "sqs:CreateQueue",
-        "sqs:DeleteQueue",
-        "sqs:GetQueueAttributes",
-        "sqs:GetQueueUrl",
-        "sqs:ListQueueTags",
-        "sqs:ReceiveMessage",
-        "sqs:RemovePermission",
-        "sqs:SetQueueAttributes",
-        "sqs:TagQueue",
-        "sqs:UntagQueue"
-      ],
-      "Resource": "arn:aws:sqs:*:*:nanotrace-*"
-    },
-    {
       "Sid": "ReadRdsForPulumiRefresh",
       "Effect": "Allow",
       "Action": [

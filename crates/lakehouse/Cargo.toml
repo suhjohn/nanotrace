@@ -9,6 +9,7 @@ anyhow = "1"
 arrow-array = "57.3"
 arrow-schema = "57.3"
 chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = { version = "0.9.1", default-features = false, features = ["opendal-fs", "opendal-s3"] }

@@ -6,10 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
-    pub data_dir: PathBuf,
     pub ui_dir: Option<PathBuf>,
-    pub s3_bucket: Option<String>,
-    pub s3_prefix: String,
     pub clickhouse_url: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
@@ -19,20 +16,10 @@ pub struct Config {
     pub clickhouse_max_execution_secs: u64,
     pub clickhouse_max_bytes_to_read: u64,
     pub max_request_bytes: usize,
-    pub max_event_bytes: usize,
-    pub rotate_bytes: u64,
-    pub rotate_after: Duration,
-    pub upload_poll_interval: Duration,
-    pub done_retention: Option<Duration>,
-    pub done_cleanup_interval: Duration,
-    pub writer_lanes: usize,
-    pub writer_queue_capacity: usize,
-    pub writer_flush_interval: Duration,
-    pub writer_flush_bytes: u64,
-    pub compact_batch_receipts: bool,
-    pub processor_poll_interval: Duration,
-    pub processor_builder_cmd: String,
-    pub processor_prefix: String,
+    pub kafka_brokers: String,
+    pub kafka_ingest_topic: String,
+    pub kafka_client_id: String,
+    pub kafka_produce_timeout: Duration,
     pub auth: AuthConfig,
     pub email_from: Option<String>,
     pub cors_allowed_origins: Vec<String>,
@@ -41,6 +28,8 @@ pub struct Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("{key} is required")]
+    Missing { key: &'static str },
     #[error("{key} must be a valid {kind}: {value}")]
     Invalid {
         key: &'static str,
@@ -52,19 +41,7 @@ pub enum ConfigError {
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let port = parse_env("PORT", 18_473)?;
-        let data_dir = PathBuf::from(
-            env::var("NANOTRACE_DATA_DIR").unwrap_or_else(|_| "/data/events".to_string()),
-        );
         let ui_dir = optional_string("NANOTRACE_UI_DIR").map(PathBuf::from);
-        let s3_bucket = env::var("NANOTRACE_S3_BUCKET")
-            .or_else(|_| env::var("S3_BUCKET"))
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let s3_prefix = env::var("S3_PREFIX")
-            .or_else(|_| env::var("NANOTRACE_OBJECT_PREFIX"))
-            .unwrap_or_else(|_| "events".to_string())
-            .trim_matches('/')
-            .to_string();
         let clickhouse_url = optional_string("CLICKHOUSE_URL");
         let clickhouse_user =
             optional_string("CLICKHOUSE_USER").or_else(|| optional_string("CLICKHOUSE_USERNAME"));
@@ -82,27 +59,21 @@ impl Config {
         let clickhouse_max_bytes_to_read =
             parse_env("CLICKHOUSE_MAX_BYTES_TO_READ", 1_000_000_000)?;
         let max_request_bytes = parse_env("MAX_REQUEST_BYTES", 209_715_200)?;
-        let max_event_bytes = parse_env("MAX_EVENT_BYTES", max_request_bytes)?;
-        let rotate_bytes = parse_env("NANOTRACE_PART_MAX_BYTES", 64 * 1024 * 1024)?;
-        let rotate_after_secs = parse_env("NANOTRACE_PART_MAX_AGE_SECS", 1)?;
-        let upload_poll_ms = parse_env("UPLOAD_POLL_INTERVAL_MS", 500)?;
-        let done_retention_mins = parse_env("NANOTRACE_DONE_RETENTION_MINS", 60)?;
-        let done_cleanup_interval_secs = parse_env("NANOTRACE_DONE_CLEANUP_INTERVAL_SECS", 60)?;
-        let writer_lanes: usize = parse_env("NANOTRACE_WRITER_LANES", 4)?;
-        let writer_queue_capacity: usize = parse_env("NANOTRACE_WRITER_QUEUE_CAPACITY", 8192)?;
-        let writer_flush_interval_ms: u64 = parse_env("NANOTRACE_WRITER_FLUSH_INTERVAL_MS", 10)?;
-        let writer_flush_bytes: u64 = parse_env("NANOTRACE_WRITER_FLUSH_BYTES", 1024 * 1024)?;
-        let compact_batch_receipts = parse_bool_env("NANOTRACE_COMPACT_BATCH_RECEIPTS", false)?;
-        let processor_poll_interval_secs: u64 = parse_env("PROCESSOR_POLL_INTERVAL_SECS", 30)?;
-        let processor_builder_cmd = env::var("PROCESSOR_BUILDER_CMD")
-            .unwrap_or_else(|_| "python3 /usr/local/bin/modal_processor_builder.py".to_string())
+        let kafka_brokers = optional_string("NANOTRACE_KAFKA_BROKERS")
+            .or_else(|| optional_string("KAFKA_BROKERS"))
+            .ok_or(ConfigError::Missing {
+                key: "NANOTRACE_KAFKA_BROKERS",
+            })?;
+        let kafka_ingest_topic = env::var("NANOTRACE_KAFKA_INGEST_TOPIC")
+            .unwrap_or_else(|_| nanotrace_ingest::DEFAULT_INGEST_TOPIC.to_string())
             .trim()
             .to_string();
-        let processor_prefix = env::var("PROCESSOR_PREFIX")
-            .unwrap_or_else(|_| "processors".to_string())
+        let kafka_client_id = env::var("NANOTRACE_KAFKA_CLIENT_ID")
+            .unwrap_or_else(|_| "nanotrace-server".to_string())
             .trim()
-            .trim_matches('/')
             .to_string();
+        let kafka_produce_timeout_ms: u64 =
+            parse_env("NANOTRACE_KAFKA_PRODUCE_TIMEOUT_MS", 30_000)?;
         let public_base_url = optional_string("NANOTRACE_PUBLIC_BASE_URL");
         let app_base_url = optional_string("NANOTRACE_APP_BASE_URL");
         let session_secure = optional_bool_env("NANOTRACE_SESSION_SECURE")?.unwrap_or_else(|| {
@@ -112,10 +83,12 @@ impl Config {
         });
         let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
         let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 60 * 60)?;
+        let api_key_cache_refresh_secs: u64 = parse_env("NANOTRACE_API_KEY_CACHE_REFRESH_SECS", 5)?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
             bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),
             public_base_url,
+            api_key_cache_refresh_interval: Duration::from_secs(api_key_cache_refresh_secs),
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
                 .unwrap_or_else(|_| "nanotrace_session".to_string())
                 .trim()
@@ -128,14 +101,14 @@ impl Config {
             admin_emails: parse_list_env("NANOTRACE_ADMIN_EMAILS"),
         };
         let cors_allowed_origins = parse_list_env("NANOTRACE_CORS_ALLOWED_ORIGINS");
-        ensure_nonzero("NANOTRACE_WRITER_LANES", writer_lanes)?;
-        ensure_nonzero("NANOTRACE_WRITER_QUEUE_CAPACITY", writer_queue_capacity)?;
         ensure_nonzero(
-            "NANOTRACE_WRITER_FLUSH_INTERVAL_MS",
-            writer_flush_interval_ms,
+            "NANOTRACE_KAFKA_PRODUCE_TIMEOUT_MS",
+            kafka_produce_timeout_ms,
         )?;
-        ensure_nonzero("NANOTRACE_WRITER_FLUSH_BYTES", writer_flush_bytes)?;
-        ensure_nonzero("PROCESSOR_POLL_INTERVAL_SECS", processor_poll_interval_secs)?;
+        ensure_nonzero(
+            "NANOTRACE_API_KEY_CACHE_REFRESH_SECS",
+            api_key_cache_refresh_secs,
+        )?;
         ensure_nonzero("NANOTRACE_SESSION_TTL_SECS", session_ttl_secs)?;
         ensure_nonzero("NANOTRACE_MAGIC_LINK_TTL_SECS", magic_link_ttl_secs)?;
         ensure_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
@@ -149,10 +122,7 @@ impl Config {
 
         Ok(Self {
             port,
-            data_dir,
             ui_dir,
-            s3_bucket,
-            s3_prefix,
             clickhouse_url,
             clickhouse_user,
             clickhouse_password,
@@ -162,24 +132,10 @@ impl Config {
             clickhouse_max_execution_secs,
             clickhouse_max_bytes_to_read,
             max_request_bytes,
-            max_event_bytes,
-            rotate_bytes,
-            rotate_after: Duration::from_secs(rotate_after_secs),
-            upload_poll_interval: Duration::from_millis(upload_poll_ms),
-            done_retention: if done_retention_mins == 0 {
-                None
-            } else {
-                Some(Duration::from_secs(done_retention_mins * 60))
-            },
-            done_cleanup_interval: Duration::from_secs(done_cleanup_interval_secs),
-            writer_lanes,
-            writer_queue_capacity,
-            writer_flush_interval: Duration::from_millis(writer_flush_interval_ms),
-            writer_flush_bytes,
-            compact_batch_receipts,
-            processor_poll_interval: Duration::from_secs(processor_poll_interval_secs),
-            processor_builder_cmd,
-            processor_prefix,
+            kafka_brokers,
+            kafka_ingest_topic,
+            kafka_client_id,
+            kafka_produce_timeout: Duration::from_millis(kafka_produce_timeout_ms),
             auth,
             email_from: optional_string("NANOTRACE_EMAIL_FROM"),
             cors_allowed_origins,
@@ -224,10 +180,6 @@ where
         }),
         Err(_) => Ok(default),
     }
-}
-
-fn parse_bool_env(key: &'static str, default: bool) -> Result<bool, ConfigError> {
-    Ok(optional_bool_env(key)?.unwrap_or(default))
 }
 
 fn optional_bool_env(key: &'static str) -> Result<Option<bool>, ConfigError> {

@@ -1,0 +1,23 @@
+{
+  "event_id": "fixture-materializer-report-materialized",
+  "timestamp": "2026-05-08T01:23:45.923Z",
+  "observed_timestamp": "2026-05-08T01:23:45.930Z",
+  "data": {
+    "tenant_id": "fixture",
+    "service": "materializer",
+    "event_type": "materializer.report_materialized",
+    "signal": "pipeline",
+    "environment": "prod",
+    "name": "materializer.report_materialized",
+    "duration_ms": 8400,
+    "rows_scanned": 8640000000,
+    "rows_written": 1440,
+    "materializer": {
+      "id": "mat_2",
+      "kind": "report_refresh",
+      "status": "completed",
+      "definition_id": "report_weekly_pro_conversions",
+      "slice_seconds": "3600"
+    }
+  }
+}

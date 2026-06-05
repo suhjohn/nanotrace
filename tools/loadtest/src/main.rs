@@ -197,7 +197,7 @@ enum LoadProfile {
     Logs,
     Product,
     Agent,
-    Processor,
+    Pipeline,
 }
 
 impl LoadProfile {
@@ -213,7 +213,7 @@ impl LoadProfile {
             Self::Logs => "logs",
             Self::Product => "product",
             Self::Agent => "agent",
-            Self::Processor => "processor",
+            Self::Pipeline => "pipeline",
         }
     }
 
@@ -229,7 +229,7 @@ impl LoadProfile {
                 | Self::Logs
                 | Self::Product
                 | Self::Agent
-                | Self::Processor
+                | Self::Pipeline
         )
     }
 }
@@ -255,7 +255,7 @@ struct Fixtures {
     trace_fixtures: Vec<Fixture>,
     product_fixtures: Vec<Fixture>,
     agent_fixtures: Vec<Fixture>,
-    processor_fixtures: Vec<Fixture>,
+    pipeline_fixtures: Vec<Fixture>,
     rest: Vec<Fixture>,
 }
 
@@ -738,78 +738,49 @@ fn make_event(context: &LoadContext, batch_mix: &str) -> Result<Value> {
 }
 
 fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadProfile) -> &Fixture {
-    if profile == LoadProfile::Logs || profile == LoadProfile::Llm {
-        if fixtures.log_variations.is_empty() {
-            return &fixtures.log;
-        }
-        let index = seq as usize % (fixtures.log_variations.len() + 1);
-        if index == 0 {
-            return &fixtures.log;
-        }
-        return &fixtures.log_variations[index - 1];
+    match profile {
+        LoadProfile::Logs | LoadProfile::Llm => log_fixture(fixtures, seq),
+        LoadProfile::Metrics => fixture_at(&fixtures.metric_fixtures, seq),
+        LoadProfile::Trace => fixture_at(&fixtures.trace_fixtures, seq),
+        LoadProfile::Product => fixture_at(&fixtures.product_fixtures, seq),
+        LoadProfile::Agent => fixture_at(&fixtures.agent_fixtures, seq),
+        LoadProfile::Pipeline => fixture_at(&fixtures.pipeline_fixtures, seq),
+        LoadProfile::Atlas => atlas_fixture(fixtures, seq, log_ratio),
+        LoadProfile::Codex => codex_fixture(fixtures, seq),
+        LoadProfile::Realistic => mixed_fixture(fixtures, seq, log_ratio, true),
+        LoadProfile::Fixture => mixed_fixture(fixtures, seq, log_ratio, false),
     }
-    if profile == LoadProfile::Metrics {
-        let index = seq as usize % fixtures.metric_fixtures.len();
-        return &fixtures.metric_fixtures[index];
+}
+
+fn atlas_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64) -> &Fixture {
+    let bucket = seq % 100;
+    if bucket < log_ratio_percent(log_ratio) {
+        return log_fixture(fixtures, seq);
     }
-    if profile == LoadProfile::Trace {
-        let index = seq as usize % fixtures.trace_fixtures.len();
-        return &fixtures.trace_fixtures[index];
+    if bucket < 48 {
+        return fixture_at(&fixtures.product_fixtures, seq);
     }
-    if profile == LoadProfile::Product {
-        let index = seq as usize % fixtures.product_fixtures.len();
-        return &fixtures.product_fixtures[index];
+    if bucket < 78 {
+        return fixture_at(&fixtures.agent_fixtures, seq);
     }
-    if profile == LoadProfile::Agent {
-        let index = seq as usize % fixtures.agent_fixtures.len();
-        return &fixtures.agent_fixtures[index];
+    if bucket < 92 {
+        return fixture_at(&fixtures.metric_fixtures, seq);
     }
-    if profile == LoadProfile::Processor {
-        let index = seq as usize % fixtures.processor_fixtures.len();
-        return &fixtures.processor_fixtures[index];
+    if bucket < 98 {
+        return fixture_at(&fixtures.trace_fixtures, seq);
     }
-    if profile == LoadProfile::Atlas {
-        let bucket = seq % 100;
-        if bucket < (log_ratio * 100.0).round() as u64 {
-            if fixtures.log_variations.is_empty() {
-                return &fixtures.log;
-            }
-            let index = seq as usize % (fixtures.log_variations.len() + 1);
-            if index == 0 {
-                return &fixtures.log;
-            }
-            return &fixtures.log_variations[index - 1];
-        }
-        if bucket < 48 {
-            let index = seq as usize % fixtures.product_fixtures.len();
-            return &fixtures.product_fixtures[index];
-        }
-        if bucket < 78 {
-            let index = seq as usize % fixtures.agent_fixtures.len();
-            return &fixtures.agent_fixtures[index];
-        }
-        if bucket < 92 {
-            let index = seq as usize % fixtures.metric_fixtures.len();
-            return &fixtures.metric_fixtures[index];
-        }
-        if bucket < 98 {
-            let index = seq as usize % fixtures.trace_fixtures.len();
-            return &fixtures.trace_fixtures[index];
-        }
-        let index = seq as usize % fixtures.processor_fixtures.len();
-        return &fixtures.processor_fixtures[index];
-    }
-    if profile == LoadProfile::Codex {
-        return codex_fixture(fixtures, seq);
-    }
+    fixture_at(&fixtures.pipeline_fixtures, seq)
+}
+
+fn mixed_fixture(
+    fixtures: &Fixtures,
+    seq: u64,
+    log_ratio: f64,
+    use_log_variations: bool,
+) -> &Fixture {
     if (seq % 100) < (log_ratio * 100.0).round() as u64 {
-        if profile.is_realistic() && !fixtures.log_variations.is_empty() {
-            let index = seq as usize % (fixtures.log_variations.len() + 1);
-            if index == 0 {
-                &fixtures.log
-            } else {
-                &fixtures.log_variations[index - 1]
-            }
+        if use_log_variations {
+            log_fixture(fixtures, seq)
         } else {
             &fixtures.log
         }
@@ -817,6 +788,27 @@ fn choose_fixture(fixtures: &Fixtures, seq: u64, log_ratio: f64, profile: LoadPr
         let index = seq as usize % fixtures.rest.len();
         &fixtures.rest[index]
     }
+}
+
+fn log_fixture(fixtures: &Fixtures, seq: u64) -> &Fixture {
+    if fixtures.log_variations.is_empty() {
+        return &fixtures.log;
+    }
+    let index = seq as usize % (fixtures.log_variations.len() + 1);
+    if index == 0 {
+        &fixtures.log
+    } else {
+        &fixtures.log_variations[index - 1]
+    }
+}
+
+fn fixture_at(fixtures: &[Fixture], seq: u64) -> &Fixture {
+    let index = seq as usize % fixtures.len();
+    &fixtures[index]
+}
+
+fn log_ratio_percent(log_ratio: f64) -> u64 {
+    (log_ratio * 100.0).round() as u64
 }
 
 fn codex_fixture(fixtures: &Fixtures, seq: u64) -> &Fixture {
@@ -845,7 +837,7 @@ fn codex_fixture(fixtures: &Fixtures, seq: u64) -> &Fixture {
         },
         20 => named_fixture_or_first(&fixtures.metric_fixtures, "metric"),
         22 => match group % 6 {
-            0 => &fixtures.processor_fixtures[group as usize % fixtures.processor_fixtures.len()],
+            0 => &fixtures.pipeline_fixtures[group as usize % fixtures.pipeline_fixtures.len()],
             1 => named_fixture_or_first(&fixtures.agent_fixtures, "eval_score"),
             2 => named_fixture_or_first(&fixtures.agent_fixtures, "safety_event"),
             _ => workflow_log_fixture(fixtures, workflow),
@@ -995,7 +987,7 @@ fn event_timestamps(profile: LoadProfile, run_id: &str, seq: u64) -> (String, St
         | LoadProfile::Logs
         | LoadProfile::Product
         | LoadProfile::Agent
-        | LoadProfile::Processor => {
+        | LoadProfile::Pipeline => {
             let timestamp = historical_loadtest_timestamp(run_id, seq);
             let mut rng = TinyRng::new(seed_for(run_id, "observed-timestamp", seq));
             let observed = timestamp + ChronoDuration::milliseconds(rng.range(1, 500) as i64);
@@ -1466,9 +1458,12 @@ fn enrich_realistic_data(
                 }),
             );
         }
-        "processor.run" | "processor.backfill_slice" | "processor.report_materialized" => {
+        "materializer.run" | "materializer.backfill_slice" | "materializer.report_materialized" => {
             data.insert("signal".to_owned(), Value::String("pipeline".to_owned()));
-            data.insert("service".to_owned(), Value::String("processor".to_owned()));
+            data.insert(
+                "service".to_owned(),
+                Value::String("materializer".to_owned()),
+            );
             data.insert("name".to_owned(), Value::String(event_type.clone()));
             data.insert("duration_ms".to_owned(), Value::from(rng.range(50, 30_000)));
             data.insert(
@@ -1480,9 +1475,9 @@ fn enrich_realistic_data(
                 Value::from(rng.range(1_000, 50_000_000)),
             );
             data.insert(
-                "processor".to_owned(),
+                "materializer".to_owned(),
                 json!({
-                    "id": format!("proc_{}", rng.range(1, 32)),
+                    "id": format!("mat_{}", rng.range(1, 32)),
                     "kind": rng.choose_str(&["session_rollup", "trace_summary", "token_rollup", "field_indexer", "conversation_compaction"]),
                     "status": if scenario.is_error { "failed" } else { rng.choose_str(&["completed", "completed", "running"]) },
                     "definition_id": format!("def_{}", rng.choose_str(&["service", "model", "duration_ms", "total_tokens", "tool_name"])),
@@ -1935,7 +1930,7 @@ fn log_event_message(scenario: &Scenario, fixture_name: &str, rng: &mut TinyRng)
         "log_variation_code_success" => format!(
             "applied patch to {} and verified the focused test path",
             rng.choose(&[
-                "loader schema",
+                "event schema",
                 "query builder",
                 "UI route",
                 "loadtest generator"
@@ -2003,13 +1998,13 @@ fn retrieval_query(workflow: CodexWorkflow, rng: &mut TinyRng) -> &'static str {
     match workflow {
         CodexWorkflow::CodeEdit => rng.choose_str(&[
             "applyPatch helper",
-            "loader schema recreate",
+            "event schema recreate",
             "trace density query",
         ]),
         CodexWorkflow::DebugFailure => rng.choose_str(&[
             "ClickHouse ORDER BY duplicate",
             "Pulumi launch template refresh",
-            "SQS backlog drain",
+            "Kafka lag investigation",
         ]),
         CodexWorkflow::CanvasEdit => rng.choose_str(&[
             "DensityHistogramCanvas",
@@ -2326,7 +2321,7 @@ fn realistic_scalar_value(
         "content" if current.is_string() => Value::String(llm_content(parent_key, scenario, rng)),
         "title" if parent_key.is_empty() => Value::String(
             rng.choose(&[
-                "Patch review for loader schema",
+                "Patch review for event schema",
                 "Canvas layout revision",
                 "Latency investigation for tool execution",
                 "Ingest smoke test for responses API",
@@ -2672,9 +2667,9 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         .filter(|fixture| is_agent_fixture(&fixture.name))
         .cloned()
         .collect::<Vec<_>>();
-    let processor_fixtures = loaded
+    let pipeline_fixtures = loaded
         .iter()
-        .filter(|fixture| is_processor_fixture(&fixture.name))
+        .filter(|fixture| is_pipeline_fixture(&fixture.name))
         .cloned()
         .collect::<Vec<_>>();
     let log_variations = loaded
@@ -2696,8 +2691,8 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
     if agent_fixtures.is_empty() {
         bail!("expected at least one agent fixture");
     }
-    if processor_fixtures.is_empty() {
-        bail!("expected at least one processor fixture");
+    if pipeline_fixtures.is_empty() {
+        bail!("expected at least one pipeline fixture");
     }
     Ok(Fixtures {
         log,
@@ -2706,7 +2701,7 @@ fn load_fixtures(root: &Path) -> Result<Fixtures> {
         trace_fixtures,
         product_fixtures,
         agent_fixtures,
-        processor_fixtures,
+        pipeline_fixtures,
         rest,
     })
 }
@@ -2727,8 +2722,8 @@ fn is_agent_fixture(name: &str) -> bool {
         )
 }
 
-fn is_processor_fixture(name: &str) -> bool {
-    name.starts_with("processor_")
+fn is_pipeline_fixture(name: &str) -> bool {
+    name.starts_with("materializer_") || name.starts_with("pipeline_")
 }
 
 fn validate_fixture(name: &str, fixture: &Value) -> Result<()> {
@@ -3040,157 +3035,102 @@ fn required_env(key: &str) -> Result<String> {
 }
 
 fn number_env(key: &str, fallback: f64) -> Result<f64> {
-    match env::var(key) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<f64>()
-                .with_context(|| format!("{key} must be a number"))?;
-            if parsed <= 0.0 {
-                bail!("{key} must be positive");
-            }
-            Ok(parsed)
-        }
-        Err(_) => Ok(fallback),
-    }
+    env::var(key)
+        .map(|value| parse_positive_f64(key, &value))
+        .unwrap_or(Ok(fallback))
 }
 
 fn integer_env(key: &str, fallback: u64) -> Result<u64> {
-    match env::var(key) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u64>()
-                .with_context(|| format!("{key} must be an integer"))?;
-            if parsed == 0 {
-                bail!("{key} must be positive");
-            }
-            Ok(parsed)
-        }
-        Err(_) => Ok(fallback),
-    }
+    env::var(key)
+        .map(|value| parse_positive_u64(key, &value))
+        .unwrap_or(Ok(fallback))
 }
 
 fn integer_env_allow_zero(key: &str, fallback: u64) -> Result<u64> {
-    match env::var(key) {
-        Ok(value) => value
-            .parse::<u64>()
-            .with_context(|| format!("{key} must be an integer")),
-        Err(_) => Ok(fallback),
-    }
+    env::var(key)
+        .map(|value| parse_u64(key, &value))
+        .unwrap_or(Ok(fallback))
 }
 
 fn optional_integer_env(key: &str) -> Result<Option<u64>> {
-    match env::var(key) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u64>()
-                .with_context(|| format!("{key} must be an integer"))?;
-            if parsed == 0 {
-                bail!("{key} must be positive");
-            }
-            Ok(Some(parsed))
-        }
-        Err(_) => Ok(None),
-    }
+    env::var(key)
+        .map(|value| parse_positive_u64(key, &value).map(Some))
+        .unwrap_or(Ok(None))
 }
 
 fn list_env(key: &str, fallback: &[u64]) -> Result<Vec<u64>> {
-    match env::var(key) {
-        Ok(value) => value
-            .split(',')
-            .map(str::trim)
-            .map(|item| {
-                let parsed = item
-                    .parse::<u64>()
-                    .with_context(|| format!("{key} must contain integers"))?;
-                if parsed == 0 {
-                    bail!("{key} values must be positive");
-                }
-                Ok(parsed)
-            })
-            .collect(),
-        Err(_) => Ok(fallback.to_vec()),
+    env::var(key)
+        .map(|value| parse_positive_u64_list(key, &value))
+        .unwrap_or_else(|_| Ok(fallback.to_vec()))
+}
+
+fn parse_positive_f64(key: &str, value: &str) -> Result<f64> {
+    let parsed = value
+        .parse::<f64>()
+        .with_context(|| format!("{key} must be a number"))?;
+    if parsed <= 0.0 {
+        bail!("{key} must be positive");
     }
+    Ok(parsed)
+}
+
+fn parse_u64(key: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be an integer"))
+}
+
+fn parse_positive_u64(key: &str, value: &str) -> Result<u64> {
+    let parsed = parse_u64(key, value)?;
+    if parsed == 0 {
+        bail!("{key} must be positive");
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u64_list(key: &str, value: &str) -> Result<Vec<u64>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|item| {
+            let parsed =
+                parse_u64(key, item).with_context(|| format!("{key} must contain integers"))?;
+            if parsed == 0 {
+                bail!("{key} values must be positive");
+            }
+            Ok(parsed)
+        })
+        .collect()
 }
 
 fn load_profile_env() -> Result<LoadProfile> {
     match env::var("NANOTRACE_LOADTEST_PROFILE") {
-        Ok(value)
-            if value.eq_ignore_ascii_case("codex")
-                || value.eq_ignore_ascii_case("codex_mixed")
-                || value.eq_ignore_ascii_case("mixed") =>
-        {
-            Ok(LoadProfile::Codex)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("atlas") || value.eq_ignore_ascii_case("atlas_mixed") =>
-        {
-            Ok(LoadProfile::Atlas)
-        }
-        Ok(value) if value.eq_ignore_ascii_case("realistic") => Ok(LoadProfile::Realistic),
-        Ok(value)
-            if value.eq_ignore_ascii_case("trace")
-                || value.eq_ignore_ascii_case("traces")
-                || value.eq_ignore_ascii_case("realistic_trace")
-                || value.eq_ignore_ascii_case("realistic_traces") =>
-        {
-            Ok(LoadProfile::Trace)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("metrics")
-                || value.eq_ignore_ascii_case("metric")
-                || value.eq_ignore_ascii_case("pure_metrics") =>
-        {
-            Ok(LoadProfile::Metrics)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("logs")
-                || value.eq_ignore_ascii_case("log")
-                || value.eq_ignore_ascii_case("pure_logs") =>
-        {
-            Ok(LoadProfile::Logs)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("product")
-                || value.eq_ignore_ascii_case("products")
-                || value.eq_ignore_ascii_case("analytics") =>
-        {
-            Ok(LoadProfile::Product)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("agent")
-                || value.eq_ignore_ascii_case("agents")
-                || value.eq_ignore_ascii_case("agentic")
-                || value.eq_ignore_ascii_case("agent_traces") =>
-        {
-            Ok(LoadProfile::Agent)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("processor")
-                || value.eq_ignore_ascii_case("processors")
-                || value.eq_ignore_ascii_case("pipeline")
-                || value.eq_ignore_ascii_case("pipelines") =>
-        {
-            Ok(LoadProfile::Processor)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("llm")
-                || value.eq_ignore_ascii_case("realistic_llm")
-                || value.eq_ignore_ascii_case("llm_realistic") =>
-        {
-            Ok(LoadProfile::Llm)
-        }
-        Ok(value)
-            if value.eq_ignore_ascii_case("fixture")
-                || value.eq_ignore_ascii_case("default")
-                || value.eq_ignore_ascii_case("static") =>
-        {
-            Ok(LoadProfile::Fixture)
-        }
-        Ok(value) => bail!(
-            "NANOTRACE_LOADTEST_PROFILE must be codex, atlas, llm, realistic, trace, metrics, logs, product, agent, processor, fixture, default, or static; got {value}"
-        ),
+        Ok(value) => parse_load_profile(&value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "NANOTRACE_LOADTEST_PROFILE must be codex, atlas, llm, realistic, trace, metrics, logs, product, agent, pipeline, fixture, default, or static; got {value}"
+            )
+        }),
         Err(_) => Ok(LoadProfile::Codex),
     }
+}
+
+fn parse_load_profile(value: &str) -> Option<LoadProfile> {
+    let normalized = value.to_ascii_lowercase();
+    let profile = match normalized.as_str() {
+        "codex" | "codex_mixed" | "mixed" => LoadProfile::Codex,
+        "atlas" | "atlas_mixed" => LoadProfile::Atlas,
+        "realistic" => LoadProfile::Realistic,
+        "trace" | "traces" | "realistic_trace" | "realistic_traces" => LoadProfile::Trace,
+        "metrics" | "metric" | "pure_metrics" => LoadProfile::Metrics,
+        "logs" | "log" | "pure_logs" => LoadProfile::Logs,
+        "product" | "products" | "analytics" => LoadProfile::Product,
+        "agent" | "agents" | "agentic" | "agent_traces" => LoadProfile::Agent,
+        "pipeline" | "pipelines" | "materializer" | "materializers" => LoadProfile::Pipeline,
+        "llm" | "realistic_llm" | "llm_realistic" => LoadProfile::Llm,
+        "fixture" | "default" | "static" => LoadProfile::Fixture,
+        _ => return None,
+    };
+    Some(profile)
 }
 
 fn trim_trailing_slash(mut value: String) -> String {
@@ -3226,6 +3166,24 @@ fn round(value: f64, digits: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_positive_env_numbers() {
+        assert_eq!(parse_positive_u64("COUNT", "42").unwrap(), 42);
+        assert_eq!(parse_positive_f64("SECONDS", "0.5").unwrap(), 0.5);
+        assert!(parse_positive_u64("COUNT", "0").is_err());
+        assert!(parse_positive_f64("SECONDS", "0").is_err());
+    }
+
+    #[test]
+    fn parses_positive_env_integer_lists() {
+        assert_eq!(
+            parse_positive_u64_list("BATCH_SIZES", "1, 10,100").unwrap(),
+            vec![1, 10, 100]
+        );
+        assert!(parse_positive_u64_list("BATCH_SIZES", "1,0,10").is_err());
+        assert!(parse_positive_u64_list("BATCH_SIZES", "1,nope,10").is_err());
+    }
 
     #[test]
     fn generated_event_preserves_fixture_shape_without_double_wrapping() {
@@ -3300,6 +3258,21 @@ mod tests {
     }
 
     #[test]
+    fn load_profile_aliases_parse_to_explicit_profiles() {
+        assert_eq!(parse_load_profile("mixed"), Some(LoadProfile::Codex));
+        assert_eq!(
+            parse_load_profile("REALISTIC_TRACES"),
+            Some(LoadProfile::Trace)
+        );
+        assert_eq!(
+            parse_load_profile("materializers"),
+            Some(LoadProfile::Pipeline)
+        );
+        assert_eq!(parse_load_profile("static"), Some(LoadProfile::Fixture));
+        assert_eq!(parse_load_profile("unknown"), None);
+    }
+
+    #[test]
     fn bundled_fixtures_include_realistic_log_variations() {
         let fixtures = load_fixtures(&repo_root()).expect("load fixtures");
 
@@ -3343,9 +3316,9 @@ mod tests {
         );
         assert!(
             fixtures
-                .processor_fixtures
+                .pipeline_fixtures
                 .iter()
-                .any(|fixture| fixture.name == "processor_backfill_slice")
+                .any(|fixture| fixture.name == "materializer_backfill_slice")
         );
     }
 
@@ -3359,8 +3332,8 @@ mod tests {
         assert!(is_agent_fixture(
             &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Agent).name
         ));
-        assert!(is_processor_fixture(
-            &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Processor).name
+        assert!(is_pipeline_fixture(
+            &choose_fixture(&fixtures, 0, 0.10, LoadProfile::Pipeline).name
         ));
         assert_eq!(
             choose_fixture(&fixtures, 4, 0.10, LoadProfile::Codex).name,
@@ -3683,7 +3656,7 @@ mod tests {
             .chain(fixtures.trace_fixtures.iter())
             .chain(fixtures.product_fixtures.iter())
             .chain(fixtures.agent_fixtures.iter())
-            .chain(fixtures.processor_fixtures.iter())
+            .chain(fixtures.pipeline_fixtures.iter())
             .chain(fixtures.rest.iter())
             .chain(std::iter::once(&fixtures.log))
             .find(|fixture| fixture.name == name)
@@ -4113,16 +4086,16 @@ mod tests {
                         }),
                     },
                 ],
-                processor_fixtures: vec![Fixture {
-                    name: "processor_backfill_slice".to_owned(),
+                pipeline_fixtures: vec![Fixture {
+                    name: "materializer_backfill_slice".to_owned(),
                     body: json!({
-                        "event_id": "fixture-processor-backfill-slice",
+                        "event_id": "fixture-materializer-backfill-slice",
                         "timestamp": "2026-05-08T01:23:45.123Z",
                         "observed_timestamp": "2026-05-08T01:23:45.130Z",
                         "data": {
                             "tenant_id": "fixture",
-                            "service": "processor",
-                            "event_type": "processor.backfill_slice",
+                            "service": "materializer",
+                            "event_type": "materializer.backfill_slice",
                             "signal": "pipeline",
                             "environment": "prod",
                             "rows_scanned": 1000,

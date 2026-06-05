@@ -227,6 +227,93 @@ const sequenceReports = sequenceEntities.map(entity => ({
   name: `${entity.name} Default Sequence`
 }))
 
+function reportDefinitionFromSummary([name, config]) {
+  const reportId = definitionIdentifier(name)
+  return {
+    name: reportId,
+    kind: 'report',
+    mode: 'summary',
+    config: {
+      outputs: [
+        {
+          target: 'report_results',
+          report_id: reportId,
+          bucket_seconds: bucketSeconds(config.bucket),
+          dimensions: (config.group_by ?? []).map(path => ({
+            name: definitionIdentifier(path),
+            value: { path }
+          })),
+          metrics: metricsForReport(config.metric)
+        }
+      ]
+    }
+  }
+}
+
+function sequenceDefinitionFromLegacy(report) {
+  const reportId = definitionIdentifier(report.name)
+  return {
+    name: reportId,
+    kind: 'sequence',
+    mode: 'funnel',
+    config: {
+      outputs: [
+        {
+          target: 'sequence_report_results',
+          report_id: reportId,
+          entity_id: { path: report.config.entity_id_path },
+          bucket_seconds: 300,
+          dimensions: [
+            { name: 'signal', value: { path: 'signal' } }
+          ],
+          steps: [
+            {
+              name: 'event_type',
+              match: { all: [{ path: 'event_type', op: 'exists' }] }
+            },
+            {
+              name: 'name',
+              match: { all: [{ path: 'name', op: 'exists' }] }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+
+function metricsForReport(metric) {
+  if (metric === 'error_count' || metric === 'error_rate') {
+    return [
+      { name: 'events', op: 'count' },
+      { name: 'errors', op: 'error_count' }
+    ]
+  }
+  if (typeof metric === 'string' && metric.endsWith('.sum')) {
+    const path = metric.slice(0, -4)
+    return [{ name: `${definitionIdentifier(path)}_sum`, op: 'sum', value: { path } }]
+  }
+  return [{ name: 'events', op: 'count' }]
+}
+
+function bucketSeconds(bucket) {
+  const value = String(bucket ?? '5m').trim()
+  const match = /^(\d+)([smh])$/.exec(value)
+  if (!match) return 300
+  const amount = Number(match[1])
+  if (match[2] === 's') return amount
+  if (match[2] === 'm') return amount * 60
+  return amount * 3600
+}
+
+function definitionIdentifier(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_') || 'definition'
+}
+
 function buildManifest() {
   const definitions = []
 
@@ -298,17 +385,14 @@ function buildManifest() {
     }
   }
 
-  const reports = [
-    ...summaryReports.map(([name, config]) => ({ name, kind: 'summary', enabled: true, config })),
-    ...sequenceReports.map(report => ({ ...report, enabled: true }))
-  ]
+  definitions.push(...summaryReports.map(reportDefinitionFromSummary))
+  definitions.push(...sequenceReports.map(sequenceDefinitionFromLegacy))
 
   return {
     name: 'maximal-events-pack',
     source_table: 'observatory.events',
     version: 1,
-    definitions: dedupeBy(definitions, item => `${item.kind}\u0000${item.mode}\u0000${item.name}`),
-    reports: dedupeBy(reports, item => `${item.kind}\u0000${item.name}`)
+    definitions: dedupeBy(definitions, item => `${item.kind}\u0000${item.mode}\u0000${item.name}`)
   }
 }
 
@@ -389,8 +473,9 @@ async function main() {
     definitions: manifest.definitions.length,
     fields: manifest.definitions.filter(item => item.kind === 'field').length,
     measures: manifest.definitions.filter(item => item.kind === 'measure').length,
-    reports: manifest.reports.length,
+    reports: manifest.definitions.filter(item => item.kind === 'report').length,
     rollups: manifest.definitions.filter(item => item.kind === 'rollup').length,
+    sequences: manifest.definitions.filter(item => item.kind === 'sequence').length,
     states: manifest.definitions.filter(item => item.kind === 'state').length
   }, null, 2))
 }
@@ -402,37 +487,28 @@ async function applyManifest({ apiKey, baseUrl, manifest }) {
   }
 
   const existingDefinitions = await getJson(`${baseUrl}/v1/definitions`, headers)
-  const existingReports = await getJson(`${baseUrl}/v1/reports`, headers)
   const definitionKeys = new Set(
     (existingDefinitions.definitions ?? []).map(item => `${item.kind}\u0000${item.mode}\u0000${item.name}`)
   )
-  const reportKeys = new Set(
-    (existingReports.reports ?? []).map(item => `${item.kind}\u0000${item.name}`)
-  )
 
   let createdDefinitions = 0
+  let createdReports = 0
+  let createdSequences = 0
   for (const definition of manifest.definitions) {
     const key = `${definition.kind}\u0000${definition.mode}\u0000${definition.name}`
     if (definitionKeys.has(key)) continue
     await postJson(`${baseUrl}/v1/definitions`, headers, definition)
     definitionKeys.add(key)
     createdDefinitions += 1
-  }
-
-  let createdReports = 0
-  for (const report of manifest.reports) {
-    const key = `${report.kind}\u0000${report.name}`
-    if (reportKeys.has(key)) continue
-    await postJson(`${baseUrl}/v1/reports`, headers, report)
-    reportKeys.add(key)
-    createdReports += 1
+    if (definition.kind === 'report') createdReports += 1
+    if (definition.kind === 'sequence') createdSequences += 1
   }
 
   console.log(JSON.stringify({
     created_definitions: createdDefinitions,
     created_reports: createdReports,
-    skipped_definitions: manifest.definitions.length - createdDefinitions,
-    skipped_reports: manifest.reports.length - createdReports
+    created_sequences: createdSequences,
+    skipped_definitions: manifest.definitions.length - createdDefinitions
   }, null, 2))
 }
 

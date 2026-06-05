@@ -15,7 +15,7 @@ use axum::{
 };
 use config::Config;
 use nanotrace_auth::{AuthError, AuthIdentity, AuthStore};
-use read::{EventsQueryRequest, QueryRequest, ReadError, ReadStore};
+use read::{QueryApiRequest, ReadError, ReadStore};
 use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -42,12 +42,10 @@ async fn main() -> anyhow::Result<()> {
     let auth = nanotrace_auth::AuthStore::connect(cfg.auth.clone())
         .await?
         .map(Arc::new);
-    let aws_config = aws_config::load_from_env().await;
-    let s3 = s3_client(&aws_config);
     let state = AppState {
         cfg: cfg.clone(),
         auth,
-        read: Arc::new(ReadStore::new(cfg.clone(), s3)),
+        read: Arc::new(ReadStore::new(Arc::new(read_config(&cfg)))),
     };
     let address = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     let listener = TcpListener::bind(address).await?;
@@ -59,18 +57,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn s3_client(config: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
-    let mut builder = aws_sdk_s3::config::Builder::from(config);
-    if env_bool("AWS_S3_FORCE_PATH_STYLE") || env_bool("AWS_S3_PATH_STYLE") {
-        builder.set_force_path_style(Some(true));
+fn read_config(cfg: &Config) -> read::Config {
+    read::Config {
+        clickhouse_url: cfg.clickhouse_url.clone(),
+        clickhouse_user: cfg.clickhouse_user.clone(),
+        clickhouse_password: cfg.clickhouse_password.clone(),
+        clickhouse_database: cfg.clickhouse_database.clone(),
+        clickhouse_table: cfg.clickhouse_table.clone(),
+        clickhouse_max_result_rows: cfg.clickhouse_max_result_rows,
+        clickhouse_max_execution_secs: cfg.clickhouse_max_execution_secs,
+        clickhouse_max_bytes_to_read: cfg.clickhouse_max_bytes_to_read,
     }
-    aws_sdk_s3::Client::from_conf(builder.build())
-}
-
-fn env_bool(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn router(state: AppState) -> Router {
@@ -78,7 +75,6 @@ fn router(state: AppState) -> Router {
 
     let router = Router::new()
         .route("/v1/query", post(post_query))
-        .route("/v1/events/query", post(post_events_query))
         .route("/v1/events/{event_id}", get(get_event))
         .route("/healthz", get(healthz))
         .route("/v1/healthz", get(healthz))
@@ -116,27 +112,13 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 async fn post_query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<QueryRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let identity = authorize(&state, &headers).await?;
     require_scope(&identity, "query:read")?;
-    Ok(Json(state.read.query(request, &identity.tenant_id).await?).into_response())
-}
-
-async fn post_events_query(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<EventsQueryRequest>,
-) -> Result<Response, ApiError> {
-    let identity = authorize(&state, &headers).await?;
-    require_scope(&identity, "query:read")?;
-    Ok(Json(
-        state
-            .read
-            .events_query(request, &identity.tenant_id)
-            .await?,
-    )
-    .into_response())
+    let request = serde_json::from_value::<QueryApiRequest>(request)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    Ok(Json(state.read.api_query(request, &identity.tenant_id).await?).into_response())
 }
 
 async fn get_event(
@@ -166,9 +148,6 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.cfg.s3_bucket.is_none() {
-        return Err(ApiError::Unavailable("S3 bucket is not configured"));
-    }
     if state.cfg.clickhouse_url.is_none() {
         return Err(ApiError::Unavailable("ClickHouse is not configured"));
     }
@@ -183,6 +162,7 @@ async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthIdentity
 #[derive(Debug)]
 enum ApiError {
     Unauthorized,
+    BadRequest(String),
     Unavailable(&'static str),
     Read(ReadError),
     Auth(AuthError),
@@ -198,6 +178,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message.to_string()),
             Self::Read(ReadError::InvalidQuery(err)) => (StatusCode::BAD_REQUEST, err),
             Self::Read(ReadError::ClickHouseResponse { status, body }) => {
@@ -212,10 +193,6 @@ impl IntoResponse for ApiError {
             Self::Read(ReadError::ClickHouseNotConfigured) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ClickHouse is not configured".to_string(),
-            ),
-            Self::Read(ReadError::S3NotConfigured) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "S3 bucket is not configured".to_string(),
             ),
             Self::Read(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Auth(err) => (err.status_code(), err.to_string()),

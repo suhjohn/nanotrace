@@ -3,24 +3,23 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Nanotrace Query Use Cases at 1M req/s / 100M events/s</title>
+<title>Nanotrace Use Case Query Guide</title>
 <style>
   :root {
-    --bg: #080a0d;
-    --panel: #11161d;
-    --panel-2: #171e27;
-    --panel-3: #0c1016;
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --panel-2: #191f25;
     --line: #27313d;
     --line-2: #344150;
-    --text: #e8edf2;
-    --muted: #9ca8b5;
-    --soft: #6f7d8a;
-    --blue: #77c8ff;
-    --green: #a9eebf;
-    --yellow: #ffd27a;
-    --red: #ff9d9d;
-    --violet: #cab6ff;
+    --text: #edf0f3;
+    --muted: #a8b0b8;
+    --soft: #78828d;
+    --blue: #7ac7ff;
+    --green: #96e6ad;
+    --yellow: #f2c96d;
+    --red: #ff9a9a;
     --max: 1180px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   }
 
   * { box-sizing: border-box; }
@@ -29,12 +28,9 @@
   body {
     margin: 0;
     padding: 0;
-    background:
-      radial-gradient(circle at 15% -10%, rgba(119, 200, 255, 0.18), transparent 28rem),
-      radial-gradient(circle at 80% 0%, rgba(169, 238, 191, 0.10), transparent 24rem),
-      linear-gradient(180deg, #10151c 0%, var(--bg) 34rem);
+    background: var(--bg);
     color: var(--text);
-    font: 15px/1.58 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font: 14px/1.58 var(--mono);
   }
 
   a { color: var(--blue); text-decoration: none; }
@@ -42,22 +38,20 @@
 
   code {
     border: 1px solid var(--line);
-    border-radius: 5px;
     padding: 1px 5px;
     background: var(--panel-2);
     color: #dfe8f1;
-    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font: 12.5px/1.5 var(--mono);
   }
 
   pre {
-    margin: 0;
+    margin: 8px 0 18px;
     overflow-x: auto;
     border: 1px solid #1f2833;
-    border-radius: 10px;
     padding: 14px 15px;
     background: #070a0f;
     color: #d8e0e8;
-    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font: 12.5px/1.55 var(--mono);
   }
 
   header {
@@ -74,46 +68,17 @@
   }
 
   h1 {
-    max-width: 960px;
+    max-width: 1000px;
     margin: 0 0 10px;
-    font-size: clamp(30px, 5vw, 54px);
+    font-size: 42px;
     line-height: 0.98;
-    letter-spacing: -0.055em;
   }
 
   .lede {
-    max-width: 900px;
+    max-width: 980px;
     margin: 0;
     color: var(--muted);
     font-size: 15.5px;
-  }
-
-  .scale {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    margin-top: 24px;
-  }
-
-  .scale-card {
-    min-height: 92px;
-    border: 1px solid var(--line);
-    border-radius: 15px;
-    padding: 14px 15px;
-    background: rgba(17, 22, 29, 0.78);
-  }
-
-  .scale-card strong {
-    display: block;
-    margin-bottom: 5px;
-    color: var(--text);
-    font-size: 21px;
-    letter-spacing: -0.03em;
-  }
-
-  .scale-card span {
-    color: var(--muted);
-    font-size: 13px;
   }
 
   nav {
@@ -121,7 +86,7 @@
     top: 0;
     z-index: 4;
     border-bottom: 1px solid var(--line);
-    background: rgba(8, 10, 13, 0.82);
+    background: rgba(11, 13, 16, 0.92);
     backdrop-filter: blur(12px);
   }
 
@@ -144,7 +109,7 @@
   }
 
   section {
-    margin: 0 0 46px;
+    margin: 0 0 48px;
   }
 
   h2 {
@@ -152,13 +117,12 @@
     padding-bottom: 10px;
     border-bottom: 1px solid var(--line);
     font-size: 22px;
-    letter-spacing: -0.02em;
   }
 
   h3 {
-    margin: 0;
+    margin: 0 0 12px;
     font-size: 18px;
-    letter-spacing: -0.015em;
+    line-height: 1.35;
   }
 
   p { margin: 0 0 12px; }
@@ -166,143 +130,85 @@
   ul,
   ol {
     margin: 0;
-    padding-left: 20px;
+    padding-left: 24px;
   }
 
-  li { margin: 0 0 4px; }
+  li { margin: 0 0 6px; }
 
-  .summary-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    margin: 16px 0 0;
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 14px;
   }
 
-  .group-card {
+  th,
+  td {
     border: 1px solid var(--line);
-    border-radius: 14px;
-    padding: 15px;
-    background: rgba(17, 22, 29, 0.76);
+    padding: 9px 10px;
+    vertical-align: top;
+    text-align: left;
   }
 
-  .group-card b {
-    display: block;
-    margin-bottom: 6px;
+  th {
+    color: var(--text);
+    background: rgba(20, 24, 29, 0.86);
   }
 
-  .group-card p {
-    margin: 0;
+  td {
     color: var(--muted);
-    font-size: 13px;
   }
 
-  .case-list {
-    display: grid;
-    gap: 16px;
+  .contract {
+    color: var(--muted);
   }
 
-  .case {
-    border: 1px solid var(--line);
-    border-radius: 16px;
-    background: rgba(17, 22, 29, 0.78);
-    overflow: hidden;
+  .contract li {
+    margin-bottom: 8px;
   }
 
-  .case-head {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 12px;
-    align-items: start;
-    padding: 16px 17px;
-    border-bottom: 1px solid var(--line);
-    background: linear-gradient(180deg, rgba(23, 30, 39, 0.86), rgba(17, 22, 29, 0.65));
+  .question-list {
+    list-style-position: outside;
+    padding-left: 32px;
+    counter-reset: item;
   }
 
-  .num {
-    display: inline-grid;
-    width: 32px;
-    height: 32px;
-    place-items: center;
-    border-radius: 9px;
-    background: #0b1118;
+  .question-list > li {
+    border-top: 1px solid var(--line);
+    padding: 22px 0 18px;
+    margin: 0;
+  }
+
+  .question-list > li::marker {
     color: var(--blue);
     font-weight: 750;
   }
 
-  .tag {
-    align-self: center;
-    border: 1px solid var(--line-2);
-    border-radius: 999px;
-    padding: 3px 8px;
-    color: var(--muted);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
-  .case-body {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 14px;
-    padding: 16px 17px 18px;
-  }
-
-  .two-col {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 14px;
-  }
-
-  .box {
-    border: 1px solid var(--line);
-    border-radius: 13px;
-    padding: 13px;
-    background: rgba(12, 16, 22, 0.72);
-  }
-
-  .box h4 {
-    margin: 0 0 8px;
-    color: var(--blue);
-    font-size: 13px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  .box p {
-    margin: 0;
-    color: var(--muted);
-    font-size: 13.5px;
-  }
-
-  .code-label {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 7px;
+  .meta {
+    margin: 0 0 14px;
     color: var(--soft);
-    font-size: 12px;
+    font-size: 13px;
+  }
+
+  .detail {
+    margin: 0 0 14px;
+  }
+
+  .detail b {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--green);
+    font-size: 13px;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
   }
 
-  .pill {
-    border-radius: 999px;
-    padding: 2px 7px;
-    background: rgba(119, 200, 255, 0.11);
-    color: var(--blue);
-    font-size: 11px;
-    text-transform: none;
-    letter-spacing: 0;
+  .detail p {
+    color: var(--muted);
+    margin-bottom: 8px;
   }
 
-  .group1 .num,
-  .group1 .box h4 { color: var(--green); }
-  .group2 .num,
-  .group2 .box h4 { color: var(--blue); }
-  .group3 .num,
-  .group3 .box h4 { color: var(--yellow); }
-  .group1 .pill { background: rgba(169, 238, 191, 0.11); color: var(--green); }
-  .group3 .pill { background: rgba(255, 210, 122, 0.12); color: var(--yellow); }
+  .definition b { color: var(--blue); }
+  .query b { color: var(--yellow); }
+  .answer b { color: var(--red); }
 
   .footer-note {
     margin-top: 28px;
@@ -314,730 +220,700 @@
 
   @media (max-width: 860px) {
     .wrap { width: min(100vw - 28px, var(--max)); }
-    .scale,
-    .summary-grid,
-    .two-col {
-      grid-template-columns: 1fr;
-    }
-
-    .case-head {
-      grid-template-columns: auto 1fr;
-    }
-
-    .tag {
-      grid-column: 2;
-      justify-self: start;
-    }
+    h1 { font-size: 30px; }
+    .question-list { padding-left: 26px; }
   }
 </style>
 </head>
 <body>
 <header>
   <div class="wrap hero">
-    <h1>Nanotrace Query Use Cases</h1>
+    <h1>Nanotrace Use Case Query Guide</h1>
     <p class="lede">
-      A practical taxonomy for what runs now on the Iceberg-backed ClickHouse serving plane, what becomes fast after schema/report materialization, and what needs a new subsystem when the target load is 1M requests/sec and 100M events/sec.
+      A question-led reference for engineering telemetry and business analytics. Each numbered item starts with the user question, then shows SDK/spec-shaped instrumentation pseudocode, definitions when needed, how querying works, and the answer the user should see.
     </p>
-    <div class="scale">
-      <div class="scale-card">
-        <strong>1M req/s</strong>
-        <span>Target request rate. Raw scans must be rare, bounded, or point-lookups.</span>
-      </div>
-      <div class="scale-card">
-        <strong>100 events/req</strong>
-        <span>Business and observability flows can emit many correlated events per request.</span>
-      </div>
-      <div class="scale-card">
-        <strong>Iceberg source</strong>
-        <span>Serving tables are rebuildable from committed lakehouse snapshots and guarded by watermarks.</span>
-      </div>
-    </div>
   </div>
 </header>
 
 <nav>
   <div class="wrap">
-    <a href="#groups">Classification</a>
-    <a href="#lifecycle">Lifecycle</a>
-    <a href="#group-1">Group 1</a>
-    <a href="#group-2">Group 2</a>
-    <a href="#group-3">Group 3</a>
-    <a href="#rule">Product Rule</a>
+    <a href="#contract">Form</a>
+    <a href="#integration-map">Integration Map</a>
+    <a href="#engineering">Engineering</a>
+    <a href="#business">Business</a>
+    <a href="#platform">Platform</a>
+    <a href="#boundaries">Boundaries</a>
   </div>
 </nav>
 
 <main class="wrap">
-  <section id="groups">
-    <h2>Classification</h2>
-    <p>At this scale, Iceberg is the durable source of truth. ClickHouse raw and promoted tables are serving indexes, not the only copy of analytical history.</p>
-    <p>The load-test profile that best exercises this design is <code>codex</code>: it emits correlated agent workflows rather than isolated rows, including span start/end, planning, retrieval, LLM calls, tool calls, evaluation, safety, runtime metrics, processor events, and logs.</p>
-    <div class="summary-grid">
-      <div class="group-card">
-        <b>Group 1: run now</b>
-        <p>Uses default serving tables, indexes, and freshness watermarks already maintained by the system.</p>
-      </div>
-      <div class="group-card">
-        <b>Group 2: promote/materialize/report</b>
-        <p>Has a clear optimization path through schema definitions, materialization jobs, and published result versions.</p>
-      </div>
-      <div class="group-card">
-        <b>Group 3: new subsystem</b>
-        <p>Cannot be made efficient by the current schema/report materialization model alone.</p>
-      </div>
-    </div>
+  <section id="contract">
+    <h2>Use Case Form</h2>
+    <p>The product-facing API should be one JSON endpoint: <code>POST /v1/query</code>. The request body carries a <code>type</code> such as <code>events</code>, <code>search</code>, <code>measure</code>, <code>funnel</code>, <code>cohort</code>, <code>report</code>, <code>state</code>, or <code>alerts</code>. That keeps one query surface while still letting the server validate inputs, enforce tenant scope, check freshness, and return stable response shapes. SQL is not the product workflow; historical SQL-shaped analysis belongs in operator-controlled lakehouse query/export tooling.</p>
+    <ol class="contract">
+      <li>Write the heading as the literal user question.</li>
+      <li>Show the event or SDK calls the customer should emit. Prefer SDK-shaped pseudocode over table names.</li>
+      <li>State whether this works from raw events and <code>event_kv_index</code>, or whether it needs a field, metric, measure cube, sequence, cohort, state, report, or alert definition.</li>
+      <li>Show queries as <code>POST /v1/query</code> JSON requests with a <code>type</code> field. Do not teach SQL as the product workflow.</li>
+      <li>Say what the user sees, including freshness or materialization state when relevant.</li>
+    </ol>
   </section>
 
-  <section id="lifecycle">
-    <h2>Optimization Lifecycle</h2>
-    <p>Group 2 means the serving model is known and schema-backed. The current system already has Iceberg commit tracking, raw rebuild, serving watermarks, and a continuous materializer for promoted fields, measures, metric rollups, summary reports, trace summary reports, retention reports, sequence reports, entity states, and cohort memberships. Full published-version report jobs remain separate implementation work.</p>
-    <div class="summary-grid">
-      <div class="group-card">
-        <b>Observe</b>
-        <p><code>query_usage</code> records raw fallback query shapes, JSON paths, scanned bytes, latency, and result size.</p>
-      </div>
-      <div class="group-card">
-        <b>Define</b>
-        <p>SDK-managed definitions and user/admin definitions explicitly declare fields, measures, reports, cohorts, funnels, and alerts.</p>
-      </div>
-      <div class="group-card">
-        <b>Build</b>
-        <p>The current promoted-table materializer reads <code>lakehouse_commits</code> and <code>serving_watermarks</code>; broader executors use <code>materialization_jobs</code> and <code>materialization_chunks</code>.</p>
-      </div>
-      <div class="group-card">
-        <b>Serve</b>
-        <p><code>serving_watermarks</code>, <code>materialization_versions</code>, and <code>materialization_watermarks</code> let readers select caught-up serving data and observe lag.</p>
-      </div>
-    </div>
+  <section id="integration-map">
+    <h2>Integration Test Coverage Map</h2>
+    <p>The Kafka integration test and loadtest-backed materialization check are the concrete product backbone for this document. They exercise tenant isolation, Kafka ingest, materializer-loaded ClickHouse serving rows, lakehouse commits, serving watermarks, materialization versions and watermarks, KV filters, nested arrays, field backfill, SDK metrics, measure cubes, funnels, cohorts, cohort-scoped measures, and load-generated raw plus derived serving catch-up.</p>
+    <table>
+      <thead>
+        <tr><th>Tested behavior</th><th>User-facing meaning</th><th>Serving path</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Tenant bootstrap and API key isolation</td><td>Users can query only their organization events, even if another tenant sends the same event id or spoofs tenant fields.</td><td>Domain APIs and structured product queries are tenant-scoped. Cross-tenant historical analysis is operator tooling, not a server API.</td></tr>
+        <tr><td>Kafka ingest, normalizer, ClickHouse, Iceberg, watermarks</td><td>Accepted events become durable lakehouse records and searchable serving rows with visible serving freshness.</td><td><code>/v1/events</code> -> Kafka -> normalizer -> Iceberg -> materializer -> ClickHouse.</td></tr>
+        <tr><td>Loadtest and materialization catch-up</td><td>Generated product, metric, trace, log, agent, and pipeline event mixes can be pushed through the same ingest path and observed in raw and derived tables.</td><td><code>npm run loadtest:local</code> and <code>npm run materialization:loadtest</code> validate <code>_loadtest.run_id</code> visibility, metric rollups, reports, sequences, cohorts, and watermarks.</td></tr>
+        <tr><td>Arbitrary KV indexing</td><td>Bounded scalar payload fields are immediately filterable without becoming metrics or promoted facets.</td><td><code>/v1/query</code> with <code>type=events</code> routes facets through <code>event_kv_index</code>.</td></tr>
+        <tr><td>Nested objects and arrays</td><td><code>llm.model</code>, <code>llm.usage.prompt_tokens</code>, tags, and array item attributes remain filterable.</td><td><code>event_kv_index</code> stores path, value type, and array scope metadata.</td></tr>
+        <tr><td>Field definition backfill</td><td>Repeated facets such as product, plan, country, service, or route can be promoted and backfilled.</td><td><code>definitions</code> -> <code>field_index</code> + <code>materialization_watermarks</code>.</td></tr>
+        <tr><td>SDK metric definition</td><td>Metric events produce explicit rollup semantics without auto-promoting unrelated JSON fields.</td><td>Managed <code>metric_rollup</code> definition writes counter/gauge/histogram rollups.</td></tr>
+        <tr><td>Measure cube rollups</td><td>Percentiles/count/sum/min/max/avg can be queried by approved dimensions.</td><td><code>/v1/query</code> with <code>type=measure</code>.</td></tr>
+        <tr><td>Unmaterialized grouping fails clearly</td><td>If a dashboard asks for a dimension combination that was not defined, users get a setup error instead of an accidental raw scan.</td><td><code>type=measure</code> validates available dimension sets.</td></tr>
+        <tr><td>Funnel materialization</td><td>Signup, checkout, onboarding, or agent workflow conversion can be tracked as ordered sequences.</td><td><code>/v1/query</code> with <code>type=funnel</code>.</td></tr>
+        <tr><td>Cohort membership and cohort-scoped measures</td><td>Users can ask how a specific group behaves after joining a cohort, then join membership to metrics or events.</td><td><code>/v1/query</code> with <code>type=cohort</code> plus structured measure/report queries.</td></tr>
+      </tbody>
+    </table>
   </section>
 
-  <section id="group-1">
-    <h2>Group 1: Works Well Out Of The Box</h2>
-    <div id="group1" class="case-list"></div>
+  <section id="engineering">
+    <h2>Engineering Telemetry</h2>
+    <ol id="engineering-list" class="question-list"></ol>
   </section>
 
-  <section id="group-2">
-    <h2>Group 2: Optimizable With Schema / Report / Materialization</h2>
-    <p>Each case below shows the raw <code>observatory.events</code> serving query shape that is too expensive at 100M events/sec, then the post-optimization serving query and why it is faster. The optimized query assumes the target definition/report is caught up to the required Iceberg sequence or has a completed materialization version.</p>
-    <div id="group2" class="case-list"></div>
+  <section id="business">
+    <h2>Business Analytics</h2>
+    <ol id="business-list" class="question-list"></ol>
   </section>
 
-  <section id="group-3">
-    <h2>Group 3: Fundamentally Not Optimizable In The Current System</h2>
-    <div id="group3" class="case-list"></div>
+  <section id="platform">
+    <h2>Platform And Governance</h2>
+    <ol id="platform-list" class="question-list"></ol>
   </section>
 
-  <section id="rule">
-    <h2>Product Rule</h2>
-    <div class="summary-grid">
-      <div class="group-card">
-        <b>Group 1</b>
-        <p>Run immediately.</p>
-      </div>
-      <div class="group-card">
-        <b>Group 2</b>
-        <p>Create or select a definition/report, enqueue materialization work, then serve only completed versions instead of silently running a large raw scan.</p>
-      </div>
-      <div class="group-card">
-        <b>Group 3</b>
-        <p>Present as unsupported, offline, or new-subsystem work, not as an interactive query.</p>
-      </div>
-    </div>
-    <p class="footer-note">Source Markdown: <code>docs/usecase.md</code>. This page is self-contained and does not load external assets.</p>
+  <section id="boundaries">
+    <h2>Boundaries</h2>
+    <ol id="boundary-list" class="question-list"></ol>
+    <p class="footer-note">This page is self-contained and does not load external assets.</p>
   </section>
 </main>
 
 <script>
-const group1 = [
+const engineeringCases = [
   {
-    number: 1,
-    title: 'Default event volume over time',
-    tag: 'event_density_1s',
-    question: 'How many events happened over time?',
-    shape: 'Count and error count by time bucket.',
-    path: 'event_density_1s',
-    status: 'Good. This is the default global histogram/read path.'
+    tag: 'logs',
+    question: 'What just happened in this service, environment, request, job, or customer account?',
+    codeSetupText: 'In application code, emit structured logs/events with stable service, environment, ids, severity, and trace links. Make fields explicit when users will filter on them.',
+    codeSetup: `const nt = createNanotrace({ service: 'checkout-api', environment: 'prod', transport })
+
+nt.info('checkout failed', {
+  severity: 'error',
+  route: '/checkout',
+  account_id: accountId,
+  user_id: userId,
+  request_id: requestId,
+  trace_id: traceId,
+  error_type: 'payment_declined'
+})`,
+    runOnceText: 'Nothing is required for recent browsing and exact filters. Later, promote common navigation fields such as service, route, severity, error_type, account_id, or job_id.',
+    runOnce: '',
+    queryText: 'Use the event query API with facet filters. The server routes exact scalar filters through event_kv_index.',
+    query: `POST /v1/query
+{
+  "type": "events",
+  "view": "events",
+  "filter": {
+    "facets": [
+      { "path": "service", "operator": "eq", "value": "checkout-api" },
+      { "path": "severity", "operator": "eq", "value": "error" },
+      { "path": "account_id", "operator": "eq", "value": "acct_123" }
+    ]
+  }
+}`,
+    how: 'Nanotrace keeps the raw event as the source of truth and also flattens bounded scalar payload fields into event_kv_index. The query intersects matching event ids and returns recent rows plus histogram/count context.'
   },
   {
-    number: 2,
-    title: 'Global error threshold alerts',
-    tag: 'event_density_1s',
-    question: 'Alert if error rate is above 1% for 5 minutes.',
-    shape: 'sum(error_count) / sum(count) over recent buckets.',
-    path: 'event_density_1s',
-    status: 'Good for tenant-wide error-rate and error-count alerts.'
+    tag: 'tracing',
+    question: 'What happened inside this request, background job, or agent run?',
+    codeSetupText: 'Wrap work in SDK spans and attach ids that tie spans back to the request, job, account, user, and workflow.',
+    codeSetup: `const span = nt.span('POST /checkout', {
+  request_id: requestId,
+  account_id: accountId
+})
+
+try {
+  nt.info('charge requested', { trace_id: span.traceId, provider: 'stripe' })
+  span.end({ spanStatusCode: 'ok', duration_ms: 183 })
+} catch (error) {
+  span.end({ spanStatusCode: 'error', isError: 1, error_type: 'stripe_timeout' })
+}`,
+    runOnceText: 'Known trace lookup needs no definition. Create a trace-summary report only for broad questions such as slowest traces, expensive agent runs, or top trace error causes.',
+    runOnce: '',
+    queryText: 'Query by trace_id for one waterfall. Query report_results only for broad trace ranking or summaries.',
+    query: `POST /v1/query
+{
+  "type": "events",
+  "view": "events",
+  "filter": {
+    "facets": [{ "path": "trace_id", "operator": "eq", "value": "trace_123" }]
+  }
+}`,
+    how: 'Trace lookup is a bounded event lookup. The UI reconstructs the waterfall from trace_id, span_id, and parent_span_id. Broad trace analytics should use explicit report materialization.'
   },
   {
-    number: 3,
-    title: 'Global traffic anomaly alerts',
-    tag: 'event_density_1s',
-    question: 'Alert if event volume drops by 80% or spikes 3x.',
-    shape: 'Compare recent event_density_1s buckets against a prior baseline.',
-    path: 'event_density_1s',
-    status: 'Good for tenant-wide volume anomalies.'
+    tag: 'metrics',
+    question: 'What are latency, error, counter, gauge, and histogram metrics doing by service, route, plan, country, or model?',
+    codeSetupText: 'Emit metric facts with the SDK. Include metric name, value, unit, and the dimensions users will group by.',
+    codeSetup: `nt.counter('checkout.attempts', { route: '/checkout', plan: 'pro' })
+nt.measure('checkout.latency', 183, {
+  metricUnit: 'ms',
+  route: '/checkout',
+  plan: 'pro',
+  country: 'US',
+  llm: { model: 'gpt-4.1-mini' }
+})`,
+    runOnceText: 'Create a measure cube definition for each approved groupBy set. SDK metric definitions cover basic metric semantics; cubes define the product-approved dimensions.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "checkout.latency",
+  "kind": "measure",
+  "mode": "cube",
+  "config": {
+    "match": { "all": [
+      { "path": "event_type", "op": "eq", "value": "metric" },
+      { "path": "metric_name", "op": "eq", "value": "checkout.latency" }
+    ] },
+    "outputs": [{
+      "target": "measure_cube_rollups",
+      "value": { "path": "metric_value" },
+      "unit": "ms",
+      "dimension_sets": [
+        { "id": "plan", "dimensions": [{ "name": "plan", "value": { "path": "plan" } }] },
+        { "id": "route", "dimensions": [{ "name": "route", "value": { "path": "route" } }] }
+      ],
+      "bucket_seconds": 300
+    }]
+  }
+}`,
+    queryText: 'Use the typed measures endpoint for approved dimensions. Undefined groupBy combinations fail clearly instead of falling back to raw scans.',
+    query: `POST /v1/query
+{
+  "type": "measure",
+  "measureName": "checkout.latency",
+  "groupBy": ["plan"],
+  "bucketSeconds": 300
+}`,
+    how: 'The SDK emits facts only. The definition tells the materializer which metric events become rollups and which dimensions are legal. Queries merge precomputed aggregate states instead of parsing raw events.'
   },
   {
-    number: 4,
-    title: 'Latest events / default logs',
-    tag: 'events + density',
-    question: 'Show me the latest events and histogram.',
-    shape: 'Recent event page plus density histogram.',
-    path: 'events plus event_density_1s',
-    status: 'Good for recent default browsing.'
+    tag: 'alerts',
+    question: 'Should we alert when checkout latency, error rate, volume, or cost crosses a threshold for one dimension?',
+    codeSetupText: 'Emit the threshold inputs and dimensions on the source events: route, plan, status, duration, cost, severity, and error_type.',
+    codeSetup: `nt.measure('http.server.duration', durationMs, {
+  metricUnit: 'ms',
+  service: 'checkout-api',
+  route: '/checkout',
+  plan,
+  status,
+  is_error: status >= 500 ? 1 : 0
+})`,
+    runOnceText: 'Create an alert/report definition that names the metric, dimensions, buckets, and threshold. Promote predicate fields before treating arbitrary filters as cheap.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "checkout_p95_by_route_plan",
+  "kind": "report",
+  "mode": "summary",
+  "config": {
+    "outputs": [{
+      "target": "report_results",
+      "report_id": "checkout_p95_by_route_plan",
+      "dimensions": ["route", "plan"],
+      "metrics": ["p95_ms", "events", "errors"]
+    }]
+  }
+}`,
+    queryText: 'The alert evaluator should use a JSON report query that reads compact rollup/report rows and links back to matching events for samples.',
+    query: `POST /v1/query
+{
+  "type": "report",
+  "reportId": "checkout_p95_by_route_plan",
+  "from": "now-10m",
+  "to": "now",
+  "metrics": ["p95_ms", "events", "errors"],
+  "groupBy": ["route", "plan"]
+}`,
+    how: 'Recurring alerts should not schedule broad raw scans. Nanotrace evaluates them from materialized metrics or reports and exposes freshness so users know if the alert data is caught up.'
   },
   {
-    number: 5,
-    title: 'Single event lookup',
-    tag: 'point lookup',
-    question: 'Show event evt_123.',
-    shape: 'Point lookup by event_id.',
-    path: 'events bloom index, optionally followed by S3 byte-range fetch using source_file, source_offset, and source_length.',
-    status: 'Good.'
-  },
-  {
-    number: 6,
-    title: 'Bounded trace/span lookup',
-    tag: 'bounded lookup',
-    question: 'Show events for this known trace_id or span_id.',
-    shape: 'Exact id filter over a bounded result set.',
-    path: 'Materialized trace_id / span_id plus bloom indexes.',
-    status: 'Good when bounded. This is not the same as broad trace analytics.'
+    tag: 'ai',
+    question: 'Why did this AI agent run fail, cost too much, time out, or produce a poor answer?',
+    codeSetupText: 'Emit an agent run id on every related event. Record model/provider, token counts, tool calls, evaluator scores, safety labels, cost, duration, and final outcome.',
+    codeSetup: `const run = nt.span('agent.run', { agent_run_id: runId, account_id: accountId })
+nt.measure('llm.tokens', promptTokens + completionTokens, {
+  metricUnit: 'tokens',
+  agent_run_id: runId,
+  model: 'gpt-4.1',
+  provider: 'openai'
+})
+nt.info('tool finished', { agent_run_id: runId, tool_name: 'bash', exit_code: 1 })
+run.end({ spanStatusCode: 'error', isError: 1, eval_score: 0.42 })`,
+    runOnceText: 'Known-run debugging needs no definition. Define reports/measures for recurring quality, cost, latency, and regression dashboards.',
+    runOnce: '',
+    queryText: 'Query one run by agent_run_id or trace_id. Query materialized reports for trends.',
+    query: `POST /v1/query
+{
+  "type": "events",
+  "view": "events",
+  "filter": {
+    "facets": [{ "path": "agent_run_id", "operator": "eq", "value": "run_123" }]
+  }
+}`,
+    how: 'The raw event timeline explains one run. Metrics and reports summarize repeated patterns such as cost by model, failure by tool, and quality by release.'
   }
 ]
 
-const group2 = [
+const businessCases = [
   {
-    number: 7,
-    title: 'Group by arbitrary event field',
-    tag: 'field_index',
-    examples: ['Group events by browser.', 'Group purchases by plan.', 'Group traffic by country, user group, campaign, or feature flag.'],
-    raw: `SELECT
-  data.<field> AS value,
-  count() AS events
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY value
-ORDER BY events DESC;`,
-    bad: 'The query scans the time range, extracts one JSON/subcolumn value from every raw event, builds group state for every distinct value, and sorts the result.',
-    action: 'Create a field definition with mode=facet for bounded-cardinality fields. Use materialization_jobs/materialization_chunks to backfill field_index, then keep it current with a watermark-driven materializer.',
-    optimized: `SELECT
-  value,
-  uniqCombined64(event_id) AS events
-FROM observatory.field_index
-WHERE tenant_id = {tenant_id:String}
-  AND mode = 'facet'
-  AND field_name = 'plan'
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY value
-ORDER BY events DESC
-LIMIT 100;`,
-    faster: 'Reads a narrow promoted index for one field instead of wide raw payloads. The sort key clusters by tenant, mode, field name, and value hash, so ClickHouse prunes directly to the promoted field row set.',
-    caveat: 'Facet mode is for bounded dimensions like plan, country, browser, variant, or service. High-cardinality ids usually need lookup mode or a report.'
+    tag: 'funnel',
+    question: 'Where do users drop off from signup to checkout, onboarding, invite, activation, or purchase?',
+    codeSetupText: 'Emit ordered product events with stable user/account/session ids, event names, plan, and dimensions used for segmentation.',
+    codeSetup: `nt.info('Signup Started', { event_type: 'track', entities: { user_id, account_id }, plan })
+nt.info('Checkout Started', { event_type: 'track', entities: { user_id, account_id }, plan })
+nt.info('Payment Submitted', { event_type: 'track', entities: { user_id, account_id }, plan })
+nt.info('Checkout Completed', { event_type: 'track', entities: { user_id, account_id }, plan, order_id })`,
+    runOnceText: 'Create a sequence definition with the entity id, segmentation dimensions, ordered steps, and bucket size.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "signup_to_checkout",
+  "kind": "sequence",
+  "mode": "funnel",
+  "config": {
+    "outputs": [{
+      "target": "sequence_report_results",
+      "report_id": "signup_to_checkout",
+      "entity_id": { "path": "entities.user_id" },
+      "dimensions": [{ "name": "plan", "value": { "path": "plan" } }],
+      "steps": [
+        { "name": "signup_started", "match": { "all": [{ "path": "name", "op": "eq", "value": "Signup Started" }] } },
+        { "name": "checkout_completed", "match": { "all": [{ "path": "name", "op": "eq", "value": "Checkout Completed" }] } }
+      ]
+    }]
+  }
+}`,
+    queryText: 'Read the materialized sequence rows by report id and segment.',
+    query: `POST /v1/query
+{
+  "type": "funnel",
+  "reportId": "signup_to_checkout",
+  "from": "2026-06-04T00:00:00Z",
+  "to": "2026-06-05T00:00:00Z",
+  "filters": { "plan": "pro" },
+  "allowStaleServing": true
+}`,
+    how: 'The materializer computes ordered step membership once. The dashboard reads one row per step and segment instead of replaying every user journey interactively.'
   },
   {
-    number: 8,
-    title: 'Multi-field filters',
-    tag: 'field_index intersections',
-    examples: ['Show pro users in the US on enterprise accounts.', 'Show checkout events for mobile Safari users in Canada.', 'Show LLM calls where model is gpt-4.1 and provider is OpenAI.'],
-    raw: `SELECT
-  event_id,
-  timestamp,
-  data
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-  AND data.plan = 'pro'
-  AND data.country = 'US'
-  AND data.account_tier = 'enterprise'
-ORDER BY timestamp DESC
-LIMIT 100;`,
-    bad: 'Raw predicates are evaluated row-by-row against events. Even if each predicate is selective, there is no serving index for those JSON paths.',
-    action: 'Promote every frequently used filter field. Use facet for low/medium cardinality fields and lookup for high-cardinality exact filters. Backfill and refresh each promoted path through materialization jobs.',
-    optimized: `SELECT
-  i.event_id,
-  i.timestamp,
-  i.event_type,
-  i.signal,
-  i.trace_id,
-  i.span_id,
-  i.name
-FROM observatory.field_index AS i
-WHERE i.tenant_id = {tenant_id:String}
-  AND i.field_name = 'plan'
-  AND i.value = 'pro'
-  AND i.timestamp >= {from:DateTime64(3, 'UTC')}
-  AND i.event_id IN (
-    SELECT event_id
-    FROM observatory.field_index
-    WHERE tenant_id = {tenant_id:String}
-      AND field_name = 'country'
-      AND value = 'US'
-      AND timestamp >= {from:DateTime64(3, 'UTC')}
-  )
-  AND i.event_id IN (
-    SELECT event_id
-    FROM observatory.field_index
-    WHERE tenant_id = {tenant_id:String}
-      AND field_name = 'account_tier'
-      AND value = 'enterprise'
-      AND timestamp >= {from:DateTime64(3, 'UTC')}
-  )
-ORDER BY i.timestamp DESC
-LIMIT 100;`,
-    faster: 'Each predicate becomes an exact lookup in a narrow table keyed by tenant, field name, and value. Candidate event ids are intersected after each field is pruned independently.',
-    caveat: 'Promoting every possible dynamic path recreates write fanout. Promotion should happen through explicit SDK-managed defaults or user/admin action.'
+    tag: 'cohort',
+    question: 'Which accounts or users joined a cohort such as pro accounts that completed checkout?',
+    codeSetupText: 'Emit the cohort-entry event with the entity id and fields used in the eligibility rule.',
+    codeSetup: `nt.info('Checkout Completed', {
+  event_type: 'track',
+  plan: 'pro',
+  entities: { account_id, user_id },
+  order_id
+})`,
+    runOnceText: 'Create a cohort definition with the match predicates, entity type, entity id path, and cohort id.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "pro_completed_accounts",
+  "kind": "cohort",
+  "mode": "membership",
+  "config": {
+    "match": { "all": [
+      { "path": "name", "op": "eq", "value": "Checkout Completed" },
+      { "path": "plan", "op": "eq", "value": "pro" }
+    ] },
+    "outputs": [{
+      "target": "cohort_memberships",
+      "cohort_id": "pro_completed_accounts",
+      "entity_type": "account",
+      "entity_id": { "path": "entities.account_id" }
+    }]
+  }
+}`,
+    queryText: 'Query cohort membership through the structured cohort endpoint. Use report or measure queries for cohort-scoped views.',
+    query: `POST /v1/query
+{
+  "type": "cohort",
+  "cohortId": "pro_completed_accounts",
+  "entityType": "account",
+  "limit": 100,
+  "allowStaleServing": true
+}`,
+    how: 'Cohort membership is a materialized set. Once an account qualifies, queries can reuse that membership without recomputing the qualifying event predicate.'
   },
   {
-    number: 9,
-    title: 'Dimensioned alerts',
-    tag: 'report_results',
-    examples: ['Alert if checkout error rate for enterprise users exceeds 2%.', 'Alert if p95 latency for service=api and route=/checkout exceeds 2 seconds.', 'Alert if model=gpt-4.1 errors spike for one customer.'],
-    raw: `SELECT
-  toStartOfMinute(timestamp) AS bucket,
-  count() AS events,
-  countIf(ifNull(data.is_error, 0) != 0 OR endsWith(lower(event_type), '_error')) AS errors,
-  errors / nullIf(events, 0) AS error_rate
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= now() - INTERVAL 5 MINUTE
-  AND data.service = 'checkout'
-  AND data.plan = 'enterprise'
-GROUP BY bucket
-HAVING error_rate >= 0.02
-ORDER BY bucket DESC;`,
-    bad: 'Alert checks run repeatedly. A raw scan every few seconds or minutes becomes permanent background load.',
-    action: 'Promote alert dimensions and create a report or alert rollup keyed by the dimensions needed by the rule.',
-    optimized: `SELECT
-  bucket_time,
-  toFloat64(metrics.error_rate) AS error_rate,
-  toUInt64(metrics.events) AS events,
-  toUInt64(metrics.errors) AS errors
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'checkout_error_rate_by_plan'
-  AND bucket_time >= now64(3) - INTERVAL 5 MINUTE
-  AND dimensions.service = 'checkout'
-  AND dimensions.plan = 'enterprise'
-ORDER BY bucket_time DESC;`,
-    faster: 'The evaluator reads a few precomputed bucket rows instead of recomputing error counts from raw events at every evaluation interval.',
-    caveat: 'Near-real-time latency is bounded by the async path: local file, S3, SQS, loader, ClickHouse, evaluator.'
+    tag: 'revenue',
+    question: 'Which products, plans, campaigns, countries, or customer segments generate revenue?',
+    codeSetupText: 'Emit revenue as a named measure with transaction ids, account/user ids, product, plan, campaign, country, currency, and correction/refund markers.',
+    codeSetup: `nt.measure('revenue', amount, {
+  metricUnit: currency,
+  event_type: 'track',
+  name: 'Invoice Paid',
+  product_id,
+  plan,
+  campaign,
+  country,
+  order_id,
+  entities: { account_id, user_id }
+})`,
+    runOnceText: 'Create revenue measure/report definitions. Define currency normalization, refund handling, attribution, and correction semantics.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "revenue",
+  "kind": "measure",
+  "mode": "cube",
+  "config": {
+    "outputs": [{
+      "target": "measure_cube_rollups",
+      "measure_name": "revenue",
+      "value": { "path": "metric_value" },
+      "dimension_sets": [
+        { "id": "product", "dimensions": [{ "name": "product_id", "value": { "path": "product_id" } }] },
+        { "id": "plan", "dimensions": [{ "name": "plan", "value": { "path": "plan" } }] }
+      ]
+    }]
+  }
+}`,
+    queryText: 'Use measure/report outputs for dashboards and POST /v1/query with type=events for order/account drilldown.',
+    query: `POST /v1/query
+{
+  "type": "measure",
+  "measureName": "revenue",
+  "groupBy": ["plan"],
+  "bucketSeconds": 86400
+}`,
+    how: 'Finance-style queries should not infer semantics from arbitrary JSON. The measure/report definition says what counts as revenue and how to group it.'
   },
   {
-    number: 10,
-    title: 'Arbitrary raw JSON predicate alert',
-    tag: 'promote + materialize',
-    examples: ["Alert when data.foo='bar' AND data.region='us-east' crosses a threshold.", 'Alert when a customer-defined field becomes failed.', 'Alert when a new product property matches a specific value.'],
-    raw: `SELECT
-  toStartOfMinute(timestamp) AS bucket,
-  count() AS matching_events
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= now() - INTERVAL 1 MINUTE
-  AND data.foo = 'bar'
-  AND data.region = 'us-east'
-GROUP BY bucket
-HAVING matching_events >= {threshold:UInt64}
-ORDER BY bucket DESC;`,
-    bad: 'Once an arbitrary predicate becomes an alert, it runs on a schedule. Re-running it from raw events every minute creates persistent full-scan pressure.',
-    action: 'Promote all predicate paths. Backfill if a historical baseline is needed; otherwise materialize from rule creation time.',
-    optimized: `SELECT
-  bucket_time,
-  toUInt64(metrics.matching_events) AS matching_events
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'foo_bar_region_us_east_alert'
-  AND bucket_time >= now64(3) - INTERVAL 1 MINUTE
-HAVING matching_events >= {threshold:UInt64}
-ORDER BY bucket_time DESC;`,
-    faster: 'The arbitrary predicate is paid for during field promotion and report materialization. Runtime checks read tiny result rows keyed by report id and bucket time.',
-    caveat: 'This is Group 2, not Group 3, as long as the predicate fields are promoted before the alert is treated as low-cost.'
+    tag: 'retention',
+    question: 'Do users or accounts come back after signup, activation, purchase, feature adoption, or plan upgrade?',
+    codeSetupText: 'Emit cohort-entry events and activity events with stable entity ids and segment fields.',
+    codeSetup: `nt.info('Feature Adopted', { event_type: 'track', feature: 'ai_agent', entities: { account_id, user_id } })
+nt.info('Product Active', { event_type: 'track', entities: { account_id, user_id }, plan })`,
+    runOnceText: 'Create a cohort definition for entry and a retention report definition for activity windows.',
+    runOnce: `POST /v1/definitions
+{
+  "kind": "report",
+  "mode": "retention",
+  "config": {
+    "cohort_id": "feature_ai_agent_adopters",
+    "activity": { "path": "name", "op": "eq", "value": "Product Active" },
+    "entity_id": { "path": "entities.account_id" },
+    "bucket_seconds": 86400
+  }
+}`,
+    queryText: 'Read retention buckets through a structured report query.',
+    query: `POST /v1/query
+{
+  "type": "report",
+  "reportId": "feature_ai_agent_retention",
+  "from": "2026-06-01T00:00:00Z",
+  "to": "2026-07-01T00:00:00Z",
+  "metrics": ["members", "retained"],
+  "groupBy": ["plan", "cohortAge"]
+}`,
+    how: 'Retention uses cohort membership plus later activity. Precomputing it avoids exact long-window distinct counts over raw events for every dashboard refresh.'
   },
   {
-    number: 11,
-    title: 'Numeric metrics and percentiles',
-    tag: 'measure_rollups',
-    examples: ['What is p95 latency by service?', 'What is p99 LLM call duration by model?', 'What is average tool execution time by tool name?'],
-    raw: `SELECT
-  service,
-  quantileTDigest(0.95)(toFloat64(data.duration_ms)) AS p95_ms
-FROM observatory.events
-WHERE timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY service;`,
-    bad: 'Percentiles read all numeric values in the window and build quantile states. Doing that from raw JSON for each dashboard refresh is expensive.',
-    action: 'Create a measure definition for the numeric path and a rollup definition for grouped percentiles.',
-    optimized: `SELECT
-  bucket_time,
-  dimension_value AS service,
-  quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state)[3] AS p95_ms
-FROM observatory.measure_rollups
-WHERE tenant_id = {tenant_id:String}
-  AND measure_name = 'duration_ms'
-  AND dimension_name = 'service'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-GROUP BY bucket_time, service
-ORDER BY bucket_time DESC, p95_ms DESC;`,
-    faster: 'Merges already-built aggregate states from buckets. Work scales with buckets and services, not raw events.',
-    caveat: 'Current measure_rollups bucket is 5 minutes. Add bucket-specific materialization for other granularities.'
+    tag: 'cohort metrics',
+    question: 'How does checkout latency, cost, revenue, or error rate behave for members of this cohort?',
+    codeSetupText: 'Emit the metric or measure event with the same account/user entity id used by the cohort definition.',
+    codeSetup: `nt.measure('checkout.latency', latencyMs, {
+  metricUnit: 'ms',
+  plan,
+  route,
+  entities: { account_id, user_id }
+})`,
+    runOnceText: 'Create both the cohort definition and the relevant measure/metric definition. For durable dashboards, materialize this as a report.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "checkout.latency",
+  "kind": "measure",
+  "mode": "cube",
+  "config": {
+    "outputs": [{
+      "target": "measure_cube_rollups",
+      "measure_name": "checkout.latency",
+      "value": { "path": "metric_value" },
+      "dimension_sets": [{ "id": "plan", "dimensions": [{ "name": "plan", "value": { "path": "plan" } }] }]
+    }]
+  }
+}`,
+    queryText: 'Use a structured measure query with a cohort filter. If the backend needs a join internally, that should stay behind the JSON API.',
+    query: `POST /v1/query
+{
+  "type": "measure",
+  "measureName": "checkout.latency",
+  "from": "2026-06-04T00:00:00Z",
+  "to": "2026-06-05T00:00:00Z",
+  "bucketSeconds": 300,
+  "groupBy": ["plan"],
+  "filters": { "cohortId": "pro_completed_accounts" },
+  "allowStaleServing": true
+}`,
+    how: 'The cohort is a reusable membership set. Metrics stay event-linked through event ids and entity ids, so cohort-scoped analysis can combine the two without redefining the cohort predicate.'
   },
   {
-    number: 12,
-    title: 'Revenue analytics',
-    tag: 'event_measures + reports',
-    examples: ['Revenue by product over time.', 'Revenue by plan and campaign.', 'Average order value by cohort.'],
-    raw: `SELECT
-  toStartOfDay(timestamp) AS day,
-  data.product_id,
-  sum(toFloat64(data.revenue)) AS revenue
-FROM observatory.events
-WHERE timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY day, data.product_id;`,
-    bad: 'Revenue queries combine numeric aggregation, business dimensions, and long windows. Raw scans compete with ingest.',
-    action: 'Promote revenue as a measure. Promote dimensions such as product_id, plan, campaign, currency, and country. Materialize repeated summaries.',
-    optimized: `SELECT
-  bucket_time,
-  dimension_value AS product_id,
-  sumMerge(sum_state) AS revenue
-FROM observatory.measure_rollups
-WHERE tenant_id = {tenant_id:String}
-  AND measure_name = 'revenue'
-  AND dimension_name = 'product_id'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-GROUP BY bucket_time, product_id
-ORDER BY bucket_time DESC, revenue DESC;`,
-    faster: 'Reads aggregated revenue states by product and bucket instead of parsing, grouping, and summing raw purchase events on every dashboard load.',
-    caveat: 'Currency normalization, refunds, and corrections must be defined in report semantics before treating results as finance-grade.'
+    tag: 'experiments',
+    question: 'Did variant B improve conversion, retention, latency, cost, or revenue?',
+    codeSetupText: 'Emit assignment and outcome events with the same entity ids, experiment id, variant, and attribution fields.',
+    codeSetup: `nt.info('Experiment Assigned', {
+  event_type: 'track',
+  experiment_id: 'checkout_copy',
+  variant: 'B',
+  entities: { user_id, account_id }
+})
+
+nt.info('Checkout Completed', {
+  event_type: 'track',
+  experiment_id: 'checkout_copy',
+  variant: 'B',
+  entities: { user_id, account_id },
+  order_id
+})`,
+    runOnceText: 'Create cohort/report definitions for exposure membership, attribution window, conversion event, and outcome measures.',
+    runOnce: `POST /v1/definitions
+{
+  "kind": "report",
+  "mode": "experiment",
+  "config": {
+    "experiment_id": "checkout_copy",
+    "entity_id": { "path": "entities.user_id" },
+    "variant": { "path": "variant" },
+    "conversion": { "path": "name", "op": "eq", "value": "Checkout Completed" }
+  }
+}`,
+    queryText: 'Read experiment outcomes through a structured report query and use raw events only for sample validation.',
+    query: `POST /v1/query
+{
+  "type": "report",
+  "reportId": "checkout_copy_experiment",
+  "from": "2026-06-01T00:00:00Z",
+  "to": "2026-07-01T00:00:00Z",
+  "metrics": ["conversion_rate", "revenue"],
+  "groupBy": ["variant"]
+}`,
+    how: 'Experiment analysis needs explicit exposure and attribution semantics. The report definition prevents each dashboard from inventing its own conversion window or assignment rule.'
   },
   {
-    number: 13,
-    title: 'Active users/accounts/sessions',
-    tag: 'report_results',
-    examples: ['What is DAU by plan?', 'How many active accounts did we have this week?', 'How many sessions used feature X?'],
-    raw: `SELECT
-  toStartOfDay(timestamp) AS day,
-  uniqCombined64(data.user_id) AS active_users
-FROM observatory.events
-WHERE timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY day;`,
-    bad: 'Distinct entity counts build large aggregation state. Filters and dimensions increase both scan cost and state size.',
-    action: 'Promote identity paths and dimensions. Materialize repeated DAU/WAU/MAU reports.',
-    optimized: `SELECT
-  bucket_time,
-  toUInt64(metrics.active_users) AS active_users,
-  dimensions.plan AS plan
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'daily_active_users_by_plan'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY bucket_time DESC, active_users DESC;`,
-    faster: 'The distinct set is computed once per bucket/dimension and stored. UI reads scale with rendered buckets, not raw activity events.',
-    caveat: 'Exact distinct counts over arbitrary filter combinations remain expensive; prefer sketches or precomputed report outputs for large windows.'
-  },
-  {
-    number: 14,
-    title: 'Top-N entities',
-    tag: 'report_results',
-    examples: ['Top accounts by event volume.', 'Top customers by revenue.', 'Top users by error count.'],
-    raw: `SELECT
-  data.account_id,
-  count() AS events
-FROM observatory.events
-WHERE timestamp >= {from:DateTime64(3, 'UTC')}
-GROUP BY data.account_id
-ORDER BY events DESC
-LIMIT 100;`,
-    bad: 'Entity ids are high-cardinality. Raw grouping can approach one group per active entity and requires a large top-N sort.',
-    action: 'Promote entity id and ranking measures. Materialize each repeated leaderboard.',
-    optimized: `SELECT
-  bucket_time,
-  dimensions.account_id AS account_id,
-  toUInt64(metrics.events) AS events,
-  toFloat64(metrics.revenue) AS revenue
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'top_accounts_by_revenue'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY bucket_time DESC, revenue DESC
-LIMIT 100;`,
-    faster: 'Reads a ranked or pre-aggregated entity result set. Avoids high-cardinality raw GROUP BY and top-N sort across the full event window.',
-    caveat: 'Do not expose high-cardinality value lists naively. Search exact entity ids or show a precomputed top-N.'
-  },
-  {
-    number: 15,
-    title: 'Funnel conversion',
-    tag: 'sequence_report_results',
-    examples: ['Signup -> invite teammate -> checkout within 7 days.', 'Page view -> add to cart -> purchase in one session.', 'Agent plan -> tool call -> successful final answer.'],
-    raw: `SELECT
-  data.user_id AS user_id,
-  windowFunnel(7 * 24 * 3600)(
-    timestamp,
-    data.event_type = 'signup_completed',
-    data.event_type = 'teammate_invited',
-    data.event_type = 'checkout_completed'
-  ) AS reached_step
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-  AND data.user_id != ''
-  AND data.event_type IN ('signup_completed', 'teammate_invited', 'checkout_completed')
-GROUP BY user_id;`,
-    bad: 'Funnels order events per entity and match sequences. Running that directly from raw events is historical entity replay.',
-    action: 'Create a sequence report with entity id path, step definitions, window, and optional dimensions.',
-    optimized: `SELECT
-  bucket_time,
-  step_index,
-  step_name,
-  entity_count,
-  conversion_count
-FROM observatory.sequence_report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'signup_invite_checkout_7d'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY bucket_time ASC, step_index ASC;`,
-    faster: 'Reads one row per report step and bucket after the materializer has already performed per-entity sequence work.',
-    caveat: 'The materializer can populate sequence_report_results from explicit sequence definitions. Full published-version report jobs are still separate production hardening work.'
-  },
-  {
-    number: 16,
-    title: 'Retention cohorts',
-    tag: 'cohort_memberships + reports',
-    examples: ['Users who joined in June and returned in week 1, 2, and 4.', 'Accounts that installed integration X and were active after 30 days.', 'Users in variant B retained better than variant A.'],
-    raw: `WITH cohort AS (
-  SELECT
-    data.user_id AS user_id,
-    min(timestamp) AS joined_at
-  FROM observatory.events
-  WHERE tenant_id = {tenant_id:String}
-    AND data.event_type = 'signup_completed'
-    AND timestamp >= toDateTime64('2026-06-01 00:00:00', 3, 'UTC')
-    AND timestamp < toDateTime64('2026-07-01 00:00:00', 3, 'UTC')
-  GROUP BY user_id
-)
-SELECT
-  dateDiff('week', cohort.joined_at, e.timestamp) AS retention_week,
-  uniqCombined64(cohort.user_id) AS retained_users
-FROM cohort
-INNER JOIN observatory.events AS e
-  ON e.tenant_id = {tenant_id:String}
- AND e.data.user_id = cohort.user_id
-WHERE e.timestamp >= cohort.joined_at
-  AND e.timestamp < cohort.joined_at + INTERVAL 8 WEEK
-  AND e.data.event_type = 'app_opened'
-GROUP BY retention_week
-ORDER BY retention_week ASC;`,
-    bad: 'Retention rebuilds cohort membership and scans future activity windows. Recomputing both from raw events is too expensive.',
-    action: 'Define entity id, cohort entry condition, activity event condition, retention buckets, and dimensions.',
-    optimized: `SELECT
-  bucket_time,
-  dimensions.retention_week AS retention_week,
-  toUInt64(metrics.retained_users) AS retained_users,
-  toUInt64(metrics.cohort_size) AS cohort_size,
-  toFloat64(metrics.retention_rate) AS retention_rate
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'june_signup_weekly_retention'
-ORDER BY retention_week ASC;`,
-    faster: 'Reads precomputed retention buckets after cohort membership and activity counts have been materialized.',
-    caveat: 'State corrections matter. Define whether retention uses first observed value, latest corrected value, or a separate source of truth.'
-  },
-  {
-    number: 17,
-    title: 'Entity state at time',
-    tag: 'entity_state_updates',
-    examples: ['What plan did this account have on May 1?', 'Which country was this user in when they converted?', 'What model/provider was active for this trace step?'],
-    raw: `SELECT
-  data.account_id AS account_id,
-  argMax(data.plan, timestamp) AS plan_at_time
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp <= {as_of:DateTime64(3, 'UTC')}
-  AND data.account_id != ''
-  AND data.plan != ''
-GROUP BY account_id;`,
-    bad: 'Without state materialization, the query replays state-changing raw events before the query timestamp.',
-    action: 'Create state definitions with entity_type, entity_id_path, state path, and value type.',
-    optimized: `SELECT
-  entity_id,
-  argMax(value, timestamp) AS plan_at_time
-FROM observatory.entity_state_updates
-WHERE tenant_id = {tenant_id:String}
-  AND entity_type = 'account'
-  AND state_name = 'account.plan'
-  AND timestamp <= {as_of:DateTime64(3, 'UTC')}
-GROUP BY entity_id;`,
-    faster: 'Scans only transition rows for one entity type and state name. It does not replay every raw account event or parse unrelated payload fields.',
-    caveat: 'Very frequent state changes or large as-of joins may need snapshot tables later.'
-  },
-  {
-    number: 18,
-    title: 'Experiment analysis',
-    tag: 'field_index + reports',
-    examples: ['Conversion by experiment variant.', 'Revenue by variant.', 'Error rate by feature flag.'],
-    raw: `SELECT
-  data.experiment_id AS experiment_id,
-  data.variant AS variant,
-  uniqCombined64(data.user_id) AS exposed_users,
-  uniqCombined64If(data.user_id, data.event_type = 'checkout_completed') AS converted_users,
-  sumIf(toFloat64(data.revenue), data.event_type = 'checkout_completed') AS revenue
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-  AND data.experiment_id = 'checkout_flow'
-GROUP BY experiment_id, variant;`,
-    bad: 'Experiment reads combine dimensions, measures, and sometimes funnel logic. Raw scans are too costly for repeated dashboard use.',
-    action: 'Promote experiment fields, relevant measures, and define sequence or summary reports for conversion semantics.',
-    optimized: `SELECT
-  dimensions.variant AS variant,
-  toUInt64(metrics.exposed_users) AS exposed_users,
-  toUInt64(metrics.converted_users) AS converted_users,
-  toFloat64(metrics.revenue) AS revenue,
-  toFloat64(metrics.conversion_rate) AS conversion_rate
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'checkout_flow_experiment'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY conversion_rate DESC;`,
-    faster: 'Stores exposure membership, conversion, and revenue semantics once per variant/bucket instead of recomputing distinct users and measures from raw events.',
-    caveat: 'Attribution semantics must be explicit: per-event assignment, first assignment per user, latest assignment, or state at event time.'
-  },
-  {
-    number: 19,
-    title: 'Broad trace summary analytics',
-    tag: 'trace report',
-    examples: ['Top slow traces by service over 24h.', 'Trace duration p95 by workflow.', 'Failing traces by root span name.'],
-    raw: `SELECT
-  trace_id,
-  min(timestamp) AS started_at,
-  max(timestamp) AS ended_at,
-  dateDiff('millisecond', started_at, ended_at) AS duration_ms,
-  count() AS event_count,
-  countIf(ifNull(data.is_error, 0) != 0 OR endsWith(lower(event_type), '_error')) AS errors,
-  anyIf(data.service, data.parent_span_id = '') AS root_service,
-  anyIf(data.name, data.parent_span_id = '') AS root_name
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-  AND trace_id != ''
-GROUP BY trace_id
-ORDER BY duration_ms DESC
-LIMIT 100;`,
-    bad: 'Broad trace analytics groups raw events into traces, derives start/end/root/error semantics, then ranks traces.',
-    action: 'Create a trace report model defining trace id, span id, parent id, duration semantics, root semantics, and dimensions.',
-    optimized: `SELECT
-  bucket_time,
-  dimensions.trace_id AS trace_id,
-  dimensions.root_service AS root_service,
-  dimensions.root_name AS root_name,
-  toFloat64(metrics.duration_ms) AS duration_ms,
-  toUInt64(metrics.errors) AS errors
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'top_slow_traces'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY duration_ms DESC
-LIMIT 100;`,
-    faster: 'Ranks per-trace summary rows instead of grouping millions or billions of raw span/log events by trace_id.',
-    caveat: 'This uses an explicit trace_summary report model; raw events remain the source of truth when opening a selected trace.'
-  },
-  {
-    number: 20,
-    title: 'Reusable dashboards',
-    tag: 'report_results',
-    examples: ['Show this same filtered metric every day.', 'Maintain this team dashboard with 20 saved charts.', 'Share a customer-specific analytics report.'],
-    raw: `SELECT
-  toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS bucket,
-  data.plan AS plan,
-  data.country AS country,
-  count() AS events,
-  countIf(ifNull(data.is_error, 0) != 0 OR endsWith(lower(event_type), '_error')) AS errors,
-  quantileTDigest(0.95)(toFloat64(data.duration_ms)) AS p95_ms
-FROM observatory.events
-WHERE tenant_id = {tenant_id:String}
-  AND timestamp >= {from:DateTime64(3, 'UTC')}
-  AND data.service = 'api'
-GROUP BY bucket, plan, country
-ORDER BY bucket DESC, events DESC;`,
-    bad: 'Repeated raw dashboard queries create predictable load. The system should pay this cost once during materialization, not every page load.',
-    action: 'Save the query as a report. Promote required fields and measures. Choose bucket size and refresh cadence. Backfill historical windows.',
-    optimized: `SELECT
-  bucket_time,
-  dimensions.plan AS plan,
-  dimensions.country AS country,
-  toUInt64(metrics.events) AS events,
-  toUInt64(metrics.errors) AS errors,
-  toFloat64(metrics.p95_ms) AS p95_ms
-FROM observatory.report_results
-WHERE tenant_id = {tenant_id:String}
-  AND report_id = 'api_health_by_plan_country'
-  AND bucket_time >= {from:DateTime64(3, 'UTC')}
-ORDER BY bucket_time DESC, events DESC;`,
-    faster: 'The materializer pays the scan/group/quantile cost once per refresh interval. The UI reads compact result rows.',
-    caveat: 'The report API stores metadata in Postgres. ClickHouse result materialization requires a report materialization executor.'
+    tag: 'state',
+    question: 'What is the current state of an account, and what changed before churn, expansion, or failure?',
+    codeSetupText: 'Emit state-change events with entity id, state value, timestamp, and source context.',
+    codeSetup: `nt.info('Account State Changed', {
+  event_type: 'track',
+  entities: { account_id },
+  account: { plan: 'enterprise', lifecycle_stage: 'at_risk', risk_score: 82 }
+})`,
+    runOnceText: 'Create state definitions for the fields that should become timelines or current-state reads.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "account.lifecycle_stage",
+  "kind": "state",
+  "mode": "latest",
+  "config": {
+    "path": "account.lifecycle_stage",
+    "entity_type": "account",
+    "entity_id_path": "entities.account_id"
+  }
+}`,
+    queryText: 'Read state through a structured state query. The serving table remains an implementation detail.',
+    query: `POST /v1/query
+{
+  "type": "state",
+  "entityType": "account",
+  "entityId": "acct_123",
+  "stateName": "account.lifecycle_stage",
+  "mode": "timeline"
+}`,
+    how: 'State definitions convert event facts into entity timelines. Users can inspect current state or correlate state transitions with surrounding product and engineering events.'
   }
 ]
 
-const group3 = [
+const platformCases = [
   {
-    number: 21,
-    title: 'Free-text search over payloads/log bodies',
-    tag: 'needs search index',
-    question: "Find events containing 'timeout connecting to redis'.",
-    shape: 'Substring/token search over body/message/full JSON.',
-    why: 'Field promotion helps exact fields, not general text search.',
-    needed: 'Inverted index, ClickHouse text/token indexes, dedicated log-search table, or external search engine.'
+    tag: 'security',
+    question: 'Can one tenant see or spoof another tenant telemetry stream?',
+    codeSetupText: 'Use organization-scoped API keys. Client payload tenant fields may exist, but the authenticated organization is authoritative.',
+    codeSetup: `POST /v1/events Authorization: Bearer tenantAKey
+[{ "event_id": "evt_shared", "data": { "tenant_id": "tenantB" } }]`,
+    runOnceText: 'No definition is required. Auth-derived tenant stamping and tenant-scoped query planning are platform invariants.',
+    runOnce: '',
+    queryText: 'Query as tenant A and tenant B separately through the same JSON event endpoint.',
+    query: `POST /v1/query Authorization: Bearer tenantAKey
+{
+  "type": "events",
+  "view": "events",
+  "filter": {
+    "facets": [{ "path": "event_id", "operator": "eq", "value": "evt_shared" }]
+  }
+}`,
+    how: 'The server stamps tenant_id from auth, not from client-supplied data. Query APIs scope all allowed table reads to the authenticated tenant.'
   },
   {
-    number: 22,
-    title: 'Regex over arbitrary JSON',
-    tag: 'needs search/indexing',
-    question: 'Find payloads matching this regex.',
-    shape: 'match(toJSONString(data), ...).',
-    why: 'Arbitrary regex remains a payload scan even if some fields are promoted.',
-    needed: 'Search/indexing engine or constrained extracted-field model.'
+    tag: 'definitions',
+    question: 'How do we turn a frequently used payload path into a reliable facet, metric, state, funnel, cohort, report, or alert?',
+    codeSetupText: 'Make sure source events already carry the path/value and enough ids/timestamps to backfill.',
+    codeSetup: `nt.info('Checkout Completed', {
+  product_id: 'sku-test',
+  plan: 'pro',
+  entities: { account_id, user_id }
+})`,
+    runOnceText: 'Create the definition and optional backfill window.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "product_id",
+  "kind": "field",
+  "mode": "facet",
+  "config": { "path": "product_id", "value_type": "string" },
+  "backfill": { "from": "2026-06-04T21:59:00Z", "to": "2026-06-04T22:01:00Z" }
+}`,
+    queryText: 'Check definition and materialization status through JSON metadata endpoints before relying on the optimized output.',
+    query: `GET /v1/definitions
+
+POST /v1/definitions/{definitionId}/backfills
+{
+  "source_start": "2026-06-04T21:59:00Z",
+  "source_end": "2026-06-04T22:01:00Z"
+}
+
+GET /v1/backfills/{jobId}`,
+    how: 'Definitions turn observed payload data into product intent. Backfill jobs populate serving tables and watermarks tell the planner whether the optimized path is ready.'
   },
   {
-    number: 23,
-    title: 'Exact distinct over huge arbitrary filtered windows',
-    tag: 'needs sketches/offline',
-    question: 'Exact distinct users over 180 days for any filter combination.',
-    shape: 'uniqExact over massive event sets.',
-    why: 'Exactness plus arbitrary filters creates huge state. Existing report paths optimize known dimensions, not every arbitrary exact set.',
-    needed: 'Sketch-based cubes, offline jobs, or constrained report definitions.'
+    tag: 'freshness',
+    question: 'Is this result caught up, stale but acceptable, or not ready?',
+    codeSetupText: 'No product SDK call is required. The ingest and materialization pipeline writes lakehouse_commits, serving_watermarks, and materialization_watermarks.',
+    codeSetup: `// Produced by the platform after ingest/materialization.
+lakehouse_commits
+serving_watermarks
+materialization_watermarks`,
+    runOnceText: 'Every optimized output needs a freshness contract tied to target table, definition id, definition version, and time window.',
+    runOnce: '',
+    queryText: 'Use strict queries when correctness requires caught-up serving data; set allowStaleServing only for accepted stale reads.',
+    query: `POST /v1/query
+{
+  "type": "events",
+  "view": "summary",
+  "filter": { "facets": [{ "path": "product_id", "operator": "eq", "value": "sku-test" }] },
+  "timeRange": { "createdAfter": "...", "createdBefore": "..." },
+  "allowStaleServing": false
+}`,
+    how: 'The planner can use materialized outputs only when watermarks prove coverage for the requested window. Otherwise it should report materializing/stale state or use an explicitly allowed fallback.'
+  }
+]
+
+const boundaryCases = [
+  {
+    tag: 'search',
+    question: 'Can I find every event containing a phrase or matching a regex across arbitrary payload text?',
+    codeSetupText: 'Keep structured fields for exact filters even when a message string is present.',
+    codeSetup: `nt.info('redis timeout', {
+  service: 'api',
+  error_type: 'timeout',
+  dependency: 'redis'
+})`,
+    runOnceText: 'A field definition is not enough for arbitrary substring or interactive regex search. Use ranked token search for interactive exploration and the offline lakehouse query/export regex filter for audit scans.',
+    runOnce: '',
+    queryText: 'Use exact KV filters for structured narrowing, or ranked search for exploratory text queries.',
+    query: `POST /v1/query
+{
+  "type": "search",
+  "query": "redis timeout",
+  "from": "...",
+  "to": "...",
+  "limit": 20
+}`,
+    how: 'KV filtering is exact and structured. Ranked token search has different indexing, retention, ranking, and cost semantics and is served from event_search_terms. Regex scans remain offline lakehouse query/export work; advanced analyzers, fuzzy search, and semantic search remain separate.'
   },
   {
-    number: 24,
-    title: 'Full historical entity replay on demand',
-    tag: 'needs snapshots',
-    question: "Recompute every user's complete lifecycle from raw events now.",
-    shape: 'Sort and replay all events per entity.',
-    why: 'State definitions optimize selected transitions, not arbitrary lifecycle replay.',
-    needed: 'Entity snapshot/event-sourcing worker or offline batch job.'
+    tag: 'joins',
+    question: 'Can I join all telemetry to CRM, billing, warehouse, or support records interactively?',
+    codeSetupText: 'Emit stable join keys such as account_id and user_id. Avoid relying on mutable email or domain as the only join key.',
+    codeSetup: `nt.info('Ticket Opened', {
+  event_type: 'track',
+  entities: { account_id, user_id },
+  support_ticket_id: ticketId
+})`,
+    runOnceText: 'Recurring enriched analytics should be modeled as imported dimensions, reports, or warehouse jobs with explicit freshness.',
+    runOnce: '',
+    queryText: 'Use Nanotrace for bounded telemetry filters; use lakehouse SQL for offline Parquet joins or materialize recurring enrichment into reports.',
+    query: `POST /v1/query
+{
+  "type": "events",
+  "filter": {
+    "facets": [{ "path": "entities.account_id", "operator": "eq", "value": "acct_123" }]
+  }
+}`,
+    how: 'Interactive arbitrary joins create unclear cost, freshness, and access semantics. Stable ids should let NANOTRACE_LAKEHOUSE_QUERY_SQL join committed telemetry to external Parquet tables offline, or let recurring enrichment become materialized reports.'
   },
   {
-    number: 25,
-    title: 'Cross-tenant/global analytics',
-    tag: 'needs governance',
-    question: 'Compare every tenant globally.',
-    shape: 'Aggregate without tenant pruning.',
-    why: 'The system is tenant-first for isolation and pruning.',
-    needed: 'Explicit admin/global rollups with governance.'
-  },
-  {
-    number: 26,
-    title: 'Arbitrary joins with external datasets',
-    tag: 'needs dimension model',
-    question: 'Join all events to CRM/account records by email/domain.',
-    shape: 'Large join against external business data.',
-    why: 'No dimension-table ingestion/dictionary model exists yet.',
-    needed: 'Managed dimension tables, dictionaries, or enrichment pipeline.'
-  },
-  {
-    number: 27,
-    title: 'Ultra-low-latency streaming alerts',
-    tag: 'needs streaming',
-    question: 'Alert within milliseconds of a matching event.',
-    shape: 'Streaming rule evaluation before object-store/loader delay.',
-    why: 'The current pipeline is durable async batch/object-store oriented.',
-    needed: 'Streaming rules engine or synchronous alert side path.'
+    tag: 'streaming',
+    question: 'Can I alert within milliseconds of one matching event?',
+    codeSetupText: 'Emit severity, service, entity ids, and dedupe keys at the source.',
+    codeSetup: `nt.info('Payment Failed', {
+  severity: 'critical',
+  service: 'checkout-api',
+  dedupe_key: accountId + ':payment_failed',
+  entities: { account_id: accountId }
+})`,
+    runOnceText: 'Create an alert definition for one-event standing predicates. Aggregate threshold monitors should still use report definitions.',
+    runOnce: `POST /v1/definitions
+{
+  "name": "payment_failed_hot",
+  "kind": "alert",
+  "mode": "event_match",
+  "config": {
+    "severity": "critical",
+    "dedupe_key": "dedupe_key",
+    "dedupe_seconds": 300,
+    "notifications": {
+      "webhooks": [
+        { "id": "pager", "url": "https://alerts.example.com/nanotrace" }
+      ]
+    },
+    "match": {
+      "all": [
+        { "path": "event_type", "op": "eq", "value": "Payment Failed" },
+        { "path": "severity", "op": "eq", "value": "critical" }
+      ]
+    }
+  }
+}`,
+    queryText: 'Read emitted alert events and webhook outbox status through the structured alerts query.',
+    query: `POST /v1/query
+{
+  "type": "alerts",
+  "mode": "events",
+  "alertId": "payment_failed_hot",
+  "limit": 20
+}
+
+POST /v1/query
+{
+  "type": "alerts",
+  "mode": "notifications",
+  "alertId": "payment_failed_hot",
+  "status": "retry",
+  "limit": 20
+}`,
+    how: 'Nanotrace has a hot event-match worker on the normalized Kafka topic. It records alert_events before lakehouse materialization catches up, enqueues webhook rows in alert_notifications, and a notifier loop retries delivery. Paging policy and hard sub-millisecond guarantees are separate product work.'
   }
 ]
 
@@ -1047,84 +923,27 @@ function escapeHtml(value) {
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;')
+    .replaceAll("'", '&#39;')
 }
 
-function codeBlock(label, code, pill) {
-  return `<div>
-    <div class="code-label"><span>${escapeHtml(label)}</span>${pill ? `<span class="pill">${escapeHtml(pill)}</span>` : ''}</div>
-    <pre><code>${escapeHtml(code)}</code></pre>
-  </div>`
+function renderCases(items, startNumber) {
+  return items.map((item, index) => `<li value="${startNumber + index}">
+    <h3>${escapeHtml(item.question)}</h3>
+    <p class="meta">${escapeHtml(item.tag)}</p>
+    <div class="detail"><b>Set things up in your code</b><p>${escapeHtml(item.codeSetupText)}</p></div>
+    <pre>${escapeHtml(item.codeSetup)}</pre>
+    <div class="detail definition"><b>Run once</b><p>${escapeHtml(item.runOnceText)}</p></div>
+    ${item.runOnce ? `<pre>${escapeHtml(item.runOnce)}</pre>` : ''}
+    <div class="detail query"><b>Query</b><p>${escapeHtml(item.queryText)}</p></div>
+    <pre>${escapeHtml(item.query)}</pre>
+    <div class="detail answer"><b>How it works in plaintext</b><p>${escapeHtml(item.how)}</p></div>
+  </li>`).join('')
 }
 
-function list(items) {
-  return `<ol>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ol>`
-}
-
-function renderGroup1(items) {
-  return items.map(item => `<article class="case group1">
-    <div class="case-head">
-      <span class="num">${item.number}</span>
-      <div>
-        <h3>${escapeHtml(item.title)}</h3>
-      </div>
-      <span class="tag">${escapeHtml(item.tag)}</span>
-    </div>
-    <div class="case-body two-col">
-      <div class="box"><h4>Question</h4><p>${escapeHtml(item.question)}</p></div>
-      <div class="box"><h4>Query shape</h4><p>${escapeHtml(item.shape)}</p></div>
-      <div class="box"><h4>Current path</h4><p>${escapeHtml(item.path)}</p></div>
-      <div class="box"><h4>Status</h4><p>${escapeHtml(item.status)}</p></div>
-    </div>
-  </article>`).join('')
-}
-
-function renderGroup2(items) {
-  return items.map(item => `<article class="case group2">
-    <div class="case-head">
-      <span class="num">${item.number}</span>
-      <div>
-        <h3>${escapeHtml(item.title)}</h3>
-      </div>
-      <span class="tag">${escapeHtml(item.tag)}</span>
-    </div>
-    <div class="case-body">
-      <div class="box"><h4>Question examples</h4>${list(item.examples)}</div>
-      ${codeBlock('Raw events query', item.raw, 'bad at scale')}
-      <div class="two-col">
-        <div class="box"><h4>Why raw is bad</h4><p>${escapeHtml(item.bad)}</p></div>
-        <div class="box"><h4>What to do</h4><p>${escapeHtml(item.action)}</p></div>
-      </div>
-      ${codeBlock('Post-optimization query', item.optimized, 'serving path')}
-      <div class="two-col">
-        <div class="box"><h4>Why faster</h4><p>${escapeHtml(item.faster)}</p></div>
-        <div class="box"><h4>Operational caveat</h4><p>${escapeHtml(item.caveat)}</p></div>
-      </div>
-    </div>
-  </article>`).join('')
-}
-
-function renderGroup3(items) {
-  return items.map(item => `<article class="case group3">
-    <div class="case-head">
-      <span class="num">${item.number}</span>
-      <div>
-        <h3>${escapeHtml(item.title)}</h3>
-      </div>
-      <span class="tag">${escapeHtml(item.tag)}</span>
-    </div>
-    <div class="case-body two-col">
-      <div class="box"><h4>Question</h4><p>${escapeHtml(item.question)}</p></div>
-      <div class="box"><h4>Query shape</h4><p>${escapeHtml(item.shape)}</p></div>
-      <div class="box"><h4>Why not optimizable now</h4><p>${escapeHtml(item.why)}</p></div>
-      <div class="box"><h4>Needed subsystem</h4><p>${escapeHtml(item.needed)}</p></div>
-    </div>
-  </article>`).join('')
-}
-
-document.getElementById('group1').innerHTML = renderGroup1(group1)
-document.getElementById('group2').innerHTML = renderGroup2(group2)
-document.getElementById('group3').innerHTML = renderGroup3(group3)
+document.getElementById('engineering-list').innerHTML = renderCases(engineeringCases, 1)
+document.getElementById('business-list').innerHTML = renderCases(businessCases, engineeringCases.length + 1)
+document.getElementById('platform-list').innerHTML = renderCases(platformCases, engineeringCases.length + businessCases.length + 1)
+document.getElementById('boundary-list').innerHTML = renderCases(boundaryCases, engineeringCases.length + businessCases.length + platformCases.length + 1)
 </script>
 </body>
 </html>

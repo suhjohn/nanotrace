@@ -1,6 +1,29 @@
 import dgram from 'node:dgram'
 import type { EventEnvelope, Transport } from './types.js'
 
+async function postJson({
+  errorPrefix,
+  fetchImpl,
+  headers,
+  payload,
+  url
+}: {
+  errorPrefix: string
+  fetchImpl: typeof fetch
+  headers: Record<string, string>
+  payload: EventEnvelope | EventEnvelope[]
+  url: string
+}) {
+  const response = await fetchImpl(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload)
+  })
+  if (!response.ok) {
+    throw new Error(`${errorPrefix}: HTTP ${response.status}`)
+  }
+}
+
 export function httpTransport({
   url,
   key,
@@ -14,17 +37,29 @@ export function httpTransport({
   const auth = `Bearer ${key}`
   return {
     async send(event) {
-      const response = await fetchImpl(eventsUrl, {
-        method: 'POST',
+      await postJson({
+        errorPrefix: 'Nanotrace ingest failed',
+        fetchImpl,
         headers: {
           authorization: auth,
           'content-type': 'application/json'
         },
-        body: JSON.stringify(event)
+        payload: event,
+        url: eventsUrl
       })
-      if (!response.ok) {
-        throw new Error(`Nanotrace ingest failed: HTTP ${response.status}`)
-      }
+    },
+    async sendBatch(events) {
+      if (events.length === 0) return
+      await postJson({
+        errorPrefix: 'Nanotrace ingest failed',
+        fetchImpl,
+        headers: {
+          authorization: auth,
+          'content-type': 'application/json'
+        },
+        payload: events,
+        url: eventsUrl
+      })
     }
   }
 }
@@ -59,16 +94,27 @@ export function sidecarHttpTransport({
   const eventsUrl = `${url.replace(/\/+$/, '')}/events`
   return {
     async send(event) {
-      const response = await fetchImpl(eventsUrl, {
-        method: 'POST',
+      await postJson({
+        errorPrefix: 'Nanotrace sidecar ingest failed',
+        fetchImpl,
         headers: {
           'content-type': 'application/json'
         },
-        body: JSON.stringify(event)
+        payload: event,
+        url: eventsUrl
       })
-      if (!response.ok) {
-        throw new Error(`Nanotrace sidecar ingest failed: HTTP ${response.status}`)
-      }
+    },
+    async sendBatch(events) {
+      if (events.length === 0) return
+      await postJson({
+        errorPrefix: 'Nanotrace sidecar ingest failed',
+        fetchImpl,
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: events,
+        url: eventsUrl
+      })
     }
   }
 }

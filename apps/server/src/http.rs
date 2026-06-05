@@ -7,13 +7,14 @@ use aws_sdk_sesv2::{
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{Path, Query, State},
+    extract::{MatchedPath, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, LOCATION, SET_COOKIE},
     },
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
 };
 use chrono::{DateTime, Utc};
 use nanotrace_auth::{AuthError, AuthIdentity, AuthRole, AuthStore};
@@ -27,18 +28,16 @@ use tower_http::{
 
 use crate::{
     config::Config,
-    dashboards::{
-        CreateVisualizationRequest, DashboardError, DashboardStore,
-        DashboardVisualizationsResponse, UpdateVisualizationRequest,
-    },
     definitions::{
-        BackfillRequest, CreateDefinitionRequest, DefinitionListResponse, DefinitionStore,
-        DefinitionStoreError,
+        BackfillRequest, CreateDefinitionRequest, DefinitionGetResponse, DefinitionListResponse,
+        DefinitionStore, DefinitionStoreError,
     },
-    event_log::{EventLogError, EventLogWriter, WriteReceipt},
-    processors::{ProcessorListResponse, ProcessorStore, ProcessorStoreError, PutProcessorRequest},
-    read::{EventsQueryRequest, QueryRequest, ReadError, ReadStore},
-    reports::{CreateReportRequest, ReportListResponse, ReportStore, ReportStoreError},
+    materializations::{
+        BackfillJobListResponse, BackfillJobResponse, CreateBackfillRequest, MaterializationStore,
+        MaterializationStoreError,
+    },
+    metrics::ServerMetrics,
+    read::{QueryApiRequest, QueryRecommendationListResponse, ReadError, ReadStore},
 };
 
 use utoipa::ToSchema;
@@ -47,13 +46,12 @@ use utoipa::ToSchema;
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub auth: Option<Arc<AuthStore>>,
-    pub dashboards: Arc<DashboardStore>,
     pub definitions: Arc<DefinitionStore>,
-    pub processors: Arc<ProcessorStore>,
+    pub materializations: Arc<MaterializationStore>,
     pub read: Arc<ReadStore>,
-    pub reports: Arc<ReportStore>,
+    pub raw_ingest: Arc<nanotrace_ingest::RawBatchProducer>,
     pub ses: aws_sdk_sesv2::Client,
-    pub writer: Arc<EventLogWriter>,
+    pub metrics: Arc<ServerMetrics>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -61,48 +59,44 @@ pub fn router(state: AppState) -> Router {
 
     let router = Router::new()
         .route("/v1/events", post(post_events))
-        .route("/v1/events/query", post(post_events_query))
         .route("/v1/events/{event_id}", get(get_event))
-        .route("/v1/processors", get(list_processors))
-        .route(
-            "/v1/processors/{name}",
-            put(put_processor).delete(delete_processor),
-        )
         .route(
             "/v1/definitions",
             get(list_definitions).post(create_definition),
         )
-        .route("/v1/definitions/sdk-defaults", post(seed_sdk_definitions))
-        .route("/v1/definitions/{definition_id}", delete(delete_definition))
+        .route(
+            "/v1/definitions/{definition_id}",
+            get(get_definition).delete(delete_definition),
+        )
         .route(
             "/v1/definitions/{definition_id}/backfill",
             post(backfill_definition),
         )
-        .route("/v1/reports", get(list_reports).post(create_report))
-        .route("/v1/reports/{report_id}", delete(delete_report))
+        .route(
+            "/v1/definitions/{definition_id}/backfills",
+            post(create_definition_backfill),
+        )
+        .route("/v1/backfills", get(list_backfill_jobs))
+        .route("/v1/backfills/{job_id}", get(get_backfill_job))
+        .route("/v1/query/recommendations", get(list_query_recommendations))
         .route("/v1/query", post(post_query))
-        .route(
-            "/dashboards/{dashboard_id}/visualizations",
-            get(list_dashboard_visualizations)
-                .post(create_dashboard_visualization)
-                .delete(clear_dashboard_visualizations),
-        )
-        .route(
-            "/dashboards/{dashboard_id}/visualizations/{id}",
-            put(update_dashboard_visualization).delete(delete_dashboard_visualization),
-        )
         .route("/auth/login", get(auth_login_form).post(auth_login))
         .route("/auth/callback", get(auth_callback))
         .route("/auth/logout", post(auth_logout))
         .route("/auth/me", get(auth_me))
-        .route("/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/api-keys/{id}", delete(revoke_api_key))
+        .route("/v1/auth/me", get(auth_me))
+        .route("/v1/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/v1/api-keys/{id}", delete(revoke_api_key))
         .route("/openapi.json", get(openapi_json))
         .route("/healthz", get(healthz))
         .route("/v1/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/readyz", get(readyz))
         .route("/v1/readyz", get(readyz))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_http_metrics,
+        ))
         .layer(RequestBodyLimitLayer::new(limit))
         .with_state(state.clone());
 
@@ -144,11 +138,30 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
     )
 }
 
+async fn record_http_metrics(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    state
+        .metrics
+        .record_http(&method, &route, response.status(), started_at.elapsed());
+    response
+}
+
 #[utoipa::path(
     post,
     path = "/v1/events",
     request_body = serde_json::Value,
-    responses((status = 200, description = "Accepted event receipt.", body = PostEventsResponse)),
+    responses((status = 202, description = "Accepted Kafka event batch.", body = KafkaAcceptedResponse)),
     security(("bearerAuth" = [])),
     tag = "Events"
 )]
@@ -160,126 +173,98 @@ pub(crate) async fn post_events(
     let headers = parts.headers;
     let identity = authorize_service(&state, &headers).await?;
     require_scope(&identity, "ingest:write")?;
-    let read_started_at = Instant::now();
     let body = to_bytes(body, state.cfg.max_request_bytes)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
-    state.writer.record_request_read(read_started_at.elapsed());
-    let receipts = state
-        .writer
-        .append_bytes(&body, &identity.tenant_id)
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json");
+    let body_len = body.len();
+    let produced = state
+        .raw_ingest
+        .produce_raw_batch(
+            &identity.tenant_id,
+            &identity.organization_id,
+            content_type,
+            &body,
+        )
         .await?;
-    let response = if receipts.is_batch {
-        if state.cfg.compact_batch_receipts {
-            PostEventsResponse::CompactBatch(CompactBatchReceipt::from_receipts(&receipts.receipts))
-        } else {
-            PostEventsResponse::Batch(receipts.receipts)
-        }
-    } else {
-        let receipt = receipts
-            .receipts
-            .into_iter()
-            .next()
-            .ok_or(ApiError::EmptyWrite)?;
-        PostEventsResponse::Single(receipt)
-    };
-    Ok(Json(response).into_response())
+    state.metrics.record_ingest_accepted(body_len);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(KafkaAcceptedResponse {
+            accepted: true,
+            mode: "kafka",
+            topic: produced.topic,
+            partition: produced.partition,
+            offset: produced.offset,
+        }),
+    )
+        .into_response())
 }
 
 #[utoipa::path(
     post,
     path = "/v1/query",
-    request_body = QueryRequest,
-    responses((status = 200, description = "ClickHouse JSON response.", body = serde_json::Value)),
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Structured query response.", body = serde_json::Value)),
     security(("bearerAuth" = [])),
     tag = "Query"
 )]
 pub(crate) async fn post_query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<QueryRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let response = state.read.query(request, &identity.tenant_id).await?;
-    Ok(Json(response).into_response())
+    let request = serde_json::from_value::<QueryApiRequest>(request)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let query_type = query_type_name(&request);
+    let started_at = Instant::now();
+    match state.read.api_query(request, &identity.tenant_id).await {
+        Ok(response) => {
+            state
+                .metrics
+                .record_query(query_type, "success", started_at.elapsed());
+            Ok(Json(response).into_response())
+        }
+        Err(err) => {
+            state
+                .metrics
+                .record_query(query_type, "error", started_at.elapsed());
+            Err(err.into())
+        }
+    }
 }
 
-#[utoipa::path(
-    post,
-    path = "/v1/events/query",
-    request_body = EventsQueryRequest,
-    responses((status = 200, description = "Structured events query response.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Events"
-)]
-pub(crate) async fn post_events_query(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<EventsQueryRequest>,
-) -> Result<Response, ApiError> {
-    let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let response = state
-        .read
-        .events_query(request, &identity.tenant_id)
-        .await?;
-    Ok(Json(response).into_response())
+#[derive(Debug, Deserialize)]
+pub(crate) struct QueryRecommendationsParams {
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 #[utoipa::path(
     get,
-    path = "/v1/processors",
-    responses((status = 200, description = "Processor list.", body = ProcessorListResponse)),
+    path = "/v1/query/recommendations",
+    params(
+        ("limit" = Option<u64>, Query, description = "Maximum number of recent query recommendation records to return. Clamped to 1..100.")
+    ),
+    responses((status = 200, description = "Recent successful queries with planner recommendations.", body = QueryRecommendationListResponse)),
     security(("bearerAuth" = [])),
-    tag = "Processors"
+    tag = "Query"
 )]
-pub(crate) async fn list_processors(
+pub(crate) async fn list_query_recommendations(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<ProcessorListResponse>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "processors:write").await?;
-    let processors = state.processors.list(&identity.tenant_id).await?;
-    Ok(Json(ProcessorListResponse { processors }))
-}
-
-#[utoipa::path(
-    put,
-    path = "/v1/processors/{name}",
-    params(("name" = String, Path, description = "Processor name.")),
-    request_body = PutProcessorRequest,
-    responses((status = 200, description = "Processor envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Processors"
-)]
-pub(crate) async fn put_processor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    Json(request): Json<PutProcessorRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "processors:write").await?;
-    let manifest = state
-        .processors
-        .put(&identity.tenant_id, &name, request)
+    Query(params): Query<QueryRecommendationsParams>,
+) -> Result<Json<QueryRecommendationListResponse>, ApiError> {
+    let identity = authorize_scope(&state, &headers, "query:read").await?;
+    let response = state
+        .read
+        .recent_query_recommendations(&identity.tenant_id, params.limit.unwrap_or(50))
         .await?;
-    Ok(Json(serde_json::json!({ "processor": manifest })))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/v1/processors/{name}",
-    params(("name" = String, Path, description = "Processor name.")),
-    responses((status = 200, description = "Processor envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Processors"
-)]
-pub(crate) async fn delete_processor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "processors:write").await?;
-    let manifest = state.processors.delete(&identity.tenant_id, &name).await?;
-    Ok(Json(serde_json::json!({ "processor": manifest })))
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -296,6 +281,27 @@ pub(crate) async fn list_definitions(
     let identity = authorize_scope(&state, &headers, "query:read").await?;
     let definitions = state.definitions.list(&identity.tenant_id).await?;
     Ok(Json(DefinitionListResponse { definitions }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/definitions/{definition_id}",
+    params(("definition_id" = String, Path, description = "Definition id.")),
+    responses((status = 200, description = "Definition envelope.", body = DefinitionGetResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Definitions"
+)]
+pub(crate) async fn get_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(definition_id): Path<String>,
+) -> Result<Json<DefinitionGetResponse>, ApiError> {
+    let identity = authorize_scope(&state, &headers, "query:read").await?;
+    let definition = state
+        .definitions
+        .get(&identity.tenant_id, &definition_id)
+        .await?;
+    Ok(Json(DefinitionGetResponse { definition }))
 }
 
 #[utoipa::path(
@@ -319,25 +325,6 @@ pub(crate) async fn create_definition(
     Ok(Json(
         serde_json::to_value(response).map_err(|err| ApiError::BadRequest(err.to_string()))?,
     ))
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/definitions/sdk-defaults",
-    responses((status = 200, description = "Seeded SDK definitions.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Definitions"
-)]
-pub(crate) async fn seed_sdk_definitions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
-    let definitions = state
-        .definitions
-        .seed_sdk_defaults(&identity.tenant_id)
-        .await?;
-    Ok(Json(serde_json::json!({ "definitions": definitions })))
 }
 
 #[utoipa::path(
@@ -386,172 +373,66 @@ pub(crate) async fn backfill_definition(
 
 #[utoipa::path(
     get,
-    path = "/v1/reports",
-    responses((status = 200, description = "Report list.", body = ReportListResponse)),
+    path = "/v1/backfills",
+    responses((status = 200, description = "Backfill jobs.", body = BackfillJobListResponse)),
     security(("bearerAuth" = [])),
-    tag = "Reports"
+    tag = "Backfills"
 )]
-pub(crate) async fn list_reports(
+pub(crate) async fn list_backfill_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<ReportListResponse>, ApiError> {
+) -> Result<Json<BackfillJobListResponse>, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let reports = state.reports.list(&identity.tenant_id).await?;
-    Ok(Json(ReportListResponse { reports }))
+    let backfills = state
+        .materializations
+        .list_backfills(&identity.tenant_id)
+        .await?;
+    Ok(Json(BackfillJobListResponse { backfills }))
 }
 
 #[utoipa::path(
     post,
-    path = "/v1/reports",
-    request_body = CreateReportRequest,
-    responses((status = 200, description = "Report envelope.", body = serde_json::Value)),
+    path = "/v1/definitions/{definition_id}/backfills",
+    params(("definition_id" = String, Path, description = "Definition id.")),
+    request_body = CreateBackfillRequest,
+    responses((status = 200, description = "Created backfill job.", body = BackfillJobResponse)),
     security(("bearerAuth" = [])),
-    tag = "Reports"
+    tag = "Backfills"
 )]
-pub(crate) async fn create_report(
+pub(crate) async fn create_definition_backfill(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CreateReportRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "reports:write").await?;
-    let report = state.reports.create(&identity.tenant_id, request).await?;
-    Ok(Json(serde_json::json!({ "report": report })))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/v1/reports/{report_id}",
-    params(("report_id" = String, Path, description = "Report id.")),
-    responses((status = 200, description = "Report envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Reports"
-)]
-pub(crate) async fn delete_report(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(report_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "reports:write").await?;
-    let report = state
-        .reports
-        .delete(&identity.tenant_id, &report_id)
+    Path(definition_id): Path<String>,
+    Json(request): Json<CreateBackfillRequest>,
+) -> Result<Json<BackfillJobResponse>, ApiError> {
+    let identity = authorize_admin_scope(&state, &headers, "definitions:write").await?;
+    let response = state
+        .materializations
+        .create_backfill(&identity.tenant_id, &definition_id, request)
         .await?;
-    Ok(Json(serde_json::json!({ "report": report })))
+    state.metrics.record_backfill_created();
+    Ok(Json(response))
 }
 
 #[utoipa::path(
     get,
-    path = "/dashboards/{dashboard_id}/visualizations",
-    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
-    responses((status = 200, description = "Dashboard visualizations.", body = DashboardVisualizationsResponse)),
+    path = "/v1/backfills/{job_id}",
+    params(("job_id" = String, Path, description = "Backfill job id.")),
+    responses((status = 200, description = "Backfill job with chunks.", body = BackfillJobResponse)),
     security(("bearerAuth" = [])),
-    tag = "Dashboards"
+    tag = "Backfills"
 )]
-pub(crate) async fn list_dashboard_visualizations(
+pub(crate) async fn get_backfill_job(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(dashboard_id): Path<String>,
-) -> Result<Json<DashboardVisualizationsResponse>, ApiError> {
+    Path(job_id): Path<String>,
+) -> Result<Json<BackfillJobResponse>, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let visualizations = state
-        .dashboards
-        .list(&identity.tenant_id, &dashboard_id)
+    let response = state
+        .materializations
+        .get_backfill(&identity.tenant_id, &job_id)
         .await?;
-    Ok(Json(DashboardVisualizationsResponse { visualizations }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/dashboards/{dashboard_id}/visualizations",
-    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
-    request_body = CreateVisualizationRequest,
-    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Dashboards"
-)]
-pub(crate) async fn create_dashboard_visualization(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(dashboard_id): Path<String>,
-    Json(request): Json<CreateVisualizationRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "dashboards:write").await?;
-    let visualization = state
-        .dashboards
-        .create(&identity.tenant_id, &dashboard_id, request)
-        .await?;
-    Ok(Json(serde_json::json!({ "visualization": visualization })))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/dashboards/{dashboard_id}/visualizations",
-    params(("dashboard_id" = String, Path, description = "Dashboard id.")),
-    responses((status = 200, description = "Ok.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Dashboards"
-)]
-pub(crate) async fn clear_dashboard_visualizations(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(dashboard_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "dashboards:write").await?;
-    state
-        .dashboards
-        .clear(&identity.tenant_id, &dashboard_id)
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-#[utoipa::path(
-    put,
-    path = "/dashboards/{dashboard_id}/visualizations/{id}",
-    params(
-        ("dashboard_id" = String, Path, description = "Dashboard id."),
-        ("id" = String, Path, description = "Visualization id.")
-    ),
-    request_body = UpdateVisualizationRequest,
-    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Dashboards"
-)]
-pub(crate) async fn update_dashboard_visualization(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((dashboard_id, id)): Path<(String, String)>,
-    Json(request): Json<UpdateVisualizationRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "dashboards:write").await?;
-    let visualization = state
-        .dashboards
-        .update(&identity.tenant_id, &dashboard_id, &id, request)
-        .await?;
-    Ok(Json(serde_json::json!({ "visualization": visualization })))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/dashboards/{dashboard_id}/visualizations/{id}",
-    params(
-        ("dashboard_id" = String, Path, description = "Dashboard id."),
-        ("id" = String, Path, description = "Visualization id.")
-    ),
-    responses((status = 200, description = "Visualization envelope.", body = serde_json::Value)),
-    security(("bearerAuth" = [])),
-    tag = "Dashboards"
-)]
-pub(crate) async fn delete_dashboard_visualization(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((dashboard_id, id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "dashboards:write").await?;
-    let visualization = state
-        .dashboards
-        .delete(&identity.tenant_id, &dashboard_id, &id)
-        .await?;
-    Ok(Json(serde_json::json!({ "visualization": visualization })))
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -575,16 +456,10 @@ pub(crate) async fn get_event(
     Ok(([("content-type", "application/json")], Body::from(bytes)).into_response())
 }
 
-#[utoipa::path(
-    get,
-    path = "/metrics",
-    responses((status = 200, description = "Prometheus text exposition.", content_type = "text/plain", body = String)),
-    tag = "Health"
-)]
 pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        state.writer.metrics_text(),
+        state.metrics.render_prometheus(state.auth.as_deref()),
     )
         .into_response()
 }
@@ -618,12 +493,11 @@ pub(crate) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 pub(crate) async fn readyz(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.cfg.s3_bucket.is_none() {
-        return Err(ApiError::Unavailable(
-            "S3 bucket is not configured".to_string(),
-        ));
-    }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ingest": "kafka",
+        "topic": state.cfg.kafka_ingest_topic
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -827,7 +701,7 @@ pub(crate) async fn auth_logout(
 
 #[utoipa::path(
     get,
-    path = "/auth/me",
+    path = "/v1/auth/me",
     responses((status = 200, description = "Authenticated identity.", body = serde_json::Value)),
     security(("bearerAuth" = [])),
     tag = "Auth"
@@ -841,7 +715,7 @@ pub(crate) async fn auth_me(
 
 #[utoipa::path(
     get,
-    path = "/api-keys",
+    path = "/v1/api-keys",
     responses((status = 200, description = "API key list.", body = ApiKeysResponse)),
     security(("bearerAuth" = [])),
     tag = "API Keys"
@@ -859,7 +733,7 @@ pub(crate) async fn list_api_keys(
 
 #[utoipa::path(
     post,
-    path = "/api-keys",
+    path = "/v1/api-keys",
     request_body = CreateApiKeyRequest,
     responses((status = 200, description = "Created API key.", body = serde_json::Value)),
     security(("bearerAuth" = [])),
@@ -887,7 +761,7 @@ pub(crate) async fn create_api_key(
 
 #[utoipa::path(
     delete,
-    path = "/api-keys/{id}",
+    path = "/v1/api-keys/{id}",
     params(("id" = i64, Path, description = "API key id.")),
     responses((status = 200, description = "Revoked API key envelope.", body = serde_json::Value)),
     security(("bearerAuth" = [])),
@@ -978,6 +852,19 @@ fn parse_requested_role(value: Option<&str>) -> Result<AuthRole, ApiError> {
     }
 }
 
+fn query_type_name(request: &QueryApiRequest) -> &'static str {
+    match request {
+        QueryApiRequest::Events(_) => "events",
+        QueryApiRequest::Search(_) => "search",
+        QueryApiRequest::Measure(_) => "measure",
+        QueryApiRequest::Funnel(_) => "funnel",
+        QueryApiRequest::Cohort(_) => "cohort",
+        QueryApiRequest::Report(_) => "report",
+        QueryApiRequest::State(_) => "state",
+        QueryApiRequest::Alerts(_) => "alerts",
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     Unauthorized,
@@ -986,55 +873,27 @@ pub enum ApiError {
     BadRequest(String),
     Header(String),
     PayloadTooLarge,
-    EmptyWrite,
     Unavailable(String),
     Email(String),
-    EventLog(crate::event_log::EventLogError),
-    Processor(crate::processors::ProcessorStoreError),
+    Kafka(nanotrace_ingest::IngestError),
     Definition(crate::definitions::DefinitionStoreError),
-    Dashboard(crate::dashboards::DashboardError),
-    Report(crate::reports::ReportStoreError),
+    Materialization(crate::materializations::MaterializationStoreError),
     Read(crate::read::ReadError),
     Auth(AuthError),
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(untagged)]
-pub(crate) enum PostEventsResponse {
-    Single(WriteReceipt),
-    Batch(Vec<WriteReceipt>),
-    CompactBatch(CompactBatchReceipt),
+pub(crate) struct KafkaAcceptedResponse {
+    accepted: bool,
+    mode: &'static str,
+    topic: String,
+    partition: i32,
+    offset: i64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct CompactBatchReceipt {
-    accepted: usize,
-    source_file: Option<String>,
-    source_offset: Option<u64>,
-    source_length: u64,
-}
-
-impl CompactBatchReceipt {
-    fn from_receipts(receipts: &[WriteReceipt]) -> Self {
-        let source_file = receipts.first().map(|receipt| receipt.source_file.clone());
-        let source_offset = receipts.first().map(|receipt| receipt.source_offset);
-        let source_length = receipts
-            .iter()
-            .map(|receipt| u64::from(receipt.source_length))
-            .sum();
-
-        Self {
-            accepted: receipts.len(),
-            source_file,
-            source_offset,
-            source_length,
-        }
-    }
-}
-
-impl From<crate::event_log::EventLogError> for ApiError {
-    fn from(value: crate::event_log::EventLogError) -> Self {
-        Self::EventLog(value)
+impl From<nanotrace_ingest::IngestError> for ApiError {
+    fn from(value: nanotrace_ingest::IngestError) -> Self {
+        Self::Kafka(value)
     }
 }
 
@@ -1053,28 +912,16 @@ impl IntoResponse for ApiError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body is too large".to_string(),
             ),
-            Self::EmptyWrite => (StatusCode::INTERNAL_SERVER_ERROR, "empty write".to_string()),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             Self::Email(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
-            Self::EventLog(EventLogError::Event(err)) => (StatusCode::BAD_REQUEST, err.to_string()),
-            Self::EventLog(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Self::Processor(err @ ProcessorStoreError::InvalidName)
-            | Self::Processor(err @ ProcessorStoreError::MissingStage)
-            | Self::Processor(err @ ProcessorStoreError::MissingCode(_))
-            | Self::Processor(err @ ProcessorStoreError::Json(_)) => {
-                (StatusCode::BAD_REQUEST, err.to_string())
-            }
-            Self::Processor(ProcessorStoreError::S3NotConfigured) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "S3 bucket is not configured".to_string(),
-            ),
-            Self::Processor(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Self::Kafka(err) => (StatusCode::BAD_GATEWAY, err.to_string()),
             Self::Definition(
                 err @ (DefinitionStoreError::InvalidName
                 | DefinitionStoreError::InvalidKind
                 | DefinitionStoreError::InvalidMode
                 | DefinitionStoreError::InvalidPath
-                | DefinitionStoreError::InvalidConfig),
+                | DefinitionStoreError::InvalidConfig
+                | DefinitionStoreError::UnsupportedSynchronousBackfillKind { .. }),
             ) => (StatusCode::BAD_REQUEST, err.to_string()),
             Self::Definition(DefinitionStoreError::NotFound) => {
                 (StatusCode::NOT_FOUND, "not_found".to_string())
@@ -1092,35 +939,31 @@ impl IntoResponse for ApiError {
                 (status, body)
             }
             Self::Definition(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Self::Dashboard(
-                err @ (DashboardError::InvalidId
-                | DashboardError::InvalidDashboardId
-                | DashboardError::MissingTitle
-                | DashboardError::MissingSourceCode
-                | DashboardError::InvalidDimensions),
+            Self::Materialization(
+                err @ (MaterializationStoreError::InvalidRequest
+                | MaterializationStoreError::InvalidTarget
+                | MaterializationStoreError::UnsupportedQueuedBackfillKind { .. }),
             ) => (StatusCode::BAD_REQUEST, err.to_string()),
-            Self::Dashboard(DashboardError::PostgresNotConfigured) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Postgres is not configured".to_string(),
-            ),
-            Self::Dashboard(DashboardError::NotFound) => {
+            Self::Materialization(MaterializationStoreError::DefinitionNotFound)
+            | Self::Materialization(MaterializationStoreError::NotFound) => {
                 (StatusCode::NOT_FOUND, "not_found".to_string())
             }
-            Self::Dashboard(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Self::Report(
-                err @ (ReportStoreError::InvalidId
-                | ReportStoreError::InvalidName
-                | ReportStoreError::InvalidKind
-                | ReportStoreError::InvalidConfig),
-            ) => (StatusCode::BAD_REQUEST, err.to_string()),
-            Self::Report(ReportStoreError::PostgresNotConfigured) => (
+            Self::Materialization(MaterializationStoreError::ClickHouseNotConfigured) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Postgres is not configured".to_string(),
+                "ClickHouse is not configured".to_string(),
             ),
-            Self::Report(ReportStoreError::NotFound) => {
-                (StatusCode::NOT_FOUND, "not_found".to_string())
+            Self::Materialization(MaterializationStoreError::ClickHouseResponse {
+                status,
+                body,
+            }) => {
+                let status = if status.is_client_error() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                (status, body)
             }
-            Self::Report(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Self::Materialization(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Read(ReadError::InvalidQuery(err)) => (StatusCode::BAD_REQUEST, err),
             Self::Read(ReadError::ClickHouseResponse { status, body }) => {
                 let status = if status.is_client_error() {
@@ -1134,10 +977,6 @@ impl IntoResponse for ApiError {
             Self::Read(ReadError::ClickHouseNotConfigured) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ClickHouse is not configured".to_string(),
-            ),
-            Self::Read(ReadError::S3NotConfigured) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "S3 bucket is not configured".to_string(),
             ),
             Self::Read(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Auth(err) => (err.status_code(), err.to_string()),
@@ -1153,27 +992,15 @@ impl From<crate::read::ReadError> for ApiError {
     }
 }
 
-impl From<crate::processors::ProcessorStoreError> for ApiError {
-    fn from(value: crate::processors::ProcessorStoreError) -> Self {
-        Self::Processor(value)
-    }
-}
-
 impl From<crate::definitions::DefinitionStoreError> for ApiError {
     fn from(value: crate::definitions::DefinitionStoreError) -> Self {
         Self::Definition(value)
     }
 }
 
-impl From<crate::dashboards::DashboardError> for ApiError {
-    fn from(value: crate::dashboards::DashboardError) -> Self {
-        Self::Dashboard(value)
-    }
-}
-
-impl From<crate::reports::ReportStoreError> for ApiError {
-    fn from(value: crate::reports::ReportStoreError) -> Self {
-        Self::Report(value)
+impl From<crate::materializations::MaterializationStoreError> for ApiError {
+    fn from(value: crate::materializations::MaterializationStoreError) -> Self {
+        Self::Materialization(value)
     }
 }
 

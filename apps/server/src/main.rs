@@ -1,28 +1,21 @@
 mod config;
-mod dashboards;
 mod definitions;
-mod event;
-mod event_log;
 mod http;
+mod materializations;
+mod metrics;
 mod openapi;
-mod processors;
 mod read;
-mod reports;
-mod retention;
-mod uploader;
 
 use std::sync::Arc;
 
+use nanotrace_auth::{AuthStore, DEFAULT_ORGANIZATION_ID};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use nanotrace_processor_runtime::{ProcessorRuntime, ProcessorSyncConfig};
-
 use crate::{
-    config::Config, dashboards::DashboardStore, definitions::DefinitionStore,
-    event_log::EventLogWriter, http::AppState, processors::ProcessorStore, read::ReadStore,
-    reports::ReportStore,
+    config::Config, definitions::DefinitionStore, http::AppState,
+    materializations::MaterializationStore, metrics::ServerMetrics, read::ReadStore,
 };
 
 #[tokio::main]
@@ -37,63 +30,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .map(Arc::new);
     let aws_config = aws_config::load_from_env().await;
-    let s3 = s3_client(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
-    let upload_processors = match cfg.s3_bucket.clone() {
-        Some(bucket) => ProcessorRuntime::start(
-            s3.clone(),
-            ProcessorSyncConfig {
-                bucket,
-                prefix: cfg.processor_prefix.clone(),
-                interval: cfg.processor_poll_interval,
-                root: std::path::PathBuf::from("/tmp/nanotrace-upload-processors"),
-                stage: "upload".to_string(),
-            },
-        ),
-        None => ProcessorRuntime::identity(),
-    };
-    let writer = Arc::new(EventLogWriter::new(cfg.clone()).await?);
-    let read_store = Arc::new(ReadStore::new(cfg.clone(), s3.clone()));
-    let dashboard_store = Arc::new(DashboardStore::connect(cfg.clone()).await?);
+    let raw_ingest = Arc::new(nanotrace_ingest::RawBatchProducer::new(
+        nanotrace_ingest::RawBatchProducerConfig {
+            brokers: cfg.kafka_brokers.clone(),
+            topic: cfg.kafka_ingest_topic.clone(),
+            client_id: cfg.kafka_client_id.clone(),
+            timeout: cfg.kafka_produce_timeout,
+        },
+    )?);
+    let read_store = Arc::new(ReadStore::new(Arc::new(read_config(&cfg))));
     let definition_store = Arc::new(DefinitionStore::new(cfg.clone()));
-    let processor_store = Arc::new(ProcessorStore::new(cfg.clone(), s3));
-    let report_store = Arc::new(ReportStore::connect(cfg.clone()).await?);
-
-    {
-        let cfg = cfg.clone();
-        tokio::spawn(async move { uploader::run(cfg, upload_processors).await });
+    if cfg.clickhouse_url.is_some() {
+        seed_sdk_default_definitions(definition_store.as_ref(), auth.as_deref()).await;
     }
-
-    {
-        let cfg = cfg.clone();
-        tokio::spawn(async move { retention::run(cfg).await });
-    }
-
-    {
-        let writer = writer.clone();
-        let rotate_after = cfg.rotate_after;
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(rotate_after.min(std::time::Duration::from_secs(10)));
-            loop {
-                interval.tick().await;
-                if let Err(err) = writer.rotate_if_old().await {
-                    error!(error = %err, "failed to rotate event file");
-                }
-            }
-        });
-    }
+    let materialization_store = Arc::new(MaterializationStore::new(cfg.clone()));
+    let metrics = Arc::new(ServerMetrics::new());
 
     let app = http::router(AppState {
         cfg: cfg.clone(),
         auth,
-        dashboards: dashboard_store.clone(),
         definitions: definition_store.clone(),
-        processors: processor_store.clone(),
+        materializations: materialization_store.clone(),
         read: read_store.clone(),
-        reports: report_store.clone(),
+        raw_ingest,
         ses,
-        writer: writer.clone(),
+        metrics,
     });
     let address = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&address).await?;
@@ -102,23 +64,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    writer.flush().await?;
 
     Ok(())
 }
 
-fn s3_client(config: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
-    let mut builder = aws_sdk_s3::config::Builder::from(config);
-    if env_bool("AWS_S3_FORCE_PATH_STYLE") || env_bool("AWS_S3_PATH_STYLE") {
-        builder.set_force_path_style(Some(true));
+async fn seed_sdk_default_definitions(
+    definition_store: &DefinitionStore,
+    auth: Option<&AuthStore>,
+) {
+    let tenant_ids = match auth {
+        Some(auth) => match auth.list_organization_ids().await {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => vec![DEFAULT_ORGANIZATION_ID.to_string()],
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to list organizations for SDK default definition seeding"
+                );
+                vec![DEFAULT_ORGANIZATION_ID.to_string()]
+            }
+        },
+        None => vec![DEFAULT_ORGANIZATION_ID.to_string()],
+    };
+
+    for tenant_id in tenant_ids {
+        match definition_store.seed_sdk_defaults(&tenant_id).await {
+            Ok(definitions) => {
+                info!(
+                    tenant_id,
+                    definitions = definitions.len(),
+                    "seeded SDK default definitions"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    tenant_id,
+                    error = %err,
+                    "failed to seed SDK default definitions"
+                );
+            }
+        }
     }
-    aws_sdk_s3::Client::from_conf(builder.build())
 }
 
-fn env_bool(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+fn read_config(cfg: &Config) -> read::Config {
+    read::Config {
+        clickhouse_url: cfg.clickhouse_url.clone(),
+        clickhouse_user: cfg.clickhouse_user.clone(),
+        clickhouse_password: cfg.clickhouse_password.clone(),
+        clickhouse_database: cfg.clickhouse_database.clone(),
+        clickhouse_table: cfg.clickhouse_table.clone(),
+        clickhouse_max_result_rows: cfg.clickhouse_max_result_rows,
+        clickhouse_max_execution_secs: cfg.clickhouse_max_execution_secs,
+        clickhouse_max_bytes_to_read: cfg.clickhouse_max_bytes_to_read,
+    }
 }
 
 async fn shutdown_signal() {

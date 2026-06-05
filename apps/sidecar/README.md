@@ -49,6 +49,8 @@ NANOTRACE_CLIENT_BATCH_MAX_EVENTS=100
 NANOTRACE_CLIENT_BATCH_MAX_BYTES=1048576
 NANOTRACE_CLIENT_FLUSH_MS=25
 NANOTRACE_CLIENT_QUEUE_CAPACITY=10000
+NANOTRACE_CLIENT_SPOOL_DIR=/var/lib/nanotrace-sidecar/spool
+NANOTRACE_CLIENT_SPOOL_POLL_MS=1000
 NANOTRACE_CLIENT_UDP_MAX_BYTES=65507
 NANOTRACE_CLIENT_HTTP_MAX_BYTES=1048576
 NANOTRACE_CLIENT_HTTP_TIMEOUT_MS=5000
@@ -67,8 +69,18 @@ data.service_version     NANOTRACE_VERSION, DD_VERSION, SERVICE_VERSION, APP_VER
 data.service.instance.id NANOTRACE_INSTANCE_ID, SERVICE_INSTANCE_ID, HOSTNAME, HOST
 ```
 
-The UDP path is intentionally fire-and-forget. If the process is down, the queue
-is full, or a datagram is invalid JSON, the application is not blocked. The
-local HTTP path returns a response once the event has been accepted into the
-sidecar queue; remote persistence still happens asynchronously through the
-sidecar batcher.
+The UDP path is intentionally fire-and-forget. If the process is down, the
+in-memory queue is full, the spool disk is unavailable, or a datagram is invalid
+JSON, the application is not blocked. The local HTTP path returns a response
+once the event has been accepted into the sidecar queue, or into the disk spool
+when `NANOTRACE_CLIENT_SPOOL_DIR` is configured. Remote persistence still
+happens asynchronously through the sidecar batcher.
+
+With `NANOTRACE_CLIENT_SPOOL_DIR`, accepted events are written as local spool
+files first. A background replayer claims ready files, sends them through the
+same HTTP batcher, deletes files after successful remote acceptance, and restores
+failed batches for retry. Files left `*.inflight` by a process crash are
+returned to ready state on startup. Duplicate remote delivery is still possible
+after a crash between remote acceptance and local spool deletion, so consumers
+must treat `(tenant_id, event_id)` as application identity rather than a physical
+exactly-once guarantee.

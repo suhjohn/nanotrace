@@ -1,0 +1,17 @@
+[package]
+name = "nanotrace-read"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlparser = { version = "0.62", features = ["visitor"] }
+thiserror = "2"
+tracing = "0.1"
+utoipa = { version = "5.5", features = ["chrono", "preserve_order"] }

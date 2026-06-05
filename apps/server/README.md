@@ -1,64 +1,81 @@
 Build
 
-POST /v1/events writes events to local append-only files.
-A separate uploader ships closed files to S3.
-`apps/loader` ingests the S3 files into observatory.events.
-
-S3 is the raw log. ClickHouse is the query index.
+`POST /v1/events` publishes accepted request bodies to Kafka. The server does
+not parse event JSON, write local event files, upload raw parts to S3, commit
+Iceberg snapshots, or call ClickHouse on the HTTP request path. The normalizer
+owns those asynchronous ingest writes.
 
 Event write path
+
+```text
 POST /v1/events
 -> validate API key from Authorization: Bearer ntak_...
--> parse JSON
--> build event envelope
--> append one NDJSON line to current local file
--> record byte offset + byte length
--> return 200 after local write durability policy is satisfied
+-> enforce ingest:write scope
+-> read the request body
+-> produce the raw body to NANOTRACE_KAFKA_INGEST_TOPIC
+-> return 202 with Kafka topic/partition/offset
+```
 
-Requests without a valid API key are rejected before parsing or writing the event.
+Requests without a valid service/admin API key are rejected before Kafka
+produce. The normalizer owns JSON parsing, tenant stamping, invalid-event
+handling, generic KV indexing, typed SDK-managed metric definitions, Iceberg
+commits, and ClickHouse inserts.
 
-No ClickHouse call is made on the request path.
-No S3 call is made on the request path.
+Kafka message metadata
+
+The server sets these headers on every produced batch:
+
+```text
+nanotrace-tenant-id
+nanotrace-organization-id
+nanotrace-received-at
+nanotrace-schema-version
+content-type
+```
 
 Client event contract
 
-Clients send one JSON event object:
+Clients send one JSON event object or a non-empty JSON array of event objects:
 
+```text
 event_id: non-empty string
 timestamp: non-empty string
 data: JSON object
+```
 
-POST /v1/events also accepts a non-empty JSON array of the same event objects.
-Single-event requests return one write receipt. Batch requests return an array
-of write receipts in request order.
-
-The server fills:
-
-source_file
-source_offset
-source_length
-
-`observed_timestamp` is optional. If omitted, ClickHouse defaults it to
-`timestamp`. ClickHouse fills `ingested_timestamp`.
+The normalizer stamps `tenant_id` and `organization_id` into `data`, serializes
+valid rows to Iceberg and ClickHouse JSONEachRow, and sends invalid rows to the
+invalid topic/table. Its Kafka offset advances only after the durable writes for
+that message succeed.
 
 Runtime configuration
 
-The server uses standard AWS SDK configuration for object storage. In the
-normal AWS case this means AWS_REGION, AWS_ACCESS_KEY_ID, and
-AWS_SECRET_ACCESS_KEY are enough when an instance role is not used. For EC2,
-prefer an instance role and set only AWS_REGION.
+Required ingest settings:
 
-Application settings:
+```text
+NANOTRACE_KAFKA_BROKERS
+```
 
+Common optional settings:
+
+```text
+PORT
+NANOTRACE_KAFKA_INGEST_TOPIC
+NANOTRACE_KAFKA_CLIENT_ID
+NANOTRACE_KAFKA_PRODUCE_TIMEOUT_MS
+NANOTRACE_KAFKA_SECURITY_PROTOCOL
+NANOTRACE_KAFKA_SASL_MECHANISM
+NANOTRACE_KAFKA_SASL_USERNAME
+NANOTRACE_KAFKA_SASL_PASSWORD
 NANOTRACE_POSTGRES_URL
 NANOTRACE_PUBLIC_BASE_URL
+NANOTRACE_APP_BASE_URL
 NANOTRACE_EMAIL_FROM
 NANOTRACE_MAGIC_LINK_TTL_SECS
+NANOTRACE_API_KEY_CACHE_REFRESH_SECS
 NANOTRACE_ALLOWED_EMAILS
 NANOTRACE_ADMIN_EMAILS
-PORT
-NANOTRACE_S3_BUCKET
-S3_PREFIX
+NANOTRACE_CORS_ALLOWED_ORIGINS
 CLICKHOUSE_URL
 CLICKHOUSE_USER
 CLICKHOUSE_PASSWORD
@@ -68,171 +85,115 @@ CLICKHOUSE_MAX_RESULT_ROWS
 CLICKHOUSE_MAX_EXECUTION_SECS
 CLICKHOUSE_MAX_BYTES_TO_READ
 MAX_REQUEST_BYTES
-MAX_EVENT_BYTES
-UPLOAD_POLL_INTERVAL_MS
-PROCESSOR_POLL_INTERVAL_SECS
-NANOTRACE_DONE_RETENTION_MINS
-NANOTRACE_DONE_CLEANUP_INTERVAL_SECS
-NANOTRACE_WRITER_LANES
-NANOTRACE_WRITER_QUEUE_CAPACITY
-NANOTRACE_WRITER_FLUSH_INTERVAL_MS
-NANOTRACE_WRITER_FLUSH_BYTES
-NANOTRACE_COMPACT_BATCH_RECEIPTS
-
-The writer uses group commit. A request is acknowledged only after its lane has
-appended the event rows to the active `.tmp` file and completed `flush + fsync`
-for that group. Groups commit when `NANOTRACE_WRITER_FLUSH_INTERVAL_MS` ticks or
-`NANOTRACE_WRITER_FLUSH_BYTES` is reached.
-
-`GET /metrics` exposes Prometheus text metrics for request body read time,
-queue wait, serialization, file writes, flush/sync work, rotations, bytes, and
-error counters.
+```
 
 Read APIs
 
-`POST /query` executes a constrained read-only ClickHouse query. It requires the
-same bearer token as ingest, accepts only one `SELECT`/`WITH` statement, adds
-`FORMAT JSON`, and sends `readonly=1` plus query resource limits.
+`POST /v1/query` is the user-facing query surface. It is intentionally typed:
+the body must include a `type` field and the fields for that query type. The
+server injects tenant scope, applies ClickHouse read limits, checks serving
+freshness unless `allowStaleServing` is set, records query usage, and may return
+planner recommendations under the `nanotrace` response metadata.
+
+Supported query types:
+
+```text
+events  Explore raw events, groups, density, latest rows, summaries, and flamegraphs.
+search  Search indexed event text and terms.
+measure Read promoted measure cube rollups.
+funnel  Read sequence report results.
+cohort  Read cohort memberships.
+report  Read report result rows.
+state   Read current entity state.
+alerts  Read alert events or alert notifications.
+```
+
+Examples:
 
 ```json
 {
-  "query": "SELECT count() FROM observatory.events WHERE timestamp >= {from:DateTime64(3, 'UTC')}",
-  "parameters": {
-    "from": "2026-05-10T00:00:00Z"
-  }
+  "type": "events",
+  "view": "events",
+  "filter": {
+    "createdAfter": "2026-06-06T00:00:00Z",
+    "createdBefore": "2026-06-06T01:00:00Z",
+    "facets": [
+      { "path": "service", "operator": "eq", "value": "api" },
+      { "path": "duration_ms", "operator": "gte", "value": "1000" }
+    ],
+    "text": "timeout"
+  },
+  "limit": 100,
+  "sort": { "direction": "desc" }
 }
 ```
 
-`GET /v1/events/{event_id}` uses ClickHouse only as the pointer index:
-
-```sql
-SELECT source_file, source_offset, source_length
-FROM observatory.events
-WHERE event_id = ?
-ORDER BY timestamp ASC, source_file ASC, source_offset ASC
-LIMIT 1
+```json
+{
+  "type": "search",
+  "query": "checkout timeout",
+  "mode": "token",
+  "requireAllTerms": true,
+  "includeSnippets": true,
+  "from": "2026-06-06T00:00:00Z",
+  "to": "2026-06-06T01:00:00Z",
+  "limit": 50
+}
 ```
 
-Then it fetches the exact accepted NDJSON line from S3 with a byte range,
-validates the line's `event_id`, and returns those bytes as JSON. If multiple
-rows share an `event_id`, the earliest row by `timestamp`, then
-`source_file/source_offset`, is used as the canonical event.
+```json
+{
+  "type": "measure",
+  "measureName": "checkout.latency",
+  "from": "2026-06-06T00:00:00Z",
+  "to": "2026-06-06T01:00:00Z",
+  "bucketSeconds": 60,
+  "groupBy": ["service"]
+}
+```
 
-Local files
+`GET /v1/events/{event_id}` reconstructs the event from ClickHouse serving
+rows.
 
-Each writer lane owns one current file. Lanes avoid a global append mutex under
-concurrent ingest.
+Definitions and backfills
 
-NANOTRACE_DATA_DIR/events/dt=2026-05-10/hour=12/host=i-abc123/lane=0/part-000001.ndjson.tmp
+Definitions are append/versioned control-plane rows. Creating a definition
+inserts a new active row, deleting a definition inserts a disabled/deleted
+version, and there is no in-place update endpoint. The server seeds SDK metric
+defaults internally at startup for known organizations when ClickHouse is
+configured.
 
-When file is big enough or old enough:
+```http
+GET    /v1/definitions
+GET    /v1/definitions/{definition_id}
+POST   /v1/definitions
+DELETE /v1/definitions/{definition_id}
+```
 
-flush
-fsync
-close
-rename part-000001.ndjson.tmp -> part-000001.ndjson.ready
+Synchronous backfills are for field, measure/rollup, and state definitions:
 
-Only .ready files may be uploaded.
+```http
+POST /v1/definitions/{definition_id}/backfill
+```
 
-On startup, leftover `.tmp` files are truncated to the last complete NDJSON line,
-fsynced, and recovered as `.ready`.
+Reports, sequences, and cohorts are definition kinds. To process historical
+data for one of those definitions, create a queued backfill:
 
-Uploader owns:
+```http
+POST /v1/definitions/{definition_id}/backfills
+GET  /v1/backfills
+GET  /v1/backfills/{job_id}
+```
 
-.ready -> .uploading -> .done
--> .failed
+Internally these rows are stored as materialization jobs/chunks, but the public
+API uses "backfill" because it is the user action: apply this definition to a
+historical window.
 
-Local retention cleanup owns uploaded files:
+Health
 
-.done older than NANOTRACE_DONE_RETENTION_MINS -> deleted
-
-Set NANOTRACE_DONE_RETENTION_MINS=0 to disable .done cleanup.
-S3 layout
-s3://observatory-raw/events/
-dt=2026-05-10/
-hour=12/
-host=i-abc123/
-lane=0/
-part-000001.ndjson
-
-Use uncompressed NDJSON if source_offset/source_length must support exact S3 byte-range fetches.
-
-If we compress whole files, byte offsets are not useful for direct S3 range lookup.
-
-Raw file format
-
-Each line is one event:
-
-{"event_id":"...","timestamp":"...","source_file":"...","source_offset":0,"source_length":123,"data":{...}}
-
-Each uploaded row already includes:
-
-source_file = S3 object key
-source_offset = byte offset of this line in the object
-source_length = byte length of this line
-
-ClickHouse fills `observed_timestamp` and `ingested_timestamp` when omitted.
-
-So any ClickHouse row can point back to the exact raw bytes in S3.
-
-Minimal pseudocode
-on POST /v1/events:
-if request.Authorization is not a valid API key:
-return 401
-
-event = normalize(request.json)
-line = json(event) + "\n"
-
-    lock current_file:
-        offset = current_file.size
-        write line
-        length = len(line)
-
-        remember source_offset = offset
-        remember source_length = length
-
-        if file too large or too old:
-            fsync current_file
-            close current_file
-            rename .tmp to .ready
-            open new .tmp
-
-    return 200
-
-uploader loop:
-for each \*.ready:
-rename .ready to .uploading
-if an upload processor exists:
-    run it over the closed NDJSON object
-    restamp source_file/source_offset/source_length
-upload file to S3
-if all rows were dropped:
-    skip S3 upload
-if success:
-rename .uploading to .done
-else:
-rename .uploading to .failed
-loader:
-read S3 NDJSON file
-for each line:
-insert row into ClickHouse with:
-event fields from JSON
-source_file = S3 key
-source_offset = byte offset
-source_length = byte length
-ClickHouse table
-
-Use the raw-first table as the append-only query index:
-@deploy/clickhouse/schema.sql
-
-This table does not dedupe.
-It stores what was accepted.
-Dedupe is a separate derived table or query concern.
-
-Invariants
-.tmp files are incomplete.
-.ready files are complete and immutable.
-S3 objects are immutable.
-ClickHouse rows point back to raw S3 bytes.
-Request path never depends on S3 or ClickHouse.
-Raw data is never destroyed before S3 upload succeeds.
+`GET /healthz` is liveness. `GET /readyz` reports the configured Kafka ingest
+topic. `GET /metrics` exposes ops-only Prometheus text metrics for the server
+process, including request counts/latency, accepted ingest bytes/batches,
+structured query counts/latency, created backfill jobs, uptime, and API key
+cache state. It is intentionally not part of the generated OpenAPI user surface
+and should be ingress-restricted in production.

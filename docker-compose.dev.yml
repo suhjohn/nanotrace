@@ -5,7 +5,6 @@ x-app-env: &app-env
   AWS_SECRET_ACCESS_KEY: test
   AWS_REGION: us-east-1
   AWS_ENDPOINT_URL: http://localstack:4566
-  AWS_S3_FORCE_PATH_STYLE: "true"
   CLICKHOUSE_URL: http://clickhouse:8123
   CLICKHOUSE_USER: default
   CLICKHOUSE_PASSWORD: nanotrace
@@ -16,6 +15,7 @@ x-app-env: &app-env
   CLICKHOUSE_SPAN_FRAGMENTS_TABLE: span_fragments
   CLICKHOUSE_EVENT_MEASURES_TABLE: event_measures
   CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE: entity_state_updates
+  CLICKHOUSE_ENTITY_STATE_CURRENT_TABLE: entity_state_current
   NANOTRACE_POSTGRES_URL: postgres://nanotrace:nanotrace@postgres:5432/nanotrace
   NANOTRACE_DEV_BOOTSTRAP_API_KEY: ntak_dev
   NANOTRACE_PUBLIC_BASE_URL: http://localhost:18473
@@ -24,31 +24,45 @@ x-app-env: &app-env
   NANOTRACE_ALLOWED_EMAILS: "*"
   NANOTRACE_ADMIN_EMAILS: dev@localhost
   NANOTRACE_CORS_ALLOWED_ORIGINS: http://localhost:41233,http://127.0.0.1:41233,http://localhost:41234,http://127.0.0.1:41234
-  NANOTRACE_S3_BUCKET: nanotrace-dev-events
-  S3_BUCKET: nanotrace-dev-events
-  S3_PREFIX: events
-  PROCESSOR_S3_BUCKET: nanotrace-dev-events
-  PROCESSOR_PREFIX: processors
-  PROCESSOR_BUILDER_CMD: "true"
-  NANOTRACE_LAKEHOUSE_ENABLED: ${NANOTRACE_LAKEHOUSE_ENABLED:-true}
-  NANOTRACE_INGEST_LEDGER_ENABLED: ${NANOTRACE_INGEST_LEDGER_ENABLED:-true}
-  NANOTRACE_INGEST_LEDGER_STALE_SECS: ${NANOTRACE_INGEST_LEDGER_STALE_SECS:-3600}
-  NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR: /data/lakehouse
-  NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES: ${NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES:-536870912}
-  NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP: ${NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP:-10000}
-  NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS: ${NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS:-604800000}
-  NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX: ${NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX:-100}
-  NANOTRACE_REBUILD_TRUNCATE: ${NANOTRACE_REBUILD_TRUNCATE:-false}
-  NANOTRACE_REBUILD_RAW: ${NANOTRACE_REBUILD_RAW:-true}
-  NANOTRACE_REBUILD_DERIVED: ${NANOTRACE_REBUILD_DERIVED:-true}
-  NANOTRACE_MATERIALIZE_INCREMENTAL: ${NANOTRACE_MATERIALIZE_INCREMENTAL:-false}
-  NANOTRACE_MATERIALIZE_LOOP: ${NANOTRACE_MATERIALIZE_LOOP:-false}
-  NANOTRACE_MATERIALIZE_POLL_SECS: ${NANOTRACE_MATERIALIZE_POLL_SECS:-5}
-  NANOTRACE_REBUILD_ALLOW_NON_EMPTY: ${NANOTRACE_REBUILD_ALLOW_NON_EMPTY:-false}
-  NANOTRACE_REBUILD_FROM_SEQUENCE: ${NANOTRACE_REBUILD_FROM_SEQUENCE:-0}
+  NANOTRACE_KAFKA_BROKERS: redpanda:9092
+  NANOTRACE_KAFKA_INGEST_TOPIC: events.ingest.v1
+  NANOTRACE_KAFKA_NORMALIZED_TOPIC: events.normalized.v1
+  NANOTRACE_KAFKA_INVALID_TOPIC: events.invalid.v1
+  NANOTRACE_LAKEHOUSE_ENABLED: "true"
+  NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR: /var/lib/nanotrace/lakehouse
   RUST_LOG: info
 
 services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      [
+        "redpanda",
+        "start",
+        "--mode",
+        "dev-container",
+        "--smp",
+        "1",
+        "--memory",
+        "1G",
+        "--reserve-memory",
+        "0M",
+        "--check=false",
+        "--kafka-addr",
+        "internal://0.0.0.0:9092,external://0.0.0.0:19092",
+        "--advertise-kafka-addr",
+        "internal://redpanda:9092,external://localhost:19092"
+      ]
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info --brokers 127.0.0.1:9092 >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -85,7 +99,7 @@ services:
   localstack:
     image: localstack/localstack:3
     environment:
-      SERVICES: s3,sqs,ses
+      SERVICES: ses
       AWS_DEFAULT_REGION: us-east-1
       DEBUG: "0"
     ports:
@@ -101,20 +115,6 @@ services:
       interval: 2s
       timeout: 5s
       retries: 60
-
-  localstack-init:
-    image: localstack/localstack:3
-    depends_on:
-      localstack:
-        condition: service_healthy
-    environment:
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
-      LOCALSTACK_HOST: localstack:4566
-    volumes:
-      - ./scripts/dev/localstack-init.sh:/etc/localstack-init.sh:ro
-    entrypoint: ["/bin/sh", "/etc/localstack-init.sh"]
 
   clickhouse-schema:
     image: node:24-alpine
@@ -143,53 +143,74 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redpanda:
+        condition: service_healthy
       clickhouse-schema:
         condition: service_completed_successfully
-      localstack-init:
-        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
     environment:
       <<: *app-env
       PORT: "18473"
-      NANOTRACE_DATA_DIR: /data/events
     ports:
       - "18473:18473"
     volumes:
-      - server-data:/data/events
+      - lakehouse-data:/var/lib/nanotrace/lakehouse
 
-  loader:
+  normalizer:
     image: nanotrace-dev-app:latest
     depends_on:
-      server:
-        condition: service_started
+      redpanda:
+        condition: service_healthy
       clickhouse-schema:
-        condition: service_completed_successfully
-      localstack-init:
         condition: service_completed_successfully
     environment:
       <<: *app-env
-      LOADER_SQS_QUEUE_URL: http://localstack:4566/000000000000/nanotrace-dev-events
-      LOADER_POLL_WAIT_SECS: "1"
+      NANOTRACE_NORMALIZER_GROUP_ID: nanotrace-normalizer-dev
+      NANOTRACE_NORMALIZER_CLIENT_ID: nanotrace-normalizer-dev
     volumes:
-      - lakehouse-data:/data/lakehouse
-    command: ["/usr/local/bin/nanotrace-loader"]
+      - lakehouse-data:/var/lib/nanotrace/lakehouse
+    command: ["/usr/local/bin/nanotrace-normalizer"]
+
+  alerts:
+    image: nanotrace-dev-app:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse-schema:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      NANOTRACE_ALERTS_GROUP_ID: nanotrace-alerts-dev
+      NANOTRACE_ALERTS_CLIENT_ID: nanotrace-alerts-dev
+      NANOTRACE_ALERTS_DEFINITION_REFRESH_SECS: "5"
+    command: ["/usr/local/bin/nanotrace-alerts"]
+
+  alerts-notifier:
+    image: nanotrace-dev-app:latest
+    depends_on:
+      clickhouse-schema:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      NANOTRACE_ALERTS_NOTIFIER: "true"
+      NANOTRACE_ALERTS_CLIENT_ID: nanotrace-alerts-notifier-dev
+      NANOTRACE_ALERTS_NOTIFY_POLL_SECS: "5"
+      NANOTRACE_ALERTS_NOTIFY_BATCH_SIZE: "100"
+    command: ["/usr/local/bin/nanotrace-alerts"]
 
   materializer:
     image: nanotrace-dev-app:latest
     depends_on:
-      server:
-        condition: service_started
       clickhouse-schema:
-        condition: service_completed_successfully
-      localstack-init:
         condition: service_completed_successfully
     environment:
       <<: *app-env
       NANOTRACE_MATERIALIZE_LOOP: "true"
-      NANOTRACE_REBUILD_COMMIT_SOURCE: clickhouse
-      NANOTRACE_REBUILD_RAW: "false"
-      NANOTRACE_REBUILD_DERIVED: "true"
+      NANOTRACE_REBUILD_COMMIT_SOURCE: local
+      NANOTRACE_MATERIALIZE_POLL_SECS: "2"
     volumes:
-      - lakehouse-data:/data/lakehouse
+      - lakehouse-data:/var/lib/nanotrace/lakehouse
     command: ["/usr/local/bin/nanotrace-lakehouse-rebuild"]
 
   ui:
@@ -217,6 +238,6 @@ volumes:
   localstack-data:
   lakehouse-data:
   postgres-data:
-  server-data:
+  redpanda-data:
   ui-node-modules:
   ui-app-node-modules:

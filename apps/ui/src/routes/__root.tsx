@@ -1,7 +1,7 @@
 import { Link, Outlet, createRootRoute, useRouterState } from '@tanstack/react-router'
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-import { BarChart3, ClipboardList, Cpu, Database, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
+import { Database, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../lib/cn'
@@ -160,10 +160,7 @@ function SignInScreen() {
 
 function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: state => state.location.pathname })
-  const isDashboard = pathname.startsWith('/dashboard')
   const isSchema = pathname.startsWith('/schema')
-  const isProcessors = pathname.startsWith('/processors')
-  const isReports = pathname.startsWith('/reports')
   const isApiKeys = pathname.startsWith('/settings/api-keys')
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => readSidebarMode())
   const [dragWidth, setDragWidth] = useState<number | null>(null)
@@ -250,11 +247,8 @@ function AppShell({ children }: { children: ReactNode }) {
             {sidebarExpanded ? (
               <>
                 <nav className="flex flex-1 flex-col gap-1">
-                  <NavItem active={!isDashboard && !isSchema && !isProcessors && !isReports && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
-                  <NavItem active={isDashboard} label="Dashboard" to="/dashboard" icon={<BarChart3 size={17} strokeWidth={1.8} />} />
+                  <NavItem active={!isSchema && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
                   <NavItem active={isSchema} label="Schema" to="/schema" icon={<Database size={17} strokeWidth={1.8} />} />
-                  <NavItem active={isReports} label="Reports" to="/reports" icon={<ClipboardList size={17} strokeWidth={1.8} />} />
-                  <NavItem active={isProcessors} label="Processors" to="/processors" icon={<Cpu size={17} strokeWidth={1.8} />} />
                   <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
                 </nav>
                 <AccountControl />
@@ -459,7 +453,7 @@ function NavItem({
   active: boolean
   icon: ReactNode
   label: string
-  to: '/' | '/dashboard' | '/schema' | '/reports' | '/processors' | '/settings/api-keys'
+  to: '/' | '/schema' | '/settings/api-keys'
 }) {
   return (
     <Link

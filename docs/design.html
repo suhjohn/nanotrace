@@ -3,738 +3,448 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Nanotrace - Current System Design</title>
+<title>Nanotrace System Design</title>
 <style>
   :root {
-    --bg: #090b0d;
-    --panel: #11161b;
-    --panel-2: #171d24;
-    --panel-3: #0d1116;
-    --line: #27303a;
-    --text: #e7eaee;
-    --muted: #9aa4af;
-    --soft: #6f7b87;
-    --blue: #79c7ff;
-    --green: #abe8bb;
-    --yellow: #ffd27a;
-    --red: #ff8f8f;
-    --violet: #cab6ff;
-    --max-width: 1120px;
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --panel-2: #191f25;
+    --line: #27313d;
+    --line-2: #344150;
+    --text: #edf0f3;
+    --muted: #a8b0b8;
+    --soft: #78828d;
+    --blue: #7ac7ff;
+    --green: #96e6ad;
+    --yellow: #f2c96d;
+    --red: #ff9a9a;
+    --max: 1180px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   }
-
-  * { box-sizing: border-box; }
-
-  html,
-  body {
+  * {
+    box-sizing: border-box;
+  }
+  html, body {
     margin: 0;
     padding: 0;
-    background:
-      radial-gradient(circle at 18% 0%, rgba(121, 199, 255, 0.14), transparent 28rem),
-      linear-gradient(180deg, #0f1419 0%, var(--bg) 24rem);
+    background: var(--bg);
     color: var(--text);
-    font: 15px/1.6 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font: 14px/1.58 var(--mono);
   }
-
   a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
-
   code {
+    border: 1px solid var(--line);
     padding: 1px 5px;
-    border: 1px solid var(--line);
-    border-radius: 5px;
     background: var(--panel-2);
-    color: #dce6ef;
-    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #dfe8f1;
+    font: 12.5px/1.5 var(--mono);
   }
-
   pre {
-    margin: 0 0 16px;
-    padding: 15px 17px;
+    margin: 8px 0 18px;
     overflow-x: auto;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: #080b0f;
-    color: #d7dde4;
-    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border: 1px solid #1f2833;
+    padding: 14px 15px;
+    background: #070a0f;
+    color: #d8e0e8;
+    font: 12.5px/1.55 var(--mono);
   }
-
-  header.page {
+  header {
     border-bottom: 1px solid var(--line);
   }
-
-  header.page .inner,
-  main {
-    width: min(var(--max-width), calc(100vw - 48px));
+  .wrap {
+    width: min(var(--max), calc(100vw - 48px));
     margin: 0 auto;
   }
-
-  header.page .inner {
-    padding: 42px 0 30px;
-  }
-
+  header .wrap { padding: 42px 0 32px; }
+  main { padding: 30px 0 84px; }
   h1 {
-    margin: 0 0 8px;
-    font-size: 32px;
-    line-height: 1.12;
-    letter-spacing: -0.03em;
+    max-width: 1000px;
+    margin: 0 0 10px;
+    font-size: 42px;
+    line-height: 0.98;
   }
-
-  .sub {
-    max-width: 820px;
+  .subtitle {
+    max-width: 980px;
     margin: 0;
     color: var(--muted);
-    font-size: 14.5px;
+    font-size: 15.5px;
   }
-
-  main {
-    padding: 28px 0 84px;
-  }
-
-  nav.toc {
+  nav {
     position: sticky;
     top: 0;
-    z-index: 2;
+    z-index: 4;
+    border-bottom: 1px solid var(--line);
+    background: rgba(11, 13, 16, 0.92);
+    backdrop-filter: blur(12px);
+  }
+  nav .wrap {
     display: flex;
     flex-wrap: wrap;
     gap: 8px 16px;
-    margin: 0 0 30px;
-    padding: 13px 15px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: rgba(17, 22, 27, 0.92);
-    backdrop-filter: blur(10px);
-    font-size: 13px;
+    padding: 12px 0;
   }
-
-  nav.toc a { color: var(--muted); }
-  nav.toc a:hover { color: var(--text); }
-
-  section { margin: 0 0 44px; }
-
+  nav a { color: var(--muted); font-size: 13px; }
+  nav a:hover { color: var(--text); }
+  section { margin: 0 0 48px; }
   h2 {
     margin: 0 0 14px;
-    padding: 0 0 9px;
     border-bottom: 1px solid var(--line);
-    font-size: 20px;
-    letter-spacing: -0.01em;
+    padding-bottom: 10px;
+    font-size: 22px;
   }
-
   h3 {
-    margin: 24px 0 9px;
-    color: var(--blue);
-    font-size: 15.5px;
+    margin: 0 0 12px;
+    font-size: 18px;
+    line-height: 1.35;
   }
-
-  p { margin: 0 0 13px; }
-  ul, ol { margin: 0 0 14px; padding-left: 22px; }
-  li { margin: 0 0 5px; }
-
+  p { margin: 0 0 12px; }
+  ul, ol { margin: 0; padding-left: 24px; }
+  li { margin: 0 0 6px; }
   table {
     width: 100%;
-    margin: 0 0 16px;
     border-collapse: collapse;
-    font-size: 13px;
+    margin-top: 14px;
   }
-
-  th,
-  td {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--line);
-    text-align: left;
-    vertical-align: top;
-  }
-
-  th {
-    color: var(--muted);
-    font-weight: 650;
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    margin: 0 0 16px;
-  }
-
-  .card,
-  .figure,
-  .callout {
+  th, td {
     border: 1px solid var(--line);
-    border-radius: 12px;
-    background: rgba(17, 22, 27, 0.84);
+    padding: 9px 10px;
+    vertical-align: top;
+    text-align: left;
   }
-
-  .card {
-    padding: 14px;
-  }
-
-  .card strong {
-    display: block;
-    margin-bottom: 4px;
+  th {
     color: var(--text);
+    font-weight: 700;
+    background: rgba(20, 24, 29, 0.86);
   }
-
-  .card span {
+  td { color: var(--muted); }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .box {
+    border: 1px solid var(--line);
+    padding: 11px 12px;
+    background: var(--panel);
+  }
+  .box b { display: block; margin-bottom: 3px; }
+  .box span { color: var(--muted); font-size: 12.5px; }
+  .rule {
+    margin: 0 0 14px;
+    border: 1px solid var(--line);
+    padding: 10px 12px;
+    background: var(--panel);
     color: var(--muted);
-    font-size: 13px;
   }
-
-  .figure {
-    margin: 0 0 18px;
-    padding: 18px;
-    overflow-x: auto;
-  }
-
-  .figure svg {
-    display: block;
-    margin: 0 auto;
-  }
-
-  .caption {
-    margin-top: 10px;
-    color: var(--soft);
-    font-size: 12.5px;
-    text-align: center;
-  }
-
-  .callout {
-    margin: 0 0 16px;
-    padding: 12px 14px;
-    border-left: 3px solid var(--blue);
-    color: var(--muted);
-    font-size: 13.5px;
-  }
-
-  .callout.warn { border-left-color: var(--yellow); }
-
+  .rule.warn { border-color: var(--line-2); }
+  .ok { color: var(--green); }
+  .maybe { color: var(--yellow); }
+  .no { color: var(--red); }
+  .muted { color: var(--muted); }
   footer {
     border-top: 1px solid var(--line);
-    padding: 18px 24px;
+    padding: 18px 20px;
     color: var(--soft);
-    font-size: 12.5px;
     text-align: center;
+    font-size: 13px;
   }
-
-  .node { fill: #121820; stroke: #2b3440; stroke-width: 1; }
-  .group { fill: #0b0f14; stroke: #202833; stroke-width: 1; }
-  .arrow { stroke: #556574; stroke-width: 1.35; fill: none; }
-  .dash { stroke: #556574; stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
-  .title { fill: #e7eaee; font: 650 12px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .label { fill: #9aa4af; font: 10.5px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .mini { fill: #6f7b87; font: 10px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .blue { fill: var(--blue); }
-  .green { fill: var(--green); }
-  .yellow { fill: var(--yellow); }
-  .violet { fill: var(--violet); }
-
-  @media (max-width: 780px) {
-    header.page .inner,
-    main {
-      width: min(100vw - 28px, var(--max-width));
-    }
-
-    .grid {
-      grid-template-columns: 1fr;
-    }
-
-    nav.toc {
-      position: static;
-    }
+  @media (max-width: 860px) {
+    .wrap { width: min(calc(100vw - 28px), var(--max)); }
+    h1 { font-size: 30px; }
+    .summary { grid-template-columns: 1fr; }
+    nav { position: static; }
   }
 </style>
 </head>
 <body>
-<header class="page">
-  <div class="inner">
-    <h1>Nanotrace Iceberg Lakehouse Design</h1>
-    <p class="sub">
-      Apache Iceberg is the durable event lakehouse. ClickHouse is the serving plane: fast, rebuildable, freshness-checked, and fed from committed lakehouse snapshots.
+<header>
+  <div class="wrap">
+    <h1>Nanotrace System Design</h1>
+    <p class="subtitle">
+      Concise current-state spec for ingest, storage, query planning, arbitrary KV filtering, materialization, replay, and validation.
+      The implementation is raw-first: preserve arbitrary event JSON, index bounded scalar KVs for immediate filtering, and materialize only SDK-typed or user-defined semantics.
     </p>
   </div>
 </header>
 
-<main>
-  <nav class="toc">
-    <a href="#principles">Principles</a>
-    <a href="#architecture">Architecture</a>
-    <a href="#ingest">Ingest</a>
-    <a href="#loader">Loader</a>
-    <a href="#storage">Storage</a>
-    <a href="#materialization">Materialization</a>
+<nav>
+  <div class="wrap">
+    <a href="#one-page">One Page</a>
+    <a href="#flow">Flow</a>
+    <a href="#events">Event Contract</a>
+    <a href="#tables">Tables</a>
     <a href="#queries">Queries</a>
-    <a href="#security">Security</a>
-    <a href="#deployment">Deployment</a>
-  </nav>
+    <a href="#materialization">Materialization</a>
+    <a href="#ops">Ops</a>
+    <a href="#tests">Validation</a>
+    <a href="#boundaries">Boundaries</a>
+    <a href="#map">Code Map</a>
+  </div>
+</nav>
 
-  <section id="principles">
-    <h2>1. Design Principles</h2>
-    <div class="grid">
-      <div class="card">
-        <strong>Lakehouse first</strong>
-        <span>Every loaded batch is committed to an Apache Iceberg V2 table before it is considered durable for serving.</span>
-      </div>
-      <div class="card">
-        <strong>Rebuildable serving</strong>
-        <span>ClickHouse tables are optimized serving indexes. They can be refilled from Iceberg commit metadata and Parquet data files.</span>
-      </div>
-      <div class="card">
-        <strong>Freshness checked</strong>
-        <span>Reads against raw and promoted serving tables are guarded by lakehouse serving watermarks unless the caller explicitly accepts stale data.</span>
-      </div>
+<main class="wrap">
+  <section id="one-page">
+    <h2>One Page</h2>
+    <div class="summary">
+      <div class="box"><b>Truth</b><span>Iceberg stores accepted normalized events and is the replay/rebuild base.</span></div>
+      <div class="box"><b>Serving</b><span>ClickHouse stores raw rows, generic indexes, and derived read models.</span></div>
+      <div class="box"><b>Ingest</b><span>HTTP accepts to Kafka; the normalizer owns validation, Iceberg commits, invalid rows, and offset progress.</span></div>
+      <div class="box"><b>Semantics</b><span>Only SDK types or explicit definitions create rollups, funnels, cohorts, reports, or promoted facets.</span></div>
     </div>
-
-    <p>
-      The deployed system writes accepted event batches to Iceberg, records the committed snapshot in ClickHouse metadata, then advances ClickHouse serving rows and watermarks. The canonical event shape stays raw JSON plus a small set of materialized routing columns; repeated analytical paths are promoted into narrow serving tables. This avoids the endless-widening-table problem while keeping all historical data replayable from Iceberg.
-    </p>
-  </section>
-
-  <section id="architecture">
-    <h2>2. Architecture</h2>
-
-    <div class="figure">
-      <svg viewBox="0 0 940 300" width="100%" style="max-width: 940px" aria-label="Nanotrace architecture">
-        <defs>
-          <marker id="arrow-main" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
-            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#556574" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-          </marker>
-        </defs>
-
-        <rect class="group" x="148" y="16" width="770" height="262" rx="14"/>
-        <text class="mini" x="166" y="36">AWS deployment</text>
-
-        <rect class="node" x="20" y="112" width="104" height="54" rx="10"/>
-        <text class="title blue" x="72" y="135" text-anchor="middle">SDK / App</text>
-        <text class="label" x="72" y="151" text-anchor="middle">HTTP or UDP</text>
-
-        <rect class="node" x="174" y="112" width="110" height="54" rx="10"/>
-        <text class="title blue" x="229" y="135" text-anchor="middle">ALB</text>
-        <text class="label" x="229" y="151" text-anchor="middle">path routing</text>
-
-        <rect class="node" x="326" y="40" width="152" height="66" rx="10"/>
-        <text class="title blue" x="402" y="64" text-anchor="middle">nanotrace-server</text>
-        <text class="label" x="402" y="80" text-anchor="middle">ingest, auth, files</text>
-        <text class="label" x="402" y="94" text-anchor="middle">writer + uploader</text>
-
-        <rect class="node" x="326" y="194" width="152" height="58" rx="10"/>
-        <text class="title blue" x="402" y="217" text-anchor="middle">nanotrace-query</text>
-        <text class="label" x="402" y="233" text-anchor="middle">read-only SQL proxy</text>
-
-        <rect class="node" x="532" y="32" width="128" height="52" rx="10"/>
-        <text class="title green" x="596" y="54" text-anchor="middle">S3</text>
-        <text class="label" x="596" y="70" text-anchor="middle">ingress NDJSON parts</text>
-
-        <rect class="node" x="532" y="118" width="128" height="48" rx="10"/>
-        <text class="title yellow" x="596" y="139" text-anchor="middle">SQS</text>
-        <text class="label" x="596" y="154" text-anchor="middle">object events</text>
-
-        <rect class="node" x="532" y="204" width="128" height="52" rx="10"/>
-        <text class="title blue" x="596" y="226" text-anchor="middle">nanotrace-loader</text>
-        <text class="label" x="596" y="242" text-anchor="middle">Iceberg + serving</text>
-
-        <rect class="node" x="704" y="212" width="166" height="48" rx="10"/>
-        <text class="title green" x="787" y="233" text-anchor="middle">Iceberg warehouse</text>
-        <text class="label" x="787" y="248" text-anchor="middle">canonical snapshots</text>
-
-        <rect class="node" x="720" y="112" width="150" height="64" rx="10"/>
-        <text class="title violet" x="795" y="136" text-anchor="middle">ClickHouse</text>
-        <text class="label" x="795" y="152" text-anchor="middle">serving tables</text>
-        <text class="label" x="795" y="166" text-anchor="middle">watermarks</text>
-
-        <rect class="node" x="720" y="36" width="150" height="50" rx="10"/>
-        <text class="title violet" x="795" y="57" text-anchor="middle">Postgres</text>
-        <text class="label" x="795" y="72" text-anchor="middle">auth and sessions</text>
-
-        <path class="arrow" d="M124,139 L174,139" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M284,130 C308,106 310,82 326,72" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M284,150 C312,178 312,211 326,222" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M478,62 L532,58" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M596,84 L596,118" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M596,166 L596,204" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M660,230 L704,236" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M704,224 C686,196 694,162 720,150" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M478,222 C570,214 674,170 720,146" marker-end="url(#arrow-main)"/>
-        <path class="arrow" d="M478,74 C572,72 654,62 720,60" marker-end="url(#arrow-main)"/>
-        <path class="dash" d="M402,194 C432,142 502,96 548,76" marker-end="url(#arrow-main)"/>
-      </svg>
-      <div class="caption">Solid lines are normal control/data flow. The loader commits Iceberg data files before serving writes. The dashed line is on-demand raw event byte-range lookup from S3.</div>
+    <div class="rule">
+      <b>Core rule:</b> all bounded scalar KVs are filterable by default through <code>event_kv_index</code>.
+      They do not become grouping dimensions, measures, cohorts, funnels, reports, or dashboards unless the SDK or a user/admin definition says so.
     </div>
-
+    <pre>WarpStream Kafka -> nanotrace-normalizer -> Iceberg REST catalog + S3 warehouse
+                                      \-> invalid_events + lakehouse_commits
+Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_index + event_search_terms + event_kv_index + derived serving tables</pre>
     <table>
-      <tr><th>Component</th><th>Current responsibility</th></tr>
-      <tr><td><code>nanotrace-server</code></td><td>Accepts events, authenticates users and API keys, writes durable local NDJSON parts, uploads closed parts to S3, and manages auth resources.</td></tr>
-      <tr><td><code>nanotrace-loader</code></td><td>Consumes S3 notifications from SQS, claims the deterministic ingest batch in Postgres, commits the batch to Iceberg, writes ClickHouse serving rows, and records lakehouse/serving metadata.</td></tr>
-      <tr><td><code>nanotrace-lakehouse-rebuild</code></td><td>Rebuilds raw ClickHouse rows from committed Iceberg Parquet files and also runs as the continuous promoted-table materializer.</td></tr>
-      <tr><td><code>nanotrace-query</code></td><td>Runs constrained read-only ClickHouse SQL with tenant injection and table allowlisting.</td></tr>
-      <tr><td><code>apps/ui</code></td><td>Logs, histograms, grouping, flamegraph rendering, schema/report management, and API key management.</td></tr>
-      <tr><td><code>Postgres</code></td><td>Browser auth, sessions, magic links, users, and API key metadata.</td></tr>
-      <tr><td><code>Iceberg warehouse</code></td><td>Durable lakehouse table containing canonical event Parquet files, snapshots, and metadata. Current prod uses local EBS-backed filesystem storage on the ingest node; the code also supports REST catalog/object-store warehouses.</td></tr>
-      <tr><td><code>ClickHouse</code></td><td>Serving event facts, watermarks, commit metadata, density rollups, schema definitions, and promoted analytical read models.</td></tr>
+      <thead><tr><th>Concern</th><th>Current contract</th></tr></thead>
+      <tbody>
+        <tr><td>Accepted write</td><td><code>POST /v1/events</code> returns <code>202</code> after Kafka accepts the raw request body. It is not a visibility guarantee.</td></tr>
+        <tr><td>Visibility</td><td>Rows become queryable after the normalizer commits valid events to Iceberg and the materializer catches up ClickHouse <code>events</code>, <code>event_text_index</code>, <code>event_search_terms</code>, and <code>event_kv_index</code>.</td></tr>
+        <tr><td>Replay</td><td>Kafka processing is at-least-once; deterministic source batch ids and materializer insert tokens keep replay idempotent for tested paths.</td></tr>
+        <tr><td>Tenant isolation</td><td>The authenticated API key determines tenant identity; client-supplied <code>tenant_id</code> is overwritten. Structured product queries are tenant-scoped; cross-tenant analysis belongs in operator-controlled lakehouse query/export tooling, not a server API route.</td></tr>
+        <tr><td>High cardinality</td><td>High-cardinality strings are filterable, not automatically promoted. Grouping/rollup requires an explicit definition and guardrails.</td></tr>
+      </tbody>
     </table>
   </section>
 
-  <section id="ingest">
-    <h2>3. Ingest Path</h2>
-
-    <div class="figure">
-      <svg viewBox="0 0 940 210" width="100%" style="max-width: 940px" aria-label="Ingest path">
-        <defs>
-          <marker id="arrow-ingest" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="5" orient="auto">
-            <path d="M2,2 L10,5 L2,8" fill="none" stroke="#556574" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-          </marker>
-        </defs>
-
-        <rect class="node" x="12" y="76" width="110" height="52" rx="10"/>
-        <text class="title blue" x="67" y="98" text-anchor="middle">POST /v1/events</text>
-        <text class="label" x="67" y="114" text-anchor="middle">validate batch</text>
-
-        <rect class="node" x="164" y="76" width="142" height="52" rx="10"/>
-        <text class="title blue" x="235" y="98" text-anchor="middle">writer lanes</text>
-        <text class="label" x="235" y="114" text-anchor="middle">local NDJSON parts</text>
-
-        <rect class="node" x="348" y="76" width="118" height="52" rx="10"/>
-        <text class="title blue" x="407" y="98" text-anchor="middle">uploader</text>
-        <text class="label" x="407" y="114" text-anchor="middle">PUT to S3</text>
-
-        <rect class="node" x="508" y="34" width="124" height="48" rx="10"/>
-        <text class="title green" x="570" y="55" text-anchor="middle">S3 object</text>
-        <text class="label" x="570" y="70" text-anchor="middle">ingest handoff</text>
-
-        <rect class="node" x="508" y="130" width="124" height="44" rx="10"/>
-        <text class="title yellow" x="570" y="150" text-anchor="middle">SQS notice</text>
-        <text class="label" x="570" y="165" text-anchor="middle">loader queue</text>
-
-        <rect class="node" x="674" y="76" width="116" height="52" rx="10"/>
-        <text class="title blue" x="732" y="98" text-anchor="middle">loader</text>
-        <text class="label" x="732" y="114" text-anchor="middle">commit + insert</text>
-
-        <rect class="node" x="834" y="66" width="94" height="72" rx="10"/>
-        <text class="title violet" x="881" y="94" text-anchor="middle">ClickHouse</text>
-        <text class="label" x="881" y="110" text-anchor="middle">serving rows</text>
-        <text class="label" x="881" y="124" text-anchor="middle">+ metadata</text>
-
-        <path class="arrow" d="M122,102 L164,102" marker-end="url(#arrow-ingest)"/>
-        <path class="arrow" d="M306,102 L348,102" marker-end="url(#arrow-ingest)"/>
-        <path class="arrow" d="M466,92 C486,72 492,62 508,58" marker-end="url(#arrow-ingest)"/>
-        <path class="arrow" d="M570,82 L570,130" marker-end="url(#arrow-ingest)"/>
-        <path class="arrow" d="M632,152 C654,138 656,112 674,102" marker-end="url(#arrow-ingest)"/>
-        <path class="arrow" d="M790,102 L834,102" marker-end="url(#arrow-ingest)"/>
-
-        <text class="mini" x="164" y="180">.tmp -> .ready -> .uploading -> .done</text>
-      </svg>
-      <div class="caption">Accepted events are staged locally, handed to the loader through S3/SQS, committed to Iceberg, then exposed through ClickHouse serving tables.</div>
-    </div>
-
-    <ol>
-      <li><strong>Accept.</strong> The server receives batches through <code>/v1/events</code>, authenticates the API key/session, validates event structure, and materializes tenant identity.</li>
-      <li><strong>Stage.</strong> Events are written to local NDJSON part files through concurrent writer lanes. The HTTP path is decoupled from ClickHouse availability.</li>
-      <li><strong>Upload.</strong> Closed parts move through <code>.ready</code>, <code>.uploading</code>, and <code>.done</code>. Upload-stage processors may transform the part before it is PUT to S3.</li>
-      <li><strong>Notify.</strong> S3 object-created notifications feed SQS. Loader instances share that queue.</li>
-      <li><strong>Commit.</strong> The loader acquires the deterministic ingest ledger row, writes canonical Parquet data files, commits an Iceberg snapshot, and stores the full data-file list in lakehouse metadata.</li>
-      <li><strong>Serve.</strong> The loader posts <code>FORMAT JSONEachRow</code> batches to ClickHouse and advances <code>observatory.serving_watermarks</code>.</li>
-    </ol>
-
-    <h3>Durability model</h3>
-    <p>
-      Ingest transport is object-store centered, but analytical durability is lakehouse centered. The local writer protects the request path from immediate process failures; S3 stores the immutable accepted NDJSON part and drives SQS delivery; Iceberg stores committed canonical Parquet snapshots. Delivery is at-least-once, so the Postgres ingest ledger, Iceberg source-batch id, and ClickHouse insert tokens make redelivery idempotent.
-    </p>
-  </section>
-
-  <section id="loader">
-    <h2>4. Lakehouse Loader and Materializer</h2>
-
-    <p>
-      Production uses the lakehouse path by default. The loader commits each batch to Iceberg first, then writes raw ClickHouse serving rows and metadata. Promoted tables are kept current by the separate materializer service, which reads <code>observatory.lakehouse_commits</code> and only processes snapshots ahead of each target table watermark.
-    </p>
-
+  <section id="flow">
+    <h2>Flow</h2>
+    <pre>client SDK / HTTP
+  -> nanotrace-server
+  -> Kafka / Redpanda topic events.ingest.v1
+  -> nanotrace-normalizer
+  -> Iceberg canonical event snapshot
+  -> invalid_events + lakehouse_commits
+  -> Kafka offset commit
+  -> lakehouse materializer / rebuild
+  -> ClickHouse events, event_text_index, event_search_terms, event_kv_index, field_index, event_measures, measure_rollups, reports, sequences, cohorts</pre>
     <table>
-      <tr><th>Mode</th><th>Writes</th><th>Use case</th></tr>
-      <tr>
-        <td><code>raw</code></td>
-        <td>Iceberg, <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code></td>
-        <td>Default high-throughput ingest. The loader avoids arbitrary per-event fanout and leaves definition-backed serving work to the materializer.</td>
-      </tr>
-      <tr>
-        <td><code>promoted</code></td>
-        <td><code>events</code>, <code>field_index</code>, <code>event_measures</code>, <code>entity_state_updates</code></td>
-        <td>Compatibility mode for direct loader fanout. The final deployed design prefers the continuous materializer instead.</td>
-      </tr>
+      <thead><tr><th>Component</th><th>Responsibility</th><th>Does not do</th></tr></thead>
+      <tbody>
+        <tr><td><code>apps/server</code></td><td>Auth, scopes, read request body, produce raw batch to Kafka, query APIs, definitions and backfills API, OpenAPI.</td><td>Parse event JSON, write Iceberg, write ClickHouse on the ingest request path.</td></tr>
+        <tr><td><code>apps/normalizer</code></td><td>Consume Kafka, parse/validate/stamp events, write Iceberg, write invalid rows and lakehouse commit metadata, ensure SDK-managed metric definitions, commit offsets.</td><td>Infer arbitrary payload semantics or write raw serving rows.</td></tr>
+        <tr><td><code>tools/lakehouse-rebuild</code></td><td>Replay Iceberg commits, rebuild serving rows, run incremental materialization, advance serving watermarks.</td><td>Replace the Kafka ingest path.</td></tr>
+      </tbody>
     </table>
-
-    <pre>NANOTRACE_LAKEHOUSE_ENABLED=true
-NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=/data/lakehouse
-NANOTRACE_INGEST_LEDGER_ENABLED=true
-NANOTRACE_MATERIALIZE_LOOP=true
-NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse
-LOADER_DERIVATION_MODE=raw
-LOADER_DEFINITIONS_REFRESH_SECS=60
-CLICKHOUSE_INSERT_CONCURRENCY=4
-CLICKHOUSE_INSERT_MAX_ROWS=100000
-CLICKHOUSE_INSERT_MAX_BYTES=67108864</pre>
-
-    <p>
-      The commit record stores the first data file for compatibility and the full <code>data_files</code> array for correctness when one snapshot rolls into multiple Parquet parts. Materializers must replay the full list and fall back to <code>data_file</code> only for older metadata rows.
-    </p>
   </section>
 
-  <section id="storage">
-    <h2>5. Iceberg and ClickHouse Storage Model</h2>
-
-    <div class="callout">
-      Current schema source: <code>deploy/clickhouse/schema.sql</code>. Applying it creates the serving schema plus lakehouse commit/watermark metadata. Iceberg table creation is handled by the Rust lakehouse writer.
-    </div>
-
-    <h3>Lakehouse table</h3>
-    <p>
-      The Iceberg table is <code>nanotrace.events</code>. It stores canonical columns such as event id, tenant id, timestamps, routing fields, source byte pointers, and the original payload as a JSON string column. Files are Parquet with ZSTD compression. Snapshot properties include record count, content hash, full data-file list, and deterministic <code>nanotrace.source-batch-id</code> for replay/dedupe.
-    </p>
-
-    <pre>Iceberg namespace: nanotrace
-Iceberg table: events
-Format: Apache Iceberg V2
-Data files: Parquet, ZSTD
-Commit idempotency: nanotrace.source-batch-id
-Production warehouse: /data/lakehouse on EBS-backed ingest node
-Supported future warehouse: Iceberg REST catalog + object storage</pre>
-
-    <h3>Canonical fact table</h3>
-    <p>
-      <code>observatory.events</code> is a rebuildable ClickHouse serving table partitioned by day and ordered by <code>(tenant_id, timestamp, event_type, event_id)</code>. It stores event identity, timestamps, S3 source byte pointers, and a typed ClickHouse <code>JSON</code> payload. A small set of hot routing columns is materialized from JSON because they participate in sorting, filtering, or bloom indexes.
-    </p>
-
-    <pre>CREATE TABLE observatory.events (
-  event_id String,
-  timestamp DateTime64(3, 'UTC'),
-  source_file String,
-  source_offset UInt64,
-  source_length UInt32,
-  data JSON(...),
-  tenant_id LowCardinality(String) MATERIALIZED ifNull(data.tenant_id, ''),
-  event_type String MATERIALIZED ifNull(data.event_type, ''),
-  trace_id String MATERIALIZED ifNull(data.trace_id, ''),
-  span_id String MATERIALIZED ifNull(data.span_id, ''),
-  signal LowCardinality(String) MATERIALIZED multiIf(...),
-  INDEX idx_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 4,
-  INDEX idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 4,
-  INDEX idx_span_id span_id TYPE bloom_filter(0.01) GRANULARITY 4
-) ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (tenant_id, timestamp, event_type, event_id);</pre>
-
-    <h3>Current tables</h3>
+  <section id="events">
+    <h2>Event Contract</h2>
+    <p>Clients send one event object or an array of event objects. Paths used by filters and definitions are paths inside <code>data</code>.</p>
+    <pre>{
+  "event_id": "evt_123",
+  "timestamp": "2026-06-04T23:00:00.000Z",
+  "data": {
+    "event_type": "track",
+    "name": "Checkout Completed",
+    "plan": "pro",
+    "route": "/checkout",
+    "latency_ms": 175,
+    "request_id": "req_123",
+    "entities": {
+      "user_id": "usr_1",
+      "account_id": "acct_1",
+      "session_id": "sess_1"
+    },
+    "llm": { "model": "gpt-4.1" }
+  }
+}</pre>
     <table>
-      <tr><th>Table</th><th>Engine</th><th>Purpose</th></tr>
-      <tr><td><code>events</code></td><td>MergeTree</td><td>Rebuildable raw event serving rows and source byte pointers.</td></tr>
-      <tr><td><code>lakehouse_commits</code></td><td>ReplacingMergeTree</td><td>Committed Iceberg snapshot metadata: sequence, snapshot id, data files, metadata location, source batch id, dedupe flag, and record count.</td></tr>
-      <tr><td><code>serving_watermarks</code></td><td>ReplacingMergeTree</td><td>Per-serving-table source snapshot and monotonic source sequence used to reject stale reads and drive incremental materialization.</td></tr>
-      <tr><td><code>event_density_1s</code></td><td>SummingMergeTree</td><td>Always-on global density histogram by tenant and second. Populated by <code>mv_event_density_1s</code>.</td></tr>
-      <tr><td><code>definitions</code></td><td>ReplacingMergeTree</td><td>Enabled field, measure, rollup, state, cohort, and report definitions.</td></tr>
-      <tr><td><code>field_index</code></td><td>ReplacingMergeTree</td><td>Definition-backed field value to event lookup for promoted filters/group-bys.</td></tr>
-      <tr><td><code>field_values</code></td><td>MergeTree</td><td>Default exact lookup index for core ids such as trace, span, request, user, account, session, organization, thread, and conversation.</td></tr>
-      <tr><td><code>field_rollups</code></td><td>SummingMergeTree</td><td>Default grouped rollup for core fields, with bucket granularity recorded in <code>bucket_seconds</code>.</td></tr>
-      <tr><td><code>flamegraph_rollups_1m</code></td><td>SummingMergeTree</td><td>Default hierarchical rollups for core flamegraph paths such as service/name and signal/service/name.</td></tr>
-      <tr><td><code>event_measures</code></td><td>ReplacingMergeTree</td><td>Definition-backed numeric observations extracted from events.</td></tr>
-      <tr><td><code>measure_rollups</code></td><td>AggregatingMergeTree</td><td>Aggregate states over <code>event_measures</code>, populated by <code>mv_measure_rollups</code>.</td></tr>
-      <tr><td><code>entity_state_updates</code></td><td>ReplacingMergeTree</td><td>Promoted state transitions for users/accounts/sessions or other entities.</td></tr>
-      <tr><td><code>cohort_memberships</code></td><td>ReplacingMergeTree</td><td>Backfilled or refreshed cohort membership materialization.</td></tr>
-      <tr><td><code>report_results</code></td><td>ReplacingMergeTree</td><td>Reusable summary, trace summary, and retention outputs keyed by report and bucket time.</td></tr>
-      <tr><td><code>sequence_report_results</code></td><td>ReplacingMergeTree</td><td>Funnel/sequence step outputs.</td></tr>
-      <tr><td><code>definition_stats</code></td><td>ReplacingMergeTree</td><td>Backfill and materialization status for definitions.</td></tr>
-      <tr><td><code>query_usage</code></td><td>MergeTree</td><td>Observed query fingerprints, raw fallback status, JSON paths touched, scanned bytes, latency, and result size.</td></tr>
-      <tr><td><code>materialization_jobs</code></td><td>ReplacingMergeTree</td><td>Top-level jobs for backfills, report refreshes, cohort builds, and sequence materialization.</td></tr>
-      <tr><td><code>materialization_chunks</code></td><td>ReplacingMergeTree</td><td>Claimable bounded work chunks with status, lease, attempt, row, byte, and error tracking.</td></tr>
-      <tr><td><code>materialization_versions</code></td><td>ReplacingMergeTree</td><td>Completed or building target versions used to serve stable, version-selected analytical outputs.</td></tr>
-      <tr><td><code>materialization_watermarks</code></td><td>ReplacingMergeTree</td><td>Per-target source watermarks and lag for incremental materialization.</td></tr>
-      <tr><td><code>pipeline_metrics</code></td><td>MergeTree</td><td>Operational metrics emitted by Nanotrace components.</td></tr>
+      <thead><tr><th>Kind</th><th>Typical fields</th><th>Semantic effect</th></tr></thead>
+      <tbody>
+        <tr><td>Track/product</td><td><code>event_type=track</code>, <code>name</code>, entity ids, arbitrary KVs</td><td>Stored raw and indexed for filters. No automatic rollup.</td></tr>
+        <tr><td>Trace/span</td><td><code>span_start</code>, <code>span_end</code>, <code>trace_id</code>, <code>span_id</code>, <code>duration_ms</code></td><td>Signal becomes <code>trace</code>. Span fields are not auto-promoted as measures.</td></tr>
+        <tr><td>Metric</td><td><code>event_type=metric</code>, <code>metric_name</code>, <code>metric_type</code>, <code>metric_value</code></td><td>SDK-managed metric definition can materialize metric rollups.</td></tr>
+        <tr><td>Log</td><td><code>event_type=log</code>, severity, message, service</td><td>Stored raw; exact bounded KVs are indexed and ranked interactive search uses <code>event_search_terms</code>.</td></tr>
+      </tbody>
     </table>
-
-    <h3>Why JSON-first</h3>
-    <ul>
-      <li>The event payload remains open-ended enough for product analytics, observability data, and tenant-specific attributes.</li>
-      <li>Hot paths in the JSON type declaration get columnar subcolumns without forcing every path into a top-level table column.</li>
-      <li>New user attributes can be queried from raw data immediately, then promoted later through explicit SDK-managed or user/admin definitions.</li>
-      <li>Default write fanout is bounded to the core analytics pack; additional fanout is controlled by definitions instead of by arbitrary event shape.</li>
-      <li>Flattening every JSON path into a column would make the schema and write path widen forever; the final design keeps flexible raw payloads and promotes only paths that earn a serving model.</li>
-    </ul>
+    <div class="rule warn">
+      <b>Nested KVs:</b> objects flatten to dot paths such as <code>llm.model</code>.
+      Scalar arrays emit repeated rows at the same path. Arrays of objects use paths such as <code>items[].sku</code> and carry <code>scope_path</code>/<code>scope_index</code> so filters can require values from the same array element.
+    </div>
   </section>
 
-  <section id="materialization">
-    <h2>6. Materialization Control Plane</h2>
-
-    <p>
-      A full analytics system needs optimized serving tables. Current production has a continuous materializer for definition-backed <code>field_index</code>, <code>event_measures</code>, metric rollups, <code>entity_state_updates</code>, summary, trace summary, and retention <code>report_results</code>, <code>sequence_report_results</code>, and <code>cohort_memberships</code>. It reads shared lakehouse commit metadata from ClickHouse, scans only Iceberg snapshots ahead of the target watermarks, and advances only the serving tables it caught up. Full published-version report jobs still use the control-plane schema described here.
-    </p>
-
-    <h3>Lifecycle</h3>
-    <ol>
-      <li><strong>Define.</strong> SDK-managed definitions and user/admin definitions explicitly declare promoted fields, measures, reports, cohorts, funnels, and alert rollups.</li>
-      <li><strong>Plan.</strong> The current materializer plans from <code>serving_watermarks</code>. Future published-report executors create <code>materialization_jobs</code> and bounded <code>materialization_chunks</code> for historical or incremental windows.</li>
-      <li><strong>Build.</strong> Workers claim chunks with leases, write target serving tables, and update row/byte/error progress.</li>
-      <li><strong>Publish.</strong> <code>materialization_versions</code> marks completed target versions. Readers can select completed versions instead of partial writes.</li>
-      <li><strong>Continue.</strong> <code>materialization_watermarks</code> tracks high-water marks for incremental refresh lag.</li>
-    </ol>
-
-    <h3>Idempotency model</h3>
-    <p>
-      Iceberg commits remain append-only. Derived outputs are keyed by tenant, source snapshot/sequence, target id, target version, bucket/window, and deterministic dimension or entity identity. Retried jobs use deterministic ClickHouse insert tokens and rewrite the same logical target version. Serving queries prefer completed versions or caught-up watermarks and avoid reading partially built versions.
-    </p>
-
-    <div class="callout warn">
-      Implemented now: lakehouse commit replay, raw rebuild, incremental field/measure/metric/state materialization, summary report materialization, trace summary report materialization, retention report materialization, sequence report materialization, cohort membership materialization, continuous materializer service, and serving freshness guards. Still future work: full published-version report jobs and a full Iceberg REST/object-store production catalog.
-    </div>
+  <section id="tables">
+    <h2>Tables</h2>
+    <table>
+      <thead><tr><th>Table</th><th>Writer</th><th>Role</th><th>Freshness contract</th></tr></thead>
+      <tbody>
+        <tr><td><code>events</code></td><td>Materializer/rebuild</td><td>Raw serving row with stable envelope columns and preserved JSON payload.</td><td><code>serving_watermarks</code> vs latest lakehouse commit.</td></tr>
+        <tr><td><code>invalid_events</code></td><td>Normalizer</td><td>Rejected raw payloads and validation reasons.</td><td>Written before Kafka offset progress for invalid rows.</td></tr>
+        <tr><td><code>event_text_index</code></td><td>Materializer/rebuild</td><td>Bounded per-event search documents for event text filters.</td><td><code>serving_watermarks</code>.</td></tr>
+        <tr><td><code>event_search_terms</code></td><td>Materializer/rebuild</td><td>Token-level inverted index for ranked interactive search.</td><td><code>serving_watermarks</code>.</td></tr>
+        <tr><td><code>event_kv_index</code></td><td>Materializer/rebuild</td><td>Universal exact/range filter substrate for bounded scalar arbitrary KVs.</td><td><code>serving_watermarks</code>.</td></tr>
+        <tr><td><code>field_rollups</code></td><td>ClickHouse MV</td><td>Always-on summaries for core dimensions: signal, event_type, name, service, environment, is_error.</td><td>Follows <code>events</code>.</td></tr>
+        <tr><td><code>field_values</code></td><td>ClickHouse MV</td><td>Always-on lookup for common identifiers such as trace_id, span_id, request_id, user_id, account_id.</td><td>Follows <code>events</code>.</td></tr>
+        <tr><td><code>field_index</code></td><td>Definition backfill, materializer/rebuild</td><td>Explicit promoted field index for facets, grouping, and drilldown.</td><td>Definition version watermark or full-table serving watermark.</td></tr>
+        <tr><td><code>event_measures</code></td><td>Definition backfill, materializer/rebuild</td><td>Event-level numeric extraction rows for measures and drilldown.</td><td>Definition/materializer watermark.</td></tr>
+        <tr><td><code>measure_rollups</code></td><td>ClickHouse MV from <code>event_measures</code></td><td>Aggregate states for count, sum, min, max, avg, p50, p90, p95, p99.</td><td>Follows <code>event_measures</code>.</td></tr>
+        <tr><td><code>entity_state_updates</code></td><td>Definition backfill, materializer/rebuild</td><td>Append-style state update history for as-of reads.</td><td><code>serving_watermarks</code> and definition/materializer watermark.</td></tr>
+        <tr><td><code>entity_state_current</code></td><td>Definition backfill, materializer/rebuild</td><td>Current state snapshot for latest entity state reads.</td><td><code>serving_watermarks</code>.</td></tr>
+        <tr><td><code>report_results</code></td><td>Materializer/rebuild</td><td>Summary, trace summary, and retention outputs.</td><td><code>serving_watermarks</code> plus published <code>materialization_versions</code> and <code>materialization_watermarks</code>.</td></tr>
+        <tr><td><code>sequence_report_results</code></td><td>Materializer/rebuild</td><td>Funnels and ordered workflow step counts/conversions.</td><td><code>serving_watermarks</code> plus published <code>materialization_versions</code> and <code>materialization_watermarks</code>.</td></tr>
+        <tr><td><code>cohort_memberships</code></td><td>Materializer/rebuild</td><td>Versioned reusable entity membership sets.</td><td><code>serving_watermarks</code> plus published <code>materialization_versions</code> and <code>materialization_watermarks</code>.</td></tr>
+        <tr><td><code>lakehouse_commits</code></td><td>Normalizer, rebuild</td><td>ClickHouse-visible index of committed Iceberg snapshots and data files.</td><td>Append metadata for replay and lag checks.</td></tr>
+        <tr><td><code>serving_watermarks</code></td><td>Rebuild/materializer</td><td>Which lakehouse snapshot each serving table has loaded.</td><td>Primary serving freshness signal.</td></tr>
+        <tr><td><code>materialization_jobs</code></td><td><code>/v1/definitions/{definition_id}/backfills</code>, materializer</td><td>Durable job ledger for explicit report, sequence, and cohort backfills.</td><td>Status, chunk progress, row counts, and completion timestamp.</td></tr>
+        <tr><td><code>materialization_chunks</code></td><td><code>/v1/definitions/{definition_id}/backfills</code>, queued executor, materializer</td><td>Pending/running/completed chunk queue for report, sequence, and cohort jobs.</td><td>Claimed by the queued executor with leases and attempts.</td></tr>
+        <tr><td><code>materialization_versions</code></td><td>Materializer/rebuild</td><td>Published stable output versions for reports, sequences, and cohorts.</td><td>Typed reads select active/completed versions.</td></tr>
+        <tr><td><code>materialization_watermarks</code></td><td>Definition backfill, materializer/rebuild</td><td>Definition/output freshness by target and source window.</td><td>Used by planners for promoted and materialized reads.</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section id="queries">
-    <h2>7. Query and UI Behavior</h2>
-
-    <h3>Controls and performance</h3>
-    <p>
-      The product exposes raw data first, then lets humans and systems choose where to spend extra write or materialization work for faster reads. Query usage can show that a path is expensive, but it should not silently create new serving tables or promote arbitrary fields.
-    </p>
-
+    <h2>Queries</h2>
     <table>
-      <tr><th>Control</th><th>Who controls it</th><th>Concrete example</th><th>Write/materialization impact</th><th>Read impact</th></tr>
-      <tr><td>Send arbitrary event JSON</td><td>Application or SDK caller</td><td>Add <code>{"browser":"Chrome","cart_value":123}</code> to event data.</td><td>No schema work. One raw event row is written, plus the small always-on baseline views.</td><td>Correct immediately, but broad filters or groups on <code>browser</code> and <code>cart_value</code> scan raw event JSON until promoted.</td></tr>
-      <tr><td>Always-on global density</td><td>System schema</td><td>The default histogram for "all events in the last 7 days".</td><td>Every event contributes one small count row to <code>event_density_1s</code>.</td><td>No-group histograms read count buckets instead of scanning raw events.</td></tr>
-      <tr><td>Always-on core dimensions</td><td>System schema</td><td>Group by <code>service</code>, filter to <code>service=api</code>, then draw a grouped histogram.</td><td>Each event fans out only across the core fields <code>signal</code>, <code>event_type</code>, <code>name</code>, <code>service</code>, <code>environment</code>, and <code>is_error</code> into <code>field_rollups</code>.</td><td>Common group lists and grouped histograms read pre-aggregated buckets. Adding more core fields makes reads faster for those fields but increases write fanout for every event.</td></tr>
-      <tr><td>Always-on identifier lookup</td><td>System schema</td><td>Open <code>trace_id=abc</code>, <code>request_id=req_123</code>, or <code>session_id=s_123</code>.</td><td>Events with built-in identifiers write rows to <code>field_values</code>. This is event-level indexing, not aggregation.</td><td>Exact id lookups avoid broad JSON scans, but high-cardinality ids are not treated as useful group-by dimensions.</td></tr>
-      <tr><td>Promote a bounded field</td><td>User/admin definition</td><td>Create a field definition for <code>browser</code> with <code>mode: "facet"</code>.</td><td>Historical data needs a backfill. Future matching events write one <code>field_index</code> row per promoted value.</td><td>Filters like <code>browser=Chrome</code>, value lists, and group-bys can use the promoted index instead of raw JSON scans.</td></tr>
-      <tr><td>Promote a high-cardinality lookup</td><td>User/admin definition</td><td>Create a field definition for <code>customer_request_id</code> with <code>mode: "lookup"</code>.</td><td>Historical data needs a backfill if old ids must resolve. Future events write exact-match index rows.</td><td>Point lookups become fast. The UI should not encourage top-N value lists or broad group-bys on this field.</td></tr>
-      <tr><td>Materialize a repeated report</td><td>User/admin definition plus materializer</td><td>Daily active accounts by plan, retention by cohort, or p95 latency by service and route.</td><td>Backfill and incremental jobs compute result rows into report, sequence, cohort, or measure tables. This is more expensive than a field index but scoped to an explicit analytical question.</td><td>Dashboard cards and alerts read compact result rows instead of recomputing large aggregations on every page load.</td></tr>
-      <tr><td>Accept or reject stale serving data</td><td>Query caller and system watermarks</td><td>A dashboard waits for fresh <code>field_index</code>; a diagnostic query sets <code>allow_stale_serving=true</code>.</td><td>Loaders and materializers advance watermarks as they catch up to lakehouse commits.</td><td>Freshness checks prevent mixing current raw rows with stale derived rows unless the caller explicitly accepts that tradeoff.</td></tr>
+      <thead><tr><th>Question shape</th><th>Preferred substrate</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Latest events, event detail, bounded trace/span lookup</td><td><code>events</code>, <code>field_values</code></td><td>Tenant and time predicates are mandatory for broad reads.</td></tr>
+        <tr><td>Bounded event text search</td><td><code>event_text_index</code></td><td>Event-level text filters use a capped search document, not arbitrary full-text search.</td></tr>
+        <tr><td>Ranked interactive search</td><td><code>event_search_terms</code></td><td><code>/v1/query</code> with <code>type=search</code> ranks events by matched weighted exact, prefix, or bounded fuzzy terms and joins back to <code>events</code>.</td></tr>
+        <tr><td>Arbitrary scalar equality, IN, exists, numeric ranges</td><td><code>event_kv_index</code></td><td>Correct default for unpromoted paths such as <code>request_id</code>, <code>plan</code>, <code>llm.model</code>.</td></tr>
+        <tr><td>Repeated grouping/faceting</td><td><code>field_rollups</code> for core fields; <code>field_index</code> for explicit definitions</td><td>High-cardinality group-by needs fanout checks.</td></tr>
+        <tr><td>Percentiles/sums/averages</td><td><code>measure_rollups</code> or <code>event_measures</code></td><td>Requires explicit measure or SDK metric semantics.</td></tr>
+        <tr><td>Latest/as-of entity state</td><td><code>entity_state_current</code>, <code>entity_state_updates</code></td><td>Latest reads use the compact snapshot; as-of reads use update history.</td></tr>
+        <tr><td>Funnel conversion</td><td><code>sequence_report_results</code></td><td>Requires a sequence definition with entity id and steps.</td></tr>
+        <tr><td>Reusable population</td><td><code>cohort_memberships</code></td><td>Use cohorts for retention denominators, experiments, eligibility, and repeated drilldowns.</td></tr>
+        <tr><td>Large text search, regex over arbitrary JSON</td><td>Not <code>event_kv_index</code></td><td>Use <code>event_search_terms</code> for ranked exact, prefix, or bounded fuzzy term search and <code>NANOTRACE_LAKEHOUSE_QUERY_REGEX</code> for offline regex scans; advanced analyzers and semantic search remain separate.</td></tr>
+      </tbody>
     </table>
-
-    <p>
-      The default answer to "can this field be queried?" is yes, through raw events. The default answer to "will this field be fast for a broad dashboard?" is no, unless it is a built-in dimension, a built-in identifier, or an explicit definition/report has been materialized.
-    </p>
-
-    <p>
-      Example: <code>service</code> is a system-controlled core dimension, so <code>service=commonlearning-agent</code> histograms read <code>field_rollups</code>. <code>request_id</code> is a system-controlled identifier, so exact request drilldown reads an index. <code>browser</code> starts as raw JSON; it becomes fast for filtering and grouping only after a user/admin creates a field definition and backfills it. A query like "weekly conversion by browser and plan" should become a report if it is a repeated dashboard, because the expensive aggregation should be paid once by the materializer rather than on every read.
-    </p>
-
-    <p>
-      Example custom field promotion:
-    </p>
-
-    <pre>curl -X POST "$NANOTRACE_API_URL/v1/definitions" \
-  -H "Authorization: Bearer $NANOTRACE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "browser",
-    "kind": "field",
-    "mode": "facet",
-    "config": {
-      "path": "browser",
-      "value_type": "string"
-    },
-    "backfill": {
-      "from": "2026-05-01T00:00:00Z",
-      "to": "2026-05-22T00:00:00Z"
-    }
-  }'</pre>
-
-    <p>
-      The operational rule is simple: keep the automatic write path narrow, promote fields only when users need repeated fast filtering or grouping, and use reports for repeated broad aggregations.
-    </p>
-
-    <h3>Default logs view</h3>
-    <p>
-      With no grouping and no restrictive filter, the UI uses <code>event_density_1s</code> for the histogram and <code>events</code> for the event table. The flamegraph area is still present, but without a selected group it shows histogram-only density.
-    </p>
-
-    <h3>Group-by and filters</h3>
-    <p>
-      Core group lists and grouped histograms read <code>field_rollups</code> at the bucket size appropriate for the query. Exact id lookups can use <code>field_values</code> or the native event indexes. Non-core fields still require promotion/materialization before they are treated as guaranteed-fast group-bys.
-    </p>
-
-    <table>
-      <tr><th>Query shape</th><th>Preferred path</th><th>Fallback</th></tr>
-      <tr><td>No group, recent density</td><td><code>event_density_1s</code></td><td><code>events</code></td></tr>
-      <tr><td>Core group-by list</td><td><code>field_rollups</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
-      <tr><td>Core grouped histogram</td><td><code>field_rollups</code></td><td><code>events.data.&lt;path&gt;</code></td></tr>
-      <tr><td>Core flamegraph</td><td><code>flamegraph_rollups_1m</code></td><td><code>events</code> raw aggregation</td></tr>
-      <tr><td>Group by promoted field</td><td><code>field_index</code> or a report-specific rollup</td><td><code>events.data.&lt;path&gt;</code></td></tr>
-      <tr><td>Multi-field promoted filters</td><td><code>field_index</code> semi-joins by <code>event_id</code></td><td><code>events</code> raw predicates</td></tr>
-      <tr><td>Numeric measure aggregates</td><td><code>measure_rollups</code> or <code>event_measures</code></td><td><code>events</code> raw extraction</td></tr>
-      <tr><td>Funnel/retention/cohort reports</td><td><code>sequence_report_results</code>, <code>report_results</code>, <code>cohort_memberships</code></td><td>Ad hoc raw query or report backfill</td></tr>
-      <tr><td>Single event lookup</td><td><code>events</code> by <code>event_id</code>, then S3 byte range when raw line is needed</td><td>ClickHouse row payload</td></tr>
-    </table>
-
-    <h3>Schema and report promotion</h3>
-    <p>
-      Schema/report definitions are the mechanism for making a repeated query shape fast. A definition identifies a tenant, a path or measure, extraction mode, and versioned config. Historical work should be represented as materialization jobs and chunks; completed outputs should be published as materialization versions. The lakehouse event loader stays focused on durable commits and baseline serving rows; promotion work belongs to materializers.
-    </p>
-
-    <h3>Serving freshness</h3>
-    <p>
-      Query APIs inspect table sources and compare them to <code>observatory.serving_watermarks</code>. Reads from <code>events</code>, <code>field_index</code>, <code>event_measures</code>, and <code>entity_state_updates</code> are rejected if the serving table is behind the latest lakehouse commit, unless the request sets <code>allow_stale_serving=true</code>.
-    </p>
+    <p><code>POST /v1/query</code> is the structured product query API. The request body carries a <code>type</code> such as <code>events</code>, <code>search</code>, <code>measure</code>, <code>funnel</code>, <code>cohort</code>, <code>report</code>, <code>state</code>, or <code>alerts</code>. Event queries plan arbitrary scalar filters through <code>event_kv_index</code> and use promoted indexes only with freshness proof.</p>
+    <p>There is no public server SQL route. <code>POST /v1/query</code> is the user-facing structured query API and remains tenant-scoped. SQL-shaped historical analysis should use operator-controlled lakehouse export/query tooling.</p>
   </section>
 
-  <section id="security">
-    <h2>8. Auth and Security</h2>
-
-    <h3>Authentication</h3>
-    <ul>
-      <li>Browser login uses one-time magic links. Tokens are random, hashed before storage, TTL-bound, and deleted on use.</li>
-      <li>Sessions are server-side hashed and stored in Postgres. Cookies are <code>HttpOnly</code>, <code>SameSite=Lax</code>, and secure when served over HTTPS.</li>
-      <li>API keys use an <code>ntak_</code> prefix. Only hashes and short prefixes are stored; the full key is shown only at creation.</li>
-      <li>Roles and permissions separate ingest, query, schema/report writes, API key management, and admin actions.</li>
-    </ul>
-
-    <h3>Tenant isolation</h3>
-    <p>
-      Tenant identity is not accepted from arbitrary query input. The read service rewrites allowed table references into tenant-filtered subqueries using <code>{__nanotrace_tenant_id:String}</code>. The canonical table exposes materialized <code>tenant_id</code>, <code>event_type</code>, <code>trace_id</code>, <code>span_id</code>, and <code>signal</code> for efficient tenant-scoped reads.
-    </p>
-
-    <h3>Query sandbox</h3>
-    <ul>
-      <li>Only read-only SQL is accepted; multi-statement DDL/DML paths are rejected.</li>
-      <li>Tables are allowlisted to the current analytics schema: <code>events</code>, <code>lakehouse_commits</code>, <code>serving_watermarks</code>, <code>field_index</code>, <code>field_values</code>, <code>field_rollups</code>, <code>flamegraph_rollups_1m</code>, <code>event_density_1s</code>, <code>definitions</code>, <code>event_measures</code>, <code>measure_rollups</code>, <code>entity_state_updates</code>, <code>report_results</code>, <code>sequence_report_results</code>, <code>cohort_memberships</code>, <code>definition_stats</code>, <code>query_usage</code>, <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, <code>materialization_watermarks</code>, and <code>pipeline_metrics</code>.</li>
-      <li>User values are passed as ClickHouse parameters; identifier-like names are validated.</li>
-      <li>ClickHouse requests are sent with readonly and bounded execution/result settings.</li>
-    </ul>
-  </section>
-
-  <section id="deployment">
-    <h2>9. Deployment</h2>
-
-    <p>
-      The Pulumi program in <code>deploy/pulumi/nanotrace</code> provisions the AWS stack: VPC, public ALB, EC2 Auto Scaling Groups, S3 buckets, SQS queue, Postgres connectivity, ECR, CloudFront, SES, KMS/IAM policy, and the ClickHouse schema application command. The current production deploy is image <code>deploy-20260518191032</code> at <code>https://api.nanotrace.dev</code>.
-    </p>
-
-    <table>
-      <tr><th>Runtime</th><th>Default shape</th></tr>
-      <tr><td>Server ASG</td><td>Runs <code>nanotrace-server</code>, <code>nanotrace-loader</code>, and <code>nanotrace-lakehouse-rebuild</code> materializer containers. Uses EBS for local part staging and the current Iceberg warehouse.</td></tr>
-      <tr><td>Query ASG</td><td>Runs <code>nanotrace-query</code> for read-only SQL and event lookup.</td></tr>
-      <tr><td>S3 event bucket</td><td>Stores ingress NDJSON parts and processor artifacts under configured prefixes.</td></tr>
-      <tr><td>SQS loader queue</td><td>Receives object-created notifications. Loader deletes messages after the batch is committed to Iceberg and ClickHouse serving metadata is written.</td></tr>
-      <tr><td>RDS Postgres</td><td>Auth/session/key metadata.</td></tr>
-      <tr><td>ClickHouse</td><td>External OLAP endpoint configured by env/Pulumi settings.</td></tr>
-    </table>
-
-    <h3>Important deployment knobs</h3>
-    <pre>CLICKHOUSE_SCHEMA_PATH=deploy/clickhouse/schema.sql
-CLICKHOUSE_DATABASE=observatory
-CLICKHOUSE_TABLE=events
-NANOTRACE_LAKEHOUSE_ENABLED=true
-NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=/data/lakehouse
-NANOTRACE_INGEST_LEDGER_ENABLED=true
-NANOTRACE_MATERIALIZE_LOOP=true
-NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse
-LOADER_DERIVATION_MODE=raw
-LOADER_DEFINITIONS_REFRESH_SECS=60
-NANOTRACE_WRITER_LANES=4
-NANOTRACE_PART_MAX_BYTES=67108864
-NANOTRACE_PART_MAX_AGE_SECS=5</pre>
-
-    <div class="callout warn">
-      Production load test after the Iceberg deploy accepted and loaded 1,854,503 events. On the one-instance ingest ASG, the bounded test found about 16.4k events/sec at batch size 100 while staying under the 2s p95 criterion. The load-test tool defaults to <code>NANOTRACE_LOADTEST_PROFILE=codex</code>, a correlated Codex-like workflow mix of agent requests, planning, retrieval, LLM calls with usage payloads, tool execution, evaluation, safety, runtime metrics, processor activity, and terminal logs across a 60-day history.
+  <section id="materialization">
+    <h2>Materialization</h2>
+    <div class="rule">
+      <b>Intent sources:</b> SDK-typed metric/trace/product calls and user/admin definitions. Observed payload shape alone is never intent.
     </div>
+    <table>
+      <thead><tr><th>Definition kind</th><th>Output</th><th>Current execution</th></tr></thead>
+      <tbody>
+        <tr><td><code>field</code></td><td><code>field_index</code></td><td>API backfill and lakehouse materializer.</td></tr>
+        <tr><td><code>measure</code> / <code>rollup</code></td><td><code>event_measures</code>, then <code>measure_rollups</code></td><td>API backfill and lakehouse materializer.</td></tr>
+        <tr><td><code>metric_rollup</code></td><td><code>counter_rollups</code>, <code>gauge_rollups</code>, <code>histogram_rollups</code></td><td>SDK-managed default plus lakehouse materializer.</td></tr>
+        <tr><td><code>state</code></td><td><code>entity_state_updates</code>, <code>entity_state_current</code></td><td>API backfill and lakehouse materializer maintain history plus current snapshots.</td></tr>
+        <tr><td><code>report</code></td><td><code>report_results</code></td><td>Lakehouse materializer for summary, trace summary, and retention-style outputs.</td></tr>
+        <tr><td><code>sequence</code></td><td><code>sequence_report_results</code></td><td>Lakehouse materializer.</td></tr>
+        <tr><td><code>cohort</code></td><td><code>cohort_memberships</code></td><td>Lakehouse materializer.</td></tr>
+      </tbody>
+    </table>
+    <pre>Example measure definition:
+{
+  "name": "checkout.latency",
+  "kind": "measure",
+  "config": {
+    "match": { "all": [{ "path": "event_type", "op": "eq", "value": "metric" }] },
+    "outputs": [{
+      "target": "event_measures",
+      "measure_name": "checkout.latency",
+      "value": { "path": "metric_value" },
+      "unit": "ms",
+      "dimensions": [
+        { "name": "plan", "value": { "path": "plan" } },
+        { "name": "route", "value": { "path": "route" } }
+      ]
+    }]
+  }
+}</pre>
+  </section>
+
+  <section id="ops">
+    <h2>Ops</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Command</th><th>What it proves/does</th></tr></thead>
+      <tbody>
+        <tr><td>Local stack</td><td><code>npm run dev:up:detached</code></td><td>Starts Redpanda, Postgres, ClickHouse, Localstack SES, server, normalizer, materializer, alerts workers, and UI.</td></tr>
+        <tr><td>Kafka E2E</td><td><code>npm run integration:kafka</code></td><td>Runs tenant isolation, ingest, replay, KV, definitions, 10k synthetic oracle, measure/funnel/cohort checks.</td></tr>
+        <tr><td>Local loadtest</td><td><code>npm run loadtest:local</code></td><td>Posts fixture-backed synthetic events through <code>/v1/events</code>, measures request latency and throughput, and optionally waits for accepted <code>_loadtest.run_id</code> rows in ClickHouse.</td></tr>
+        <tr><td>Rewrite loadtest</td><td><code>npm run dev:rewrite:loadtest</code></td><td>Resets the local ClickHouse schema, sends a fixed generated event set through the normal ingest path, and waits for serving visibility.</td></tr>
+        <tr><td>Materialization loadtest</td><td><code>npm run materialization:loadtest</code></td><td>Seeds SDK/report/sequence/cohort/retention definitions, runs the metrics load profile, and polls raw plus derived serving tables until they catch up.</td></tr>
+        <tr><td>Pulumi E2E</td><td><code>npm run e2e:pulumi</code></td><td>Posts through deployed ingest URL, checks ClickHouse, KV index, watermarks, public query path.</td></tr>
+        <tr><td>Pulumi loadtest</td><td><code>npm run loadtest:pulumi</code></td><td>Reads deploy outputs when needed and finds the maximum passing request rate for configured batch sizes.</td></tr>
+        <tr><td>Rebuild</td><td><code>npm run lakehouse:rebuild:local</code></td><td>Replays committed Iceberg snapshots into ClickHouse serving tables.</td></tr>
+        <tr><td>Incremental materialize</td><td><code>NANOTRACE_MATERIALIZE_INCREMENTAL=true NANOTRACE_REBUILD_RAW=false npm run lakehouse:rebuild:local</code></td><td>Scans only commits ahead of at least one raw, generic-index, or derived serving watermark and advances only targets it actually loaded.</td></tr>
+        <tr><td>Continuous materializer</td><td><code>NANOTRACE_MATERIALIZE_LOOP=true ... nanotrace-lakehouse-rebuild</code></td><td>Polls lakehouse commits and keeps raw, generic-index, and derived serving targets current by watermark.</td></tr>
+        <tr><td>Schedule backfill</td><td><code>POST /v1/definitions/{definition_id}/backfills</code></td><td>Creates tenant-scoped pending report, sequence, or cohort jobs/chunks from an existing definition.</td></tr>
+        <tr><td>Queued materialization</td><td><code>NANOTRACE_MATERIALIZATION_QUEUE_EXECUTOR=true ... nanotrace-lakehouse-rebuild</code></td><td>Claims pending report, sequence, and cohort chunks from <code>materialization_chunks</code>, writes the requested output table, and advances job/version/watermark metadata.</td></tr>
+        <tr><td>Hot alerts</td><td><code>nanotrace-alerts</code></td><td>Consumes the normalized Kafka topic, evaluates enabled <code>kind=alert</code> event-match definitions, dedupes matches in memory, writes <code>alert_events</code>, and enqueues webhook outbox rows in <code>alert_notifications</code>.</td></tr>
+        <tr><td>Alert notification delivery</td><td><code>NANOTRACE_ALERTS_NOTIFIER=true nanotrace-alerts</code></td><td>Polls pending/retry <code>alert_notifications</code>, posts webhook payloads, and writes delivered/retry/failed status rows.</td></tr>
+        <tr><td>Lakehouse maintenance</td><td><code>NANOTRACE_LAKEHOUSE_MAINTENANCE=true ... nanotrace-lakehouse-rebuild</code></td><td>Audits commit/data-file/small-file pressure, writes <code>pipeline_metrics</code>, can run first-party local compaction with <code>NANOTRACE_LAKEHOUSE_NATIVE_COMPACTION=true</code>, and can invoke <code>NANOTRACE_ICEBERG_MAINTENANCE_CMD</code> for engine-specific REST/object-store maintenance.</td></tr>
+        <tr><td>Lakehouse query/export</td><td><code>NANOTRACE_LAKEHOUSE_QUERY=true ... nanotrace-lakehouse-rebuild</code></td><td>Scans committed local or S3 Parquet data files directly, supports tenant/time/event-type/text/regex filters, or runs <code>NANOTRACE_LAKEHOUSE_QUERY_SQL</code> with committed events plus optional external Parquet tables for offline joins.</td></tr>
+      </tbody>
+    </table>
+    <p>Production deploys require Kafka plus a shared Iceberg REST catalog and object-store warehouse. Local filesystem lakehouse storage is for local or single-node operation only.</p>
+  </section>
+
+  <section id="tests">
+    <h2>Validation</h2>
+    <table>
+      <thead><tr><th>Path</th><th>Coverage</th></tr></thead>
+      <tbody>
+        <tr><td><code>cargo test --all-features</code></td><td>Normalizer/ingest helpers, lakehouse commits, query planner, definition validation/backfill, rebuild/materializer row extraction.</td></tr>
+        <tr><td><code>npm --workspace apps/ui run typecheck</code></td><td>Event explorer preserves backend <code>nanotrace.query</code> metadata and renders the event-table plan/source badge, including per-filter routes when present.</td></tr>
+        <tr><td><code>npm run integration:kafka</code></td><td>End-to-end Docker Compose path. Posts to HTTP, verifies Kafka mode, ClickHouse visibility, <code>event_kv_index</code>, tenant isolation, no accidental promotion, explicit field backfill, normalizer replay, and synthetic 10k-session oracle.</td></tr>
+        <tr><td><code>npm run loadtest:local</code></td><td>HTTP ingest pressure or fixed-volume replay with generated <code>_loadtest</code> metadata, request latency percentiles, throughput counters, status distribution, and optional ClickHouse visibility wait.</td></tr>
+        <tr><td><code>npm run materialization:loadtest</code></td><td>Definition-seeded metrics profile that checks raw event catch-up plus counter, gauge, histogram, report, retention, sequence, cohort, and serving-watermark outputs.</td></tr>
+        <tr><td>Synthetic oracle</td><td>Generates deterministic track and metric events, precomputes exact counts and tolerated p90 values, creates measure/sequence/cohort definitions, materializes, then compares actual queries against expected answers.</td></tr>
+        <tr><td><code>npm run e2e:pulumi</code></td><td>Deployed-stack smoke test for Kafka ingest mode, ClickHouse event row, KV rows, serving watermarks, and public query APIs.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="boundaries">
+    <h2>Boundaries And Open Work</h2>
+    <table>
+      <thead><tr><th>Status</th><th>Item</th></tr></thead>
+      <tbody>
+        <tr><td class="ok">Current</td><td>Default ingest is HTTP -> Kafka -> normalizer -> Iceberg -> materializer -> ClickHouse.</td></tr>
+        <tr><td class="ok">Current</td><td>Arbitrary bounded scalar KVs are filterable through <code>event_kv_index</code>.</td></tr>
+        <tr><td class="ok">Current</td><td>Query responses carry planner/source metadata and per-filter event routes; the event explorer shows these in the event-table plan badge.</td></tr>
+        <tr><td class="ok">Current</td><td>Lakehouse rebuild/materializer supports fields, measures, metric rollups, states, reports, sequences, and cohorts.</td></tr>
+        <tr><td class="ok">Current split</td><td>The definitions API handles field, measure, rollup, and state backfills. Reports, sequences, and cohorts are produced by the lakehouse materializer, not by synchronous API backfill.</td></tr>
+        <tr><td class="ok">Current</td><td>The materializer publishes completed <code>materialization_jobs</code>, <code>materialization_chunks</code>, <code>materialization_versions</code>, and <code>materialization_watermarks</code> rows for produced report, sequence, and cohort outputs.</td></tr>
+        <tr><td class="ok">Current</td><td><code>/v1/definitions/{definition_id}/backfills</code> creates tenant-scoped report, sequence, and cohort jobs/chunks; <code>/v1/backfills</code> lists them, and the queued materialization executor claims pending chunks for explicit historical backfills.</td></tr>
+        <tr><td class="ok">Current</td><td>The schema UI can create reviewed field, measure, state, saved search, custom report, sequence, cohort, and alert definitions from JSON templates, then backfill field/measure/state definitions, queue report/sequence/cohort backfill jobs for the selected source window, or hand hot event-match alerts to <code>nanotrace-alerts</code>.</td></tr>
+        <tr><td class="ok">Current</td><td><code>nanotrace-alerts</code> supports hot event-match alerts plus webhook outbox delivery through <code>alert_events</code> and <code>alert_notifications</code>.</td></tr>
+        <tr><td class="no">Not current</td><td>No processor-management API/runtime is part of the default architecture.</td></tr>
+        <tr><td class="ok">Current</td><td>The event explorer exposes ranked exact-token, prefix, bounded fuzzy, and phrase search controls; exact/prefix/fuzzy search is served by <code>event_search_terms</code>, while exact KV filtering remains separate from search ranking.</td></tr>
+        <tr><td class="no">Not current</td><td>Dashboard-specific APIs are removed for now. Reusable views should use structured <code>/v1/query</code> helpers for <code>events</code>, <code>measure</code>, <code>state</code>, <code>report</code>, <code>funnel</code>, <code>cohort</code>, and alert reads.</td></tr>
+        <tr><td class="ok">Current</td><td>The event explorer can approve planner recommendations into field, saved search, numeric measure, and basic summary report definitions; grouped report approval also queues the backfill job for the viewed source window and shows matching job status.</td></tr>
+        <tr><td class="ok">Current</td><td><code>GET /v1/query/recommendations</code> exposes recent query-usage recommendation records, and the schema UI can prefill field, measure, and grouped report drafts from that feed while showing live approval, backfill, and report-job status.</td></tr>
+        <tr><td class="no">Not current</td><td>Advanced analyzers, semantic search, and regex indexing are not exact KV-index features; regex exists only as an offline lakehouse query/export filter.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="map">
+    <h2>Code And Doc Map</h2>
+    <table>
+      <thead><tr><th>Area</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td>HTTP routes, auth, Kafka accept, query APIs</td><td><a href="../apps/server/src/http.rs">apps/server/src/http.rs</a>, <a href="../apps/server/src/read.rs">apps/server/src/read.rs</a></td></tr>
+        <tr><td>Definition validation/backfill</td><td><a href="../apps/server/src/definitions.rs">apps/server/src/definitions.rs</a></td></tr>
+        <tr><td>Materialization scheduling/monitoring</td><td><a href="../apps/server/src/materializations.rs">apps/server/src/materializations.rs</a></td></tr>
+        <tr><td>Kafka normalization, Iceberg and ClickHouse ingest</td><td><a href="../apps/normalizer/src/main.rs">apps/normalizer/src/main.rs</a>, <a href="../crates/ingest/src/lib.rs">crates/ingest/src/lib.rs</a></td></tr>
+        <tr><td>Lakehouse commit implementation</td><td><a href="../crates/lakehouse/src/lib.rs">crates/lakehouse/src/lib.rs</a></td></tr>
+        <tr><td>Rebuild and materialization</td><td><a href="../tools/lakehouse-rebuild/src/main.rs">tools/lakehouse-rebuild/src/main.rs</a></td></tr>
+        <tr><td>ClickHouse schema</td><td><a href="../deploy/clickhouse/schema.sql">deploy/clickhouse/schema.sql</a></td></tr>
+        <tr><td>Integration scenarios</td><td><a href="../tests/integration/kafka-e2e.mjs">tests/integration/kafka-e2e.mjs</a></td></tr>
+        <tr><td>Hard invariants</td><td><a href="invariants.md">docs/invariants.md</a></td></tr>
+        <tr><td>Detailed topic references</td><td><a href="iceberg-final-spec.md">Iceberg spec</a>, <a href="engineering-spec.md">engineering spec</a>, <a href="database-observability-research-review.md">database research review</a>, <a href="usecase.html">use cases</a></td></tr>
+      </tbody>
+    </table>
   </section>
 </main>
 
 <footer>
-  Current-state Iceberg design for Nanotrace. Last updated 2026-05-18.
+  Nanotrace canonical system design. Keep this page aligned with code changes that alter ingest, query, serving, or materialization contracts.
 </footer>
 </body>
 </html>

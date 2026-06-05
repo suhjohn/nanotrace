@@ -15,6 +15,30 @@ class NanotraceTransportError(RuntimeError):
     pass
 
 
+def _post_json(
+    *,
+    events_url: str,
+    error_prefix: str,
+    headers: dict[str, str],
+    payload: JsonObject | list[JsonObject],
+    timeout: float,
+) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        events_url,
+        data=body,
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raise NanotraceTransportError(f"{error_prefix}: HTTP {error.code}") from error
+    if status < 200 or status >= 300:
+        raise NanotraceTransportError(f"{error_prefix}: HTTP {status}")
+
+
 @dataclass
 class HttpTransport:
     url: str
@@ -26,23 +50,30 @@ class HttpTransport:
         self.auth = f"Bearer {self.key}"
 
     def send(self, event: JsonObject) -> None:
-        body = json.dumps(event, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
-            self.events_url,
-            data=body,
-            method="POST",
+        _post_json(
+            events_url=self.events_url,
+            error_prefix="Nanotrace ingest failed",
             headers={
                 "authorization": self.auth,
                 "content-type": "application/json",
             },
+            payload=event,
+            timeout=self.timeout,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                status = response.status
-        except urllib.error.HTTPError as error:
-            raise NanotraceTransportError(f"Nanotrace ingest failed: HTTP {error.code}") from error
-        if status < 200 or status >= 300:
-            raise NanotraceTransportError(f"Nanotrace ingest failed: HTTP {status}")
+
+    def send_batch(self, events: list[JsonObject]) -> None:
+        if not events:
+            return
+        _post_json(
+            events_url=self.events_url,
+            error_prefix="Nanotrace ingest failed",
+            headers={
+                "authorization": self.auth,
+                "content-type": "application/json",
+            },
+            payload=events,
+            timeout=self.timeout,
+        )
 
 
 @dataclass
@@ -54,20 +85,24 @@ class SidecarHttpTransport:
         self.events_url = f"{self.url.rstrip('/')}/events"
 
     def send(self, event: JsonObject) -> None:
-        body = json.dumps(event, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
-            self.events_url,
-            data=body,
-            method="POST",
+        _post_json(
+            events_url=self.events_url,
+            error_prefix="Nanotrace sidecar ingest failed",
             headers={"content-type": "application/json"},
+            payload=event,
+            timeout=self.timeout,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                status = response.status
-        except urllib.error.HTTPError as error:
-            raise NanotraceTransportError(f"Nanotrace sidecar ingest failed: HTTP {error.code}") from error
-        if status < 200 or status >= 300:
-            raise NanotraceTransportError(f"Nanotrace sidecar ingest failed: HTTP {status}")
+
+    def send_batch(self, events: list[JsonObject]) -> None:
+        if not events:
+            return
+        _post_json(
+            events_url=self.events_url,
+            error_prefix="Nanotrace sidecar ingest failed",
+            headers={"content-type": "application/json"},
+            payload=events,
+            timeout=self.timeout,
+        )
 
 
 class UdpTransport:
@@ -89,6 +124,9 @@ class AsyncHttpTransport:
     async def send(self, event: JsonObject) -> None:
         await asyncio.to_thread(self._sync.send, event)
 
+    async def send_batch(self, events: list[JsonObject]) -> None:
+        await asyncio.to_thread(self._sync.send_batch, events)
+
 
 class AsyncSidecarHttpTransport:
     def __init__(self, url: str = "http://127.0.0.1:4320", timeout: float = 1.0) -> None:
@@ -96,6 +134,9 @@ class AsyncSidecarHttpTransport:
 
     async def send(self, event: JsonObject) -> None:
         await asyncio.to_thread(self._sync.send, event)
+
+    async def send_batch(self, events: list[JsonObject]) -> None:
+        await asyncio.to_thread(self._sync.send_batch, events)
 
 
 class AsyncUdpTransport:

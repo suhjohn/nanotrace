@@ -167,24 +167,6 @@
       "Resource": "arn:aws:route53:::change/*"
     },
     {
-      "Sid": "ListQueuesForCleanup",
-      "Effect": "Allow",
-      "Action": "sqs:ListQueues",
-      "Resource": "*"
-    },
-    {
-      "Sid": "DeleteQueues",
-      "Effect": "Allow",
-      "Action": [
-        "sqs:DeleteQueue",
-        "sqs:GetQueueAttributes",
-        "sqs:GetQueueUrl",
-        "sqs:RemovePermission",
-        "sqs:UntagQueue"
-      ],
-      "Resource": "arn:aws:sqs:*:*:nanotrace-*"
-    },
-    {
       "Sid": "DeleteEcr",
       "Effect": "Allow",
       "Action": [

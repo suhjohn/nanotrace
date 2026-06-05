@@ -19,6 +19,7 @@ export type EventEnvelope = {
 
 export type Transport = {
   send(event: EventEnvelope): void | Promise<void>
+  sendBatch?(events: EventEnvelope[]): void | Promise<void>
 }
 
 export type CommonFields = {
@@ -54,7 +55,6 @@ export type CommonFields = {
   llmModel?: string
   llmProvider?: string
   toolName?: string
-  processorName?: string
   [key: string]: Json | undefined
 }
 

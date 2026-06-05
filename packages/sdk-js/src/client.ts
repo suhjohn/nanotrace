@@ -24,17 +24,44 @@ import type {
 
 export type NanotraceOptions = CommonFields & {
   transport: Transport
+  batch?: BatchOptions
 }
+
+export type BatchOptions = {
+  maxEvents?: number
+  maxBytes?: number
+  flushIntervalMs?: number
+}
+
+type ResolvedBatchOptions = Required<BatchOptions>
+
+const DEFAULT_BATCH_OPTIONS: ResolvedBatchOptions = {
+  maxEvents: 100,
+  maxBytes: 512 * 1024,
+  flushIntervalMs: 1000
+}
+
+const HTTP_SERVER_KEYS = ['method', 'route', 'path', 'url', 'statusCode', 'durationMs'] as const
+const HTTP_CLIENT_KEYS = ['method', 'url', 'statusCode', 'durationMs'] as const
+const DB_QUERY_KEYS = ['system', 'operation', 'statement', 'durationMs'] as const
+const RPC_KEYS = ['system', 'service', 'method', 'durationMs'] as const
+const MESSAGE_KEYS = ['system', 'destination', 'durationMs'] as const
+const PAGE_KEYS = ['name', 'url', 'path', 'title', 'referrer'] as const
 
 export class Nanotrace {
   private readonly baseContext: CommonFields
   private readonly transport: Transport
+  private readonly batch: ResolvedBatchOptions
+  private queue: EventEnvelope[] = []
+  private queueBytes = 0
+  private flushTimer: NodeJS.Timeout | undefined
   private readonly pending = new Set<Promise<void>>()
   private readonly errors: unknown[] = []
 
   constructor(options: NanotraceOptions) {
-    const { transport, ...baseContext } = options
+    const { transport, batch, ...baseContext } = options
     this.transport = transport
+    this.batch = { ...DEFAULT_BATCH_OPTIONS, ...batch }
     this.baseContext = baseContext
   }
 
@@ -54,6 +81,7 @@ export class Nanotrace {
   }
 
   async flush(): Promise<void> {
+    this.flushQueued()
     while (this.pending.size > 0) {
       await Promise.allSettled([...this.pending])
     }
@@ -187,10 +215,10 @@ export class Nanotrace {
       ...(data.route ? { 'http.route': data.route } : {}),
       ...(data.path ? { 'url.path': data.path } : {}),
       ...(data.url ? { 'url.full': data.url } : {}),
-      ...(data.statusCode ? { 'http.status_code': data.statusCode, 'http.response.status_code': data.statusCode } : {}),
+      ...httpStatusFields(data.statusCode),
       duration_ms: data.durationMs,
-      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0,
-      ...normalizeCommon(withoutKeys(data, ['method', 'route', 'path', 'url', 'statusCode', 'durationMs']))
+      is_error: isServerError(data.statusCode),
+      ...normalizeCommon(withoutKeys(data, HTTP_SERVER_KEYS))
     })
   }
 
@@ -201,16 +229,16 @@ export class Nanotrace {
       'http.method': data.method,
       'http.request.method': data.method,
       'url.full': data.url,
-      ...(data.statusCode ? { 'http.status_code': data.statusCode, 'http.response.status_code': data.statusCode } : {}),
+      ...httpStatusFields(data.statusCode),
       duration_ms: data.durationMs,
-      is_error: data.statusCode && data.statusCode >= 500 ? 1 : 0,
-      ...normalizeCommon(withoutKeys(data, ['method', 'url', 'statusCode', 'durationMs']))
+      is_error: isServerError(data.statusCode),
+      ...normalizeCommon(withoutKeys(data, HTTP_CLIENT_KEYS))
     })
   }
 
   dbQuery(data: DbQuery): void {
     this.write('span', {
-      ...normalizeCommon(withoutKeys(data, ['system', 'operation', 'statement', 'durationMs'])),
+      ...normalizeCommon(withoutKeys(data, DB_QUERY_KEYS)),
       name: data.operation ?? data.system,
       span_kind: 'client',
       'db.system': data.system,
@@ -222,7 +250,7 @@ export class Nanotrace {
 
   rpcCall(data: RpcCall): void {
     this.write('span', {
-      ...normalizeCommon(withoutKeys(data, ['system', 'service', 'method', 'durationMs'])),
+      ...normalizeCommon(withoutKeys(data, RPC_KEYS)),
       name: `${data.service}/${data.method}`,
       span_kind: 'client',
       'rpc.system': data.system,
@@ -252,6 +280,10 @@ export class Nanotrace {
     this.metric(name, 'histogram', value, {}, data)
   }
 
+  measure(name: string, value: number, data?: CommonFields): void {
+    this.histogram(name, value, data)
+  }
+
   timing(name: string, durationMs: number, data?: CommonFields): void {
     this.histogram(name, durationMs, { metricUnit: 'ms', ...data })
   }
@@ -274,7 +306,7 @@ export class Nanotrace {
 
   page(data: PageEvent): void {
     this.write('page', {
-      ...normalizeCommon(withoutKeys(data, ['name', 'url', 'path', 'title', 'referrer'])),
+      ...normalizeCommon(withoutKeys(data, PAGE_KEYS)),
       ...(data.name ? { name: data.name } : {}),
       ...(data.url ? { page_url: data.url } : {}),
       ...(data.path ? { page_path: data.path } : {}),
@@ -300,9 +332,38 @@ export class Nanotrace {
   }
 
   private enqueue(event: EventEnvelope): void {
+    const eventBytes = Buffer.byteLength(JSON.stringify(event), 'utf8')
+    this.queue.push(event)
+    this.queueBytes += eventBytes
+    if (this.queue.length >= this.batch.maxEvents || this.queueBytes >= this.batch.maxBytes) {
+      this.flushQueued()
+      return
+    }
+    this.scheduleFlush()
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer || this.batch.flushIntervalMs <= 0) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined
+      this.flushQueued()
+    }, this.batch.flushIntervalMs)
+    this.flushTimer.unref?.()
+  }
+
+  private flushQueued(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = undefined
+    }
+    if (this.queue.length === 0) return
+    const events = this.queue
+    this.queue = []
+    this.queueBytes = 0
+
     let promise: Promise<void>
     promise = Promise.resolve()
-      .then(() => this.transport.send(event))
+      .then(() => this.sendEvents(events))
       .catch(error => {
         this.errors.push(error)
       })
@@ -312,9 +373,23 @@ export class Nanotrace {
     this.pending.add(promise)
   }
 
+  private async sendEvents(events: EventEnvelope[]): Promise<void> {
+    if (events.length === 1) {
+      await this.transport.send(events[0]!)
+      return
+    }
+    if (this.transport.sendBatch) {
+      await this.transport.sendBatch(events)
+      return
+    }
+    for (const event of events) {
+      await this.transport.send(event)
+    }
+  }
+
   private messageOperation(operation: 'publish' | 'consume', data: MessageOperation): void {
     this.write('span', {
-      ...normalizeCommon(withoutKeys(data, ['system', 'destination', 'durationMs'])),
+      ...normalizeCommon(withoutKeys(data, MESSAGE_KEYS)),
       name: `${operation} ${data.destination}`,
       span_kind: operation === 'publish' ? 'producer' : 'consumer',
       'messaging.system': data.system,
@@ -349,17 +424,15 @@ export function createNanotrace(options: NanotraceOptions): Nanotrace {
   return new Nanotrace(options)
 }
 
+const SEVERITY_NUMBERS: Record<LogLevel, number> = {
+  debug: 5,
+  error: 17,
+  info: 9,
+  warn: 13
+}
+
 function severityNumber(level: LogLevel): number {
-  switch (level) {
-    case 'debug':
-      return 5
-    case 'info':
-      return 9
-    case 'warn':
-      return 13
-    case 'error':
-      return 17
-  }
+  return SEVERITY_NUMBERS[level]
 }
 
 function errorPayload(error: unknown): { name: string; message: string; stack?: string } {
@@ -371,6 +444,18 @@ function errorPayload(error: unknown): { name: string; message: string; stack?: 
     }
   }
   return { name: 'Error', message: String(error) }
+}
+
+function httpStatusFields(statusCode: number | undefined): JsonObject {
+  if (!statusCode) return {}
+  return {
+    'http.status_code': statusCode,
+    'http.response.status_code': statusCode
+  }
+}
+
+function isServerError(statusCode: number | undefined): 0 | 1 {
+  return statusCode && statusCode >= 500 ? 1 : 0
 }
 
 function randomHex(bytes: number): string {

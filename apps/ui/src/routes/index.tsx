@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, ChevronDown, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
@@ -86,7 +86,71 @@ type LogEventsPage = {
   group?: LogGroupSummary
   nextCursor?: EventCursor
   prevCursor?: EventCursor
+  queryPlan?: QueryPlanMetadata
 }
+
+type QueryPlanMetadata = {
+  allowStaleServing?: boolean
+  eventFilters: QueryFilterPlan[]
+  freshnessOverrides?: string[]
+  planKind?: string
+  recommendations: QueryRecommendation[]
+  shapeClass?: string
+  sourceTables: string[]
+  surface?: string
+}
+
+type QueryRecommendation = {
+  action?: string
+  groupBy?: string[]
+  kind?: string
+  operator?: string
+  path?: string
+  reportId?: string
+  reason?: string
+  source?: string
+  targetTable?: string
+  targetType?: string
+}
+
+type DefinitionRecord = {
+  config?: Record<string, unknown>
+  definition_id: string
+  kind: string
+  mode: string
+  name: string
+  updated_at: string
+}
+
+type MaterializationJobRecord = {
+  completed_at?: string | null
+  completed_chunks: number
+  failed_chunks: number
+  job_id: string
+  rows_scanned: number
+  rows_written: number
+  source_end: string
+  source_start: string
+  status: string
+  target_id: string
+  target_table: string
+  target_type: string
+  target_version: number
+  total_chunks: number
+  updated_at: string
+}
+
+type QueryFilterPlan = {
+  negated?: boolean
+  operator?: string
+  path?: string
+  role?: string
+  route?: string
+  scope?: string
+  strategy?: string
+}
+
+type EventSearchMode = 'token' | 'prefix' | 'fuzzy' | 'phrase'
 
 type EventPageParam = {
   after?: string
@@ -422,6 +486,7 @@ export function ObservatoryHome({
 }) {
   const observatoryUrl = nanotraceApiBaseUrl()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const { setSidebarOpen, sidebarOpen } = useAppShell()
   const [runsWidth, setRunsWidth] = useCookieState({
     cookieName: 'observatory-ui-runs-width',
@@ -475,6 +540,11 @@ export function ObservatoryHome({
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
+  const [eventSearchDraft, setEventSearchDraft] = useState('')
+  const [eventSearchQuery, setEventSearchQuery] = useState('')
+  const [eventSearchMode, setEventSearchMode] = useState<EventSearchMode>('token')
+  const [eventSearchRequireAllTerms, setEventSearchRequireAllTerms] = useState(false)
+  const [eventSearchIncludeSnippets, setEventSearchIncludeSnippets] = useState(false)
   const [eventAnchorOverride, setEventAnchorOverride] = useState<{ eventId: string; key: string; timestamp: string } | null>(null)
   const [inspectorQuery, setInspectorQuery] = useState('')
 
@@ -703,11 +773,116 @@ export function ObservatoryHome({
     refetchInterval: liveRefetchInterval,
     retry: false
   })
+  const activeEventSearchQuery = eventSearchQuery.trim()
+  const eventSearchActive = activeEventSearchQuery.length >= 2
+  const eventSearchResultsQuery = useQuery({
+    enabled: eventSearchActive,
+    queryKey: [
+      'logs',
+      observatoryUrl,
+      'search',
+      activeEventSearchQuery,
+      eventSearchMode,
+      eventSearchRequireAllTerms,
+      eventSearchIncludeSnippets,
+      selectedTimeRangeCacheKey
+    ],
+    queryFn: () =>
+      fetchEventSearch({
+        apiBaseUrl: observatoryUrl,
+        includeSnippets: eventSearchIncludeSnippets,
+        mode: eventSearchMode,
+        query: activeEventSearchQuery,
+        requireAllTerms: eventSearchRequireAllTerms,
+        timeRange: selectedTimeRange
+      }),
+    retry: false
+  })
   const eventPages = eventsQuery.data?.pages ?? []
   const allEvents = useMemo(
     () => eventPages.flatMap(page => page.events),
     [eventPages]
   )
+  const searchEvents = eventSearchResultsQuery.data?.events ?? []
+  const displayedEvents = eventSearchActive ? searchEvents : allEvents
+  const displayedFields = eventSearchActive
+    ? eventSearchResultsQuery.data?.fields ?? []
+    : mergeLogFields(eventPages.flatMap(page => page.fields))
+  const displayedQueryPlan = eventSearchActive
+    ? eventSearchResultsQuery.data?.queryPlan
+    : eventPages.find(page => page.queryPlan)?.queryPlan
+  const eventQueryPlan = useMemo(
+    () => displayedQueryPlan,
+    [displayedQueryPlan]
+  )
+  const reportRecommendation = eventQueryPlan?.recommendations.find(isReportDefinitionRecommendation)
+  const reportRecommendationTargetId = reportRecommendation
+    ? reportDefinitionIdFromRecommendation({ groupBy, recommendation: reportRecommendation, selectedGroupValue })
+    : ''
+  const materializationJobsQuery = useQuery({
+    enabled: Boolean(reportRecommendationTargetId),
+    queryKey: ['materialization-jobs', observatoryUrl],
+    queryFn: () => fetchMaterializationJobs({ apiBaseUrl: observatoryUrl }),
+    refetchInterval: reportRecommendationTargetId ? 5000 : false,
+    retry: false
+  })
+  const reportMaterializationJob = reportRecommendationTargetId
+    ? latestMaterializationJobForTarget(materializationJobsQuery.data?.jobs ?? [], 'report', reportRecommendationTargetId)
+    : null
+  const createFieldDefinitionMutation = useMutation({
+    mutationFn: (recommendation: QueryRecommendation) =>
+      createFieldDefinitionFromRecommendation({
+        apiBaseUrl: observatoryUrl,
+        recommendation
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] })
+      await eventsQuery.refetch()
+    }
+  })
+  const createReportDefinitionMutation = useMutation({
+    mutationFn: (recommendation: QueryRecommendation) =>
+      createReportDefinitionFromRecommendation({
+        apiBaseUrl: observatoryUrl,
+        eventFilter: eventFilterParams,
+        groupBy,
+        recommendation,
+        selectedGroupValue,
+        timeRange: selectedTimeRange
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] })
+      await queryClient.invalidateQueries({ queryKey: ['materialization-jobs', observatoryUrl] })
+      await eventsQuery.refetch()
+    }
+  })
+  const createMeasureDefinitionMutation = useMutation({
+    mutationFn: (recommendation: QueryRecommendation) =>
+      createMeasureDefinitionFromRecommendation({
+        apiBaseUrl: observatoryUrl,
+        recommendation
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] })
+      await eventsQuery.refetch()
+    }
+  })
+  const createSearchDefinitionMutation = useMutation({
+    mutationFn: (recommendation: QueryRecommendation) =>
+      createSearchDefinitionFromRecommendation({
+        apiBaseUrl: observatoryUrl,
+        eventFilter: eventFilterParams,
+        includeSnippets: eventSearchIncludeSnippets,
+        query: activeEventSearchQuery,
+        recommendation,
+        requireAllTerms: eventSearchRequireAllTerms,
+        searchMode: eventSearchMode
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] })
+      await eventsQuery.refetch()
+    }
+  })
   const liveFreshScopeKey = [
     eventDataKey,
     effectiveEventSortDirection
@@ -785,11 +960,13 @@ export function ObservatoryHome({
       }
     : null
   const eventDetail =
-    eventPages.length > 0
+    eventSearchActive || eventPages.length > 0
       ? {
-          fields: mergeLogFields(eventPages.flatMap(page => page.fields)),
-          group: eventPages[0]?.group ?? pageGroupSummary({ events: allEvents, groupBy: '', selectedGroupValue: 'events' }),
-          events: allEvents,
+          fields: displayedFields,
+          group: eventSearchActive
+            ? pageGroupSummary({ events: displayedEvents, groupBy: 'search', selectedGroupValue: activeEventSearchQuery })
+            : eventPages[0]?.group ?? pageGroupSummary({ events: allEvents, groupBy: '', selectedGroupValue: 'events' }),
+          events: displayedEvents,
           relatedEvents: []
         }
       : null
@@ -799,6 +976,7 @@ export function ObservatoryHome({
     (!hasEventQuery && needsLatest ? errorMessage(latestQuery.error) : '') ||
     errorMessage(summaryQuery.error) ||
     errorMessage(eventsQuery.error) ||
+    errorMessage(eventSearchResultsQuery.error) ||
     (graphMode === 'histogram' ? errorMessage(densityQuery.error) : errorMessage(flamegraphQuery.error))
   const loadingList = groupOptionsQuery.isPending || (Boolean(groupBy) && groupsQuery.isPending)
   const emptyObservatory = !loadingList && !listError && groupOptions.length === 0
@@ -811,7 +989,7 @@ export function ObservatoryHome({
       ? densityQuery.isPending
       : flamegraphQuery.isPending
   const loadingDetail = hasEventQuery && (waitingForLatest || waitingForSummary || loadingGraph)
-  const loadingTableDetail = hasEventQuery && eventsQuery.isPending
+  const loadingTableDetail = eventSearchActive ? eventSearchResultsQuery.isPending : hasEventQuery && eventsQuery.isPending
   const loadingAnchoredEvents = Boolean(
     eventAnchorOverride?.key === eventDataKey &&
     eventsQuery.isFetching &&
@@ -971,6 +1149,17 @@ export function ObservatoryHome({
     commitEventFilter({ text: '' })
   }
 
+  function applyEventSearch() {
+    setEventSearchQuery(eventSearchDraft.trim())
+    setEventAnchorOverride(null)
+  }
+
+  function clearEventSearch() {
+    setEventSearchDraft('')
+    setEventSearchQuery('')
+    setEventAnchorOverride(null)
+  }
+
   function applyHistogramTimeRange({ createdAfter, createdBefore }: { createdAfter: string; createdBefore: string }) {
     filterTouchedRef.current = true
     setCustomRange(formatDateTimeLocalInput(new Date(createdAfter)), formatDateTimeLocalInput(new Date(createdBefore)))
@@ -1056,7 +1245,10 @@ export function ObservatoryHome({
     const kept = selectedEventColumns.filter(path => available.has(path))
     return kept.length > 0 ? kept : [...defaultEventColumns].filter(path => available.has(path))
   }, [eventDetail, selectedEventColumns])
-  const selectedEvent = allEvents.find(event => event.id === selectedEventId) ?? null
+  const selectedEvent =
+    displayedEvents.find(event => event.id === selectedEventId) ??
+    allEvents.find(event => event.id === selectedEventId) ??
+    null
   const eventPayloadQuery = useQuery({
     enabled: Boolean(selectedEventId),
     queryKey: ['logs', observatoryUrl, 'event', selectedEventId],
@@ -1441,6 +1633,77 @@ export function ObservatoryHome({
             </div>
           </div>
 
+          <form
+            className="flex min-w-0 flex-wrap items-center gap-2 border-b border-neutral-800 bg-black px-2 py-1.5"
+            onSubmit={event => {
+              event.preventDefault()
+              applyEventSearch()
+            }}
+          >
+            <input
+              aria-label="Ranked event search"
+              className="h-7 min-w-[220px] flex-1 border border-neutral-800 bg-neutral-950 px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+              placeholder="ranked event search..."
+              value={eventSearchDraft}
+              onChange={event => setEventSearchDraft(event.target.value)}
+            />
+            <div className="inline-flex h-7 shrink-0 border border-neutral-800 bg-neutral-950">
+              {eventSearchModeOptions.map(option => (
+                <button
+                  key={option.value}
+                  className={cn(
+                    'border-l border-neutral-800 px-2 text-[11px] text-neutral-500 first:border-l-0 hover:text-white',
+                    eventSearchMode === option.value && 'bg-neutral-800 text-white'
+                  )}
+                  title={option.title}
+                  type="button"
+                  onClick={() => setEventSearchMode(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <label className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-neutral-800 bg-neutral-950 px-2 text-[11px] text-neutral-400">
+              <input
+                checked={eventSearchRequireAllTerms}
+                className="h-3 w-3 accent-neutral-200"
+                type="checkbox"
+                onChange={event => setEventSearchRequireAllTerms(event.target.checked)}
+              />
+              All terms
+            </label>
+            <label className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-neutral-800 bg-neutral-950 px-2 text-[11px] text-neutral-400">
+              <input
+                checked={eventSearchIncludeSnippets}
+                className="h-3 w-3 accent-neutral-200"
+                type="checkbox"
+                onChange={event => setEventSearchIncludeSnippets(event.target.checked)}
+              />
+              Snippets
+            </label>
+            <button
+              className="h-7 shrink-0 border border-neutral-700 bg-neutral-100 px-2 text-[12px] text-black hover:bg-white disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600"
+              disabled={eventSearchDraft.trim().length < 2}
+              type="submit"
+            >
+              Search
+            </button>
+            {eventSearchActive ? (
+              <button
+                className="h-7 shrink-0 border border-neutral-800 bg-neutral-950 px-2 text-[12px] text-neutral-400 hover:text-white"
+                type="button"
+                onClick={clearEventSearch}
+              >
+                Clear
+              </button>
+            ) : null}
+            {eventSearchActive ? (
+              <span className="min-w-0 truncate text-[11px] text-neutral-600">
+                {eventSearchResultsQuery.isFetching ? 'searching' : `${searchEvents.length} results`}
+              </span>
+            ) : null}
+          </form>
+
           {hasEventQuery ? (
           <>
           <div className="overflow-hidden border-b border-neutral-800 bg-black" style={{ height: flamegraphHeight, minHeight: flamegraphHeight }}>
@@ -1525,32 +1788,65 @@ export function ObservatoryHome({
               {viewingGroupedEvents && flamegraphDisabled ? (
                 <span className="truncate text-[11px] text-neutral-600">Flamegraph preview capped at 20k events.</span>
               ) : null}
+              <QueryPlanBadge
+                createFieldError={errorMessage(createFieldDefinitionMutation.error)}
+                createMeasureError={errorMessage(createMeasureDefinitionMutation.error)}
+                createReportError={errorMessage(createReportDefinitionMutation.error)}
+                createSearchError={errorMessage(createSearchDefinitionMutation.error)}
+                creatingFieldPath={createFieldDefinitionMutation.variables?.path}
+                creatingMeasurePath={createMeasureDefinitionMutation.variables?.path}
+                creatingReportKey={
+                  createReportDefinitionMutation.variables
+                    ? reportRecommendationKey(createReportDefinitionMutation.variables)
+                    : undefined
+                }
+                creatingSearchKey={
+                  createSearchDefinitionMutation.variables
+                    ? searchRecommendationKey(createSearchDefinitionMutation.variables)
+                    : undefined
+                }
+                plan={eventQueryPlan}
+                reportMaterializationStatus={reportMaterializationJob ? materializationJobStatusLabel(reportMaterializationJob) : ''}
+                reportMaterializationTitle={reportMaterializationJob ? materializationJobTitle(reportMaterializationJob) : ''}
+                onCreateFieldDefinition={recommendation => createFieldDefinitionMutation.mutate(recommendation)}
+                onCreateMeasureDefinition={recommendation => createMeasureDefinitionMutation.mutate(recommendation)}
+                onCreateReportDefinition={recommendation => createReportDefinitionMutation.mutate(recommendation)}
+                onCreateSearchDefinition={recommendation => createSearchDefinitionMutation.mutate(recommendation)}
+              />
             </div>
           ) : null}
 
           {eventDetail ? (
             <EventPanel
               anchorIndex={eventPages[0]?.anchorIndex ?? 0}
-              events={allEvents}
-              emptyLabel={hasAppliedEventFilter(eventFilterParams) ? 'No events matched filter.' : 'No events.'}
+              events={displayedEvents}
+              emptyLabel={
+                eventSearchActive
+                  ? 'No search results.'
+                  : hasAppliedEventFilter(eventFilterParams) ? 'No events matched filter.' : 'No events.'
+              }
               fields={eventDetail.fields}
               freshEventIds={freshEventIds}
-              hasMore={eventsQuery.hasNextPage}
-              hasPrevious={eventsQuery.hasPreviousPage}
+              hasMore={eventSearchActive ? false : eventsQuery.hasNextPage}
+              hasPrevious={eventSearchActive ? false : eventsQuery.hasPreviousPage}
               highlightedEventIds={highlightedEventIds}
               loading={loadingTableDetail}
               loadingAnchor={loadingAnchoredEvents}
-              loadingMore={eventsQuery.isFetchingNextPage}
-              loadingPrevious={eventsQuery.isFetchingPreviousPage}
-              scrollStateKey={eventTableScrollKey}
+              loadingMore={eventSearchActive ? false : eventsQuery.isFetchingNextPage}
+              loadingPrevious={eventSearchActive ? false : eventsQuery.isFetchingPreviousPage}
+              scrollStateKey={
+                eventSearchActive
+                  ? `observatory-ui-search-scroll\u0000${activeEventSearchQuery}\u0000${eventSearchMode}\u0000${eventSearchRequireAllTerms}\u0000${eventSearchIncludeSnippets}\u0000${selectedTimeRangeCacheKey}`
+                  : eventTableScrollKey
+              }
               selectedColumns={selectedEventColumnsForTrace}
               selectedEventAlign={eventAnchorOverride?.key === eventDataKey ? 'center' : 'auto'}
               selectedEventId={selectedEventId}
               sortDirection={effectiveEventSortDirection}
               onLoadMore={() => {
-                void eventsQuery.fetchNextPage()
+                if (!eventSearchActive) void eventsQuery.fetchNextPage()
               }}
-              onLoadPrevious={() => eventsQuery.fetchPreviousPage().then(() => undefined)}
+              onLoadPrevious={() => eventSearchActive ? Promise.resolve() : eventsQuery.fetchPreviousPage().then(() => undefined)}
               onInspect={selectEvent}
               onSetColumns={setSelectedEventColumns}
               onToggleSortDirection={() => setEffectiveEventSortDirection(current => current === 'desc' ? 'asc' : 'desc')}
@@ -2211,6 +2507,142 @@ function ApiKeyMenu({
 
 function EmptyState({ label }: { label: string }) {
   return <div className="px-3 py-6 text-center text-neutral-500">{label}</div>
+}
+
+function QueryPlanBadge({
+  createFieldError,
+  createMeasureError,
+  createReportError,
+  createSearchError,
+  creatingFieldPath,
+  creatingMeasurePath,
+  creatingReportKey,
+  creatingSearchKey,
+  onCreateFieldDefinition,
+  onCreateMeasureDefinition,
+  onCreateReportDefinition,
+  onCreateSearchDefinition,
+  plan,
+  reportMaterializationStatus,
+  reportMaterializationTitle
+}: {
+  createFieldError?: string
+  createMeasureError?: string
+  createReportError?: string
+  createSearchError?: string
+  creatingFieldPath?: string
+  creatingMeasurePath?: string
+  creatingReportKey?: string
+  creatingSearchKey?: string
+  onCreateFieldDefinition?: (recommendation: QueryRecommendation) => void
+  onCreateMeasureDefinition?: (recommendation: QueryRecommendation) => void
+  onCreateReportDefinition?: (recommendation: QueryRecommendation) => void
+  onCreateSearchDefinition?: (recommendation: QueryRecommendation) => void
+  plan?: QueryPlanMetadata
+  reportMaterializationStatus?: string
+  reportMaterializationTitle?: string
+}) {
+  if (!plan?.planKind) {
+    return null
+  }
+
+  const sourceLabel = compactSourceTables(plan.sourceTables)
+  const fieldRecommendation = plan.recommendations.find(isFieldDefinitionRecommendation)
+  const measureRecommendation = plan.recommendations.find(isMeasureDefinitionRecommendation)
+  const reportRecommendation = plan.recommendations.find(isReportDefinitionRecommendation)
+  const searchRecommendation = plan.recommendations.find(isSearchDefinitionRecommendation)
+  const reportKey = reportRecommendation ? reportRecommendationKey(reportRecommendation) : ''
+  const searchKey = searchRecommendation ? searchRecommendationKey(searchRecommendation) : ''
+  const baseLabel = sourceLabel ? `${planLabel(plan.planKind)} via ${sourceLabel}` : planLabel(plan.planKind)
+  const recommendationLabelText = plan.recommendations.length
+    ? `Recommend ${recommendationLabel(plan.recommendations[0])}`
+    : ''
+  const label = recommendationLabelText ? `${baseLabel}: ${recommendationLabelText}` : baseLabel
+  const details = [
+    `plan: ${plan.planKind}`,
+    plan.shapeClass ? `shape: ${plan.shapeClass}` : '',
+    plan.surface ? `surface: ${plan.surface}` : '',
+    sourceLabel ? `sources: ${sourceLabel}` : '',
+    ...plan.eventFilters.map(filterPlanDetail),
+    ...plan.recommendations.map(recommendationPlanDetail),
+    createFieldError ? `create field failed: ${createFieldError}` : '',
+    createMeasureError ? `create measure failed: ${createMeasureError}` : '',
+    createReportError ? `create report failed: ${createReportError}` : '',
+    createSearchError ? `create search failed: ${createSearchError}` : '',
+    reportMaterializationTitle ? `report backfill: ${reportMaterializationTitle}` : '',
+    plan.allowStaleServing ? 'stale serving allowed' : '',
+    plan.freshnessOverrides?.length ? `freshness overrides: ${plan.freshnessOverrides.join(', ')}` : ''
+  ].filter(Boolean).join('\n')
+  const rawFallback = isRawFallbackPlan(plan.planKind)
+  const hasRecommendation = plan.recommendations.length > 0
+
+  return (
+    <span className="ml-auto inline-flex min-w-0 max-w-[520px] items-center gap-1">
+      <span
+        className={cn(
+          'min-w-0 truncate border px-2 py-1 text-[11px]',
+          rawFallback || hasRecommendation
+            ? 'border-amber-900/70 bg-amber-950/30 text-amber-300'
+            : 'border-neutral-800 bg-black text-neutral-500'
+        )}
+        title={details}
+      >
+        {label}
+      </span>
+      {fieldRecommendation && onCreateFieldDefinition ? (
+        <button
+          className="h-6 shrink-0 border border-amber-900/70 bg-black px-2 text-[11px] text-amber-200 hover:bg-amber-950/40 disabled:text-neutral-700"
+          disabled={creatingFieldPath === fieldRecommendation.path}
+          title={`Create field definition for ${fieldRecommendation.path}`}
+          type="button"
+          onClick={() => onCreateFieldDefinition(fieldRecommendation)}
+        >
+          {creatingFieldPath === fieldRecommendation.path ? 'Creating' : 'Create field'}
+        </button>
+      ) : null}
+      {measureRecommendation && onCreateMeasureDefinition ? (
+        <button
+          className="h-6 shrink-0 border border-amber-900/70 bg-black px-2 text-[11px] text-amber-200 hover:bg-amber-950/40 disabled:text-neutral-700"
+          disabled={creatingMeasurePath === measureRecommendation.path}
+          title={`Create measure definition for ${measureRecommendation.path}`}
+          type="button"
+          onClick={() => onCreateMeasureDefinition(measureRecommendation)}
+        >
+          {creatingMeasurePath === measureRecommendation.path ? 'Creating' : 'Create measure'}
+        </button>
+      ) : null}
+      {reportRecommendation && onCreateReportDefinition ? (
+        <button
+          className="h-6 shrink-0 border border-amber-900/70 bg-black px-2 text-[11px] text-amber-200 hover:bg-amber-950/40 disabled:text-neutral-700"
+          disabled={creatingReportKey === reportKey}
+          title={`Create report definition for ${reportRecommendation.groupBy?.join(', ') || 'this query'}`}
+          type="button"
+          onClick={() => onCreateReportDefinition(reportRecommendation)}
+        >
+          {creatingReportKey === reportKey ? 'Creating' : 'Create report'}
+        </button>
+      ) : null}
+      {reportRecommendation && reportMaterializationStatus ? (
+        <span
+          className="h-6 shrink-0 border border-neutral-800 bg-black px-2 py-1 text-[11px] text-neutral-300"
+          title={reportMaterializationTitle}
+        >
+          {reportMaterializationStatus}
+        </span>
+      ) : null}
+      {searchRecommendation && onCreateSearchDefinition ? (
+        <button
+          className="h-6 shrink-0 border border-amber-900/70 bg-black px-2 text-[11px] text-amber-200 hover:bg-amber-950/40 disabled:text-neutral-700"
+          disabled={creatingSearchKey === searchKey}
+          title="Create saved search definition for this query"
+          type="button"
+          onClick={() => onCreateSearchDefinition(searchRecommendation)}
+        >
+          {creatingSearchKey === searchKey ? 'Creating' : 'Create search'}
+        </button>
+      ) : null}
+    </span>
+  )
 }
 
 function DensityHistogramCanvas({
@@ -3863,6 +4295,158 @@ function objectField(value: JsonValue | undefined) {
 
 type ClickHouseResponse<T> = {
   data?: T[]
+  nanotrace?: {
+    query?: {
+      allowStaleServing?: boolean
+      eventFilters?: QueryFilterPlan[]
+      freshnessOverrides?: string[]
+      planKind?: string
+      recommendations?: QueryRecommendation[]
+      shapeClass?: string
+      sourceTables?: string[]
+      surface?: string
+    }
+  }
+}
+
+function queryPlanMetadata<T>(response: ClickHouseResponse<T>): QueryPlanMetadata | undefined {
+  const query = response.nanotrace?.query
+  if (!query?.planKind) {
+    return undefined
+  }
+  return {
+    allowStaleServing: Boolean(query.allowStaleServing),
+    eventFilters: Array.isArray(query.eventFilters) ? query.eventFilters : [],
+    freshnessOverrides: Array.isArray(query.freshnessOverrides) ? query.freshnessOverrides : [],
+    planKind: query.planKind,
+    recommendations: Array.isArray(query.recommendations) ? query.recommendations : [],
+    shapeClass: query.shapeClass,
+    sourceTables: Array.isArray(query.sourceTables) ? query.sourceTables : [],
+    surface: query.surface
+  }
+}
+
+function compactSourceTables(sourceTables: string[]) {
+  return sourceTables
+    .map(table => table.split('.').filter(Boolean).at(-1) ?? table)
+    .filter(Boolean)
+    .filter((table, index, tables) => tables.indexOf(table) === index)
+    .join(', ')
+}
+
+function planLabel(planKind: string) {
+  return planKind
+    .split('_')
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function filterPlanDetail(filter: QueryFilterPlan) {
+  const path = filter.path || filter.role || 'filter'
+  const operator = filter.operator ? ` ${filter.operator}` : ''
+  const negated = filter.negated ? 'not ' : ''
+  const route = filter.route ? ` -> ${filter.route}` : ''
+  const strategy = filter.strategy ? ` (${filter.strategy})` : ''
+  const scope = filter.scope ? ` scope=${filter.scope}` : ''
+  return `${path}: ${negated}${operator.trim()}${route}${strategy}${scope}`.trim()
+}
+
+function recommendationLabel(recommendation: QueryRecommendation) {
+  const target = recommendation.targetType || recommendation.targetTable || recommendation.kind || 'target'
+  const path = recommendation.path ? ` ${recommendation.path}` : ''
+  return `${planLabel(target)}${path}`
+}
+
+function recommendationPlanDetail(recommendation: QueryRecommendation) {
+  const parts = [
+    `recommend: ${recommendation.kind || 'promotion'}`,
+    recommendation.targetType ? `target=${recommendation.targetType}` : '',
+    recommendation.targetTable ? `table=${recommendation.targetTable}` : '',
+    recommendation.path ? `path=${recommendation.path}` : '',
+    recommendation.groupBy?.length ? `groupBy=${recommendation.groupBy.join(', ')}` : '',
+    recommendation.source ? `source=${recommendation.source}` : '',
+    recommendation.action ? `action=${recommendation.action}` : '',
+    recommendation.reason || ''
+  ].filter(Boolean)
+  return parts.join(' | ')
+}
+
+function isFieldDefinitionRecommendation(recommendation: QueryRecommendation) {
+  return recommendation.targetType === 'field' && Boolean(recommendation.path?.trim())
+}
+
+function isMeasureDefinitionRecommendation(recommendation: QueryRecommendation) {
+  return recommendation.targetType === 'measure' && Boolean(recommendation.path?.trim())
+}
+
+function isReportDefinitionRecommendation(recommendation: QueryRecommendation) {
+  return (
+    recommendation.targetType === 'report' &&
+    recommendation.targetTable === 'report_results' &&
+    Array.isArray(recommendation.groupBy) &&
+    recommendation.groupBy.some(path => isDefinitionPath(path))
+  )
+}
+
+function isSearchDefinitionRecommendation(recommendation: QueryRecommendation) {
+  return recommendation.targetType === 'search'
+}
+
+function reportRecommendationKey(recommendation: QueryRecommendation) {
+  return (recommendation.groupBy ?? []).join('|') || recommendation.reason || 'report'
+}
+
+function reportDefinitionIdFromRecommendation({
+  groupBy,
+  recommendation,
+  selectedGroupValue
+}: {
+  groupBy: string
+  recommendation: QueryRecommendation
+  selectedGroupValue: string
+}) {
+  const groupByPaths = uniqueDefinitionPaths(
+    (recommendation.groupBy?.length ? recommendation.groupBy : [groupBy])
+      .map(path => facetKey(path))
+      .filter(isDefinitionPath)
+  )
+  return groupByPaths.length > 0
+    ? definitionIdentifierFromParts(['events', ...groupByPaths, selectedGroupValue || 'all'])
+    : ''
+}
+
+function searchRecommendationKey(recommendation: QueryRecommendation) {
+  return recommendation.path || recommendation.reason || recommendation.action || 'search'
+}
+
+function isRawFallbackPlan(planKind: string) {
+  return planKind === 'raw_events' || planKind === 'raw_text_scan' || planKind === 'table_scan'
+}
+
+function latestMaterializationJobForTarget(jobs: MaterializationJobRecord[], targetType: string, targetId: string) {
+  return jobs
+    .filter(job => job.target_type === targetType && job.target_id === targetId)
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null
+}
+
+function materializationJobStatusLabel(job: MaterializationJobRecord) {
+  if (job.total_chunks > 0 && job.completed_chunks < job.total_chunks && job.status !== 'completed') {
+    return `${job.status} ${job.completed_chunks}/${job.total_chunks}`
+  }
+  return job.status
+}
+
+function materializationJobTitle(job: MaterializationJobRecord) {
+  const rows = `${job.rows_written.toLocaleString()} written / ${job.rows_scanned.toLocaleString()} scanned`
+  return [
+    `${job.target_type}/${job.target_id}`,
+    `status: ${job.status}`,
+    `chunks: ${job.completed_chunks}/${job.total_chunks}`,
+    rows,
+    `window: ${formatDateTimeUs(job.source_start)} -> ${formatDateTimeUs(job.source_end)}`,
+    `updated: ${formatDateTimeUs(job.updated_at)}`
+  ].join('\n')
 }
 
 type EventsQueryRequest = {
@@ -3886,6 +4470,18 @@ type EventsQueryRequest = {
   view: 'density' | 'event' | 'events' | 'flamegraph' | 'group_options' | 'groups' | 'latest' | 'summary'
 }
 
+type SearchQueryRequest = {
+  eventType?: string
+  from?: string
+  includeSnippets?: boolean
+  limit?: number
+  mode: EventSearchMode
+  offset?: number
+  query: string
+  requireAllTerms?: boolean
+  to?: string
+}
+
 type TimeDomain = {
   from: string
   to: string
@@ -3907,6 +4503,20 @@ type EventRow = {
   timestamp: string
   trace_id?: string
 }
+
+type SearchEventRow = EventRow & {
+  matched_paths?: string[]
+  matched_terms?: string[]
+  score?: number
+  snippet?: string
+}
+
+const eventSearchModeOptions: Array<{ label: string; title: string; value: EventSearchMode }> = [
+  { label: 'Token', title: 'Rank exact indexed terms', value: 'token' },
+  { label: 'Prefix', title: 'Rank indexed terms that start with the query tokens', value: 'prefix' },
+  { label: 'Fuzzy', title: 'Rank indexed terms within a bounded edit distance', value: 'fuzzy' },
+  { label: 'Phrase', title: 'Search the bounded event text document', value: 'phrase' }
+]
 
 type FlamegraphEventRow = {
   duration_ms?: number
@@ -4192,7 +4802,45 @@ async function fetchEvents({
       ? events.length >= limit ? eventCursor(events[0]) : undefined
       : pageParam.around
         ? eventCursor(events[0])
-        : undefined
+        : undefined,
+    queryPlan: queryPlanMetadata(response)
+  }
+}
+
+async function fetchEventSearch({
+  apiBaseUrl,
+  includeSnippets,
+  mode,
+  query,
+  requireAllTerms,
+  timeRange
+}: {
+  apiBaseUrl: string
+  includeSnippets: boolean
+  mode: EventSearchMode
+  query: string
+  requireAllTerms: boolean
+  timeRange: ResolvedTimeRange
+}): Promise<LogEventsPage> {
+  const domain = queryTimeDomain({ eventFilter: { text: '' }, timeRange })
+  const response = await postSearchQuery<SearchEventRow>({
+    apiBaseUrl,
+    request: {
+      includeSnippets,
+      limit: 100,
+      mode,
+      query,
+      requireAllTerms,
+      ...(domain?.from ? { from: domain.from } : {}),
+      ...(domain?.to ? { to: domain.to } : {})
+    }
+  })
+  const events = (response.data ?? []).map(rowToSearchTraceEvent)
+  return {
+    events,
+    fields: orderLogFields(inferLogFields(events)),
+    group: pageGroupSummary({ events, groupBy: 'search', selectedGroupValue: query }),
+    queryPlan: queryPlanMetadata(response)
   }
 }
 
@@ -4302,7 +4950,7 @@ async function fetchEvent({
       return { event: rowToTraceEvent(row) }
     }
   } catch {
-    // Fall back to the read-only query endpoint when S3 reads are not configured.
+    // Fall back to the read-only query endpoint when direct event reconstruction fails.
   }
 
   const response = await postEventsQuery<EventRow>({
@@ -4325,7 +4973,7 @@ async function postEventsQuery<T>({
   request: EventsQueryRequest
 }): Promise<ClickHouseResponse<T>> {
   const response = await fetch(eventsQueryUrl(apiBaseUrl), {
-    body: JSON.stringify(request),
+    body: JSON.stringify({ type: 'events', ...request }),
     credentials: 'include',
     headers: queryHeaders(),
     method: 'POST'
@@ -4338,6 +4986,278 @@ async function postEventsQuery<T>({
     })
   }
   return (await response.json()) as ClickHouseResponse<T>
+}
+
+async function postSearchQuery<T>({
+  apiBaseUrl,
+  request
+}: {
+  apiBaseUrl: string
+  request: SearchQueryRequest
+}): Promise<ClickHouseResponse<T>> {
+  const response = await fetch(eventsQueryUrl(apiBaseUrl), {
+    body: JSON.stringify({ type: 'search', ...request }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  return (await response.json()) as ClickHouseResponse<T>
+}
+
+async function createFieldDefinitionFromRecommendation({
+  apiBaseUrl,
+  recommendation
+}: {
+  apiBaseUrl: string
+  recommendation: QueryRecommendation
+}): Promise<DefinitionRecord> {
+  const path = recommendation.path?.trim()
+  if (!path) throw new HTTPError({ message: 'field recommendation missing path', status: 400 })
+  const response = await fetch(definitionsUrl(apiBaseUrl), {
+    body: JSON.stringify({
+      config: {
+        path,
+        value_type: 'string'
+      },
+      kind: 'field',
+      mode: 'facet',
+      name: definitionIdentifierFromParts(['field', path])
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  const body = (await response.json()) as { definition?: DefinitionRecord }
+  if (!body.definition) throw new HTTPError({ message: 'definition response missing definition', status: 502 })
+  return body.definition
+}
+
+async function createMeasureDefinitionFromRecommendation({
+  apiBaseUrl,
+  recommendation
+}: {
+  apiBaseUrl: string
+  recommendation: QueryRecommendation
+}): Promise<DefinitionRecord> {
+  const path = recommendation.path?.trim()
+  if (!path) throw new HTTPError({ message: 'measure recommendation missing path', status: 400 })
+  const response = await fetch(definitionsUrl(apiBaseUrl), {
+    body: JSON.stringify({
+      config: {
+        path,
+        value_type: 'number'
+      },
+      kind: 'measure',
+      mode: 'measure',
+      name: definitionIdentifierFromParts(['measure', path])
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  const body = (await response.json()) as { definition?: DefinitionRecord }
+  if (!body.definition) throw new HTTPError({ message: 'definition response missing definition', status: 502 })
+  return body.definition
+}
+
+async function createSearchDefinitionFromRecommendation({
+  apiBaseUrl,
+  eventFilter,
+  includeSnippets,
+  query,
+  recommendation,
+  requireAllTerms,
+  searchMode
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+  includeSnippets: boolean
+  query: string
+  recommendation: QueryRecommendation
+  requireAllTerms: boolean
+  searchMode: EventSearchMode
+}): Promise<DefinitionRecord> {
+  const rankedQuery = query.trim()
+  const filterText = eventFilter.text.trim()
+  const savedQuery = rankedQuery || filterText
+  if (!savedQuery) throw new HTTPError({ message: 'search recommendation missing query text', status: 400 })
+  const path = recommendation.path?.trim()
+  const response = await fetch(definitionsUrl(apiBaseUrl), {
+    body: JSON.stringify({
+      config: {
+        include_snippets: rankedQuery ? includeSnippets : true,
+        query: savedQuery,
+        recommendation: {
+          ...(recommendation.action ? { action: recommendation.action } : {}),
+          ...(recommendation.reason ? { reason: recommendation.reason } : {}),
+          ...(recommendation.source ? { source: recommendation.source } : {}),
+          ...(recommendation.targetTable ? { target_table: recommendation.targetTable } : {})
+        },
+        require_all_terms: rankedQuery ? requireAllTerms : false,
+        search_mode: rankedQuery ? searchMode : 'phrase',
+        ...(path && isDefinitionPath(path) ? { path } : {})
+      },
+      kind: 'search',
+      mode: 'saved',
+      name: definitionIdentifierFromParts(['search', path || savedQuery])
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  const body = (await response.json()) as { definition?: DefinitionRecord }
+  if (!body.definition) throw new HTTPError({ message: 'definition response missing definition', status: 502 })
+  return body.definition
+}
+
+async function createReportDefinitionFromRecommendation({
+  apiBaseUrl,
+  eventFilter,
+  groupBy,
+  recommendation,
+  selectedGroupValue,
+  timeRange
+}: {
+  apiBaseUrl: string
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  recommendation: QueryRecommendation
+  selectedGroupValue: string
+  timeRange: ResolvedTimeRange
+}): Promise<DefinitionRecord> {
+  const groupByPaths = uniqueDefinitionPaths(
+    (recommendation.groupBy?.length ? recommendation.groupBy : [groupBy])
+      .map(path => facetKey(path))
+      .filter(isDefinitionPath)
+  )
+  if (groupByPaths.length === 0) {
+    throw new HTTPError({ message: 'report recommendation missing groupBy path', status: 400 })
+  }
+  const domain = queryTimeDomain({ eventFilter, timeRange })
+  if (!domain) {
+    throw new HTTPError({ message: 'report recommendation missing backfill window', status: 400 })
+  }
+  const reportId = definitionIdentifierFromParts(['events', ...groupByPaths, selectedGroupValue || 'all'])
+  const match = reportDefinitionMatch({ eventFilter, groupBy, selectedGroupValue })
+  const response = await fetch(definitionsUrl(apiBaseUrl), {
+    body: JSON.stringify({
+      config: {
+        ...(match ? { match } : {}),
+        outputs: [
+          {
+            bucket_seconds: 60,
+            dimensions: groupByPaths.map(path => ({
+              name: path,
+              value: { path }
+            })),
+            metrics: [
+              { name: 'events', op: 'count' },
+              { name: 'errors', op: 'error_count' }
+            ],
+            report_id: reportId,
+            target: 'report_results'
+          }
+        ]
+      },
+      kind: 'report',
+      mode: 'summary',
+      name: reportId
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  const body = (await response.json()) as { definition?: DefinitionRecord }
+  if (!body.definition) throw new HTTPError({ message: 'definition response missing definition', status: 502 })
+  await queueMaterializationJobForDefinition({
+    apiBaseUrl,
+    definitionId: body.definition.definition_id,
+    sourceEnd: domain.to,
+    sourceStart: domain.from
+  })
+  return body.definition
+}
+
+async function queueMaterializationJobForDefinition({
+  apiBaseUrl,
+  definitionId,
+  sourceEnd,
+  sourceStart
+}: {
+  apiBaseUrl: string
+  definitionId: string
+  sourceEnd: string
+  sourceStart: string
+}): Promise<void> {
+  const response = await fetch(materializationsUrl(apiBaseUrl, definitionId), {
+    body: JSON.stringify({
+      chunk_seconds: 3600,
+      source_end: sourceEnd,
+      source_start: sourceStart
+    }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+}
+
+async function fetchMaterializationJobs({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ jobs: MaterializationJobRecord[] }> {
+  const response = await fetch(backfillsUrl(apiBaseUrl), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({
+      message: text || response.statusText,
+      status: response.status
+    })
+  }
+  const body = (await response.json()) as { backfills?: MaterializationJobRecord[] }
+  return { jobs: body.backfills ?? [] }
 }
 
 async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthIdentity> {
@@ -4435,13 +5355,89 @@ async function revokeApiKey({
 
 function eventsQueryUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/v1/events/query` : '/v1/events/query'
+  return base ? `${base}/v1/query` : '/v1/query'
 }
 
 function eventUrl(apiBaseUrl: string, eventId: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   const path = `/v1/events/${encodeURIComponent(eventId)}`
   return base ? `${base}${path}` : path
+}
+
+function definitionsUrl(apiBaseUrl: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/v1/definitions` : '/v1/definitions'
+}
+
+function materializationsUrl(apiBaseUrl: string, definitionId: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  const path = `/v1/definitions/${encodeURIComponent(definitionId)}/backfills`
+  return base ? `${base}${path}` : path
+}
+
+function backfillsUrl(apiBaseUrl: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/v1/backfills` : '/v1/backfills'
+}
+
+function reportDefinitionMatch({
+  eventFilter,
+  groupBy,
+  selectedGroupValue
+}: {
+  eventFilter: ParsedEventFilter
+  groupBy: string
+  selectedGroupValue: string
+}) {
+  const predicates: JsonObject[] = []
+  const selectedGroupPath = facetKey(groupBy)
+  if (selectedGroupValue && isDefinitionPath(selectedGroupPath)) {
+    predicates.push({ op: 'eq', path: selectedGroupPath, value: selectedGroupValue })
+  }
+  for (const facet of eventFilter.facets ?? []) {
+    if (facet.negated) continue
+    const path = facetKey(facet.path)
+    if (!isDefinitionPath(path)) continue
+    if ((facet.operator ?? 'eq') === 'eq' && facet.value) {
+      predicates.push({ op: 'eq', path, value: facet.value })
+    } else if (facet.operator === 'in') {
+      const values = (facet.values ?? []).filter(Boolean)
+      if (values.length > 0) predicates.push({ op: 'in', path, value: values })
+    }
+  }
+  const uniquePredicates = uniqueJsonObjects(predicates)
+  return uniquePredicates.length > 0 ? { all: uniquePredicates } : null
+}
+
+function uniqueDefinitionPaths(paths: string[]) {
+  return Array.from(new Set(paths.filter(isDefinitionPath)))
+}
+
+function uniqueJsonObjects<T extends JsonObject>(values: T[]) {
+  const seen = new Set<string>()
+  return values.filter(value => {
+    const key = JSON.stringify(value)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function definitionIdentifierFromParts(parts: string[]) {
+  const id = parts
+    .flatMap(part => part.split(/[^A-Za-z0-9_]+/))
+    .map(part => part.trim().toLowerCase())
+    .filter(Boolean)
+    .join('_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return id.slice(0, 96) || 'events_report'
+}
+
+function isDefinitionPath(path: string) {
+  return path.length > 0 &&
+    path.length <= 160 &&
+    path.split('.').every(part => /^[A-Za-z0-9_]+$/.test(part))
 }
 
 function authUrl(apiBaseUrl: string, path: string) {
@@ -4451,7 +5447,7 @@ function authUrl(apiBaseUrl: string, path: string) {
 
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/api-keys` : '/api-keys'
+  return base ? `${base}/v1/api-keys` : '/v1/api-keys'
 }
 
 function resolveTimeRange({
@@ -4517,46 +5513,29 @@ function queryTimeDomain({
   return Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs ? { from, to } : null
 }
 
+const FIELD_PATH_ALIASES: Record<string, string> = {
+  durationMs: 'duration_ms',
+  endedAt: 'end_time',
+  parentSpanId: 'parent_span_id',
+  spanId: 'span_id',
+  startedAt: 'start_time',
+  traceId: 'trace_id'
+}
+
 function nanotracePath(path: string) {
-  switch (path) {
-    case 'traceId':
-      return 'trace_id'
-    case 'spanId':
-      return 'span_id'
-    case 'parentSpanId':
-      return 'parent_span_id'
-    case 'startedAt':
-      return 'start_time'
-    case 'endedAt':
-      return 'end_time'
-    case 'durationMs':
-      return 'duration_ms'
-    default:
-      return normalizedPayloadPath(path)
-  }
+  return FIELD_PATH_ALIASES[path] ?? normalizedPayloadPath(path)
 }
 
 function facetKey(path: string) {
   return nanotracePath(path)
 }
 
+const DISPLAY_FIELD_PATH_ALIASES: Record<string, string> = Object.fromEntries(
+  Object.entries(FIELD_PATH_ALIASES).map(([displayPath, storedPath]) => [storedPath, displayPath])
+)
+
 function displayFacetPath(path: string) {
-  switch (path) {
-    case 'trace_id':
-      return 'traceId'
-    case 'span_id':
-      return 'spanId'
-    case 'parent_span_id':
-      return 'parentSpanId'
-    case 'start_time':
-      return 'startedAt'
-    case 'end_time':
-      return 'endedAt'
-    case 'duration_ms':
-      return 'durationMs'
-    default:
-      return path
-  }
+  return DISPLAY_FIELD_PATH_ALIASES[path] ?? path
 }
 
 function mergeGroupOptions(fields: GroupOption[], limit: number) {
@@ -4577,6 +5556,23 @@ function rowToTraceEvent(row: EventRow): TraceEvent {
     id: String(row.event_id),
     createdAt: normalizeTimestamp(row.timestamp),
     data
+  }
+}
+
+function rowToSearchTraceEvent(row: SearchEventRow): TraceEvent {
+  const event = rowToTraceEvent(row)
+  const snippet = typeof row.snippet === 'string' ? row.snippet.trim() : ''
+  return {
+    ...event,
+    data: {
+      ...event.data,
+      _search: {
+        matchedPaths: Array.isArray(row.matched_paths) ? row.matched_paths : [],
+        matchedTerms: Array.isArray(row.matched_terms) ? row.matched_terms : [],
+        score: Number(row.score) || 0,
+        ...(snippet ? { snippet } : {})
+      }
+    }
   }
 }
 

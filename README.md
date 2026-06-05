@@ -21,9 +21,11 @@ What changed in account state before support tickets, latency, or churn spiked?
 
 Instead of stitching together separate logging, tracing, metrics, product
 analytics, warehouse, and agent-evaluation systems, Nanotrace stores operational
-telemetry and business facts in the same lakehouse-backed event table. Common
-fields make events easy to scan and join; raw JSON keeps domain-specific context
-intact until a field is important enough to promote into a fast serving index.
+telemetry and business facts in the same Kafka-ingested, ClickHouse-served event
+table. Common fields make events easy to scan and join; raw JSON keeps
+domain-specific context intact. A generic KV index makes scalar payload fields
+filterable immediately; explicit promoted definitions are still required for
+fast grouping, aggregation, reports, and reusable dashboards.
 
 ## What Nanotrace Offers
 
@@ -39,12 +41,24 @@ intact until a field is important enough to promote into a fast serving index.
 - **Raw-first analytics:** keep arbitrary customer and application fields in
   `data` by default, so new questions do not require a schema migration or a new
   pipeline.
+- **Universal scalar filtering:** flatten scalar KVs into `event_kv_index` so
+  exact and numeric filters over arbitrary payload paths work without promoting
+  the field into a semantic definition.
 - **Promotion when queries repeat:** turn useful JSON paths into indexed fields,
   measures, state updates, rollups, reports, or dashboards when they need to be
-  fast.
-- **Open durable history:** commit accepted event batches to Apache
-  Iceberg/Parquet, then use ClickHouse as a rebuildable serving layer for
-  interactive queries.
+  grouped, aggregated, reused, or made predictably cheap.
+- **Durable ingest path:** accept batches through HTTP, publish them to Kafka,
+  normalize asynchronously, commit valid rows to Iceberg, and serve interactive
+  queries from ClickHouse.
+
+## Canonical Docs
+
+The concise current-state architecture spec is
+[docs/design.html](docs/design.html). It consolidates the ingest path, event
+contract, serving tables, query planner, materialization model, operational
+commands, validation coverage, and open boundaries. The markdown files under
+`docs/` remain deeper references for specific design areas, with
+[docs/invariants.md](docs/invariants.md) capturing the hard system contracts.
 
 ## Why A Unified Table
 
@@ -60,9 +74,9 @@ from a business symptom and drill into infrastructure, or start from an error
 and climb back up to the customer, workflow, model, account, and outcome it
 affected.
 
-The core design is lakehouse-first. ClickHouse makes the UI fast, but Iceberg is
-the durable record. If an index, rollup, or promoted table changes, Nanotrace can
-replay committed snapshots and produce a new serving view.
+The core design is streaming-first. Kafka is the ingest buffer and replay point;
+Iceberg is the durable lakehouse record for accepted normalized events; and
+ClickHouse is the interactive serving layer.
 
 ## Data Path
 
@@ -71,63 +85,69 @@ The production data path is:
 ```text
 HTTP clients
   -> ALB
-  -> EC2/EBS ingest servers
-  -> S3 landing objects
-  -> SQS
-  -> loader
-  -> Iceberg/Parquet commit
-  -> ClickHouse raw serving rows + commit metadata
-  -> materializer
-  -> promoted serving tables and rollups
+  -> ingest server
+  -> Kafka raw ingest topic
+  -> normalizer
+  -> Iceberg lakehouse commit
+  -> alert worker for hot event-match alerts and webhook outbox
+  -> serving materializer
+  -> ClickHouse raw rows, event_text_index rows, event_search_terms rows, and event_kv_index rows
+  -> promoted serving indexes, definitions, alert events, reports, sequences, and cohorts
 ```
 
-The server validates event JSON, writes durable local NDJSON parts, and uploads
-closed parts to S3. The loader consumes S3 notifications, commits the batch to
-the Iceberg event table, records the lakehouse snapshot in ClickHouse, and then
-loads the committed events into ClickHouse serving tables. A separate
-materializer keeps derived serving tables caught up from the same lakehouse
-commit stream.
+The server authenticates the request and produces the raw request body to Kafka.
+The normalizer consumes that topic, validates and tenant-stamps events, writes
+valid rows to Iceberg, and records invalid rows separately. ClickHouse serving
+rows are loaded from committed lakehouse snapshots by the materializer/rebuild
+worker; the normalizer does not write raw serving rows or serving indexes.
+Semantic definitions come from typed SDK-managed defaults or user/admin
+definitions, not from observed arbitrary payload shape. The Kafka consumer
+offset advances only after the durable ingest work for that message succeeds.
+SDK metric defaults are tenant bootstrap data: the server seeds them
+idempotently at startup for known organizations when ClickHouse is configured,
+not through a public `/v1/definitions/sdk-defaults` endpoint.
 
 ## Repository Layout
 
 ```text
-apps/server        Rust ingest server and raw S3 uploader
-apps/loader        Rust S3/SQS to ClickHouse loader
+apps/server        Rust HTTP ingest API that produces raw batches to Kafka
+apps/normalizer    Rust Kafka consumer that normalizes events into Iceberg
+apps/alerts        Rust Kafka consumer/notifier for hot alert matches and webhooks
 apps/query         Rust stateless read/query service
 apps/sidecar      UDP sidecar client that batches and forwards events
 packages/sdk-js    TypeScript SDK for app instrumentation
 tools/loadtest     Rust deploy-aware load testing tool
 tools/lakehouse-rebuild  Lakehouse replay and materialization worker
 deploy/clickhouse  ClickHouse schema
-deploy/pulumi/nanotrace  Pulumi EC2/EBS/S3 infrastructure
+deploy/pulumi/nanotrace  Pulumi EC2/S3/ECR/RDS/KMS infrastructure
 scripts            E2E commands
 ```
 
 ## How It Works
 
-Nanotrace has three durable layers:
+Nanotrace has three operational layers:
 
-- Landing: ingest servers write accepted batches to local disk first, then S3.
-- Lakehouse: the loader writes canonical Parquet files and commits them through
-  Apache Iceberg table metadata.
-- Serving: ClickHouse stores raw rows, rollups, indexes, and watermarks for
-  interactive reads.
+- Ingest: HTTP servers publish raw accepted batches to Kafka.
+- Normalize: the normalizer validates events, stamps tenancy, emits invalid
+  rows, and commits valid rows to Iceberg.
+- Serving: ClickHouse stores raw rows, rollups, indexes, definitions, reports,
+  sequences, and cohorts for interactive reads. The materializer
+  loads raw and derived serving rows from lakehouse commits.
 
 The canonical event table keeps a stable flattened vocabulary for common fields:
 tenant, event id, timestamps, signal, event type, trace/span ids, service,
 environment, name, duration, error state, and the raw `data` JSON. Arbitrary
-customer fields stay in `data` until they become useful enough to promote.
+customer fields stay in `data` and are also flattened into `event_kv_index` for
+exact/range filtering. Promotion is reserved for fields and measures that need
+semantic materialization.
 
-Each Iceberg commit is mirrored into `observatory.lakehouse_commits`. Each
-ClickHouse serving table records the latest source snapshot it has consumed in
-`observatory.serving_watermarks`. Query APIs compare those watermarks before
-reading raw or promoted serving tables, so stale serving data is rejected by
-default. Diagnostic callers can opt in with `allow_stale_serving: true`.
+Kafka-sourced rows use `kafka://<topic>/<partition>/<offset>` source pointers.
+Event reads are reconstructed from ClickHouse serving rows.
 
 ## Query and Index Model
 
-ClickHouse is used as a serving/index engine on top of Iceberg, not as the
-system of record. Query planning follows this ladder:
+ClickHouse is used as the serving/index engine. Query planning follows this
+ladder:
 
 - `events`: raw serving rows. This is the correctness fallback for every query.
   Time-window and tenant predicates use the table order key for pruning.
@@ -140,8 +160,19 @@ system of record. Query planning follows this ladder:
   `span_id`, `request_id`, `user_id`, `anonymous_id`, `account_id`,
   `session_id`, `group_id`, `organization_id`, `thread_id`, and
   `conversation_id`.
-- `field_index`: definition-backed promoted-field index. Materializers populate
-  this for fields that need guaranteed-fast filtering, grouping, or drilldown.
+- `event_text_index`: bounded per-event search documents for event text search.
+- `event_search_terms`: token-level inverted index for ranked interactive
+  search over event text and common identifiers. `/v1/query` `type=search`
+  defaults to token ranking, can run prefix or bounded fuzzy term matching, can
+  require all query terms, can return bounded snippets from `event_text_index`,
+  and can run phrase searches through the text-document index.
+- `event_kv_index`: generic inverted index for arbitrary scalar payload paths.
+  This is the default substrate for equality, set membership, existence, and
+  numeric range filters over unpromoted KVs, including nested paths and
+  array-object correlation.
+- `field_index`: definition-backed promoted-field index. Materializers or
+  definition backfills populate this for fields that need guaranteed-fast
+  filtering, grouping, or drilldown.
 
 The UI filter DSL supports equality, inequality, negation, disjunction,
 substring matching, and set membership:
@@ -154,9 +185,17 @@ request_id IN [req_1, req_2, req_3]
 message CONTAINS timeout
 ```
 
-Simple indexed equality filters can use `field_index` semi-joins by `event_id`.
-Advanced boolean filters, `CONTAINS`, and unpromoted JSON paths fall back to raw
-`events` predicates so the result stays correct. Repeated broad queries should
+Unpromoted equality, existence, set, and numeric range filters use
+`event_kv_index` semi-joins by `event_id`. Promoted field filters can use
+`field_index` only when the planner has a freshness proof for the promoted
+definition/version or the lakehouse serving watermark says the whole index is
+current. Those generated promoted-index reads are constrained by
+`definition_id` and `definition_version`, not just field name. Event text
+filters use bounded `event_text_index` documents; ranked interactive search uses
+`event_search_terms` through `/v1/query` with `type=search`, with prefix,
+bounded fuzzy, phrase, and snippet support backed by `event_text_index` when
+needed. Field-specific
+substring predicates remain bounded fallback work. Repeated broad queries should
 become a promoted field, measure, report, cohort, or another materialized output
 rather than repeatedly scanning arbitrary JSON.
 
@@ -199,21 +238,27 @@ are visible in local ClickHouse at `http://localhost:18123`. Override
 `NANOTRACE_LOADTEST_PROFILE`, or `NANOTRACE_LOADTEST_RUN_ID` to change the
 rewrite size and shape.
 
-Local Compose enables the lakehouse writer by default. The loader commits each
-processed event batch to a local Apache Iceberg V2 table under
-`/data/lakehouse/nanotrace/events`, then loads the same committed batch into
-ClickHouse serving tables. ClickHouse stores commit and serving watermark rows
-in `observatory.lakehouse_commits` and `observatory.serving_watermarks`.
-After a ClickHouse reset, refill serving rows from the committed lakehouse files
-with:
+Local Compose runs Redpanda, Postgres, ClickHouse, Localstack, the ingest
+server, the normalizer, the materializer, and the UI. The default path is the
+same one used by the Kafka integration test: HTTP events are accepted by
+`nanotrace-server`, produced to Redpanda, consumed by `nanotrace-normalizer`,
+committed to the local Iceberg lakehouse Docker volume, then loaded into
+ClickHouse by `nanotrace-lakehouse-rebuild` running in materializer-loop mode.
+
+The lakehouse rebuild and materialization tools replay committed lakehouse
+snapshots back into ClickHouse serving tables. To rebuild serving rows from the
+current lakehouse source, run:
 
 ```sh
 npm run lakehouse:rebuild:local
 ```
 
-The rebuild command restores raw `events` and, when active definitions exist,
-materializes promoted `field_index`, `event_measures`, and
-`entity_state_updates` rows from the same lakehouse snapshots. It refuses to
+The rebuild command restores raw `events` and materializes `event_text_index`,
+`event_search_terms`, `event_kv_index`, and other serving outputs. When active definitions exist, it
+also materializes promoted `field_index`,
+`event_measures`, metric rollups, `entity_state_updates`,
+`entity_state_current`, reports, sequences, and cohorts from the same lakehouse
+snapshots. It refuses to
 rewrite raw or derived rows into non-empty ClickHouse serving tables unless
 `NANOTRACE_REBUILD_TRUNCATE=true` or `NANOTRACE_REBUILD_ALLOW_NON_EMPTY=true`.
 Set `NANOTRACE_REBUILD_RAW=false` to run materialization only, or
@@ -222,45 +267,41 @@ be local `file://` paths or remote `s3://`/`s3a://` paths; S3 rebuilds use the
 standard AWS environment and cap each fetched Parquet file with
 `NANOTRACE_REBUILD_S3_MAX_FILE_BYTES`.
 
-For normal catch-up after new lakehouse commits, run the same command with
-`NANOTRACE_MATERIALIZE_INCREMENTAL=true NANOTRACE_REBUILD_RAW=false`. That mode
-uses `observatory.serving_watermarks` to materialize only promoted serving
-tables that are behind the latest committed Iceberg sequence, so it can run
-against non-empty derived tables without a destructive refill.
+For normal catch-up after lakehouse commits, run the same command with
+`NANOTRACE_MATERIALIZE_INCREMENTAL=true NANOTRACE_REBUILD_RAW=false`.
+For explicit historical report, sequence, or cohort backfills, create
+tenant-scoped jobs with `POST /v1/definitions/{definition_id}/backfills`; the
+queued materializer claims the generated `materialization_chunks` rows and
+publishes versions and watermarks when chunks complete.
+Field, measure/rollup, and state definitions use synchronous
+`POST /v1/definitions/{definition_id}/backfill`. Definitions are append/versioned:
+create inserts an active row, delete inserts a disabled/deleted row, and there
+is no in-place update endpoint.
+For offline historical export or audit scans, run `nanotrace-lakehouse-rebuild`
+with `NANOTRACE_LAKEHOUSE_QUERY=true`. It reads committed lakehouse Parquet
+files directly, supports tenant/time/event-type/text/regex filters, and emits
+matching events as NDJSON without using ClickHouse serving tables. For
+SQL-shaped historical analysis, set `NANOTRACE_LAKEHOUSE_QUERY_SQL`; the tool
+registers committed event Parquet files as the `events` table and can register
+additional Parquet inputs from `NANOTRACE_LAKEHOUSE_QUERY_TABLES` for offline
+joins.
 
-Local Compose also includes a long-running materializer service:
+Lakehouse maintenance mode can audit commit/data-file/small-file pressure and
+publish `pipeline_metrics`. For local filesystem catalogs, setting
+`NANOTRACE_LAKEHOUSE_NATIVE_COMPACTION=true` rewrites the current Iceberg
+snapshot into compacted Parquet files without writing a new Nanotrace append
+commit record, so ClickHouse materialization does not replay compacted rows as
+new data. REST/object-store deployments can still provide
+`NANOTRACE_ICEBERG_MAINTENANCE_CMD` for engine-specific compaction, snapshot
+expiry, and orphan cleanup.
 
-```sh
-npm run lakehouse:materializer:local
-```
-
-The service runs `nanotrace-lakehouse-rebuild` with
-`NANOTRACE_MATERIALIZE_LOOP=true`, reloads active definitions every poll, and
-continuously advances promoted serving watermarks from committed lakehouse
-snapshots. Set `NANOTRACE_MATERIALIZE_POLL_SECS` to tune its cadence. In
-service mode it can use `NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse` so workers
-read shared `observatory.lakehouse_commits` metadata instead of local sidecar
-files. Commit metadata stores the full Iceberg data-file list for each
-snapshot, so materializers replay every file when a high-throughput commit rolls
-over into multiple Parquet parts.
-
-Lakehouse tables are created and kept current with production-oriented Iceberg
-properties for ZSTD Parquet writes, target file sizing, metadata cleanup, and
-snapshot-retention policy. Tune these with
-`NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES`,
-`NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP`,
-`NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS`, and
-`NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX`.
-
-When `NANOTRACE_POSTGRES_URL` is configured, the loader also uses a Postgres
-`nanotrace_ingest_batches` ledger keyed by the deterministic S3 batch token. A
-concurrent loader that sees the same batch will either skip it if completed or
-leave the SQS message for the active owner before downloading S3 objects; stale
-processing rows can be reclaimed after `NANOTRACE_INGEST_LEDGER_STALE_SECS`.
-
-Query APIs check `observatory.serving_watermarks` before reading raw or promoted
-serving tables. Requests that intentionally accept stale serving data can set
-`allow_stale_serving: true` in the `/v1/query` JSON body.
+Query paths check `observatory.serving_watermarks` before reading lakehouse-fed
+serving tables and use `observatory.materialization_watermarks` for
+definition-scoped backfills. Requests that intentionally accept stale serving
+data can set `allow_stale_serving: true` in the `/v1/query` JSON body.
+`POST /v1/query` is the user-facing structured query API and remains
+tenant-scoped. Cross-tenant or SQL-shaped historical analysis should use
+operator-controlled lakehouse export/query tooling, not a public server route.
 
 See [docs/iceberg-final-spec.md](docs/iceberg-final-spec.md) for the
 Iceberg-native final design and current implementation slice.
@@ -283,7 +324,20 @@ CLICKHOUSE_URL=https://...
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=...
 CLICKHOUSE_DATABASE=observatory
+NANOTRACE_KAFKA_BROKERS=...
+NANOTRACE_KAFKA_SECURITY_PROTOCOL=SASL_SSL
+NANOTRACE_KAFKA_SASL_MECHANISM=SCRAM-SHA-512
+NANOTRACE_KAFKA_SASL_USERNAME=...
+NANOTRACE_KAFKA_SASL_PASSWORD=...
+NANOTRACE_ICEBERG_REST_URI=https://...
 ```
+
+Pulumi derives `NANOTRACE_ICEBERG_WAREHOUSE` from the provisioned storage
+bucket and the `iceberg/` prefix unless `nanotrace:icebergWarehouse` or
+`NANOTRACE_ICEBERG_WAREHOUSE` is set explicitly. The deployed write path is
+WarpStream-compatible Kafka to the normalizer, then Iceberg object storage for
+accepted normalized events. A separate materializer container tails lakehouse
+commits and keeps ClickHouse serving tables current.
 
 Browser login uses one-time email links sent through AWS SES. The sender in
 `NANOTRACE_EMAIL_FROM` must be a verified SES identity in the deployment
@@ -301,34 +355,22 @@ op run -- npm run deploy:up
 ```
 
 Run the deploy-aware E2E after `deploy:up`. It reads Pulumi outputs, posts
-through the ALB, waits for the
-returned S3 object key, and verifies the uploaded NDJSON row:
+through the ALB, waits for the event to appear in ClickHouse, verifies
+`event_kv_index`, checks serving watermarks, and exercises the public query
+path:
 
 ```sh
 npm run e2e:pulumi
 ```
 
 Run the deploy-aware Rust load test to find the max sustainable request rate
-for 1, 10, and 100 events per request. It reads the schema-shaped JSON fixtures
-from `fixtures/events`, uses a 10% log / 90% rest event mix, and generates fresh
+for configured batch sizes. It reads the schema-shaped JSON fixtures from
+`fixtures/events`, uses a 10% log / 90% rest event mix, and generates fresh
 `event_id`, `timestamp`, and `_loadtest` metadata for each event:
 
 ```sh
 npm run loadtest:pulumi
 ```
-
-To originate load from Modal instead of the local machine, set
-`NANOTRACE_INGEST_URL` and `NANOTRACE_API_KEY`, then run:
-
-```sh
-npm run loadtest:modal
-```
-
-The Modal wrapper starts `NANOTRACE_LOADTEST_GENERATORS` sandboxes, uploads this
-repo, and runs the same Rust loadtester in each sandbox. Event sequences are
-sharded with `NANOTRACE_LOADTEST_SEQUENCE_OFFSET` and
-`NANOTRACE_LOADTEST_SEQUENCE_STRIDE` so generators can share one run id without
-colliding event ids.
 
 Useful knobs:
 
@@ -347,14 +389,14 @@ NANOTRACE_LOADTEST_GENERATORS=4
 
 `NANOTRACE_LOADTEST_PROFILE` defaults to `codex`, which produces a Codex-like
 mix of agent traces, LLM calls, tool calls, retrieval steps, runtime metrics,
-processor activity, and realistic logs over a 60-day history. The Codex profile
+materializer activity, and realistic logs over a 60-day history. The Codex profile
 emits correlated 24-event workflows rather than independent samples, so traces
 look like actual request lifecycles: span start/end, agent planning, retrieval,
 LLM requests with message and usage payloads, tool execution, evaluation,
 safety, runtime metrics, and terminal logs. It can also be `atlas` for the
 older Atlas Markets mix, `realistic` for generic mixed fixture replay,
 `product` for product/state analytics, `agent` for deep agent traces, `trace`
-for trace-shaped events, `processor` for pipeline events, `metrics` for pure
+for trace-shaped events, `pipeline` for materializer/pipeline events, `metrics` for pure
 metric traffic, `logs` for pure log traffic, `llm` for LLM log traffic, or
 `fixture` for mostly static fixture replay.
 Synthetic non-fixture profiles generate timestamps across a fixed 60-day
@@ -368,12 +410,10 @@ ClickHouse and reports visible event count plus ingest-lag percentiles. If
 Pulumi secrets are locked, set `NANOTRACE_INGEST_URL` directly to avoid reading
 Pulumi outputs.
 
-The AWS deployment runs `nanotrace-loader` beside `nanotrace-server` on each EC2
-instance. S3 sends object-created notifications to SQS; loader instances share
-that queue, fetch raw NDJSON objects from S3, commit the batch to Iceberg, and
-load the committed rows into ClickHouse serving tables. Processors are shared
-for the deployment under the `processors` S3 prefix. The uploaded row fields
-match the raw-first analytics schema in
+The AWS deployment runs `nanotrace-server` and `nanotrace-normalizer` on ingest
+EC2 instances. Set `nanotrace:kafkaBrokers` or `NANOTRACE_KAFKA_BROKERS` before
+deploying; Pulumi passes the broker list and topic names into both containers.
+Rows are served from ClickHouse using the schema in
 [deploy/clickhouse/schema.sql](deploy/clickhouse/schema.sql).
 
 Destroy AWS resources:

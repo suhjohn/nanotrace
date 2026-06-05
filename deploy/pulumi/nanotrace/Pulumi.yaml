@@ -1,5 +1,5 @@
 name: nanotrace
-description: Nanotrace ALB to EC2/EBS event-log cluster with S3/SQS loader source.
+description: Nanotrace ALB to EC2 Kafka ingest cluster.
 runtime:
   name: nodejs
 main: index.ts

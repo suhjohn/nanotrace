@@ -1,0 +1,18 @@
+[package]
+name = "nanotrace-normalizer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+nanotrace-ingest = { path = "../../crates/ingest" }
+nanotrace-lakehouse = { path = "../../crates/lakehouse" }
+rdkafka = { version = "0.37", features = ["cmake-build", "ssl-vendored", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

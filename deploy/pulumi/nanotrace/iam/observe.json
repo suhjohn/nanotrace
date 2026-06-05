@@ -138,23 +138,6 @@
       ]
     },
     {
-      "Sid": "ListQueuesForObservation",
-      "Effect": "Allow",
-      "Action": "sqs:ListQueues",
-      "Resource": "*"
-    },
-    {
-      "Sid": "ObserveQueues",
-      "Effect": "Allow",
-      "Action": [
-        "sqs:GetQueueAttributes",
-        "sqs:GetQueueUrl",
-        "sqs:ListQueueTags",
-        "sqs:ReceiveMessage"
-      ],
-      "Resource": "arn:aws:sqs:*:*:nanotrace-*"
-    },
-    {
       "Sid": "ObserveEcr",
       "Effect": "Allow",
       "Action": [

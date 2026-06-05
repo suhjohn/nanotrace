@@ -11,13 +11,15 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    env,
+    env, fs,
     net::SocketAddr,
+    path::{Path, PathBuf},
+    process,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::UdpSocket,
@@ -44,6 +46,12 @@ async fn main() -> Result<()> {
         .build()
         .context("build HTTP client")?;
     let (tx, rx) = mpsc::channel(cfg.queue_capacity);
+    if let Some(spool_dir) = cfg.spool_dir.as_deref() {
+        fs::create_dir_all(spool_dir)
+            .with_context(|| format!("create sidecar spool dir {}", spool_dir.display()))?;
+        recover_spool_dir(spool_dir)
+            .with_context(|| format!("recover sidecar spool dir {}", spool_dir.display()))?;
+    }
 
     info!(
         udp_bind = %cfg.udp_bind,
@@ -53,6 +61,7 @@ async fn main() -> Result<()> {
         batch_max_bytes = cfg.batch_max_bytes,
         flush_ms = cfg.flush_interval.as_millis(),
         queue_capacity = cfg.queue_capacity,
+        spool_dir = cfg.spool_dir.as_ref().map(|dir| dir.display().to_string()).unwrap_or_else(|| "disabled".to_owned()),
         "starting nanotrace sidecar"
     );
 
@@ -65,7 +74,7 @@ async fn main() -> Result<()> {
         Some(_) => tokio::spawn(receive_http_intake(
             Arc::clone(&cfg),
             Arc::clone(&metrics),
-            tx,
+            tx.clone(),
         )),
         None => tokio::spawn(async { std::future::pending::<Result<()>>().await }),
     };
@@ -75,12 +84,21 @@ async fn main() -> Result<()> {
         http,
         rx,
     ));
+    let spool_task = match cfg.spool_dir.is_some() {
+        true => tokio::spawn(run_spool_replayer(
+            Arc::clone(&cfg),
+            Arc::clone(&metrics),
+            tx.clone(),
+        )),
+        false => tokio::spawn(async { std::future::pending::<Result<()>>().await }),
+    };
     let metrics_task = tokio::spawn(log_metrics(Arc::clone(&metrics)));
 
     tokio::select! {
         result = udp_task => result.context("UDP task join failed")??,
         result = http_intake_task => result.context("HTTP intake task join failed")??,
         result = batch_task => result.context("batch task join failed")??,
+        result = spool_task => result.context("spool task join failed")??,
         result = tokio::signal::ctrl_c() => {
             result.context("install ctrl-c handler")?;
             info!("shutdown requested");
@@ -102,6 +120,8 @@ struct Config {
     batch_max_bytes: usize,
     flush_interval: Duration,
     queue_capacity: usize,
+    spool_dir: Option<PathBuf>,
+    spool_poll_interval: Duration,
     udp_max_bytes: usize,
     http_intake_max_bytes: usize,
     http_timeout: Duration,
@@ -125,6 +145,8 @@ impl Config {
         let batch_max_bytes = usize_env("NANOTRACE_CLIENT_BATCH_MAX_BYTES", 1024 * 1024)?;
         let flush_ms = u64_env("NANOTRACE_CLIENT_FLUSH_MS", 25)?;
         let queue_capacity = usize_env("NANOTRACE_CLIENT_QUEUE_CAPACITY", 10_000)?;
+        let spool_dir = optional_path_env("NANOTRACE_CLIENT_SPOOL_DIR");
+        let spool_poll_ms = u64_env("NANOTRACE_CLIENT_SPOOL_POLL_MS", 1_000)?;
         let udp_max_bytes = usize_env("NANOTRACE_CLIENT_UDP_MAX_BYTES", 65_507)?;
         let http_intake_max_bytes = usize_env("NANOTRACE_CLIENT_HTTP_MAX_BYTES", 1024 * 1024)?;
         let http_timeout_ms = u64_env("NANOTRACE_CLIENT_HTTP_TIMEOUT_MS", 5_000)?;
@@ -139,6 +161,9 @@ impl Config {
         }
         if queue_capacity == 0 {
             bail!("NANOTRACE_CLIENT_QUEUE_CAPACITY must be greater than zero");
+        }
+        if spool_poll_ms == 0 {
+            bail!("NANOTRACE_CLIENT_SPOOL_POLL_MS must be greater than zero");
         }
         if udp_max_bytes == 0 {
             bail!("NANOTRACE_CLIENT_UDP_MAX_BYTES must be greater than zero");
@@ -160,6 +185,8 @@ impl Config {
             batch_max_bytes,
             flush_interval: Duration::from_millis(flush_ms),
             queue_capacity,
+            spool_dir,
+            spool_poll_interval: Duration::from_millis(spool_poll_ms),
             udp_max_bytes,
             http_intake_max_bytes,
             http_timeout: Duration::from_millis(http_timeout_ms),
@@ -179,6 +206,9 @@ struct Metrics {
     events_sent: AtomicU64,
     events_dropped_invalid: AtomicU64,
     events_dropped_queue_full: AtomicU64,
+    events_spooled: AtomicU64,
+    events_spool_replayed: AtomicU64,
+    spool_errors: AtomicU64,
     batches_sent: AtomicU64,
     batches_failed: AtomicU64,
     http_retries: AtomicU64,
@@ -188,6 +218,7 @@ struct Metrics {
 struct QueuedEvent {
     value: Value,
     bytes: usize,
+    spool_path: Option<PathBuf>,
 }
 
 async fn receive_udp(
@@ -220,17 +251,18 @@ async fn receive_udp(
 
         match prepare_queued_events(value, &cfg.enrichment) {
             Ok(events) => {
-                for event in events {
-                    match tx.try_send(event) {
-                        Ok(()) => {
-                            metrics.events_accepted.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Err(err) = accept_events(&cfg, &metrics, &tx, events, false) {
+                    match err {
+                        AcceptEventsError::QueueClosed => return Ok(()),
+                        AcceptEventsError::QueueFull(count) => {
                             metrics
                                 .events_dropped_queue_full
-                                .fetch_add(1, Ordering::Relaxed);
+                                .fetch_add(count as u64, Ordering::Relaxed);
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        AcceptEventsError::Spool(err) => {
+                            metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+                            warn!(%peer, %err, "dropping UDP event after spool write failed");
+                        }
                     }
                 }
             }
@@ -316,27 +348,27 @@ async fn post_sidecar_events(
             return (StatusCode::BAD_REQUEST, err.reason).into_response();
         }
     };
-    let accepted = events.len();
-    let permits = match state.tx.try_reserve_many(accepted) {
-        Ok(permits) => permits,
-        Err(mpsc::error::TrySendError::Full(_)) => {
+    let accepted = match accept_events(&state.cfg, &state.metrics, &state.tx, events, true) {
+        Ok(accepted) => accepted,
+        Err(AcceptEventsError::QueueFull(count)) => {
             state
                 .metrics
                 .events_dropped_queue_full
-                .fetch_add(accepted as u64, Ordering::Relaxed);
+                .fetch_add(count as u64, Ordering::Relaxed);
             return (StatusCode::SERVICE_UNAVAILABLE, "sidecar queue is full").into_response();
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(AcceptEventsError::QueueClosed) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "sidecar queue is closed").into_response();
         }
+        Err(AcceptEventsError::Spool(err)) => {
+            state.metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("sidecar spool write failed: {err}"),
+            )
+                .into_response();
+        }
     };
-    for (permit, event) in permits.zip(events) {
-        permit.send(event);
-    }
-    state
-        .metrics
-        .events_accepted
-        .fetch_add(accepted as u64, Ordering::Relaxed);
 
     Json(serde_json::json!({ "accepted": accepted })).into_response()
 }
@@ -345,13 +377,77 @@ async fn sidecar_healthz() -> Json<Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+#[derive(Debug)]
+enum AcceptEventsError {
+    QueueFull(usize),
+    QueueClosed,
+    Spool(anyhow::Error),
+}
+
+fn accept_events(
+    cfg: &Config,
+    metrics: &Metrics,
+    tx: &mpsc::Sender<QueuedEvent>,
+    events: Vec<QueuedEvent>,
+    reject_queue_full: bool,
+) -> std::result::Result<usize, AcceptEventsError> {
+    let accepted = events.len();
+    if let Some(spool_dir) = cfg.spool_dir.as_deref() {
+        for event in events {
+            persist_spooled_event(spool_dir, &event.value).map_err(AcceptEventsError::Spool)?;
+        }
+        metrics
+            .events_spooled
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        metrics
+            .events_accepted
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        return Ok(accepted);
+    }
+
+    if reject_queue_full {
+        let permits = tx.try_reserve_many(accepted).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => AcceptEventsError::QueueFull(accepted),
+            mpsc::error::TrySendError::Closed(_) => AcceptEventsError::QueueClosed,
+        })?;
+        for (permit, event) in permits.zip(events) {
+            permit.send(event);
+        }
+        metrics
+            .events_accepted
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        return Ok(accepted);
+    }
+
+    let mut accepted_count = 0_usize;
+    let mut dropped_count = 0_usize;
+    for event in events {
+        match tx.try_send(event) {
+            Ok(()) => accepted_count += 1,
+            Err(mpsc::error::TrySendError::Full(_)) => dropped_count += 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(AcceptEventsError::QueueClosed);
+            }
+        }
+    }
+    if accepted_count > 0 {
+        metrics
+            .events_accepted
+            .fetch_add(accepted_count as u64, Ordering::Relaxed);
+    }
+    if dropped_count > 0 {
+        return Err(AcceptEventsError::QueueFull(dropped_count));
+    }
+    Ok(accepted_count)
+}
+
 async fn run_batcher(
     cfg: Arc<Config>,
     metrics: Arc<Metrics>,
     http: reqwest::Client,
     mut rx: mpsc::Receiver<QueuedEvent>,
 ) -> Result<()> {
-    let mut batch = Vec::with_capacity(cfg.batch_max_events);
+    let mut batch: Vec<QueuedEvent> = Vec::with_capacity(cfg.batch_max_events);
     let mut batch_bytes = 0_usize;
     let mut ticker = interval(cfg.flush_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -372,7 +468,7 @@ async fn run_batcher(
                 }
 
                 batch_bytes = batch_bytes.saturating_add(event.bytes);
-                batch.push(event.value);
+                batch.push(event);
 
                 if batch.len() >= cfg.batch_max_events || batch_bytes >= cfg.batch_max_bytes {
                     flush_batch(&cfg, &metrics, &http, &mut batch, &mut batch_bytes).await;
@@ -389,7 +485,7 @@ async fn flush_batch(
     cfg: &Config,
     metrics: &Metrics,
     http: &reqwest::Client,
-    batch: &mut Vec<Value>,
+    batch: &mut Vec<QueuedEvent>,
     batch_bytes: &mut usize,
 ) {
     if batch.is_empty() {
@@ -400,22 +496,224 @@ async fn flush_batch(
     *batch_bytes = 0;
     let event_count = events.len() as u64;
     let body = if events.len() == 1 {
-        events.into_iter().next().unwrap_or(Value::Null)
+        events
+            .first()
+            .map(|event| event.value.clone())
+            .unwrap_or(Value::Null)
     } else {
-        Value::Array(events)
+        Value::Array(events.iter().map(|event| event.value.clone()).collect())
     };
 
     match send_with_retry(cfg, metrics, http, &body).await {
         Ok(()) => {
+            delete_spooled_events(&events, metrics);
             metrics.batches_sent.fetch_add(1, Ordering::Relaxed);
             metrics
                 .events_sent
                 .fetch_add(event_count, Ordering::Relaxed);
         }
         Err(err) => {
+            restore_spooled_events(&events, metrics);
             metrics.batches_failed.fetch_add(1, Ordering::Relaxed);
             error!(%err, event_count, "dropping batch after retries");
         }
+    }
+}
+
+async fn run_spool_replayer(
+    cfg: Arc<Config>,
+    metrics: Arc<Metrics>,
+    tx: mpsc::Sender<QueuedEvent>,
+) -> Result<()> {
+    let Some(spool_dir) = cfg.spool_dir.as_deref() else {
+        return Ok(());
+    };
+    let mut ticker = interval(cfg.spool_poll_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        replay_spool_once(spool_dir, &metrics, &tx).await?;
+        ticker.tick().await;
+    }
+}
+
+async fn replay_spool_once(
+    spool_dir: &Path,
+    metrics: &Metrics,
+    tx: &mpsc::Sender<QueuedEvent>,
+) -> Result<()> {
+    let mut paths = ready_spool_files(spool_dir)?;
+    paths.sort();
+    for path in paths {
+        match take_spooled_event(&path) {
+            Ok(event) => {
+                metrics
+                    .events_spool_replayed
+                    .fetch_add(1, Ordering::Relaxed);
+                if tx.send(event).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+                warn!(path = %path.display(), %err, "quarantining unreadable sidecar spool file");
+                quarantine_spool_file(&path, metrics);
+                quarantine_spool_file(&path.with_extension("inflight"), metrics);
+            }
+        }
+    }
+    Ok(())
+}
+
+static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn persist_spooled_event(spool_dir: &Path, value: &Value) -> Result<PathBuf> {
+    fs::create_dir_all(spool_dir)
+        .with_context(|| format!("create sidecar spool dir {}", spool_dir.display()))?;
+    let body = serde_json::to_vec(value).context("serialize sidecar spool event")?;
+    for _ in 0..10 {
+        let sequence = SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_name = format!("event-{now}-{}-{sequence}.json", process::id());
+        let ready_path = spool_dir.join(file_name);
+        let tmp_path = ready_path.with_extension("tmp");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(&body)
+                    .with_context(|| format!("write sidecar spool file {}", tmp_path.display()))?;
+                file.write_all(b"\n")
+                    .with_context(|| format!("write sidecar spool file {}", tmp_path.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("sync sidecar spool file {}", tmp_path.display()))?;
+                drop(file);
+                fs::rename(&tmp_path, &ready_path).with_context(|| {
+                    format!(
+                        "publish sidecar spool file {} to {}",
+                        tmp_path.display(),
+                        ready_path.display()
+                    )
+                })?;
+                return Ok(ready_path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create sidecar spool file {}", tmp_path.display()));
+            }
+        }
+    }
+    bail!("failed to allocate unique sidecar spool file name")
+}
+
+fn recover_spool_dir(spool_dir: &Path) -> Result<()> {
+    if !spool_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(spool_dir)
+        .with_context(|| format!("read sidecar spool dir {}", spool_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("inflight") {
+            let ready = path.with_extension("json");
+            fs::rename(&path, &ready).with_context(|| {
+                format!(
+                    "recover sidecar spool file {} to {}",
+                    path.display(),
+                    ready.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn ready_spool_files(spool_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !spool_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(spool_dir)
+        .with_context(|| format!("read sidecar spool dir {}", spool_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn take_spooled_event(path: &Path) -> Result<QueuedEvent> {
+    let inflight = path.with_extension("inflight");
+    fs::rename(path, &inflight).with_context(|| {
+        format!(
+            "claim sidecar spool file {} as {}",
+            path.display(),
+            inflight.display()
+        )
+    })?;
+    let body = fs::read(&inflight)
+        .with_context(|| format!("read sidecar spool file {}", inflight.display()))?;
+    let value: Value = serde_json::from_slice(&body)
+        .with_context(|| format!("parse sidecar spool file {}", inflight.display()))?;
+    Ok(QueuedEvent {
+        value,
+        bytes: body.len(),
+        spool_path: Some(inflight),
+    })
+}
+
+fn delete_spooled_events(events: &[QueuedEvent], metrics: &Metrics) {
+    for event in events {
+        let Some(path) = event.spool_path.as_deref() else {
+            continue;
+        };
+        if let Err(err) = fs::remove_file(path) {
+            metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(path = %path.display(), %err, "failed to delete sent sidecar spool file");
+        }
+    }
+}
+
+fn restore_spooled_events(events: &[QueuedEvent], metrics: &Metrics) {
+    for event in events {
+        let Some(path) = event.spool_path.as_deref() else {
+            continue;
+        };
+        let ready = path.with_extension("json");
+        if let Err(err) = fs::rename(path, &ready) {
+            metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                path = %path.display(),
+                ready = %ready.display(),
+                %err,
+                "failed to restore sidecar spool file after send failure"
+            );
+        }
+    }
+}
+
+fn quarantine_spool_file(path: &Path, metrics: &Metrics) {
+    if !path.exists() {
+        return;
+    }
+    let bad = path.with_extension("bad");
+    if let Err(err) = fs::rename(path, &bad) {
+        metrics.spool_errors.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            path = %path.display(),
+            bad = %bad.display(),
+            %err,
+            "failed to quarantine sidecar spool file"
+        );
     }
 }
 
@@ -469,6 +767,9 @@ async fn log_metrics(metrics: Arc<Metrics>) {
             events_sent = metrics.events_sent.load(Ordering::Relaxed),
             events_dropped_invalid = metrics.events_dropped_invalid.load(Ordering::Relaxed),
             events_dropped_queue_full = metrics.events_dropped_queue_full.load(Ordering::Relaxed),
+            events_spooled = metrics.events_spooled.load(Ordering::Relaxed),
+            events_spool_replayed = metrics.events_spool_replayed.load(Ordering::Relaxed),
+            spool_errors = metrics.spool_errors.load(Ordering::Relaxed),
             batches_sent = metrics.batches_sent.load(Ordering::Relaxed),
             batches_failed = metrics.batches_failed.load(Ordering::Relaxed),
             http_retries = metrics.http_retries.load(Ordering::Relaxed),
@@ -505,6 +806,7 @@ fn prepare_queued_events(
         events.push(QueuedEvent {
             value: event,
             bytes,
+            spool_path: None,
         });
     }
     Ok(events)
@@ -604,6 +906,14 @@ fn required_env(key: &str) -> Result<String> {
 
 fn env_or(key: &str, fallback: &str) -> String {
     env::var(key).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn optional_path_env(key: &str) -> Option<PathBuf> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn optional_bind_env(key: &str, fallback: &str) -> Result<Option<SocketAddr>> {
@@ -714,5 +1024,58 @@ mod tests {
         let err = prepare_queued_events(json!([]), &BTreeMap::new()).expect_err("empty batch");
 
         assert_eq!(err.reason, "batch must contain at least one event");
+    }
+
+    #[test]
+    fn spooled_event_round_trips_through_claim_restore_and_delete() {
+        let dir = test_spool_dir("round-trip");
+        let value = json!({"event_id":"evt_1","timestamp":"t","data":{"service":"api"}});
+        let ready = persist_spooled_event(&dir, &value).expect("persist spool file");
+
+        assert_eq!(
+            ready_spool_files(&dir).expect("ready files"),
+            vec![ready.clone()]
+        );
+
+        let claimed = take_spooled_event(&ready).expect("claim spool file");
+        let inflight = claimed.spool_path.clone().expect("inflight path");
+        assert_eq!(claimed.value, value);
+        assert!(!ready.exists());
+        assert!(inflight.exists());
+
+        let metrics = Metrics::default();
+        restore_spooled_events(&[claimed], &metrics);
+        assert!(ready.exists());
+
+        let claimed = take_spooled_event(&ready).expect("claim restored spool file");
+        let inflight = claimed.spool_path.clone().expect("inflight path");
+        delete_spooled_events(&[claimed], &metrics);
+        assert!(!inflight.exists());
+        fs::remove_dir_all(&dir).expect("remove test spool dir");
+    }
+
+    #[test]
+    fn recover_spool_dir_returns_inflight_files_to_ready() {
+        let dir = test_spool_dir("recover");
+        let value = json!({"event_id":"evt_1","timestamp":"t","data":{}});
+        let ready = persist_spooled_event(&dir, &value).expect("persist spool file");
+        let claimed = take_spooled_event(&ready).expect("claim spool file");
+        let inflight = claimed.spool_path.expect("inflight path");
+
+        assert!(inflight.exists());
+        recover_spool_dir(&dir).expect("recover spool dir");
+        assert!(ready.exists());
+        assert!(!inflight.exists());
+        fs::remove_dir_all(&dir).expect("remove test spool dir");
+    }
+
+    fn test_spool_dir(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("nanotrace-sidecar-{name}-{}-{now}", process::id()));
+        fs::create_dir_all(&dir).expect("create test spool dir");
+        dir
     }
 }

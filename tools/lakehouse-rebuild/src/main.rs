@@ -1,17 +1,26 @@
 use std::{
     collections::{BTreeSet, HashMap},
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_json::LineDelimitedWriter;
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
-use nanotrace_lakehouse::LakehouseCommit;
+use datafusion::{datasource::file_format::options::ParquetReadOptions, prelude::SessionContext};
+use nanotrace_ingest::{event_kv_index_rows, event_search_term_rows, event_text_index_rows};
+use nanotrace_lakehouse::{
+    LakehouseCommit, LakehouseCompactionOptions, LakehouseCompactionResult, LakehouseConfig,
+    compact_events_iceberg,
+};
 use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::reader::ChunkReader};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -27,12 +36,18 @@ struct Config {
     clickhouse_password: Option<String>,
     clickhouse_database: String,
     clickhouse_events_table: String,
+    clickhouse_event_text_index_table: String,
+    clickhouse_event_search_terms_table: String,
+    clickhouse_event_kv_index_table: String,
     clickhouse_field_index_table: String,
     clickhouse_event_measures_table: String,
+    clickhouse_measure_cube_points_table: String,
+    clickhouse_measure_cube_rollups_table: String,
     clickhouse_counter_rollups_table: String,
     clickhouse_gauge_rollups_table: String,
     clickhouse_histogram_rollups_table: String,
     clickhouse_entity_state_updates_table: String,
+    clickhouse_entity_state_current_table: String,
     clickhouse_report_results_table: String,
     clickhouse_sequence_report_results_table: String,
     clickhouse_cohort_memberships_table: String,
@@ -42,6 +57,26 @@ struct Config {
     rebuild_derived: bool,
     incremental_materialize: bool,
     materialize_loop: bool,
+    materialization_queue_executor: bool,
+    materialization_queue_max_chunks: usize,
+    materialization_queue_lease_secs: u64,
+    materialization_queue_worker_id: String,
+    lakehouse_maintenance: bool,
+    lakehouse_maintenance_small_file_bytes: u64,
+    lakehouse_native_compaction: bool,
+    lakehouse_native_compaction_min_input_files: usize,
+    lakehouse_native_compaction_target_file_size_bytes: u64,
+    lakehouse_maintenance_cmd: Option<String>,
+    lakehouse_query: bool,
+    lakehouse_query_tenant_id: Option<String>,
+    lakehouse_query_from: Option<String>,
+    lakehouse_query_to: Option<String>,
+    lakehouse_query_event_type: Option<String>,
+    lakehouse_query_text: Option<String>,
+    lakehouse_query_regex: Option<String>,
+    lakehouse_query_sql: Option<String>,
+    lakehouse_query_tables: Vec<LakehouseSqlTableSpec>,
+    lakehouse_query_limit: usize,
     commit_source: CommitSource,
     materialize_poll_interval: Duration,
     allow_non_empty: bool,
@@ -61,6 +96,12 @@ enum CommitSource {
 struct LakehouseReader {
     s3: S3Client,
     s3_max_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LakehouseSqlTableSpec {
+    name: String,
+    locations: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +142,7 @@ struct DefinitionRecord {
 struct ExtractionDefinitions {
     fields: Vec<FieldRule>,
     measures: Vec<MeasureRule>,
+    measure_cubes: Vec<MeasureCubeRule>,
     metric_rollups: Vec<MetricRollupRule>,
     states: Vec<StateRule>,
     reports: Vec<ReportRule>,
@@ -146,9 +188,33 @@ struct MeasureOutput {
 }
 
 #[derive(Debug, Clone)]
+struct MeasureCubeRule {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    matcher: Matcher,
+    output: MeasureCubeOutput,
+}
+
+#[derive(Debug, Clone)]
+struct MeasureCubeOutput {
+    measure_name: StringExpr,
+    value: NumberExpr,
+    unit: StringExpr,
+    dimension_sets: Vec<DimensionSetOutput>,
+    bucket_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
 struct DimensionOutput {
     name: String,
     value: StringExpr,
+}
+
+#[derive(Debug, Clone)]
+struct DimensionSetOutput {
+    id: String,
+    dimensions: Vec<DimensionOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,25 +396,49 @@ enum NumberExpr {
 
 #[derive(Debug, Default)]
 struct MaterializedCounts {
+    events: usize,
+    event_text_index: usize,
+    event_search_terms: usize,
+    event_kv_index: usize,
     field_index: usize,
     event_measures: usize,
+    measure_cube_points: usize,
     counter_rollups: usize,
     gauge_rollups: usize,
     histogram_rollups: usize,
     entity_state_updates: usize,
+    entity_state_current: usize,
     report_results: usize,
     sequence_report_results: usize,
     cohort_memberships: usize,
+    output_versions: Vec<MaterializedOutputVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializedOutputVersion {
+    tenant_id: String,
+    target_type: &'static str,
+    target_id: String,
+    target_version: u64,
+    row_count: u64,
+    source_start: String,
+    source_end: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MaterializeTargets {
+    events: bool,
+    event_text_index: bool,
+    event_search_terms: bool,
+    event_kv_index: bool,
     field_index: bool,
     event_measures: bool,
+    measure_cube_points: bool,
     counter_rollups: bool,
     gauge_rollups: bool,
     histogram_rollups: bool,
     entity_state_updates: bool,
+    entity_state_current: bool,
     report_results: bool,
     sequence_report_results: bool,
     cohort_memberships: bool,
@@ -362,14 +452,40 @@ struct MaterializeOptions<'a> {
 }
 
 impl MaterializeTargets {
+    fn none() -> Self {
+        Self {
+            events: false,
+            event_text_index: false,
+            event_search_terms: false,
+            event_kv_index: false,
+            field_index: false,
+            event_measures: false,
+            measure_cube_points: false,
+            counter_rollups: false,
+            gauge_rollups: false,
+            histogram_rollups: false,
+            entity_state_updates: false,
+            entity_state_current: false,
+            report_results: false,
+            sequence_report_results: false,
+            cohort_memberships: false,
+        }
+    }
+
     fn all() -> Self {
         Self {
+            events: false,
+            event_text_index: true,
+            event_search_terms: true,
+            event_kv_index: true,
             field_index: true,
             event_measures: true,
+            measure_cube_points: true,
             counter_rollups: true,
             gauge_rollups: true,
             histogram_rollups: true,
             entity_state_updates: true,
+            entity_state_current: true,
             report_results: true,
             sequence_report_results: true,
             cohort_memberships: true,
@@ -377,12 +493,18 @@ impl MaterializeTargets {
     }
 
     fn any(self) -> bool {
-        self.field_index
+        self.events
+            || self.event_text_index
+            || self.event_search_terms
+            || self.event_kv_index
+            || self.field_index
             || self.event_measures
+            || self.measure_cube_points
             || self.counter_rollups
             || self.gauge_rollups
             || self.histogram_rollups
             || self.entity_state_updates
+            || self.entity_state_current
             || self.report_results
             || self.sequence_report_results
             || self.cohort_memberships
@@ -432,6 +554,25 @@ struct EventMeasureRow {
 }
 
 #[derive(Debug, Serialize)]
+struct MeasureCubePointRow {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: u64,
+    measure_name: String,
+    value: f64,
+    unit: String,
+    timestamp: String,
+    bucket_time: String,
+    bucket_seconds: u32,
+    event_id: String,
+    event_type: String,
+    signal: String,
+    dimension_set_id: String,
+    dimension_names: Vec<String>,
+    dimension_values: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct CounterRollupRow {
     tenant_id: String,
     definition_id: String,
@@ -478,7 +619,7 @@ struct HistogramRollupRow {
     max: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct EntityStateUpdateRow {
     tenant_id: String,
     definition_id: String,
@@ -556,6 +697,174 @@ struct ServingWatermarkRow<'a> {
     attributes: Value,
 }
 
+#[derive(Debug, Serialize)]
+struct MaterializationVersionPublishRow<'a> {
+    tenant_id: &'a str,
+    target_type: &'a str,
+    target_id: &'a str,
+    target_version: u64,
+    status: &'a str,
+    active: u8,
+    source_start: &'a str,
+    source_end: &'a str,
+    row_count: u64,
+    chunk_count: u64,
+    config_hash: u64,
+    config: Value,
+    stats: Value,
+    completed_at: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationWatermarkPublishRow<'a> {
+    tenant_id: &'a str,
+    target_type: &'a str,
+    target_id: &'a str,
+    target_version: u64,
+    source_table: &'a str,
+    low_watermark: &'a str,
+    high_watermark: &'a str,
+    status: &'a str,
+    lag_ms: u64,
+    attributes: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationJobPublishRow<'a> {
+    tenant_id: &'a str,
+    job_id: String,
+    job_kind: &'a str,
+    status: &'a str,
+    priority: u8,
+    target_type: &'a str,
+    target_table: &'a str,
+    target_id: &'a str,
+    target_version: u64,
+    source_table: &'a str,
+    source_start: &'a str,
+    source_end: &'a str,
+    chunk_seconds: u32,
+    total_chunks: u64,
+    completed_chunks: u64,
+    failed_chunks: u64,
+    rows_scanned: u64,
+    rows_written: u64,
+    bytes_scanned: u64,
+    bytes_written: u64,
+    lease_owner: &'a str,
+    leased_until: Option<&'a str>,
+    attempt: u32,
+    max_attempts: u32,
+    error: &'a str,
+    config: Value,
+    created_at: &'a str,
+    updated_at: &'a str,
+    completed_at: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationChunkPublishRow<'a> {
+    tenant_id: &'a str,
+    job_id: String,
+    chunk_id: String,
+    chunk_index: u64,
+    status: &'a str,
+    target_type: &'a str,
+    target_table: &'a str,
+    target_id: &'a str,
+    target_version: u64,
+    source_table: &'a str,
+    source_start: &'a str,
+    source_end: &'a str,
+    rows_scanned: u64,
+    rows_written: u64,
+    bytes_scanned: u64,
+    bytes_written: u64,
+    lease_owner: &'a str,
+    leased_until: Option<&'a str>,
+    attempt: u32,
+    max_attempts: u32,
+    error: &'a str,
+    started_at: Option<&'a str>,
+    updated_at: &'a str,
+    completed_at: Option<&'a str>,
+    attributes: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueuedMaterializationChunk {
+    tenant_id: String,
+    job_id: String,
+    chunk_id: String,
+    chunk_index: u64,
+    target_type: String,
+    target_table: String,
+    target_id: String,
+    target_version: u64,
+    source_table: String,
+    source_start: String,
+    source_end: String,
+    attempt: u32,
+    max_attempts: u32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MaterializationJobProgressRow {
+    completed_chunks: u64,
+    failed_chunks: u64,
+    rows_scanned: u64,
+    rows_written: u64,
+    total_chunks: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PipelineMetricRow {
+    tenant_id: String,
+    component: &'static str,
+    metric_name: &'static str,
+    value: f64,
+    unit: &'static str,
+    attributes: Value,
+}
+
+#[derive(Debug, Default)]
+struct LakehouseMaintenanceAudit {
+    commit_count: usize,
+    data_file_count: usize,
+    object_store_data_file_count: usize,
+    known_data_file_bytes: u64,
+    small_data_file_count: usize,
+    data_file_inspect_error_count: usize,
+    first_sequence: u64,
+    last_sequence: u64,
+    native_compaction_ran: bool,
+    native_compaction_success: bool,
+    native_compaction_compacted: bool,
+    native_compaction_input_file_count: usize,
+    native_compaction_input_small_file_count: usize,
+    native_compaction_input_record_count: usize,
+    native_compaction_output_file_count: usize,
+    native_compaction_output_record_count: usize,
+    native_compaction_snapshot_id: String,
+    native_compaction_sequence_number: u64,
+    native_compaction_reason: String,
+    external_command_ran: bool,
+    external_command_success: bool,
+    engine_maintenance_required: bool,
+    engine_maintenance_reason: String,
+}
+
+#[derive(Debug)]
+struct LakehouseQueryFilter {
+    tenant_id: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    event_type: Option<String>,
+    text: Option<String>,
+    regex: Option<Regex>,
+    limit: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct LakehouseCommitRecord {
     namespace: String,
@@ -589,8 +898,29 @@ async fn main() -> Result<()> {
         .build()
         .context("build HTTP client")?;
 
+    if cfg.lakehouse_maintenance {
+        run_lakehouse_maintenance(&client, &lakehouse_reader, &cfg).await?;
+        return Ok(());
+    }
+
+    if cfg.lakehouse_query {
+        let rows = run_lakehouse_query(&client, &lakehouse_reader, &cfg).await?;
+        eprintln!("lakehouse_query_rows={rows}");
+        return Ok(());
+    }
+
     if cfg.materialize_loop {
+        if cfg.materialization_queue_executor {
+            run_materialization_queue_loop(&client, &lakehouse_reader, &cfg).await?;
+            return Ok(());
+        }
         run_materializer_loop(&client, &lakehouse_reader, &cfg).await?;
+        return Ok(());
+    }
+
+    if cfg.materialization_queue_executor {
+        let chunks = run_materialization_queue_pass(&client, &lakehouse_reader, &cfg).await?;
+        println!("materialization_queue_executed_chunks={chunks}");
         return Ok(());
     }
 
@@ -604,9 +934,10 @@ async fn main() -> Result<()> {
             .await
             .context("load active materialization definitions")?;
         println!(
-            "materialization_definitions fields={} measures={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
+            "materialization_definitions fields={} measures={} measure_cubes={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
             definitions.fields.len(),
             definitions.measures.len(),
+            definitions.measure_cubes.len(),
             definitions.states.len(),
             definitions.reports.len(),
             definitions.trace_reports.len(),
@@ -656,12 +987,18 @@ async fn main() -> Result<()> {
     }
     if cfg.rebuild_derived && !cfg.allow_non_empty {
         for table in [
+            cfg.qualified_event_text_index_table(),
+            cfg.qualified_event_search_terms_table(),
+            cfg.qualified_event_kv_index_table(),
             cfg.qualified_field_index_table(),
             cfg.qualified_event_measures_table(),
+            cfg.qualified_measure_cube_points_table(),
+            cfg.qualified_measure_cube_rollups_table(),
             cfg.qualified_counter_rollups_table(),
             cfg.qualified_gauge_rollups_table(),
             cfg.qualified_histogram_rollups_table(),
             cfg.qualified_entity_state_updates_table(),
+            cfg.qualified_entity_state_current_table(),
             cfg.qualified_report_results_table(),
             cfg.qualified_sequence_report_results_table(),
             cfg.qualified_cohort_memberships_table(),
@@ -703,9 +1040,23 @@ impl Config {
     fn from_env() -> Result<Self> {
         let clickhouse_database = env_or("CLICKHOUSE_DATABASE", "observatory");
         let clickhouse_events_table = env_or("CLICKHOUSE_TABLE", "events");
+        let clickhouse_event_text_index_table =
+            env_or("CLICKHOUSE_EVENT_TEXT_INDEX_TABLE", "event_text_index");
+        let clickhouse_event_search_terms_table =
+            env_or("CLICKHOUSE_EVENT_SEARCH_TERMS_TABLE", "event_search_terms");
+        let clickhouse_event_kv_index_table =
+            env_or("CLICKHOUSE_EVENT_KV_INDEX_TABLE", "event_kv_index");
         let clickhouse_field_index_table = env_or("CLICKHOUSE_FIELD_INDEX_TABLE", "field_index");
         let clickhouse_event_measures_table =
             env_or("CLICKHOUSE_EVENT_MEASURES_TABLE", "event_measures");
+        let clickhouse_measure_cube_points_table = env_or(
+            "CLICKHOUSE_MEASURE_CUBE_POINTS_TABLE",
+            "measure_cube_points",
+        );
+        let clickhouse_measure_cube_rollups_table = env_or(
+            "CLICKHOUSE_MEASURE_CUBE_ROLLUPS_TABLE",
+            "measure_cube_rollups",
+        );
         let clickhouse_counter_rollups_table =
             env_or("CLICKHOUSE_COUNTER_ROLLUPS_TABLE", "counter_rollups");
         let clickhouse_gauge_rollups_table =
@@ -715,6 +1066,10 @@ impl Config {
         let clickhouse_entity_state_updates_table = env_or(
             "CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE",
             "entity_state_updates",
+        );
+        let clickhouse_entity_state_current_table = env_or(
+            "CLICKHOUSE_ENTITY_STATE_CURRENT_TABLE",
+            "entity_state_current",
         );
         let clickhouse_report_results_table =
             env_or("CLICKHOUSE_REPORT_RESULTS_TABLE", "report_results");
@@ -728,12 +1083,32 @@ impl Config {
         validate_identifier("CLICKHOUSE_DATABASE", &clickhouse_database)?;
         validate_identifier("CLICKHOUSE_TABLE", &clickhouse_events_table)?;
         validate_identifier(
+            "CLICKHOUSE_EVENT_TEXT_INDEX_TABLE",
+            &clickhouse_event_text_index_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_EVENT_SEARCH_TERMS_TABLE",
+            &clickhouse_event_search_terms_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_EVENT_KV_INDEX_TABLE",
+            &clickhouse_event_kv_index_table,
+        )?;
+        validate_identifier(
             "CLICKHOUSE_FIELD_INDEX_TABLE",
             &clickhouse_field_index_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_EVENT_MEASURES_TABLE",
             &clickhouse_event_measures_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_MEASURE_CUBE_POINTS_TABLE",
+            &clickhouse_measure_cube_points_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_MEASURE_CUBE_ROLLUPS_TABLE",
+            &clickhouse_measure_cube_rollups_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_COUNTER_ROLLUPS_TABLE",
@@ -750,6 +1125,10 @@ impl Config {
         validate_identifier(
             "CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE",
             &clickhouse_entity_state_updates_table,
+        )?;
+        validate_identifier(
+            "CLICKHOUSE_ENTITY_STATE_CURRENT_TABLE",
+            &clickhouse_entity_state_current_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_REPORT_RESULTS_TABLE",
@@ -771,7 +1150,7 @@ impl Config {
         Ok(Self {
             warehouse_dir: PathBuf::from(env_or(
                 "NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR",
-                "/data/lakehouse",
+                "/var/lib/nanotrace/lakehouse",
             )),
             namespace: env_or("NANOTRACE_LAKEHOUSE_NAMESPACE", "nanotrace"),
             source_table: env_or("NANOTRACE_LAKEHOUSE_TABLE", "events"),
@@ -780,12 +1159,18 @@ impl Config {
             clickhouse_password: optional("CLICKHOUSE_PASSWORD"),
             clickhouse_database,
             clickhouse_events_table,
+            clickhouse_event_text_index_table,
+            clickhouse_event_search_terms_table,
+            clickhouse_event_kv_index_table,
             clickhouse_field_index_table,
             clickhouse_event_measures_table,
+            clickhouse_measure_cube_points_table,
+            clickhouse_measure_cube_rollups_table,
             clickhouse_counter_rollups_table,
             clickhouse_gauge_rollups_table,
             clickhouse_histogram_rollups_table,
             clickhouse_entity_state_updates_table,
+            clickhouse_entity_state_current_table,
             clickhouse_report_results_table,
             clickhouse_sequence_report_results_table,
             clickhouse_cohort_memberships_table,
@@ -795,6 +1180,48 @@ impl Config {
             rebuild_derived: env_bool_default("NANOTRACE_REBUILD_DERIVED", true),
             incremental_materialize: env_bool("NANOTRACE_MATERIALIZE_INCREMENTAL"),
             materialize_loop: env_bool("NANOTRACE_MATERIALIZE_LOOP"),
+            materialization_queue_executor: env_bool("NANOTRACE_MATERIALIZATION_QUEUE_EXECUTOR"),
+            materialization_queue_max_chunks: optional_usize(
+                "NANOTRACE_MATERIALIZATION_QUEUE_MAX_CHUNKS",
+                10,
+            )?,
+            materialization_queue_lease_secs: optional_u64(
+                "NANOTRACE_MATERIALIZATION_QUEUE_LEASE_SECS",
+                300,
+            )?,
+            materialization_queue_worker_id: env_or(
+                "NANOTRACE_MATERIALIZATION_QUEUE_WORKER_ID",
+                "lakehouse-rebuild",
+            ),
+            lakehouse_maintenance: env_bool("NANOTRACE_LAKEHOUSE_MAINTENANCE"),
+            lakehouse_maintenance_small_file_bytes: optional_u64(
+                "NANOTRACE_LAKEHOUSE_MAINTENANCE_SMALL_FILE_BYTES",
+                128 * 1024 * 1024,
+            )?,
+            lakehouse_native_compaction: env_bool("NANOTRACE_LAKEHOUSE_NATIVE_COMPACTION"),
+            lakehouse_native_compaction_min_input_files: optional_usize(
+                "NANOTRACE_LAKEHOUSE_NATIVE_COMPACTION_MIN_INPUT_FILES",
+                2,
+            )?,
+            lakehouse_native_compaction_target_file_size_bytes: optional_u64(
+                "NANOTRACE_LAKEHOUSE_NATIVE_COMPACTION_TARGET_FILE_SIZE_BYTES",
+                512 * 1024 * 1024,
+            )?,
+            lakehouse_maintenance_cmd: optional("NANOTRACE_ICEBERG_MAINTENANCE_CMD"),
+            lakehouse_query: env_bool("NANOTRACE_LAKEHOUSE_QUERY"),
+            lakehouse_query_tenant_id: optional("NANOTRACE_LAKEHOUSE_QUERY_TENANT_ID"),
+            lakehouse_query_from: optional("NANOTRACE_LAKEHOUSE_QUERY_FROM"),
+            lakehouse_query_to: optional("NANOTRACE_LAKEHOUSE_QUERY_TO"),
+            lakehouse_query_event_type: optional("NANOTRACE_LAKEHOUSE_QUERY_EVENT_TYPE"),
+            lakehouse_query_text: optional("NANOTRACE_LAKEHOUSE_QUERY_TEXT"),
+            lakehouse_query_regex: optional("NANOTRACE_LAKEHOUSE_QUERY_REGEX"),
+            lakehouse_query_sql: optional("NANOTRACE_LAKEHOUSE_QUERY_SQL"),
+            lakehouse_query_tables: optional("NANOTRACE_LAKEHOUSE_QUERY_TABLES")
+                .as_deref()
+                .map(parse_lakehouse_sql_table_specs)
+                .transpose()?
+                .unwrap_or_default(),
+            lakehouse_query_limit: optional_usize("NANOTRACE_LAKEHOUSE_QUERY_LIMIT", 1000)?,
             commit_source: parse_commit_source(&env_or("NANOTRACE_REBUILD_COMMIT_SOURCE", "local"))
                 .context("parse NANOTRACE_REBUILD_COMMIT_SOURCE")?,
             materialize_poll_interval: Duration::from_secs(optional_u64(
@@ -830,6 +1257,27 @@ impl Config {
         )
     }
 
+    fn qualified_event_kv_index_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_event_kv_index_table
+        )
+    }
+
+    fn qualified_event_text_index_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_event_text_index_table
+        )
+    }
+
+    fn qualified_event_search_terms_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_event_search_terms_table
+        )
+    }
+
     fn qualified_field_index_table(&self) -> String {
         format!(
             "{}.{}",
@@ -841,6 +1289,20 @@ impl Config {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_event_measures_table
+        )
+    }
+
+    fn qualified_measure_cube_points_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_measure_cube_points_table
+        )
+    }
+
+    fn qualified_measure_cube_rollups_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_measure_cube_rollups_table
         )
     }
 
@@ -869,6 +1331,13 @@ impl Config {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_entity_state_updates_table
+        )
+    }
+
+    fn qualified_entity_state_current_table(&self) -> String {
+        format!(
+            "{}.{}",
+            self.clickhouse_database, self.clickhouse_entity_state_current_table
         )
     }
 
@@ -906,6 +1375,26 @@ impl Config {
 
     fn qualified_serving_watermarks_table(&self) -> String {
         format!("{}.serving_watermarks", self.clickhouse_database)
+    }
+
+    fn qualified_materialization_jobs_table(&self) -> String {
+        format!("{}.materialization_jobs", self.clickhouse_database)
+    }
+
+    fn qualified_materialization_chunks_table(&self) -> String {
+        format!("{}.materialization_chunks", self.clickhouse_database)
+    }
+
+    fn qualified_materialization_versions_table(&self) -> String {
+        format!("{}.materialization_versions", self.clickhouse_database)
+    }
+
+    fn qualified_materialization_watermarks_table(&self) -> String {
+        format!("{}.materialization_watermarks", self.clickhouse_database)
+    }
+
+    fn qualified_pipeline_metrics_table(&self) -> String {
+        format!("{}.pipeline_metrics", self.clickhouse_database)
     }
 }
 
@@ -980,15 +1469,21 @@ async fn rebuild_commit(
                 },
             )
             .await?;
+            materialized.event_text_index += counts.event_text_index;
+            materialized.event_search_terms += counts.event_search_terms;
+            materialized.event_kv_index += counts.event_kv_index;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
+            materialized.measure_cube_points += counts.measure_cube_points;
             materialized.counter_rollups += counts.counter_rollups;
             materialized.gauge_rollups += counts.gauge_rollups;
             materialized.histogram_rollups += counts.histogram_rollups;
             materialized.entity_state_updates += counts.entity_state_updates;
+            materialized.entity_state_current += counts.entity_state_current;
             materialized.report_results += counts.report_results;
             materialized.sequence_report_results += counts.sequence_report_results;
             materialized.cohort_memberships += counts.cohort_memberships;
+            materialized.output_versions.extend(counts.output_versions);
         }
     }
 
@@ -1047,18 +1542,46 @@ async fn run_incremental_materialize(
                 },
             )
             .await?;
+            materialized.event_kv_index += counts.event_kv_index;
+            materialized.events += counts.events;
+            materialized.event_text_index += counts.event_text_index;
+            materialized.event_search_terms += counts.event_search_terms;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
+            materialized.measure_cube_points += counts.measure_cube_points;
             materialized.counter_rollups += counts.counter_rollups;
             materialized.gauge_rollups += counts.gauge_rollups;
             materialized.histogram_rollups += counts.histogram_rollups;
             materialized.entity_state_updates += counts.entity_state_updates;
+            materialized.entity_state_current += counts.entity_state_current;
             materialized.report_results += counts.report_results;
             materialized.sequence_report_results += counts.sequence_report_results;
             materialized.cohort_memberships += counts.cohort_memberships;
+            materialized.output_versions.extend(counts.output_versions);
         }
         insert_incremental_materialization_metadata(client, cfg, commit, &materialized, targets)
             .await?;
+        if targets.events {
+            watermarks.insert(cfg.clickhouse_events_table.clone(), commit.sequence_number);
+        }
+        if targets.event_kv_index {
+            watermarks.insert(
+                cfg.clickhouse_event_kv_index_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.event_text_index {
+            watermarks.insert(
+                cfg.clickhouse_event_text_index_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.event_search_terms {
+            watermarks.insert(
+                cfg.clickhouse_event_search_terms_table.clone(),
+                commit.sequence_number,
+            );
+        }
         if targets.field_index {
             watermarks.insert(
                 cfg.clickhouse_field_index_table.clone(),
@@ -1068,6 +1591,12 @@ async fn run_incremental_materialize(
         if targets.event_measures {
             watermarks.insert(
                 cfg.clickhouse_event_measures_table.clone(),
+                commit.sequence_number,
+            );
+        }
+        if targets.measure_cube_points {
+            watermarks.insert(
+                cfg.clickhouse_measure_cube_rollups_table.clone(),
                 commit.sequence_number,
             );
         }
@@ -1095,6 +1624,12 @@ async fn run_incremental_materialize(
                 commit.sequence_number,
             );
         }
+        if targets.entity_state_current {
+            watermarks.insert(
+                cfg.clickhouse_entity_state_current_table.clone(),
+                commit.sequence_number,
+            );
+        }
         if targets.report_results {
             watermarks.insert(
                 cfg.clickhouse_report_results_table.clone(),
@@ -1114,16 +1649,22 @@ async fn run_incremental_materialize(
             );
         }
         println!(
-            "materialized snapshot={} sequence={} scanned_rows={} field_index_rows={} event_measure_rows={} counter_rollup_rows={} gauge_rollup_rows={} histogram_rollup_rows={} entity_state_update_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
+            "materialized snapshot={} sequence={} scanned_rows={} event_rows={} event_text_index_rows={} event_search_term_rows={} event_kv_index_rows={} field_index_rows={} event_measure_rows={} measure_cube_point_rows={} counter_rollup_rows={} gauge_rollup_rows={} histogram_rollup_rows={} entity_state_update_rows={} entity_state_current_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
             commit.snapshot_id,
             commit.sequence_number,
             commit_scanned_rows,
+            materialized.events,
+            materialized.event_text_index,
+            materialized.event_search_terms,
+            materialized.event_kv_index,
             materialized.field_index,
             materialized.event_measures,
+            materialized.measure_cube_points,
             materialized.counter_rollups,
             materialized.gauge_rollups,
             materialized.histogram_rollups,
             materialized.entity_state_updates,
+            materialized.entity_state_current,
             materialized.report_results,
             materialized.sequence_report_results,
             materialized.cohort_memberships
@@ -1177,9 +1718,10 @@ async fn run_materializer_pass(
         .await
         .context("load active materialization definitions")?;
     println!(
-        "materialization_definitions fields={} measures={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
+        "materialization_definitions fields={} measures={} measure_cubes={} states={} reports={} trace_reports={} retentions={} sequences={} cohorts={}",
         definitions.fields.len(),
         definitions.measures.len(),
+        definitions.measure_cubes.len(),
         definitions.states.len(),
         definitions.reports.len(),
         definitions.trace_reports.len(),
@@ -1190,12 +1732,1023 @@ async fn run_materializer_pass(
     run_incremental_materialize(client, lakehouse_reader, cfg, &commits, &definitions).await
 }
 
+async fn run_lakehouse_maintenance(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+) -> Result<()> {
+    let commits = read_available_commit_records(client, cfg).await?;
+    let mut audit = audit_lakehouse_maintenance(lakehouse_reader, cfg, &commits).await?;
+    if cfg.lakehouse_native_compaction {
+        audit.native_compaction_ran = true;
+        match run_native_lakehouse_compaction(cfg).await {
+            Ok(result) => {
+                audit.native_compaction_success = true;
+                apply_native_compaction_result(&mut audit, result);
+            }
+            Err(err) => {
+                audit.native_compaction_success = false;
+                audit.native_compaction_reason = format!("{err:#}");
+                eprintln!("native Iceberg compaction failed: {err:#}");
+            }
+        }
+    }
+    if let Some(command) = cfg.lakehouse_maintenance_cmd.as_deref() {
+        audit.external_command_ran = true;
+        audit.external_command_success = run_external_iceberg_maintenance_command(cfg, command)?;
+    }
+    publish_lakehouse_maintenance_metrics(client, cfg, &audit).await?;
+    println!(
+        "lakehouse_maintenance commit_count={} data_file_count={} object_store_data_file_count={} known_data_file_bytes={} small_data_file_count={} data_file_inspect_error_count={} native_compaction_ran={} native_compaction_success={} native_compaction_compacted={} native_compaction_input_files={} native_compaction_output_files={} command_ran={} command_success={} engine_maintenance_required={}",
+        audit.commit_count,
+        audit.data_file_count,
+        audit.object_store_data_file_count,
+        audit.known_data_file_bytes,
+        audit.small_data_file_count,
+        audit.data_file_inspect_error_count,
+        audit.native_compaction_ran,
+        audit.native_compaction_success,
+        audit.native_compaction_compacted,
+        audit.native_compaction_input_file_count,
+        audit.native_compaction_output_file_count,
+        audit.external_command_ran,
+        audit.external_command_success,
+        audit.engine_maintenance_required
+    );
+    if audit.native_compaction_ran && !audit.native_compaction_success {
+        bail!("native Iceberg compaction failed");
+    }
+    if audit.external_command_ran && !audit.external_command_success {
+        bail!("external Iceberg maintenance command failed");
+    }
+    Ok(())
+}
+
+async fn run_lakehouse_query(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+) -> Result<usize> {
+    if cfg
+        .lakehouse_query_sql
+        .as_deref()
+        .is_some_and(|sql| !sql.trim().is_empty())
+    {
+        return run_lakehouse_sql_query(client, lakehouse_reader, cfg).await;
+    }
+
+    let filter = LakehouseQueryFilter::from_config(cfg)?;
+    let commits = read_available_commit_records(client, cfg).await?;
+    let mut seen_data_files = BTreeSet::new();
+    let mut emitted = 0usize;
+    for commit in &commits {
+        let data_files = commit_data_files(commit);
+        for data_file in data_files {
+            if !seen_data_files.insert(data_file.clone()) {
+                continue;
+            }
+            let rows = lakehouse_reader
+                .read_event_rows(&data_file)
+                .await
+                .with_context(|| format!("lakehouse query read {data_file}"))?;
+            for row in rows {
+                if !lakehouse_query_row_matches(&row, &filter) {
+                    continue;
+                }
+                let output = serde_json::json!({
+                    "event_id": row.event_id,
+                    "timestamp": row.timestamp,
+                    "observed_timestamp": row.observed_timestamp,
+                    "ingested_timestamp": row.ingested_timestamp,
+                    "source_file": row.source_file,
+                    "source_offset": row.source_offset,
+                    "source_length": row.source_length,
+                    "source_namespace": commit.namespace,
+                    "source_table": commit.table,
+                    "source_snapshot_id": commit.snapshot_id,
+                    "source_sequence_number": commit.sequence_number,
+                    "source_data_file": data_file,
+                    "data": row.data,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string(&output).context("serialize lakehouse query row")?
+                );
+                emitted += 1;
+                if filter.limit > 0 && emitted >= filter.limit {
+                    return Ok(emitted);
+                }
+            }
+        }
+    }
+    Ok(emitted)
+}
+
+async fn run_lakehouse_sql_query(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+) -> Result<usize> {
+    let sql = cfg
+        .lakehouse_query_sql
+        .as_deref()
+        .map(str::trim)
+        .filter(|sql| !sql.is_empty())
+        .context("NANOTRACE_LAKEHOUSE_QUERY_SQL is required for SQL lakehouse query mode")?;
+    let commits = read_available_commit_records(client, cfg).await?;
+    let event_locations = unique_commit_data_files(&commits);
+    if event_locations.is_empty() {
+        bail!("no committed lakehouse data files are available for SQL query");
+    }
+
+    let mut tables = vec![LakehouseSqlTableSpec {
+        name: "events".to_string(),
+        locations: event_locations,
+    }];
+    tables.extend(cfg.lakehouse_query_tables.iter().cloned());
+    let stdout = std::io::stdout();
+    run_lakehouse_sql_query_for_tables(
+        lakehouse_reader,
+        tables,
+        sql,
+        cfg.lakehouse_query_limit,
+        stdout.lock(),
+    )
+    .await
+}
+
+async fn run_lakehouse_sql_query_for_tables<W: Write>(
+    lakehouse_reader: &LakehouseReader,
+    tables: Vec<LakehouseSqlTableSpec>,
+    sql: &str,
+    limit: usize,
+    output: W,
+) -> Result<usize> {
+    let ctx = SessionContext::new();
+    let mut tempdir = None::<tempfile::TempDir>;
+
+    for table in tables {
+        validate_lakehouse_sql_table_name(&table.name)?;
+        if table.locations.is_empty() {
+            bail!(
+                "lakehouse SQL table {} has no Parquet locations",
+                table.name
+            );
+        }
+        let paths = lakehouse_reader
+            .datafusion_local_paths(&table.locations, &mut tempdir)
+            .await
+            .with_context(|| format!("prepare lakehouse SQL table {}", table.name))?;
+        let frame = ctx
+            .read_parquet(paths, ParquetReadOptions::default())
+            .await
+            .with_context(|| format!("register Parquet inputs for {}", table.name))?;
+        ctx.register_table(&table.name, frame.into_view())
+            .with_context(|| format!("register lakehouse SQL table {}", table.name))?;
+    }
+
+    let batches = ctx
+        .sql(sql)
+        .await
+        .context("plan lakehouse SQL query")?
+        .collect()
+        .await
+        .context("execute lakehouse SQL query")?;
+    write_record_batches_as_ndjson(batches, limit, output)
+}
+
+fn write_record_batches_as_ndjson<W: Write>(
+    batches: Vec<RecordBatch>,
+    limit: usize,
+    output: W,
+) -> Result<usize> {
+    let mut writer = LineDelimitedWriter::new(output);
+    let mut emitted = 0usize;
+    for batch in batches {
+        if limit > 0 && emitted >= limit {
+            break;
+        }
+        let batch = if limit > 0 {
+            let remaining = limit - emitted;
+            if batch.num_rows() > remaining {
+                batch.slice(0, remaining)
+            } else {
+                batch
+            }
+        } else {
+            batch
+        };
+        emitted += batch.num_rows();
+        writer.write(&batch).context("write lakehouse SQL result")?;
+    }
+    writer.finish().context("finish lakehouse SQL output")?;
+    Ok(emitted)
+}
+
+impl LakehouseQueryFilter {
+    fn from_config(cfg: &Config) -> Result<Self> {
+        Ok(Self {
+            tenant_id: cfg.lakehouse_query_tenant_id.clone(),
+            from: cfg
+                .lakehouse_query_from
+                .as_deref()
+                .map(parse_required_event_timestamp)
+                .transpose()
+                .context("parse NANOTRACE_LAKEHOUSE_QUERY_FROM")?,
+            to: cfg
+                .lakehouse_query_to
+                .as_deref()
+                .map(parse_required_event_timestamp)
+                .transpose()
+                .context("parse NANOTRACE_LAKEHOUSE_QUERY_TO")?,
+            event_type: cfg.lakehouse_query_event_type.clone(),
+            text: cfg
+                .lakehouse_query_text
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            regex: cfg
+                .lakehouse_query_regex
+                .as_deref()
+                .map(Regex::new)
+                .transpose()
+                .context("compile NANOTRACE_LAKEHOUSE_QUERY_REGEX")?,
+            limit: cfg.lakehouse_query_limit,
+        })
+    }
+}
+
+fn commit_data_files(commit: &LakehouseCommit) -> Vec<String> {
+    if commit.data_files.is_empty() {
+        if commit.data_file.is_empty() {
+            Vec::new()
+        } else {
+            vec![commit.data_file.clone()]
+        }
+    } else {
+        commit.data_files.clone()
+    }
+}
+
+fn unique_commit_data_files(commits: &[LakehouseCommit]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut data_files = Vec::new();
+    for commit in commits {
+        for data_file in commit_data_files(commit) {
+            if seen.insert(data_file.clone()) {
+                data_files.push(data_file);
+            }
+        }
+    }
+    data_files
+}
+
+fn lakehouse_query_row_matches(row: &EventInsertRow, filter: &LakehouseQueryFilter) -> bool {
+    let data = row.data.as_object();
+    if let Some(tenant_id) = filter.tenant_id.as_deref()
+        && data
+            .map(|data| string_value(data.get("tenant_id")) != tenant_id)
+            .unwrap_or(true)
+    {
+        return false;
+    }
+    if let Some(event_type) = filter.event_type.as_deref()
+        && data
+            .map(|data| string_value(data.get("event_type")) != event_type)
+            .unwrap_or(true)
+    {
+        return false;
+    }
+    if filter.from.is_some() || filter.to.is_some() {
+        let Some(timestamp) = parse_event_timestamp(&row.timestamp) else {
+            return false;
+        };
+        if filter.from.as_ref().is_some_and(|from| timestamp < *from) {
+            return false;
+        }
+        if filter.to.as_ref().is_some_and(|to| timestamp >= *to) {
+            return false;
+        }
+    }
+    let mut haystack = None::<String>;
+    if let Some(needle) = filter.text.as_deref() {
+        let haystack_value = lakehouse_query_haystack(row);
+        let haystack_lower = haystack_value.to_ascii_lowercase();
+        if !haystack_lower.contains(needle) {
+            return false;
+        }
+        haystack = Some(haystack_value);
+    }
+    if let Some(regex) = filter.regex.as_ref() {
+        let haystack_value = haystack.get_or_insert_with(|| lakehouse_query_haystack(row));
+        if !regex.is_match(haystack_value) {
+            return false;
+        }
+    }
+    true
+}
+
+fn lakehouse_query_haystack(row: &EventInsertRow) -> String {
+    let data = serde_json::to_string(&row.data).unwrap_or_default();
+    if row.event_id.is_empty() {
+        data
+    } else if data.is_empty() {
+        row.event_id.clone()
+    } else {
+        format!("{}\n{}", row.event_id, data)
+    }
+}
+
+async fn audit_lakehouse_maintenance(
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+    commits: &[LakehouseCommit],
+) -> Result<LakehouseMaintenanceAudit> {
+    let mut audit = LakehouseMaintenanceAudit {
+        commit_count: commits.len(),
+        first_sequence: commits
+            .iter()
+            .map(|commit| commit.sequence_number)
+            .min()
+            .unwrap_or(0),
+        last_sequence: commits
+            .iter()
+            .map(|commit| commit.sequence_number)
+            .max()
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    let mut data_files = BTreeSet::new();
+    for commit in commits {
+        if commit.data_files.is_empty() {
+            if !commit.data_file.is_empty() {
+                data_files.insert(commit.data_file.clone());
+            }
+        } else {
+            data_files.extend(commit.data_files.iter().cloned());
+        }
+    }
+    audit.data_file_count = data_files.len();
+    for data_file in data_files {
+        if is_object_store_data_file(&data_file) {
+            audit.object_store_data_file_count += 1;
+        }
+        match lakehouse_reader.data_file_size(&data_file).await {
+            Ok(Some(size)) => {
+                audit.known_data_file_bytes = audit.known_data_file_bytes.saturating_add(size);
+                if size < cfg.lakehouse_maintenance_small_file_bytes {
+                    audit.small_data_file_count += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                audit.data_file_inspect_error_count += 1;
+                eprintln!("lakehouse maintenance could not inspect {data_file}: {err:#}");
+            }
+        }
+    }
+    if object_store_engine_maintenance_required(&audit, cfg) {
+        audit.engine_maintenance_required = true;
+        audit.engine_maintenance_reason = format!(
+            "object-store Iceberg table has {} small files and no NANOTRACE_ICEBERG_MAINTENANCE_CMD",
+            audit.small_data_file_count
+        );
+    }
+    Ok(audit)
+}
+
+fn is_object_store_data_file(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    lower.starts_with("s3://")
+        || lower.starts_with("s3a://")
+        || lower.starts_with("gs://")
+        || lower.starts_with("abfs://")
+        || lower.starts_with("abfss://")
+}
+
+fn object_store_engine_maintenance_required(
+    audit: &LakehouseMaintenanceAudit,
+    cfg: &Config,
+) -> bool {
+    audit.object_store_data_file_count > 0
+        && audit.small_data_file_count >= cfg.lakehouse_native_compaction_min_input_files
+        && cfg.lakehouse_maintenance_cmd.is_none()
+}
+
+async fn run_native_lakehouse_compaction(cfg: &Config) -> Result<LakehouseCompactionResult> {
+    let mut lakehouse_cfg = LakehouseConfig::events_table(cfg.warehouse_dir.clone())
+        .with_write_target_file_size_bytes(cfg.lakehouse_native_compaction_target_file_size_bytes);
+    lakehouse_cfg.namespace = cfg.namespace.clone();
+    lakehouse_cfg.table = cfg.source_table.clone();
+    compact_events_iceberg(
+        &lakehouse_cfg,
+        LakehouseCompactionOptions {
+            small_file_bytes: cfg.lakehouse_maintenance_small_file_bytes,
+            min_input_files: cfg.lakehouse_native_compaction_min_input_files,
+            target_file_size_bytes: cfg.lakehouse_native_compaction_target_file_size_bytes,
+        },
+    )
+    .await
+}
+
+fn apply_native_compaction_result(
+    audit: &mut LakehouseMaintenanceAudit,
+    result: LakehouseCompactionResult,
+) {
+    audit.native_compaction_compacted = result.compacted;
+    audit.native_compaction_input_file_count = result.input_file_count;
+    audit.native_compaction_input_small_file_count = result.input_small_file_count;
+    audit.native_compaction_input_record_count = result.input_record_count;
+    audit.native_compaction_output_file_count = result.output_file_count;
+    audit.native_compaction_output_record_count = result.output_record_count;
+    audit.native_compaction_snapshot_id = result.snapshot_id.unwrap_or_default();
+    audit.native_compaction_sequence_number = result.sequence_number.unwrap_or(0);
+    audit.native_compaction_reason = result.reason.unwrap_or_default();
+}
+
+fn run_external_iceberg_maintenance_command(cfg: &Config, command: &str) -> Result<bool> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("NANOTRACE_LAKEHOUSE_NAMESPACE", &cfg.namespace)
+        .env("NANOTRACE_LAKEHOUSE_TABLE", &cfg.source_table)
+        .env("NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR", &cfg.warehouse_dir)
+        .env(
+            "NANOTRACE_LAKEHOUSE_MAINTENANCE_SMALL_FILE_BYTES",
+            cfg.lakehouse_maintenance_small_file_bytes.to_string(),
+        )
+        .output()
+        .context("run external Iceberg maintenance command")?;
+    if !output.stdout.is_empty() {
+        println!(
+            "iceberg maintenance stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    if !output.stderr.is_empty() {
+        eprintln!(
+            "iceberg maintenance stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.status.success())
+}
+
+async fn publish_lakehouse_maintenance_metrics(
+    client: &Client,
+    cfg: &Config,
+    audit: &LakehouseMaintenanceAudit,
+) -> Result<()> {
+    let attributes = serde_json::json!({
+        "namespace": &cfg.namespace,
+        "table": &cfg.source_table,
+        "first_sequence": audit.first_sequence,
+        "last_sequence": audit.last_sequence,
+        "small_file_threshold_bytes": cfg.lakehouse_maintenance_small_file_bytes,
+        "native_compaction_configured": cfg.lakehouse_native_compaction,
+        "native_compaction_ran": audit.native_compaction_ran,
+        "native_compaction_success": audit.native_compaction_success,
+        "native_compaction_compacted": audit.native_compaction_compacted,
+        "native_compaction_min_input_files": cfg.lakehouse_native_compaction_min_input_files,
+        "native_compaction_target_file_size_bytes": cfg.lakehouse_native_compaction_target_file_size_bytes,
+        "native_compaction_snapshot_id": audit.native_compaction_snapshot_id,
+        "native_compaction_sequence_number": audit.native_compaction_sequence_number,
+        "native_compaction_reason": audit.native_compaction_reason,
+        "external_command_configured": cfg.lakehouse_maintenance_cmd.is_some(),
+        "external_command_ran": audit.external_command_ran,
+        "external_command_success": audit.external_command_success,
+        "object_store_data_file_count": audit.object_store_data_file_count,
+        "engine_maintenance_required": audit.engine_maintenance_required,
+        "engine_maintenance_reason": audit.engine_maintenance_reason,
+    });
+    let rows = vec![
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "commit_count",
+            value: audit.commit_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "data_file_count",
+            value: audit.data_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "object_store_data_file_count",
+            value: audit.object_store_data_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "known_data_file_bytes",
+            value: audit.known_data_file_bytes as f64,
+            unit: "bytes",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "small_data_file_count",
+            value: audit.small_data_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "data_file_inspect_error_count",
+            value: audit.data_file_inspect_error_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "native_compaction_input_file_count",
+            value: audit.native_compaction_input_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "native_compaction_input_small_file_count",
+            value: audit.native_compaction_input_small_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "native_compaction_input_record_count",
+            value: audit.native_compaction_input_record_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "native_compaction_output_file_count",
+            value: audit.native_compaction_output_file_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "native_compaction_output_record_count",
+            value: audit.native_compaction_output_record_count as f64,
+            unit: "count",
+            attributes: attributes.clone(),
+        },
+        PipelineMetricRow {
+            tenant_id: "system".to_string(),
+            component: "lakehouse_maintenance",
+            metric_name: "engine_maintenance_required",
+            value: if audit.engine_maintenance_required {
+                1.0
+            } else {
+                0.0
+            },
+            unit: "boolean",
+            attributes,
+        },
+    ];
+    let dedupe_token = format!(
+        "lakehouse-maintenance:pipeline_metrics:{}:{}:{}",
+        cfg.namespace,
+        cfg.source_table,
+        Utc::now().timestamp_millis()
+    );
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_pipeline_metrics_table(),
+        &rows_to_ndjson(&rows)?,
+        &dedupe_token,
+    )
+    .await
+}
+
+async fn run_materialization_queue_loop(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+) -> Result<()> {
+    println!(
+        "materialization queue executor starting namespace={} table={} poll_secs={} worker={}",
+        cfg.namespace,
+        cfg.source_table,
+        cfg.materialize_poll_interval.as_secs(),
+        cfg.materialization_queue_worker_id
+    );
+
+    loop {
+        match run_materialization_queue_pass(client, lakehouse_reader, cfg).await {
+            Ok(chunks) => {
+                println!("materialization queue pass complete chunks={chunks}");
+            }
+            Err(err) => {
+                eprintln!("materialization queue pass failed: {err:?}");
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(cfg.materialize_poll_interval) => {}
+            _ = shutdown_signal() => {
+                println!("materialization queue executor stopping");
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_materialization_queue_pass(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+) -> Result<usize> {
+    let chunks = pending_materialization_chunks(client, cfg).await?;
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let commits = read_available_commit_records(client, cfg).await?;
+    if commits.is_empty() {
+        return Ok(0);
+    }
+    let definitions = active_definitions(client, cfg)
+        .await
+        .context("load active materialization definitions")?;
+
+    let mut executed = 0usize;
+    for chunk in chunks {
+        claim_materialization_chunk(client, cfg, &chunk).await?;
+        match execute_materialization_chunk(
+            client,
+            lakehouse_reader,
+            cfg,
+            &commits,
+            &definitions,
+            &chunk,
+        )
+        .await
+        {
+            Ok(counts) => {
+                complete_materialization_chunk(client, cfg, &chunk, &counts).await?;
+                publish_queued_materialization_version(client, cfg, &chunk, &counts).await?;
+                refresh_materialization_job_progress(client, cfg, &chunk).await?;
+                executed += 1;
+            }
+            Err(err) => {
+                fail_materialization_chunk(client, cfg, &chunk, &err.to_string()).await?;
+                refresh_materialization_job_progress(client, cfg, &chunk).await?;
+                return Err(err).with_context(|| {
+                    format!(
+                        "execute materialization chunk {} for job {}",
+                        chunk.chunk_id, chunk.job_id
+                    )
+                });
+            }
+        }
+    }
+    Ok(executed)
+}
+
+async fn execute_materialization_chunk(
+    client: &Client,
+    lakehouse_reader: &LakehouseReader,
+    cfg: &Config,
+    commits: &[LakehouseCommit],
+    definitions: &ExtractionDefinitions,
+    chunk: &QueuedMaterializationChunk,
+) -> Result<MaterializedCounts> {
+    let source_start = parse_event_timestamp(&chunk.source_start).with_context(|| {
+        format!(
+            "parse materialization chunk source_start {}",
+            chunk.source_start
+        )
+    })?;
+    let source_end = parse_event_timestamp(&chunk.source_end).with_context(|| {
+        format!(
+            "parse materialization chunk source_end {}",
+            chunk.source_end
+        )
+    })?;
+    if source_end <= source_start {
+        bail!(
+            "materialization chunk {} has empty or negative source window {}..{}",
+            chunk.chunk_id,
+            chunk.source_start,
+            chunk.source_end
+        );
+    }
+    let expected_target_table = materialization_target_table(&chunk.target_type);
+    if chunk.target_table != expected_target_table {
+        bail!(
+            "materialization chunk {} target_table={} does not match target_type={} expected table {}",
+            chunk.chunk_id,
+            chunk.target_table,
+            chunk.target_type,
+            expected_target_table
+        );
+    }
+
+    let definitions = definitions_for_queued_target(definitions, chunk)?;
+    if !queued_definitions_have_target(&definitions, chunk.target_type.as_str()) {
+        bail!(
+            "no active literal {} definition found for target_id={} target_version={}",
+            chunk.target_type,
+            chunk.target_id,
+            chunk.target_version
+        );
+    }
+    let targets = materialize_targets_for_queued_target(chunk.target_type.as_str())?;
+    let mut total = MaterializedCounts::default();
+
+    for commit in commits {
+        let files = if commit.data_files.is_empty() {
+            vec![commit.data_file.clone()]
+        } else {
+            commit.data_files.clone()
+        };
+        for (file_index, data_file) in files.iter().enumerate() {
+            let rows = lakehouse_reader
+                .read_event_rows(data_file)
+                .await
+                .with_context(|| format!("read lakehouse data file {data_file}"))?;
+            let rows = rows
+                .into_iter()
+                .filter(|row| event_row_in_window(row, source_start, source_end))
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                continue;
+            }
+            let token_namespace = format!("queued-materialize:{}:{}", chunk.job_id, chunk.chunk_id);
+            let counts = materialize_rows(
+                client,
+                cfg,
+                commit,
+                &rows,
+                &definitions,
+                MaterializeOptions {
+                    file_index,
+                    targets,
+                    token_namespace: &token_namespace,
+                },
+            )
+            .await?;
+            total.events += rows.len();
+            total.report_results += counts.report_results;
+            total.sequence_report_results += counts.sequence_report_results;
+            total.cohort_memberships += counts.cohort_memberships;
+            total.output_versions.extend(counts.output_versions);
+        }
+    }
+    Ok(total)
+}
+
+async fn pending_materialization_chunks(
+    client: &Client,
+    cfg: &Config,
+) -> Result<Vec<QueuedMaterializationChunk>> {
+    let query = format!(
+        "SELECT tenant_id, job_id, chunk_id, chunk_index, target_type, target_table, target_id, target_version, source_table, source_start, source_end, attempt, max_attempts FROM {} FINAL WHERE source_table = '{}' AND status IN ('pending', 'retry') AND attempt < max_attempts AND (isNull(leased_until) OR leased_until < now64(3)) ORDER BY source_start, job_id, chunk_index LIMIT {} FORMAT JSON",
+        cfg.qualified_materialization_chunks_table(),
+        sql_string(&cfg.source_table),
+        cfg.materialization_queue_max_chunks
+    );
+    let body = clickhouse_query(client, cfg, &query).await?;
+    let response: ClickHouseJson<QueuedMaterializationChunk> =
+        serde_json::from_str(&body).context("parse pending materialization chunks response")?;
+    Ok(response.data)
+}
+
+async fn claim_materialization_chunk(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+) -> Result<()> {
+    let lease_until = format!(
+        "now64(3) + INTERVAL {} SECOND",
+        cfg.materialization_queue_lease_secs
+    );
+    let predicate = materialization_chunk_predicate(chunk);
+    let query = format!(
+        "ALTER TABLE {} UPDATE status = 'running', lease_owner = '{}', leased_until = {lease_until}, started_at = ifNull(started_at, now64(3)), updated_at = now64(3), attempt = attempt + 1 WHERE {predicate} SETTINGS mutations_sync = 1",
+        cfg.qualified_materialization_chunks_table(),
+        sql_string(&cfg.materialization_queue_worker_id),
+    );
+    clickhouse_query(client, cfg, &query).await?;
+    Ok(())
+}
+
+async fn complete_materialization_chunk(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+    counts: &MaterializedCounts,
+) -> Result<()> {
+    let rows_written = queued_rows_written(chunk.target_type.as_str(), counts);
+    let predicate = materialization_chunk_predicate(chunk);
+    let query = format!(
+        "ALTER TABLE {} UPDATE status = 'completed', rows_scanned = {}, rows_written = {}, lease_owner = '', leased_until = NULL, error = '', updated_at = now64(3), completed_at = now64(3) WHERE {predicate} SETTINGS mutations_sync = 1",
+        cfg.qualified_materialization_chunks_table(),
+        counts.events,
+        rows_written,
+    );
+    clickhouse_query(client, cfg, &query).await?;
+    Ok(())
+}
+
+async fn fail_materialization_chunk(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+    error: &str,
+) -> Result<()> {
+    let status = if chunk.attempt + 1 >= chunk.max_attempts {
+        "failed"
+    } else {
+        "retry"
+    };
+    let predicate = materialization_chunk_predicate(chunk);
+    let query = format!(
+        "ALTER TABLE {} UPDATE status = '{status}', lease_owner = '', leased_until = NULL, error = '{}', updated_at = now64(3) WHERE {predicate} SETTINGS mutations_sync = 1",
+        cfg.qualified_materialization_chunks_table(),
+        sql_string(error),
+    );
+    clickhouse_query(client, cfg, &query).await?;
+    Ok(())
+}
+
+async fn refresh_materialization_job_progress(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+) -> Result<()> {
+    let progress = materialization_job_progress(client, cfg, chunk).await?;
+    let status = if progress.failed_chunks > 0 {
+        "failed"
+    } else if progress.total_chunks > 0 && progress.completed_chunks >= progress.total_chunks {
+        "completed"
+    } else {
+        "running"
+    };
+    let completed_at = if status == "completed" {
+        "now64(3)"
+    } else {
+        "NULL"
+    };
+    let query = format!(
+        "ALTER TABLE {} UPDATE status = '{status}', completed_chunks = {}, failed_chunks = {}, rows_scanned = {}, rows_written = {}, lease_owner = '{}', leased_until = NULL, updated_at = now64(3), completed_at = {completed_at} WHERE tenant_id = '{}' AND job_id = '{}' SETTINGS mutations_sync = 1",
+        cfg.qualified_materialization_jobs_table(),
+        progress.completed_chunks,
+        progress.failed_chunks,
+        progress.rows_scanned,
+        progress.rows_written,
+        sql_string(&cfg.materialization_queue_worker_id),
+        sql_string(&chunk.tenant_id),
+        sql_string(&chunk.job_id),
+    );
+    clickhouse_query(client, cfg, &query).await?;
+    Ok(())
+}
+
+async fn materialization_job_progress(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+) -> Result<MaterializationJobProgressRow> {
+    let query = format!(
+        "SELECT countIf(status = 'completed') AS completed_chunks, countIf(status = 'failed') AS failed_chunks, sum(rows_scanned) AS rows_scanned, sum(rows_written) AS rows_written, count() AS total_chunks FROM {} FINAL WHERE tenant_id = '{}' AND job_id = '{}' FORMAT JSON",
+        cfg.qualified_materialization_chunks_table(),
+        sql_string(&chunk.tenant_id),
+        sql_string(&chunk.job_id),
+    );
+    let body = clickhouse_query(client, cfg, &query).await?;
+    let response: ClickHouseJson<MaterializationJobProgressRow> =
+        serde_json::from_str(&body).context("parse materialization job progress response")?;
+    Ok(response.data.into_iter().next().unwrap_or_default())
+}
+
+async fn publish_queued_materialization_version(
+    client: &Client,
+    cfg: &Config,
+    chunk: &QueuedMaterializationChunk,
+    counts: &MaterializedCounts,
+) -> Result<()> {
+    let rows_written = queued_rows_written(chunk.target_type.as_str(), counts);
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let target_type = queued_static_target_type(chunk.target_type.as_str())?;
+    let version = MaterializedOutputVersion {
+        tenant_id: chunk.tenant_id.clone(),
+        target_type,
+        target_id: chunk.target_id.clone(),
+        target_version: chunk.target_version,
+        row_count: rows_written,
+        source_start: chunk.source_start.clone(),
+        source_end: chunk.source_end.clone(),
+    };
+    let version_row = MaterializationVersionPublishRow {
+        tenant_id: &version.tenant_id,
+        target_type: version.target_type,
+        target_id: &version.target_id,
+        target_version: version.target_version,
+        status: "completed",
+        active: 1,
+        source_start: &version.source_start,
+        source_end: &version.source_end,
+        row_count: version.row_count,
+        chunk_count: 1,
+        config_hash: 0,
+        config: serde_json::json!({
+            "job_id": &chunk.job_id,
+            "chunk_id": &chunk.chunk_id,
+            "chunk_index": chunk.chunk_index,
+            "executor": "queued_materialization"
+        }),
+        stats: serde_json::json!({
+            "rows_scanned": counts.events,
+            "rows_written": rows_written
+        }),
+        completed_at: completed_at.as_str(),
+    };
+    let watermark_row = MaterializationWatermarkPublishRow {
+        tenant_id: &version.tenant_id,
+        target_type: version.target_type,
+        target_id: &version.target_id,
+        target_version: version.target_version,
+        source_table: &chunk.source_table,
+        low_watermark: &version.source_start,
+        high_watermark: &version.source_end,
+        status: "materialized",
+        lag_ms: 0,
+        attributes: serde_json::json!({
+            "job_id": &chunk.job_id,
+            "chunk_id": &chunk.chunk_id,
+            "chunk_index": chunk.chunk_index,
+            "rows_scanned": counts.events,
+            "rows_written": rows_written,
+            "executor": "queued_materialization"
+        }),
+    };
+    let token_prefix = format!(
+        "queued-materialize-metadata:{}:{}",
+        chunk.job_id, chunk.chunk_id
+    );
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_versions_table(),
+        &rows_to_ndjson(&[version_row])?,
+        &format!("{token_prefix}:materialization_versions"),
+    )
+    .await?;
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_watermarks_table(),
+        &rows_to_ndjson(&[watermark_row])?,
+        &format!("{token_prefix}:materialization_watermarks"),
+    )
+    .await?;
+    Ok(())
+}
+
 fn materialize_targets_for_commit(
     cfg: &Config,
     sequence_number: u64,
     watermarks: &HashMap<String, u64>,
 ) -> MaterializeTargets {
     MaterializeTargets {
+        events: watermarks
+            .get(&cfg.clickhouse_events_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        event_text_index: watermarks
+            .get(&cfg.clickhouse_event_text_index_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        event_search_terms: watermarks
+            .get(&cfg.clickhouse_event_search_terms_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        event_kv_index: watermarks
+            .get(&cfg.clickhouse_event_kv_index_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
         field_index: watermarks
             .get(&cfg.clickhouse_field_index_table)
             .copied()
@@ -1203,6 +2756,11 @@ fn materialize_targets_for_commit(
             < sequence_number,
         event_measures: watermarks
             .get(&cfg.clickhouse_event_measures_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
+        measure_cube_points: watermarks
+            .get(&cfg.clickhouse_measure_cube_rollups_table)
             .copied()
             .unwrap_or(0)
             < sequence_number,
@@ -1226,6 +2784,11 @@ fn materialize_targets_for_commit(
             .copied()
             .unwrap_or(0)
             < sequence_number,
+        entity_state_current: watermarks
+            .get(&cfg.clickhouse_entity_state_current_table)
+            .copied()
+            .unwrap_or(0)
+            < sequence_number,
         report_results: watermarks
             .get(&cfg.clickhouse_report_results_table)
             .copied()
@@ -1244,6 +2807,158 @@ fn materialize_targets_for_commit(
     }
 }
 
+fn materialize_targets_for_queued_target(target_type: &str) -> Result<MaterializeTargets> {
+    let mut targets = MaterializeTargets::none();
+    match target_type {
+        "report" => targets.report_results = true,
+        "sequence" => targets.sequence_report_results = true,
+        "cohort" => targets.cohort_memberships = true,
+        other => bail!(
+            "queued materialization target_type must be report, sequence, or cohort; got {other}"
+        ),
+    }
+    Ok(targets)
+}
+
+fn definitions_for_queued_target(
+    definitions: &ExtractionDefinitions,
+    chunk: &QueuedMaterializationChunk,
+) -> Result<ExtractionDefinitions> {
+    let mut filtered = ExtractionDefinitions::default();
+    match chunk.target_type.as_str() {
+        "report" => {
+            filtered.reports = definitions
+                .reports
+                .iter()
+                .filter(|rule| queued_report_rule_matches(rule, chunk))
+                .cloned()
+                .collect();
+            filtered.trace_reports = definitions
+                .trace_reports
+                .iter()
+                .filter(|rule| queued_trace_report_rule_matches(rule, chunk))
+                .cloned()
+                .collect();
+            filtered.retentions = definitions
+                .retentions
+                .iter()
+                .filter(|rule| queued_retention_rule_matches(rule, chunk))
+                .cloned()
+                .collect();
+        }
+        "sequence" => {
+            filtered.sequences = definitions
+                .sequences
+                .iter()
+                .filter(|rule| queued_sequence_rule_matches(rule, chunk))
+                .cloned()
+                .collect();
+        }
+        "cohort" => {
+            filtered.cohorts = definitions
+                .cohorts
+                .iter()
+                .filter(|rule| queued_cohort_rule_matches(rule, chunk))
+                .cloned()
+                .collect();
+        }
+        other => bail!(
+            "queued materialization target_type must be report, sequence, or cohort; got {other}"
+        ),
+    }
+    Ok(filtered)
+}
+
+fn queued_definitions_have_target(definitions: &ExtractionDefinitions, target_type: &str) -> bool {
+    match target_type {
+        "report" => {
+            !definitions.reports.is_empty()
+                || !definitions.trace_reports.is_empty()
+                || !definitions.retentions.is_empty()
+        }
+        "sequence" => !definitions.sequences.is_empty(),
+        "cohort" => !definitions.cohorts.is_empty(),
+        _ => false,
+    }
+}
+
+fn queued_report_rule_matches(rule: &&ReportRule, chunk: &QueuedMaterializationChunk) -> bool {
+    rule.tenant_id == chunk.tenant_id
+        && rule.definition_version == chunk.target_version
+        && string_expr_literal_eq(&rule.output.report_id, &chunk.target_id)
+}
+
+fn queued_trace_report_rule_matches(
+    rule: &&TraceReportRule,
+    chunk: &QueuedMaterializationChunk,
+) -> bool {
+    rule.tenant_id == chunk.tenant_id
+        && rule.definition_version == chunk.target_version
+        && string_expr_literal_eq(&rule.output.report_id, &chunk.target_id)
+}
+
+fn queued_retention_rule_matches(
+    rule: &&RetentionRule,
+    chunk: &QueuedMaterializationChunk,
+) -> bool {
+    rule.tenant_id == chunk.tenant_id
+        && rule.definition_version == chunk.target_version
+        && string_expr_literal_eq(&rule.output.report_id, &chunk.target_id)
+}
+
+fn queued_sequence_rule_matches(rule: &&SequenceRule, chunk: &QueuedMaterializationChunk) -> bool {
+    rule.tenant_id == chunk.tenant_id
+        && rule.definition_version == chunk.target_version
+        && string_expr_literal_eq(&rule.output.report_id, &chunk.target_id)
+}
+
+fn queued_cohort_rule_matches(rule: &&CohortRule, chunk: &QueuedMaterializationChunk) -> bool {
+    rule.tenant_id == chunk.tenant_id
+        && rule.definition_version == chunk.target_version
+        && string_expr_literal_eq(&rule.output.cohort_id, &chunk.target_id)
+}
+
+fn string_expr_literal_eq(expr: &StringExpr, value: &str) -> bool {
+    matches!(expr, StringExpr::Literal(literal) if literal == value)
+}
+
+fn event_row_in_window(row: &EventInsertRow, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+    parse_event_timestamp(&row.timestamp)
+        .is_some_and(|timestamp| timestamp >= start && timestamp < end)
+}
+
+fn queued_rows_written(target_type: &str, counts: &MaterializedCounts) -> u64 {
+    match target_type {
+        "report" => counts.report_results.try_into().unwrap_or(u64::MAX),
+        "sequence" => counts
+            .sequence_report_results
+            .try_into()
+            .unwrap_or(u64::MAX),
+        "cohort" => counts.cohort_memberships.try_into().unwrap_or(u64::MAX),
+        _ => 0,
+    }
+}
+
+fn queued_static_target_type(target_type: &str) -> Result<&'static str> {
+    match target_type {
+        "report" => Ok("report"),
+        "sequence" => Ok("sequence"),
+        "cohort" => Ok("cohort"),
+        other => bail!(
+            "queued materialization target_type must be report, sequence, or cohort; got {other}"
+        ),
+    }
+}
+
+fn materialization_chunk_predicate(chunk: &QueuedMaterializationChunk) -> String {
+    format!(
+        "tenant_id = '{}' AND job_id = '{}' AND chunk_id = '{}'",
+        sql_string(&chunk.tenant_id),
+        sql_string(&chunk.job_id),
+        sql_string(&chunk.chunk_id)
+    )
+}
+
 async fn materialize_rows(
     client: &Client,
     cfg: &Config,
@@ -1252,22 +2967,43 @@ async fn materialize_rows(
     definitions: &ExtractionDefinitions,
     options: MaterializeOptions<'_>,
 ) -> Result<MaterializedCounts> {
+    let mut event_text_index = Vec::new();
+    let mut event_search_terms = Vec::new();
+    let mut event_kv_index = Vec::new();
     let mut field_index = Vec::new();
     let mut event_measures = Vec::new();
+    let mut measure_cube_points = Vec::new();
     let mut counter_rollups = Vec::new();
     let mut gauge_rollups = Vec::new();
     let mut histogram_rollups = Vec::new();
     let mut entity_state_updates = Vec::new();
+    let mut entity_state_current = Vec::new();
     let mut report_results = Vec::new();
     let mut sequence_report_results = Vec::new();
     let mut cohort_memberships = Vec::new();
 
     for row in rows {
+        if options.targets.event_text_index {
+            let value = serde_json::to_value(row).context("serialize event row for text index")?;
+            event_text_index.extend(event_text_index_rows(&value));
+        }
+        if options.targets.event_search_terms {
+            let value =
+                serde_json::to_value(row).context("serialize event row for search terms")?;
+            event_search_terms.extend(event_search_term_rows(&value));
+        }
+        if options.targets.event_kv_index {
+            let value = serde_json::to_value(row).context("serialize event row for KV index")?;
+            event_kv_index.extend(event_kv_index_rows(&value));
+        }
         if options.targets.field_index {
             field_index.extend(field_index_rows(row, definitions));
         }
         if options.targets.event_measures {
             event_measures.extend(event_measure_rows(row, definitions));
+        }
+        if options.targets.measure_cube_points {
+            measure_cube_points.extend(measure_cube_point_rows(row, definitions));
         }
         let metric_rows = metric_rollup_rows(row, definitions);
         if options.targets.counter_rollups {
@@ -1281,6 +3017,9 @@ async fn materialize_rows(
         }
         if options.targets.entity_state_updates {
             entity_state_updates.extend(entity_state_update_rows(row, definitions));
+        }
+        if options.targets.entity_state_current {
+            entity_state_current.extend(entity_state_update_rows(row, definitions));
         }
     }
     if options.targets.report_results {
@@ -1305,21 +3044,84 @@ async fn materialize_rows(
     }
 
     let counts = MaterializedCounts {
+        events: if options.targets.events {
+            rows.len()
+        } else {
+            0
+        },
+        event_text_index: event_text_index.len(),
+        event_search_terms: event_search_terms.len(),
+        event_kv_index: event_kv_index.len(),
         field_index: field_index.len(),
         event_measures: event_measures.len(),
+        measure_cube_points: measure_cube_points.len(),
         counter_rollups: counter_rollups.len(),
         gauge_rollups: gauge_rollups.len(),
         histogram_rollups: histogram_rollups.len(),
         entity_state_updates: entity_state_updates.len(),
+        entity_state_current: entity_state_current.len(),
         report_results: report_results.len(),
         sequence_report_results: sequence_report_results.len(),
         cohort_memberships: cohort_memberships.len(),
+        output_versions: materialized_output_versions(
+            &report_results,
+            &sequence_report_results,
+            &cohort_memberships,
+        ),
     };
     let token_prefix = format!(
         "{}:{}:{}:{}",
         options.token_namespace, commit.namespace, commit.snapshot_id, options.file_index
     );
 
+    if options.targets.events && !rows.is_empty() {
+        let body = rows_to_ndjson(rows)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_events_table(),
+            &body,
+            &format!("{token_prefix}:events"),
+        )
+        .await
+        .context("insert materialized event rows")?;
+    }
+    if !event_text_index.is_empty() {
+        let body = rows_to_ndjson(&event_text_index)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_event_text_index_table(),
+            &body,
+            &format!("{token_prefix}:event_text_index"),
+        )
+        .await
+        .context("insert materialized event text index rows")?;
+    }
+    if !event_search_terms.is_empty() {
+        let body = rows_to_ndjson(&event_search_terms)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_event_search_terms_table(),
+            &body,
+            &format!("{token_prefix}:event_search_terms"),
+        )
+        .await
+        .context("insert materialized event search term rows")?;
+    }
+    if !event_kv_index.is_empty() {
+        let body = rows_to_ndjson(&event_kv_index)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_event_kv_index_table(),
+            &body,
+            &format!("{token_prefix}:event_kv_index"),
+        )
+        .await
+        .context("insert materialized event KV index rows")?;
+    }
     if !field_index.is_empty() {
         let body = rows_to_ndjson(&field_index)?;
         insert_clickhouse(
@@ -1343,6 +3145,18 @@ async fn materialize_rows(
         )
         .await
         .context("insert materialized event measure rows")?;
+    }
+    if !measure_cube_points.is_empty() {
+        let body = rows_to_ndjson(&measure_cube_points)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_measure_cube_points_table(),
+            &body,
+            &format!("{token_prefix}:measure_cube_points"),
+        )
+        .await
+        .context("insert materialized measure cube point rows")?;
     }
     if !counter_rollups.is_empty() {
         let body = rows_to_ndjson(&counter_rollups)?;
@@ -1392,6 +3206,18 @@ async fn materialize_rows(
         .await
         .context("insert materialized entity state rows")?;
     }
+    if !entity_state_current.is_empty() {
+        let body = rows_to_ndjson(&entity_state_current)?;
+        insert_clickhouse(
+            client,
+            cfg,
+            &cfg.qualified_entity_state_current_table(),
+            &body,
+            &format!("{token_prefix}:entity_state_current"),
+        )
+        .await
+        .context("insert materialized current entity state rows")?;
+    }
     if !report_results.is_empty() {
         let body = rows_to_ndjson(&report_results)?;
         insert_clickhouse(
@@ -1432,6 +3258,164 @@ async fn materialize_rows(
     Ok(counts)
 }
 
+fn materialized_output_versions(
+    report_results: &[ReportResultRow],
+    sequence_report_results: &[SequenceReportResultRow],
+    cohort_memberships: &[CohortMembershipRow],
+) -> Vec<MaterializedOutputVersion> {
+    let mut versions =
+        HashMap::<(String, &'static str, String, u64), MaterializedOutputVersion>::new();
+    for row in report_results {
+        push_materialized_output_version(
+            &mut versions,
+            &row.tenant_id,
+            "report",
+            &row.report_id,
+            row.report_version,
+            &row.bucket_time,
+            &row.bucket_time,
+        );
+    }
+    for row in sequence_report_results {
+        push_materialized_output_version(
+            &mut versions,
+            &row.tenant_id,
+            "sequence",
+            &row.report_id,
+            row.report_version,
+            &row.bucket_time,
+            &row.bucket_time,
+        );
+    }
+    for row in cohort_memberships {
+        push_materialized_output_version(
+            &mut versions,
+            &row.tenant_id,
+            "cohort",
+            &row.cohort_id,
+            row.cohort_version,
+            &row.first_seen,
+            &row.last_seen,
+        );
+    }
+    let mut values = versions.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.target_type.cmp(right.target_type))
+            .then(left.target_id.cmp(&right.target_id))
+            .then(left.target_version.cmp(&right.target_version))
+    });
+    values
+}
+
+fn push_materialized_output_version(
+    versions: &mut HashMap<(String, &'static str, String, u64), MaterializedOutputVersion>,
+    tenant_id: &str,
+    target_type: &'static str,
+    target_id: &str,
+    target_version: u64,
+    source_start: &str,
+    source_end: &str,
+) {
+    if tenant_id.is_empty()
+        || target_id.is_empty()
+        || source_start.is_empty()
+        || source_end.is_empty()
+    {
+        return;
+    }
+    let key = (
+        tenant_id.to_string(),
+        target_type,
+        target_id.to_string(),
+        target_version,
+    );
+    versions
+        .entry(key)
+        .and_modify(|version| {
+            version.row_count += 1;
+            if source_start < version.source_start.as_str() {
+                version.source_start = source_start.to_string();
+            }
+            if source_end > version.source_end.as_str() {
+                version.source_end = source_end.to_string();
+            }
+        })
+        .or_insert_with(|| MaterializedOutputVersion {
+            tenant_id: tenant_id.to_string(),
+            target_type,
+            target_id: target_id.to_string(),
+            target_version,
+            row_count: 1,
+            source_start: source_start.to_string(),
+            source_end: source_end.to_string(),
+        });
+}
+
+fn combined_materialized_output_versions(
+    versions: &[MaterializedOutputVersion],
+) -> Vec<MaterializedOutputVersion> {
+    let mut combined =
+        HashMap::<(String, &'static str, String, u64), MaterializedOutputVersion>::new();
+    for version in versions {
+        let key = (
+            version.tenant_id.clone(),
+            version.target_type,
+            version.target_id.clone(),
+            version.target_version,
+        );
+        combined
+            .entry(key)
+            .and_modify(|current| {
+                current.row_count += version.row_count;
+                if version.source_start < current.source_start {
+                    current.source_start = version.source_start.clone();
+                }
+                if version.source_end > current.source_end {
+                    current.source_end = version.source_end.clone();
+                }
+            })
+            .or_insert_with(|| version.clone());
+    }
+    let mut values = combined.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then(left.target_type.cmp(right.target_type))
+            .then(left.target_id.cmp(&right.target_id))
+            .then(left.target_version.cmp(&right.target_version))
+    });
+    values
+}
+
+fn materialization_target_table(target_type: &str) -> &'static str {
+    match target_type {
+        "cohort" => "cohort_memberships",
+        "sequence" => "sequence_report_results",
+        _ => "report_results",
+    }
+}
+
+fn materialization_job_id(commit: &LakehouseCommit, version: &MaterializedOutputVersion) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        commit.namespace,
+        commit.snapshot_id,
+        version.tenant_id,
+        version.target_type,
+        version.target_id,
+        version.target_version
+    )
+}
+
+fn materialization_chunk_id(
+    commit: &LakehouseCommit,
+    version: &MaterializedOutputVersion,
+) -> String {
+    format!("{}:chunk:0", materialization_job_id(commit, version))
+}
+
 async fn insert_commit_metadata(
     client: &Client,
     cfg: &Config,
@@ -1470,12 +3454,17 @@ async fn insert_commit_metadata(
             "source_batch_id": &commit.source_batch_id,
             "rebuilt_rows": rebuilt_rows,
             "materialized_enabled": materialized_enabled,
+            "event_text_index_rows": materialized.event_text_index,
+            "event_search_term_rows": materialized.event_search_terms,
+            "event_kv_index_rows": materialized.event_kv_index,
             "field_index_rows": materialized.field_index,
             "event_measure_rows": materialized.event_measures,
+            "measure_cube_point_rows": materialized.measure_cube_points,
             "counter_rollup_rows": materialized.counter_rollups,
             "gauge_rollup_rows": materialized.gauge_rollups,
             "histogram_rollup_rows": materialized.histogram_rollups,
             "entity_state_update_rows": materialized.entity_state_updates,
+            "entity_state_current_rows": materialized.entity_state_current,
             "report_result_rows": materialized.report_results,
             "sequence_report_result_rows": materialized.sequence_report_results,
             "cohort_membership_rows": materialized.cohort_memberships,
@@ -1513,6 +3502,8 @@ async fn insert_commit_metadata(
         &format!("{token_prefix}:serving_watermarks"),
     )
     .await?;
+    insert_materialization_publication_metadata(client, cfg, commit, materialized, &token_prefix)
+        .await?;
     Ok(())
 }
 
@@ -1560,6 +3551,195 @@ async fn insert_incremental_materialization_metadata(
         &format!("{token_prefix}:serving_watermarks"),
     )
     .await?;
+    insert_materialization_publication_metadata(client, cfg, commit, materialized, &token_prefix)
+        .await?;
+    Ok(())
+}
+
+async fn insert_materialization_publication_metadata(
+    client: &Client,
+    cfg: &Config,
+    commit: &LakehouseCommit,
+    materialized: &MaterializedCounts,
+    token_prefix: &str,
+) -> Result<()> {
+    let versions = combined_materialized_output_versions(&materialized.output_versions);
+    if versions.is_empty() {
+        return Ok(());
+    }
+
+    let completed_at = format_timestamp_ms(commit.committed_at_ms)?;
+    let job_rows = versions
+        .iter()
+        .map(|version| {
+            let target_table = materialization_target_table(version.target_type);
+            MaterializationJobPublishRow {
+                tenant_id: &version.tenant_id,
+                job_id: materialization_job_id(commit, version),
+                job_kind: "lakehouse_commit",
+                status: "completed",
+                priority: 50,
+                target_type: version.target_type,
+                target_table,
+                target_id: &version.target_id,
+                target_version: version.target_version,
+                source_table: &commit.table,
+                source_start: &version.source_start,
+                source_end: &version.source_end,
+                chunk_seconds: 0,
+                total_chunks: 1,
+                completed_chunks: 1,
+                failed_chunks: 0,
+                rows_scanned: commit.record_count.try_into().unwrap_or(u64::MAX),
+                rows_written: version.row_count,
+                bytes_scanned: 0,
+                bytes_written: 0,
+                lease_owner: "lakehouse-rebuild",
+                leased_until: None,
+                attempt: 1,
+                max_attempts: 1,
+                error: "",
+                config: serde_json::json!({
+                    "source_namespace": &commit.namespace,
+                    "source_snapshot_id": &commit.snapshot_id,
+                    "source_sequence_number": commit.sequence_number,
+                    "metadata_location": &commit.metadata_location,
+                    "source_batch_id": &commit.source_batch_id,
+                }),
+                created_at: completed_at.as_str(),
+                updated_at: completed_at.as_str(),
+                completed_at: Some(completed_at.as_str()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let chunk_rows = versions
+        .iter()
+        .map(|version| {
+            let target_table = materialization_target_table(version.target_type);
+            MaterializationChunkPublishRow {
+                tenant_id: &version.tenant_id,
+                job_id: materialization_job_id(commit, version),
+                chunk_id: materialization_chunk_id(commit, version),
+                chunk_index: 0,
+                status: "completed",
+                target_type: version.target_type,
+                target_table,
+                target_id: &version.target_id,
+                target_version: version.target_version,
+                source_table: &commit.table,
+                source_start: &version.source_start,
+                source_end: &version.source_end,
+                rows_scanned: commit.record_count.try_into().unwrap_or(u64::MAX),
+                rows_written: version.row_count,
+                bytes_scanned: 0,
+                bytes_written: 0,
+                lease_owner: "lakehouse-rebuild",
+                leased_until: None,
+                attempt: 1,
+                max_attempts: 1,
+                error: "",
+                started_at: Some(completed_at.as_str()),
+                updated_at: completed_at.as_str(),
+                completed_at: Some(completed_at.as_str()),
+                attributes: serde_json::json!({
+                    "source_namespace": &commit.namespace,
+                    "source_snapshot_id": &commit.snapshot_id,
+                    "source_sequence_number": commit.sequence_number,
+                    "metadata_location": &commit.metadata_location,
+                    "source_batch_id": &commit.source_batch_id,
+                    "row_count": version.row_count,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    let version_rows = versions
+        .iter()
+        .map(|version| MaterializationVersionPublishRow {
+            tenant_id: &version.tenant_id,
+            target_type: version.target_type,
+            target_id: &version.target_id,
+            target_version: version.target_version,
+            status: "completed",
+            active: 1,
+            source_start: &version.source_start,
+            source_end: &version.source_end,
+            row_count: version.row_count,
+            chunk_count: 1,
+            config_hash: 0,
+            config: Value::Object(Map::new()),
+            stats: serde_json::json!({
+                "source_namespace": &commit.namespace,
+                "source_table": &commit.table,
+                "source_snapshot_id": &commit.snapshot_id,
+                "source_sequence_number": commit.sequence_number,
+                "metadata_location": &commit.metadata_location,
+                "source_batch_id": &commit.source_batch_id,
+            }),
+            completed_at: completed_at.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let watermark_rows = versions
+        .iter()
+        .map(|version| MaterializationWatermarkPublishRow {
+            tenant_id: &version.tenant_id,
+            target_type: version.target_type,
+            target_id: &version.target_id,
+            target_version: version.target_version,
+            source_table: &commit.table,
+            low_watermark: &version.source_start,
+            high_watermark: &version.source_end,
+            status: "materialized",
+            lag_ms: 0,
+            attributes: serde_json::json!({
+                "source_namespace": &commit.namespace,
+                "source_snapshot_id": &commit.snapshot_id,
+                "source_sequence_number": commit.sequence_number,
+                "row_count": version.row_count,
+                "metadata_location": &commit.metadata_location,
+                "source_batch_id": &commit.source_batch_id,
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    let jobs_body = rows_to_ndjson(&job_rows)?;
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_jobs_table(),
+        &jobs_body,
+        &format!("{token_prefix}:materialization_jobs"),
+    )
+    .await?;
+
+    let chunks_body = rows_to_ndjson(&chunk_rows)?;
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_chunks_table(),
+        &chunks_body,
+        &format!("{token_prefix}:materialization_chunks"),
+    )
+    .await?;
+
+    let versions_body = rows_to_ndjson(&version_rows)?;
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_versions_table(),
+        &versions_body,
+        &format!("{token_prefix}:materialization_versions"),
+    )
+    .await?;
+
+    let watermarks_body = rows_to_ndjson(&watermark_rows)?;
+    insert_clickhouse(
+        client,
+        cfg,
+        &cfg.qualified_materialization_watermarks_table(),
+        &watermarks_body,
+        &format!("{token_prefix}:materialization_watermarks"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1571,6 +3751,30 @@ fn materialized_watermarks<'a>(
 ) -> Vec<ServingWatermarkRow<'a>> {
     [
         (
+            cfg.clickhouse_events_table.as_str(),
+            "event_rows",
+            materialized.events,
+            targets.events,
+        ),
+        (
+            cfg.clickhouse_event_text_index_table.as_str(),
+            "event_text_index_rows",
+            materialized.event_text_index,
+            targets.event_text_index,
+        ),
+        (
+            cfg.clickhouse_event_search_terms_table.as_str(),
+            "event_search_term_rows",
+            materialized.event_search_terms,
+            targets.event_search_terms,
+        ),
+        (
+            cfg.clickhouse_event_kv_index_table.as_str(),
+            "event_kv_index_rows",
+            materialized.event_kv_index,
+            targets.event_kv_index,
+        ),
+        (
             cfg.clickhouse_field_index_table.as_str(),
             "field_index_rows",
             materialized.field_index,
@@ -1581,6 +3785,12 @@ fn materialized_watermarks<'a>(
             "event_measure_rows",
             materialized.event_measures,
             targets.event_measures,
+        ),
+        (
+            cfg.clickhouse_measure_cube_rollups_table.as_str(),
+            "measure_cube_point_rows",
+            materialized.measure_cube_points,
+            targets.measure_cube_points,
         ),
         (
             cfg.clickhouse_counter_rollups_table.as_str(),
@@ -1605,6 +3815,12 @@ fn materialized_watermarks<'a>(
             "entity_state_update_rows",
             materialized.entity_state_updates,
             targets.entity_state_updates,
+        ),
+        (
+            cfg.clickhouse_entity_state_current_table.as_str(),
+            "entity_state_current_rows",
+            materialized.entity_state_current,
+            targets.entity_state_current,
         ),
         (
             cfg.clickhouse_report_results_table.as_str(),
@@ -1752,6 +3968,7 @@ impl ExtractionDefinitions {
     fn from_records(records: Vec<DefinitionRecord>) -> Self {
         let mut fields = Vec::new();
         let mut measures = Vec::new();
+        let mut measure_cubes = Vec::new();
         let mut metric_rollups = Vec::new();
         let mut states = Vec::new();
         let mut reports = Vec::new();
@@ -1766,6 +3983,7 @@ impl ExtractionDefinitions {
                 }
                 "measure" | "rollup" => {
                     measures.extend(measure_rules_from_record(&record));
+                    measure_cubes.extend(measure_cube_rules_from_record(&record));
                 }
                 "metric_rollup" => {
                     metric_rollups.extend(metric_rollup_rules_from_record(&record));
@@ -1794,6 +4012,7 @@ impl ExtractionDefinitions {
         Self {
             fields,
             measures,
+            measure_cubes,
             metric_rollups,
             states,
             reports,
@@ -1920,6 +4139,48 @@ fn measure_rules_from_record(record: &DefinitionRecord) -> Vec<MeasureRule> {
     rules
 }
 
+fn measure_cube_rules_from_record(record: &DefinitionRecord) -> Vec<MeasureCubeRule> {
+    if record.kind != "measure" || record.mode != "cube" {
+        return Vec::new();
+    }
+    let matcher = matcher_from_config(&record.config);
+    generalized_outputs(&record.config, "measure_cube_rollups")
+        .filter(|output| {
+            output
+                .get("target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| target == "measure_cube_rollups")
+        })
+        .filter_map(|output| {
+            let dimension_sets = dimension_sets_from_output(output);
+            if dimension_sets.is_empty() {
+                return None;
+            }
+            let measure_name = string_expr_from_value(output.get("measure_name"))
+                .unwrap_or_else(|| StringExpr::Literal(record.name.clone()));
+            let value = number_expr_from_value(output.get("value"))?;
+            Some(MeasureCubeRule {
+                tenant_id: record.tenant_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.version,
+                matcher: matcher.clone(),
+                output: MeasureCubeOutput {
+                    measure_name,
+                    value,
+                    unit: string_expr_from_value(output.get("unit"))
+                        .unwrap_or_else(|| StringExpr::Literal(String::new())),
+                    dimension_sets,
+                    bucket_seconds: output
+                        .get("bucket_seconds")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.try_into().ok())
+                        .unwrap_or(300),
+                },
+            })
+        })
+        .collect()
+}
+
 fn metric_rollup_rules_from_record(record: &DefinitionRecord) -> Vec<MetricRollupRule> {
     let matcher = matcher_from_config(&record.config);
     generalized_outputs(&record.config, "metric_rollups")
@@ -2017,23 +4278,21 @@ fn state_rules_from_record(record: &DefinitionRecord) -> Vec<StateRule> {
 fn report_rules_from_record(record: &DefinitionRecord) -> Vec<ReportRule> {
     let matcher = matcher_from_config(&record.config);
     generalized_outputs(&record.config, "report_results")
-        .filter_map(|output| {
-            Some(ReportRule {
-                tenant_id: record.tenant_id.clone(),
-                definition_version: record.version,
-                matcher: matcher.clone(),
-                output: ReportOutput {
-                    report_id: string_expr_from_value(output.get("report_id"))
-                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
-                    dimensions: dimensions_from_output(output),
-                    metrics: report_metrics_from_output(output),
-                    bucket_seconds: output
-                        .get("bucket_seconds")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| value.try_into().ok())
-                        .unwrap_or(60),
-                },
-            })
+        .map(|output| ReportRule {
+            tenant_id: record.tenant_id.clone(),
+            definition_version: record.version,
+            matcher: matcher.clone(),
+            output: ReportOutput {
+                report_id: string_expr_from_value(output.get("report_id"))
+                    .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                dimensions: dimensions_from_output(output),
+                metrics: report_metrics_from_output(output),
+                bucket_seconds: output
+                    .get("bucket_seconds")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| value.try_into().ok())
+                    .unwrap_or(60),
+            },
         })
         .collect()
 }
@@ -2041,22 +4300,20 @@ fn report_rules_from_record(record: &DefinitionRecord) -> Vec<ReportRule> {
 fn trace_report_rules_from_record(record: &DefinitionRecord) -> Vec<TraceReportRule> {
     let matcher = matcher_from_config(&record.config);
     generalized_outputs(&record.config, "report_results")
-        .filter_map(|output| {
-            Some(TraceReportRule {
-                tenant_id: record.tenant_id.clone(),
-                definition_version: record.version,
-                matcher: matcher.clone(),
-                output: TraceReportOutput {
-                    report_id: string_expr_from_value(output.get("report_id"))
-                        .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
-                    dimensions: dimensions_from_output(output),
-                    bucket_seconds: output
-                        .get("bucket_seconds")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| value.try_into().ok())
-                        .unwrap_or(60),
-                },
-            })
+        .map(|output| TraceReportRule {
+            tenant_id: record.tenant_id.clone(),
+            definition_version: record.version,
+            matcher: matcher.clone(),
+            output: TraceReportOutput {
+                report_id: string_expr_from_value(output.get("report_id"))
+                    .unwrap_or_else(|| StringExpr::Literal(record.name.clone())),
+                dimensions: dimensions_from_output(output),
+                bucket_seconds: output
+                    .get("bucket_seconds")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| value.try_into().ok())
+                    .unwrap_or(60),
+            },
         })
         .collect()
 }
@@ -2207,7 +4464,7 @@ fn string_expr_from_value(value: Option<&Value>) -> Option<StringExpr> {
             }
             let default = object
                 .get("default")
-                .map(|value| scalar_value_to_string(value))
+                .map(scalar_value_to_string)
                 .unwrap_or_default();
             Some(StringExpr::Path { path, default })
         }
@@ -2258,6 +4515,41 @@ fn dimensions_from_output(output: &Map<String, Value>) -> Vec<DimensionOutput> {
             }
             let value = string_expr_from_value(object.get("value"))?;
             Some(DimensionOutput { name, value })
+        })
+        .collect()
+}
+
+fn dimension_sets_from_output(output: &Map<String, Value>) -> Vec<DimensionSetOutput> {
+    output
+        .get("dimension_sets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|dimension_sets| dimension_sets.iter())
+        .filter_map(|dimension_set| {
+            let object = dimension_set.as_object()?;
+            let id = object.get("id")?.as_str()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let dimensions = object
+                .get("dimensions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flat_map(|dimensions| dimensions.iter())
+                .filter_map(|dimension| {
+                    let object = dimension.as_object()?;
+                    let name = object.get("name")?.as_str()?.trim().to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = string_expr_from_value(object.get("value"))?;
+                    Some(DimensionOutput { name, value })
+                })
+                .collect::<Vec<_>>();
+            if dimensions.is_empty() {
+                return None;
+            }
+            Some(DimensionSetOutput { id, dimensions })
         })
         .collect()
 }
@@ -2565,6 +4857,65 @@ fn event_measure_rows(
                 signal: context.signal.clone(),
                 dimension_name,
                 dimension_value,
+            });
+        }
+    }
+    rows
+}
+
+fn measure_cube_point_rows(
+    row: &EventInsertRow,
+    definitions: &ExtractionDefinitions,
+) -> Vec<MeasureCubePointRow> {
+    let Some(data) = row.data.as_object() else {
+        return Vec::new();
+    };
+    let context = EventContext::from_event(row, data);
+    let mut rows = Vec::new();
+    for rule in &definitions.measure_cubes {
+        if rule.tenant_id != context.tenant_id || !rule.matcher.matches(data) {
+            continue;
+        }
+        let Some(value) = eval_number_expr(data, &rule.output.value) else {
+            continue;
+        };
+        let measure_name = eval_string_expr(data, &rule.output.measure_name);
+        if measure_name.is_empty() {
+            continue;
+        }
+        let unit = eval_string_expr(data, &rule.output.unit);
+        for dimension_set in &rule.output.dimension_sets {
+            let mut dimension_names = Vec::with_capacity(dimension_set.dimensions.len());
+            let mut dimension_values = Vec::with_capacity(dimension_set.dimensions.len());
+            let mut complete = true;
+            for dimension in &dimension_set.dimensions {
+                let value = eval_string_expr(data, &dimension.value);
+                if value.is_empty() {
+                    complete = false;
+                    break;
+                }
+                dimension_names.push(dimension.name.clone());
+                dimension_values.push(value);
+            }
+            if !complete || dimension_names.is_empty() {
+                continue;
+            }
+            rows.push(MeasureCubePointRow {
+                tenant_id: context.tenant_id.clone(),
+                definition_id: rule.definition_id.clone(),
+                definition_version: rule.definition_version,
+                measure_name: measure_name.clone(),
+                value,
+                unit: unit.clone(),
+                timestamp: context.timestamp.clone(),
+                bucket_time: context.bucket_time.clone(),
+                bucket_seconds: rule.output.bucket_seconds,
+                event_id: context.event_id.clone(),
+                event_type: context.event_type.clone(),
+                signal: context.signal.clone(),
+                dimension_set_id: dimension_set.id.clone(),
+                dimension_names,
+                dimension_values,
             });
         }
     }
@@ -2904,13 +5255,13 @@ fn trace_report_result_rows(
                         .entry("root_name".to_string())
                         .or_insert_with(|| Value::String(context.name.clone()));
                 }
-                if let Some(service) = data.get("service").map(scalar_value_to_string) {
-                    if !service.is_empty() {
-                        aggregate
-                            .dimensions
-                            .entry("root_service".to_string())
-                            .or_insert(Value::String(service));
-                    }
+                if let Some(service) = data.get("service").map(scalar_value_to_string)
+                    && !service.is_empty()
+                {
+                    aggregate
+                        .dimensions
+                        .entry("root_service".to_string())
+                        .or_insert(Value::String(service));
                 }
             }
             let start = context
@@ -2923,15 +5274,15 @@ fn trace_report_result_rows(
                 .as_deref()
                 .and_then(parse_event_timestamp)
                 .or_else(|| parse_event_timestamp(&context.timestamp));
-            if let Some(start) = start {
-                if aggregate.started_at.is_none_or(|current| start < current) {
-                    aggregate.started_at = Some(start);
-                }
+            if let Some(start) = start
+                && aggregate.started_at.is_none_or(|current| start < current)
+            {
+                aggregate.started_at = Some(start);
             }
-            if let Some(end) = end {
-                if aggregate.ended_at.is_none_or(|current| end > current) {
-                    aggregate.ended_at = Some(end);
-                }
+            if let Some(end) = end
+                && aggregate.ended_at.is_none_or(|current| end > current)
+            {
+                aggregate.ended_at = Some(end);
             }
         }
     }
@@ -3518,6 +5869,72 @@ impl LakehouseReader {
         }
     }
 
+    async fn datafusion_local_paths(
+        &self,
+        locations: &[String],
+        tempdir: &mut Option<tempfile::TempDir>,
+    ) -> Result<Vec<String>> {
+        let mut paths = Vec::with_capacity(locations.len());
+        for (index, location) in locations.iter().enumerate() {
+            match data_file_location(location)? {
+                DataFileLocation::Local(path) => {
+                    paths.push(path.display().to_string());
+                }
+                DataFileLocation::S3 { bucket, key } => {
+                    if tempdir.is_none() {
+                        *tempdir = Some(tempfile::tempdir().context(
+                            "create temporary directory for lakehouse SQL S3 Parquet inputs",
+                        )?);
+                    }
+                    let root = tempdir
+                        .as_ref()
+                        .expect("lakehouse SQL temporary directory")
+                        .path();
+                    let file_name = format!(
+                        "table-{}-{}.parquet",
+                        index,
+                        Sha256::digest(location.as_bytes())
+                            .iter()
+                            .take(8)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    );
+                    let path = root.join(file_name);
+                    let bytes = self.read_s3_object(&bucket, &key).await?;
+                    fs::write(&path, bytes)
+                        .with_context(|| format!("write temporary {}", path.display()))?;
+                    paths.push(path.display().to_string());
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    async fn data_file_size(&self, location: &str) -> Result<Option<u64>> {
+        match data_file_location(location)? {
+            DataFileLocation::Local(path) => match fs::metadata(&path) {
+                Ok(metadata) => Ok(Some(metadata.len())),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => {
+                    Err(err).with_context(|| format!("stat local Parquet {}", path.display()))
+                }
+            },
+            DataFileLocation::S3 { bucket, key } => {
+                let head = self
+                    .s3
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .with_context(|| format!("head s3://{bucket}/{key}"))?;
+                Ok(head
+                    .content_length()
+                    .and_then(|value| u64::try_from(value).ok()))
+            }
+        }
+    }
+
     async fn read_s3_object(&self, bucket: &str, key: &str) -> Result<Bytes> {
         let head = self
             .s3
@@ -3665,12 +6082,18 @@ async fn derived_watermark_sequences(
     cfg: &Config,
 ) -> Result<HashMap<String, u64>> {
     let serving_tables = [
+        cfg.clickhouse_events_table.as_str(),
+        cfg.clickhouse_event_text_index_table.as_str(),
+        cfg.clickhouse_event_search_terms_table.as_str(),
+        cfg.clickhouse_event_kv_index_table.as_str(),
         cfg.clickhouse_field_index_table.as_str(),
         cfg.clickhouse_event_measures_table.as_str(),
+        cfg.clickhouse_measure_cube_rollups_table.as_str(),
         cfg.clickhouse_counter_rollups_table.as_str(),
         cfg.clickhouse_gauge_rollups_table.as_str(),
         cfg.clickhouse_histogram_rollups_table.as_str(),
         cfg.clickhouse_entity_state_updates_table.as_str(),
+        cfg.clickhouse_entity_state_current_table.as_str(),
         cfg.clickhouse_report_results_table.as_str(),
         cfg.clickhouse_sequence_report_results_table.as_str(),
         cfg.clickhouse_cohort_memberships_table.as_str(),
@@ -3789,6 +6212,14 @@ fn format_timestamp_us(value: i64) -> Result<String> {
     Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
+fn format_timestamp_ms(value: i64) -> Result<String> {
+    let secs = value.div_euclid(1_000);
+    let millis = value.rem_euclid(1_000) as u32;
+    let dt = DateTime::<Utc>::from_timestamp(secs, millis * 1_000_000)
+        .ok_or_else(|| anyhow!("timestamp out of range: {value}"))?;
+    Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
 trait NonEmptyString {
     fn into_non_empty(self) -> Option<String>;
 }
@@ -3823,6 +6254,10 @@ fn parse_event_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
                 .map(|value| value.and_utc())
         })
         .ok()
+}
+
+fn parse_required_event_timestamp(timestamp: &str) -> Result<DateTime<Utc>> {
+    parse_event_timestamp(timestamp).ok_or_else(|| anyhow!("invalid timestamp: {timestamp}"))
 }
 
 fn string_value(value: Option<&Value>) -> String {
@@ -4074,6 +6509,10 @@ fn quote_ident(value: &str) -> Result<String> {
     }
 }
 
+fn sql_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
 fn env_or(key: &'static str, fallback: &'static str) -> String {
     optional(key).unwrap_or_else(|| fallback.to_string())
 }
@@ -4109,6 +6548,44 @@ fn optional_u64(key: &'static str, fallback: u64) -> Result<u64> {
     }
 }
 
+fn parse_lakehouse_sql_table_specs(value: &str) -> Result<Vec<LakehouseSqlTableSpec>> {
+    let mut tables = Vec::new();
+    for entry in value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (name, locations) = entry.split_once('=').with_context(|| {
+            format!("NANOTRACE_LAKEHOUSE_QUERY_TABLES entry must be name=path[,path]: {entry}")
+        })?;
+        let name = name.trim().to_string();
+        validate_lakehouse_sql_table_name(&name)?;
+        let locations = locations
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if locations.is_empty() {
+            bail!("lakehouse SQL table {name} must include at least one Parquet path");
+        }
+        tables.push(LakehouseSqlTableSpec { name, locations });
+    }
+    Ok(tables)
+}
+
+fn validate_lakehouse_sql_table_name(value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.chars().enumerate().all(|(index, ch)| {
+            ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || ch.is_ascii_alphabetic())
+        });
+    if valid {
+        Ok(())
+    } else {
+        bail!("lakehouse SQL table names must be simple identifiers")
+    }
+}
+
 fn validate_identifier(key: &'static str, value: &str) -> Result<()> {
     if value
         .chars()
@@ -4128,16 +6605,20 @@ fn quote_sql_string(value: &str) -> String {
 mod tests {
     use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+    use nanotrace_lakehouse::{LakehouseConfig, commit_events_ndjson_iceberg};
+    use regex::Regex;
     use serde_json::json;
 
     use super::{
-        CommitSource, Config, DataFileLocation, DefinitionRecord, EventInsertRow,
-        ExtractionDefinitions, LakehouseCommitRecord, cohort_membership_rows,
+        CohortMembershipRow, CommitSource, Config, DataFileLocation, DefinitionRecord,
+        EventInsertRow, ExtractionDefinitions, LakehouseCommitRecord, ReportResultRow,
+        SequenceReportResultRow, cohort_membership_rows, combined_materialized_output_versions,
         commit_record_to_commit, data_file_location, entity_state_update_rows, event_measure_rows,
-        field_index_rows, format_timestamp_us, materialize_targets_for_commit, metric_rollup_rows,
-        ndjson_chunks, report_result_rows, retention_report_result_rows,
-        sdk_metric_managed_definition_record, sequence_report_result_rows,
-        trace_report_result_rows,
+        field_index_rows, format_timestamp_us, materialization_chunk_id, materialization_job_id,
+        materialization_target_table, materialize_targets_for_commit, materialized_output_versions,
+        metric_rollup_rows, ndjson_chunks, queued_rows_written, report_result_rows,
+        retention_report_result_rows, sdk_metric_managed_definition_record,
+        sequence_report_result_rows, trace_report_result_rows,
     };
 
     #[test]
@@ -4158,6 +6639,407 @@ mod tests {
                 b"{\"a\":3}\n".as_slice()
             ]
         );
+    }
+
+    #[test]
+    fn materialized_output_versions_aggregate_report_sequence_and_cohort_rows() {
+        let reports = vec![
+            ReportResultRow {
+                tenant_id: "tenant-a".to_string(),
+                report_id: "checkout".to_string(),
+                report_version: 7,
+                bucket_time: "2026-06-04T00:00:00.000Z".to_string(),
+                dimensions: json!({}),
+                metrics: json!({"events": 1}),
+            },
+            ReportResultRow {
+                tenant_id: "tenant-a".to_string(),
+                report_id: "checkout".to_string(),
+                report_version: 7,
+                bucket_time: "2026-06-04T00:01:00.000Z".to_string(),
+                dimensions: json!({"plan": "pro"}),
+                metrics: json!({"events": 1}),
+            },
+        ];
+        let sequences = vec![SequenceReportResultRow {
+            tenant_id: "tenant-a".to_string(),
+            report_id: "signup".to_string(),
+            report_version: 3,
+            bucket_time: "2026-06-04T00:00:00.000Z".to_string(),
+            segment: json!({}),
+            step_index: 0,
+            step_name: "start".to_string(),
+            entity_count: 10,
+            conversion_count: 4,
+        }];
+        let cohorts = vec![CohortMembershipRow {
+            tenant_id: "tenant-a".to_string(),
+            cohort_id: "june_signups".to_string(),
+            cohort_version: 2,
+            entity_type: "user".to_string(),
+            entity_id: "user_1".to_string(),
+            first_seen: "2026-06-01T00:00:00.000Z".to_string(),
+            last_seen: "2026-06-04T00:00:00.000Z".to_string(),
+        }];
+
+        let versions = combined_materialized_output_versions(&materialized_output_versions(
+            &reports, &sequences, &cohorts,
+        ));
+
+        let report = versions
+            .iter()
+            .find(|version| version.target_type == "report")
+            .expect("report version");
+        assert_eq!(report.target_id, "checkout");
+        assert_eq!(report.target_version, 7);
+        assert_eq!(report.row_count, 2);
+        assert_eq!(report.source_start, "2026-06-04T00:00:00.000Z");
+        assert_eq!(report.source_end, "2026-06-04T00:01:00.000Z");
+
+        assert!(
+            versions
+                .iter()
+                .any(|version| version.target_type == "sequence"
+                    && version.target_id == "signup"
+                    && version.target_version == 3)
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|version| version.target_type == "cohort"
+                    && version.target_id == "june_signups"
+                    && version.target_version == 2)
+        );
+    }
+
+    #[test]
+    fn materialization_control_plane_ids_are_stable_for_outputs() {
+        let record = LakehouseCommitRecord {
+            namespace: "nanotrace".to_string(),
+            table_name: "events".to_string(),
+            snapshot_id: "snapshot-9".to_string(),
+            sequence_number: 42,
+            committed_at_ms: 1_779_120_000_123,
+            data_file: "file:///tmp/events.parquet".to_string(),
+            data_files: vec!["file:///tmp/events.parquet".to_string()],
+            record_count: 10,
+            content_sha256: "abc".to_string(),
+            metadata_location: "file:///tmp/metadata.json".to_string(),
+            source_batch_id: "batch-1".to_string(),
+            deduplicated: 0,
+        };
+        let commit = commit_record_to_commit(record);
+        let version = super::MaterializedOutputVersion {
+            tenant_id: "tenant-a".to_string(),
+            target_type: "sequence",
+            target_id: "signup".to_string(),
+            target_version: 3,
+            row_count: 12,
+            source_start: "2026-06-04T00:00:00.000Z".to_string(),
+            source_end: "2026-06-04T00:05:00.000Z".to_string(),
+        };
+
+        assert_eq!(
+            materialization_job_id(&commit, &version),
+            "nanotrace:snapshot-9:tenant-a:sequence:signup:3"
+        );
+        assert_eq!(
+            materialization_chunk_id(&commit, &version),
+            "nanotrace:snapshot-9:tenant-a:sequence:signup:3:chunk:0"
+        );
+        assert_eq!(materialization_target_table("report"), "report_results");
+        assert_eq!(
+            materialization_target_table("sequence"),
+            "sequence_report_results"
+        );
+        assert_eq!(materialization_target_table("cohort"), "cohort_memberships");
+    }
+
+    #[test]
+    fn queued_target_helpers_select_expected_tables_and_counts() {
+        let report_targets =
+            super::materialize_targets_for_queued_target("report").expect("report target");
+        assert!(report_targets.report_results);
+        assert!(!report_targets.sequence_report_results);
+        assert!(!report_targets.cohort_memberships);
+
+        let sequence_targets =
+            super::materialize_targets_for_queued_target("sequence").expect("sequence target");
+        assert!(sequence_targets.sequence_report_results);
+        assert!(!sequence_targets.report_results);
+
+        let counts = super::MaterializedCounts {
+            report_results: 3,
+            sequence_report_results: 4,
+            cohort_memberships: 5,
+            ..Default::default()
+        };
+        assert_eq!(queued_rows_written("report", &counts), 3);
+        assert_eq!(queued_rows_written("sequence", &counts), 4);
+        assert_eq!(queued_rows_written("cohort", &counts), 5);
+    }
+
+    #[test]
+    fn queued_definition_filter_requires_literal_matching_target() {
+        let definitions = ExtractionDefinitions {
+            reports: vec![
+                super::ReportRule {
+                    tenant_id: "tenant-a".to_string(),
+                    definition_version: 7,
+                    matcher: super::Matcher::default(),
+                    output: super::ReportOutput {
+                        report_id: super::StringExpr::Literal("checkout".to_string()),
+                        dimensions: Vec::new(),
+                        metrics: Vec::new(),
+                        bucket_seconds: 60,
+                    },
+                },
+                super::ReportRule {
+                    tenant_id: "tenant-a".to_string(),
+                    definition_version: 7,
+                    matcher: super::Matcher::default(),
+                    output: super::ReportOutput {
+                        report_id: super::StringExpr::Literal("other".to_string()),
+                        dimensions: Vec::new(),
+                        metrics: Vec::new(),
+                        bucket_seconds: 60,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let chunk = super::QueuedMaterializationChunk {
+            tenant_id: "tenant-a".to_string(),
+            job_id: "job-1".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            chunk_index: 0,
+            target_type: "report".to_string(),
+            target_table: "report_results".to_string(),
+            target_id: "checkout".to_string(),
+            target_version: 7,
+            source_table: "events".to_string(),
+            source_start: "2026-06-04T00:00:00.000Z".to_string(),
+            source_end: "2026-06-05T00:00:00.000Z".to_string(),
+            attempt: 0,
+            max_attempts: 5,
+        };
+
+        let filtered =
+            super::definitions_for_queued_target(&definitions, &chunk).expect("filter target");
+        assert_eq!(filtered.reports.len(), 1);
+        assert!(super::queued_definitions_have_target(&filtered, "report"));
+    }
+
+    #[tokio::test]
+    async fn lakehouse_maintenance_audit_counts_local_small_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanotrace-maintenance-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let small = dir.join("small.parquet");
+        let large = dir.join("large.parquet");
+        std::fs::write(&small, b"small").expect("write small file");
+        std::fs::write(&large, b"large-enough").expect("write large file");
+
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .build();
+        let reader = super::LakehouseReader {
+            s3: super::S3Client::from_conf(s3_config),
+            s3_max_file_bytes: 1024 * 1024,
+        };
+        let mut cfg = test_config();
+        cfg.lakehouse_maintenance_small_file_bytes = 10;
+        let commits = vec![super::LakehouseCommit {
+            namespace: "nanotrace".to_string(),
+            table: "events".to_string(),
+            snapshot_id: "snapshot-1".to_string(),
+            sequence_number: 7,
+            committed_at_ms: 0,
+            data_file: String::new(),
+            data_files: vec![
+                small.display().to_string(),
+                large.display().to_string(),
+                dir.join("missing.parquet").display().to_string(),
+            ],
+            record_count: 2,
+            content_sha256: "abc".to_string(),
+            metadata_location: String::new(),
+            source_batch_id: None,
+            deduplicated: false,
+        }];
+
+        let audit = super::audit_lakehouse_maintenance(&reader, &cfg, &commits)
+            .await
+            .expect("audit maintenance");
+
+        assert_eq!(audit.commit_count, 1);
+        assert_eq!(audit.data_file_count, 3);
+        assert_eq!(audit.object_store_data_file_count, 0);
+        assert_eq!(audit.known_data_file_bytes, 17);
+        assert_eq!(audit.small_data_file_count, 1);
+        assert_eq!(audit.data_file_inspect_error_count, 0);
+        assert!(!audit.engine_maintenance_required);
+        assert_eq!(audit.first_sequence, 7);
+        assert_eq!(audit.last_sequence, 7);
+
+        std::fs::remove_dir_all(dir).expect("remove test dir");
+    }
+
+    #[test]
+    fn object_store_data_file_detector_covers_common_iceberg_schemes() {
+        assert!(super::is_object_store_data_file(
+            "s3://bucket/table/data.parquet"
+        ));
+        assert!(super::is_object_store_data_file(
+            "s3a://bucket/table/data.parquet"
+        ));
+        assert!(super::is_object_store_data_file(
+            "gs://bucket/table/data.parquet"
+        ));
+        assert!(super::is_object_store_data_file(
+            "abfs://container/table/data.parquet"
+        ));
+        assert!(super::is_object_store_data_file(
+            "abfss://container/table/data.parquet"
+        ));
+        assert!(!super::is_object_store_data_file("/tmp/table/data.parquet"));
+        assert!(!super::is_object_store_data_file(
+            "file:///tmp/table/data.parquet"
+        ));
+    }
+
+    #[test]
+    fn lakehouse_maintenance_flags_object_store_pressure_without_engine_command() {
+        let mut cfg = test_config();
+        cfg.lakehouse_native_compaction_min_input_files = 2;
+        cfg.lakehouse_maintenance_cmd = None;
+        let audit = super::LakehouseMaintenanceAudit {
+            object_store_data_file_count: 2,
+            small_data_file_count: 2,
+            ..Default::default()
+        };
+
+        assert!(super::object_store_engine_maintenance_required(
+            &audit, &cfg
+        ));
+        cfg.lakehouse_maintenance_cmd = Some("spark-maintenance".to_string());
+        assert!(!super::object_store_engine_maintenance_required(
+            &audit, &cfg
+        ));
+    }
+
+    #[test]
+    fn lakehouse_query_filter_matches_tenant_time_type_and_text() {
+        let row = fixture_row("llm_call.json");
+        let filter = super::LakehouseQueryFilter {
+            tenant_id: Some("fixture".to_string()),
+            from: Some(
+                super::parse_required_event_timestamp("2026-05-08T01:00:00.000Z").expect("from"),
+            ),
+            to: Some(
+                super::parse_required_event_timestamp("2026-05-08T02:00:00.000Z").expect("to"),
+            ),
+            event_type: Some("llm.call".to_string()),
+            text: Some("gpt-5.5".to_string()),
+            regex: Some(Regex::new(r#""model":"gpt-5\.5""#).expect("regex")),
+            limit: 100,
+        };
+
+        assert!(super::lakehouse_query_row_matches(&row, &filter));
+
+        let wrong_tenant = super::LakehouseQueryFilter {
+            tenant_id: Some("other".to_string()),
+            ..filter
+        };
+        assert!(!super::lakehouse_query_row_matches(&row, &wrong_tenant));
+    }
+
+    #[test]
+    fn lakehouse_query_filter_rejects_non_matching_regex() {
+        let row = fixture_row("llm_call.json");
+        let filter = super::LakehouseQueryFilter {
+            tenant_id: None,
+            from: None,
+            to: None,
+            event_type: None,
+            text: None,
+            regex: Some(Regex::new(r#"error_rate":0\.[5-9]"#).expect("regex")),
+            limit: 100,
+        };
+
+        assert!(!super::lakehouse_query_row_matches(&row, &filter));
+    }
+
+    #[test]
+    fn parses_lakehouse_sql_table_specs() {
+        let specs = super::parse_lakehouse_sql_table_specs(
+            "accounts=/tmp/accounts-1.parquet,/tmp/accounts-2.parquet; tickets=s3://bucket/tickets.parquet",
+        )
+        .expect("parse table specs");
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "accounts");
+        assert_eq!(
+            specs[0].locations,
+            vec![
+                "/tmp/accounts-1.parquet".to_string(),
+                "/tmp/accounts-2.parquet".to_string()
+            ]
+        );
+        assert_eq!(specs[1].name, "tickets");
+        assert!(super::parse_lakehouse_sql_table_specs("bad-name=/tmp/a.parquet").is_err());
+        assert!(super::parse_lakehouse_sql_table_specs("missing_equals").is_err());
+    }
+
+    #[tokio::test]
+    async fn lakehouse_sql_query_runs_join_over_committed_parquet() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cfg = LakehouseConfig::events_table(root.path());
+        let commit = commit_events_ndjson_iceberg(
+            &cfg,
+            br#"{"event_id":"evt-a","timestamp":"2026-06-04T00:00:00Z","data":{"tenant_id":"tenant-a","event_type":"span","trace_id":"trace-1","span_id":"span-a","service":"api"}}
+{"event_id":"evt-b","timestamp":"2026-06-04T00:00:01Z","data":{"tenant_id":"tenant-a","event_type":"span","trace_id":"trace-1","span_id":"span-b","service":"worker"}}
+"#,
+            None,
+        )
+        .await
+        .expect("commit events");
+        let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let reader = super::LakehouseReader {
+            s3: super::s3_client(&aws_config),
+            s3_max_file_bytes: 1024 * 1024,
+        };
+        let mut output = Vec::new();
+
+        let rows = super::run_lakehouse_sql_query_for_tables(
+            &reader,
+            vec![super::LakehouseSqlTableSpec {
+                name: "events".to_string(),
+                locations: super::commit_data_files(&commit),
+            }],
+            "SELECT a.event_id AS parent_event, b.event_id AS child_event FROM events a JOIN events b ON a.trace_id = b.trace_id WHERE a.event_id < b.event_id",
+            10,
+            &mut output,
+        )
+        .await
+        .expect("run sql");
+
+        assert_eq!(rows, 1);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains(r#""parent_event":"evt-a""#));
+        assert!(output.contains(r#""child_event":"evt-b""#));
     }
 
     #[test]
@@ -4779,13 +7661,20 @@ mod tests {
         let mut watermarks = HashMap::new();
         watermarks.insert("field_index".to_string(), 8);
         watermarks.insert("event_measures".to_string(), 9);
+        watermarks.insert("measure_cube_rollups".to_string(), 9);
         watermarks.insert("entity_state_updates".to_string(), 7);
 
         let targets = materialize_targets_for_commit(&cfg, 9, &watermarks);
 
+        assert!(targets.events);
+        assert!(targets.event_text_index);
+        assert!(targets.event_search_terms);
+        assert!(targets.event_kv_index);
         assert!(targets.field_index);
         assert!(!targets.event_measures);
+        assert!(!targets.measure_cube_points);
         assert!(targets.entity_state_updates);
+        assert!(targets.entity_state_current);
         assert!(targets.any());
     }
 
@@ -4830,12 +7719,18 @@ mod tests {
             clickhouse_password: None,
             clickhouse_database: "observatory".to_string(),
             clickhouse_events_table: "events".to_string(),
+            clickhouse_event_text_index_table: "event_text_index".to_string(),
+            clickhouse_event_search_terms_table: "event_search_terms".to_string(),
+            clickhouse_event_kv_index_table: "event_kv_index".to_string(),
             clickhouse_field_index_table: "field_index".to_string(),
             clickhouse_event_measures_table: "event_measures".to_string(),
+            clickhouse_measure_cube_points_table: "measure_cube_points".to_string(),
+            clickhouse_measure_cube_rollups_table: "measure_cube_rollups".to_string(),
             clickhouse_counter_rollups_table: "counter_rollups".to_string(),
             clickhouse_gauge_rollups_table: "gauge_rollups".to_string(),
             clickhouse_histogram_rollups_table: "histogram_rollups".to_string(),
             clickhouse_entity_state_updates_table: "entity_state_updates".to_string(),
+            clickhouse_entity_state_current_table: "entity_state_current".to_string(),
             clickhouse_report_results_table: "report_results".to_string(),
             clickhouse_sequence_report_results_table: "sequence_report_results".to_string(),
             clickhouse_cohort_memberships_table: "cohort_memberships".to_string(),
@@ -4845,6 +7740,26 @@ mod tests {
             rebuild_derived: true,
             incremental_materialize: false,
             materialize_loop: false,
+            materialization_queue_executor: false,
+            materialization_queue_max_chunks: 10,
+            materialization_queue_lease_secs: 300,
+            materialization_queue_worker_id: "test-worker".to_string(),
+            lakehouse_maintenance: false,
+            lakehouse_maintenance_small_file_bytes: 128 * 1024 * 1024,
+            lakehouse_native_compaction: false,
+            lakehouse_native_compaction_min_input_files: 2,
+            lakehouse_native_compaction_target_file_size_bytes: 512 * 1024 * 1024,
+            lakehouse_maintenance_cmd: None,
+            lakehouse_query: false,
+            lakehouse_query_tenant_id: None,
+            lakehouse_query_from: None,
+            lakehouse_query_to: None,
+            lakehouse_query_event_type: None,
+            lakehouse_query_text: None,
+            lakehouse_query_regex: None,
+            lakehouse_query_sql: None,
+            lakehouse_query_tables: Vec::new(),
+            lakehouse_query_limit: 1000,
             commit_source: CommitSource::Local,
             materialize_poll_interval: Duration::from_secs(5),
             allow_non_empty: false,

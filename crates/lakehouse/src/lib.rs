@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,11 +11,17 @@ use anyhow::{Context, Result, bail};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use iceberg::{
-    Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, MetadataLocation, NamespaceIdent, TableCreation, TableIdent,
+    TableUpdate,
     io::LocalFsStorageFactory,
     memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder},
-    spec::{DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Type},
+    spec::{
+        DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestListWriter,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, Summary, Type,
+    },
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
@@ -64,6 +71,37 @@ pub struct LakehouseRestCatalogConfig {
     pub uri: String,
     pub warehouse: String,
     pub properties: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LakehouseCompactionOptions {
+    pub small_file_bytes: u64,
+    pub min_input_files: usize,
+    pub target_file_size_bytes: u64,
+}
+
+impl Default for LakehouseCompactionOptions {
+    fn default() -> Self {
+        Self {
+            small_file_bytes: 128_u64 * 1024 * 1024,
+            min_input_files: 2,
+            target_file_size_bytes: 512_u64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LakehouseCompactionResult {
+    pub compacted: bool,
+    pub input_file_count: usize,
+    pub input_small_file_count: usize,
+    pub input_record_count: usize,
+    pub output_file_count: usize,
+    pub output_record_count: usize,
+    pub snapshot_id: Option<String>,
+    pub sequence_number: Option<u64>,
+    pub metadata_location: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +278,7 @@ pub async fn commit_events_ndjson_iceberg(
     );
     snapshot_properties.insert(
         "nanotrace.writer".to_string(),
-        "nanotrace-loader".to_string(),
+        "nanotrace-lakehouse".to_string(),
     );
     if let Some(source_batch_id) = source_batch_id {
         snapshot_properties.insert(
@@ -307,6 +345,335 @@ pub async fn commit_events_ndjson_iceberg(
         .context("write nanotrace lakehouse current commit record")?;
 
     Ok(commit)
+}
+
+pub async fn compact_events_iceberg(
+    cfg: &LakehouseConfig,
+    options: LakehouseCompactionOptions,
+) -> Result<LakehouseCompactionResult> {
+    if !matches!(cfg.catalog, LakehouseCatalogConfig::LocalFilesystem) {
+        bail!(
+            "native Rust Iceberg compaction currently supports the local filesystem catalog; REST/catalog deployments should use NANOTRACE_ICEBERG_MAINTENANCE_CMD"
+        );
+    }
+
+    let (_catalog, table) = load_or_create_iceberg_table(cfg).await?;
+    let Some(current_snapshot) = table.metadata().current_snapshot() else {
+        return Ok(LakehouseCompactionResult {
+            compacted: false,
+            input_file_count: 0,
+            input_small_file_count: 0,
+            input_record_count: 0,
+            output_file_count: 0,
+            output_record_count: 0,
+            snapshot_id: None,
+            sequence_number: None,
+            metadata_location: table.metadata_location().map(str::to_string),
+            reason: Some("table has no current snapshot".to_string()),
+        });
+    };
+
+    let active_files = active_data_files(&table).await?;
+    let input_small_file_count = active_files
+        .iter()
+        .filter(|data_file| data_file.file_size_in_bytes() < options.small_file_bytes)
+        .count();
+    let input_record_count = active_files
+        .iter()
+        .map(|data_file| data_file.record_count() as usize)
+        .sum::<usize>();
+    if input_small_file_count < options.min_input_files {
+        return Ok(LakehouseCompactionResult {
+            compacted: false,
+            input_file_count: active_files.len(),
+            input_small_file_count,
+            input_record_count,
+            output_file_count: 0,
+            output_record_count: 0,
+            snapshot_id: Some(current_snapshot.snapshot_id().to_string()),
+            sequence_number: Some(current_snapshot.sequence_number().try_into().unwrap_or(0)),
+            metadata_location: table.metadata_location().map(str::to_string),
+            reason: Some(format!(
+                "small file count {input_small_file_count} is below min input files {}",
+                options.min_input_files
+            )),
+        });
+    }
+
+    let batches = scan_current_table_batches(&table).await?;
+    let output_files =
+        write_iceberg_record_batches(&table, batches, options.target_file_size_bytes).await?;
+    let output_file_count = output_files.len();
+    let output_record_count = output_files
+        .iter()
+        .map(|data_file| data_file.record_count() as usize)
+        .sum::<usize>();
+    let snapshot_id = generate_unique_snapshot_id(&table);
+    let sequence_number = table.metadata().next_sequence_number();
+    let metadata_location = commit_local_replace_snapshot(&table, cfg, snapshot_id, output_files)
+        .await
+        .context("commit local Iceberg compaction replace snapshot")?;
+
+    Ok(LakehouseCompactionResult {
+        compacted: true,
+        input_file_count: active_files.len(),
+        input_small_file_count,
+        input_record_count,
+        output_file_count,
+        output_record_count,
+        snapshot_id: Some(snapshot_id.to_string()),
+        sequence_number: Some(sequence_number.try_into().unwrap_or(0)),
+        metadata_location: Some(metadata_location),
+        reason: None,
+    })
+}
+
+async fn active_data_files(table: &Table) -> Result<Vec<DataFile>> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(Vec::new());
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .context("load current Iceberg manifest list")?;
+    let mut data_files = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .context("load current Iceberg manifest")?;
+        for entry in manifest.entries() {
+            if entry.is_alive() {
+                data_files.push(entry.data_file.clone());
+            }
+        }
+    }
+    Ok(data_files)
+}
+
+async fn scan_current_table_batches(table: &Table) -> Result<Vec<RecordBatch>> {
+    let scan = table
+        .scan()
+        .select_all()
+        .build()
+        .context("build Iceberg compaction scan")?;
+    let mut stream = scan
+        .to_arrow()
+        .await
+        .context("open Iceberg compaction Arrow stream")?;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .context("read Iceberg compaction Arrow batch")?
+    {
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
+async fn commit_local_replace_snapshot(
+    table: &Table,
+    cfg: &LakehouseConfig,
+    snapshot_id: i64,
+    data_files: Vec<DataFile>,
+) -> Result<String> {
+    if data_files.is_empty() {
+        bail!("cannot commit compaction snapshot with no output data files");
+    }
+
+    let sequence_number = table.metadata().next_sequence_number();
+    let parent_snapshot_id = table.metadata().current_snapshot_id();
+    let manifest_list_path =
+        write_compaction_manifest_list(table, snapshot_id, sequence_number, &data_files).await?;
+    let output_file_paths = data_files
+        .iter()
+        .map(|data_file| data_file.file_path().to_string())
+        .collect::<Vec<_>>();
+    let record_count = data_files
+        .iter()
+        .map(|data_file| data_file.record_count())
+        .sum::<u64>();
+    let mut additional_properties = HashMap::new();
+    additional_properties.insert(
+        "nanotrace.writer".to_string(),
+        "nanotrace-lakehouse".to_string(),
+    );
+    additional_properties.insert("nanotrace.operation".to_string(), "compaction".to_string());
+    additional_properties.insert(
+        "nanotrace.record-count".to_string(),
+        record_count.to_string(),
+    );
+    additional_properties.insert(
+        "nanotrace.content-sha256".to_string(),
+        hex_sha256(output_file_paths.join("\n").as_bytes()),
+    );
+    additional_properties.insert(
+        "nanotrace.data-files-json".to_string(),
+        serde_json::to_string(&output_file_paths).context("serialize compacted data file paths")?,
+    );
+
+    let snapshot = Snapshot::builder()
+        .with_manifest_list(manifest_list_path)
+        .with_snapshot_id(snapshot_id)
+        .with_parent_snapshot_id(parent_snapshot_id)
+        .with_sequence_number(sequence_number)
+        .with_summary(Summary {
+            operation: Operation::Replace,
+            additional_properties,
+        })
+        .with_schema_id(table.metadata().current_schema_id())
+        .with_timestamp_ms(now_ms())
+        .build();
+    let updates = vec![
+        TableUpdate::AddSnapshot { snapshot },
+        TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: SnapshotReference::new(
+                snapshot_id,
+                SnapshotRetention::branch(None, None, None),
+            ),
+        },
+    ];
+    let current_metadata_location = table
+        .metadata_location_result()
+        .context("iceberg table missing metadata location before compaction commit")?
+        .to_string();
+    assert_local_catalog_pointer_matches(cfg, &current_metadata_location)
+        .context("verify local Iceberg pointer before compaction commit")?;
+    let new_metadata_location = MetadataLocation::from_str(&current_metadata_location)
+        .context("parse current Iceberg metadata location")?
+        .with_next_version()
+        .to_string();
+    let mut builder = table
+        .metadata()
+        .clone()
+        .into_builder(Some(current_metadata_location.clone()));
+    for update in updates {
+        builder = update.apply(builder)?;
+    }
+    let metadata = builder
+        .build()
+        .context("build compacted Iceberg table metadata")?
+        .metadata;
+    metadata
+        .write_to(table.file_io(), &new_metadata_location)
+        .await
+        .context("write compacted Iceberg metadata")?;
+    assert_local_catalog_pointer_matches(cfg, &current_metadata_location)
+        .context("verify local Iceberg pointer before publishing compaction commit")?;
+    write_local_catalog_pointer(cfg, &new_metadata_location)?;
+    Ok(new_metadata_location)
+}
+
+async fn write_compaction_manifest_list(
+    table: &Table,
+    snapshot_id: i64,
+    sequence_number: i64,
+    data_files: &[DataFile],
+) -> Result<String> {
+    let commit_uuid = Uuid::new_v4();
+    let manifest_path = format!(
+        "{}/metadata/{}-m0.{}",
+        table.metadata().location(),
+        commit_uuid,
+        DataFileFormat::Avro
+    );
+    let mut manifest_writer = {
+        let builder = ManifestWriterBuilder::new(
+            table.file_io().new_output(manifest_path.clone())?,
+            Some(snapshot_id),
+            None,
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        );
+        match table.metadata().format_version() {
+            FormatVersion::V1 => builder.build_v1(),
+            FormatVersion::V2 => builder.build_v2_data(),
+            FormatVersion::V3 => builder.build_v3_data(),
+        }
+    };
+    for data_file in data_files {
+        manifest_writer
+            .add_file(data_file.clone(), sequence_number)
+            .context("add compacted data file to manifest")?;
+    }
+    let manifest_file = manifest_writer
+        .write_manifest_file()
+        .await
+        .context("write compacted Iceberg manifest")?;
+
+    let manifest_list_path = format!(
+        "{}/metadata/snap-{}-0-{}.{}",
+        table.metadata().location(),
+        snapshot_id,
+        commit_uuid,
+        DataFileFormat::Avro
+    );
+    let mut manifest_list_writer = match table.metadata().format_version() {
+        FormatVersion::V1 => ManifestListWriter::v1(
+            table.file_io().new_output(manifest_list_path.clone())?,
+            snapshot_id,
+            table.metadata().current_snapshot_id(),
+        ),
+        FormatVersion::V2 => ManifestListWriter::v2(
+            table.file_io().new_output(manifest_list_path.clone())?,
+            snapshot_id,
+            table.metadata().current_snapshot_id(),
+            sequence_number,
+        ),
+        FormatVersion::V3 => ManifestListWriter::v3(
+            table.file_io().new_output(manifest_list_path.clone())?,
+            snapshot_id,
+            table.metadata().current_snapshot_id(),
+            sequence_number,
+            Some(table.metadata().next_row_id()),
+        ),
+    };
+    manifest_list_writer
+        .add_manifests(vec![manifest_file].into_iter())
+        .context("add compacted manifest to manifest list")?;
+    manifest_list_writer
+        .close()
+        .await
+        .context("write compacted Iceberg manifest list")?;
+    Ok(manifest_list_path)
+}
+
+fn generate_unique_snapshot_id(table: &Table) -> i64 {
+    let generate_random_id = || -> i64 {
+        let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
+        let snapshot_id = (lhs ^ rhs) as i64;
+        if snapshot_id < 0 {
+            -snapshot_id
+        } else {
+            snapshot_id
+        }
+    };
+    let mut snapshot_id = generate_random_id();
+    while table
+        .metadata()
+        .snapshots()
+        .any(|snapshot| snapshot.snapshot_id() == snapshot_id)
+    {
+        snapshot_id = generate_random_id();
+    }
+    snapshot_id
+}
+
+fn assert_local_catalog_pointer_matches(cfg: &LakehouseConfig, expected: &str) -> Result<()> {
+    let pointer =
+        read_local_catalog_pointer(cfg)?.context("local Iceberg catalog pointer missing")?;
+    if pointer.metadata_location != expected {
+        bail!(
+            "local Iceberg catalog pointer changed during compaction: expected {}, found {}",
+            expected,
+            pointer.metadata_location
+        );
+    }
+    Ok(())
 }
 
 fn commit_from_existing_source_snapshot(
@@ -785,6 +1152,14 @@ async fn write_iceberg_data_files(
     batch: RecordBatch,
     target_file_size_bytes: u64,
 ) -> Result<Vec<DataFile>> {
+    write_iceberg_record_batches(table, vec![batch], target_file_size_bytes).await
+}
+
+async fn write_iceberg_record_batches(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    target_file_size_bytes: u64,
+) -> Result<Vec<DataFile>> {
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .context("create iceberg data location generator")?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -810,11 +1185,13 @@ async fn write_iceberg_data_files(
     );
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
     let mut writer = UnpartitionedWriter::new(data_file_writer_builder);
-    for batch in record_batch_writer_chunks(&batch, target_file_size) {
-        writer
-            .write(batch)
-            .await
-            .context("write iceberg record batch")?;
+    for batch in batches {
+        for chunk in record_batch_writer_chunks(&batch, target_file_size) {
+            writer
+                .write(chunk)
+                .await
+                .context("write iceberg record batch")?;
+        }
     }
     writer.close().await.context("close iceberg data writer")
 }
@@ -943,8 +1320,10 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventRow, LakehouseConfig, commit_events_ndjson, commit_events_ndjson_with_source,
-        record_batch_writer_chunks, rows_to_record_batch, table_properties,
+        EventRow, LakehouseCompactionOptions, LakehouseConfig, active_data_files,
+        commit_events_ndjson, commit_events_ndjson_with_source, compact_events_iceberg,
+        load_or_create_iceberg_table, record_batch_writer_chunks, rows_to_record_batch,
+        scan_current_table_batches, table_properties,
     };
 
     #[test]
@@ -1003,6 +1382,71 @@ mod tests {
             })
             .count();
         assert_eq!(metadata_count, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compacts_local_iceberg_table_without_new_nanotrace_append_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "nanotrace-lakehouse-compaction-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = LakehouseConfig::events_table(&root).with_write_target_file_size_bytes(1);
+        let first = br#"{"event_id":"evt_1","timestamp":"2026-05-18T00:00:00Z","data":{"tenant_id":"org_1","event_type":"log","name":"one"}}"#;
+        let second = br#"{"event_id":"evt_2","timestamp":"2026-05-18T00:00:01Z","data":{"tenant_id":"org_1","event_type":"log","name":"two"}}"#;
+        commit_events_ndjson(&cfg, first).expect("commit first");
+        commit_events_ndjson(&cfg, second).expect("commit second");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(compact_events_iceberg(
+                &cfg,
+                LakehouseCompactionOptions {
+                    small_file_bytes: u64::MAX,
+                    min_input_files: 2,
+                    target_file_size_bytes: 128 * 1024 * 1024,
+                },
+            ))
+            .expect("compact");
+
+        assert!(result.compacted);
+        assert_eq!(result.input_file_count, 2);
+        assert_eq!(result.input_small_file_count, 2);
+        assert_eq!(result.input_record_count, 2);
+        assert_eq!(result.output_file_count, 1);
+        assert_eq!(result.output_record_count, 2);
+
+        let (_catalog, table) = runtime
+            .block_on(load_or_create_iceberg_table(&cfg))
+            .expect("reload table");
+        let files = runtime
+            .block_on(active_data_files(&table))
+            .expect("active files");
+        assert_eq!(files.len(), 1);
+        let rows = runtime
+            .block_on(scan_current_table_batches(&table))
+            .expect("scan compacted table")
+            .into_iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 2);
+
+        let nanotrace_snapshots = std::fs::read_dir(root.join("nanotrace/events/metadata"))
+            .expect("read metadata dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".nanotrace.json")
+                    && entry.file_name().to_string_lossy().starts_with("snapshot-")
+            })
+            .count();
+        assert_eq!(nanotrace_snapshots, 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

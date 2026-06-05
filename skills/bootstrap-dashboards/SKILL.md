@@ -15,7 +15,7 @@ This skill is for discovery and dashboard planning. Use `create-nanotrace-visual
 
 - Read data with `POST /v1/query`.
 - Discover definitions with `GET /v1/definitions`.
-- Discover report specs with `GET /v1/reports`.
+- Discover report, sequence, and cohort specs as definition records from `GET /v1/definitions`.
 - When running outside a dashboard iframe, use `NANOTRACE_API_KEY` as `Authorization: Bearer $NANOTRACE_API_KEY` if authentication is required.
 
 The `observatory.*` names in this skill are Nanotrace read models.
@@ -92,7 +92,7 @@ Never present a dashboard as production-ready if it depends on long-range raw sc
 Use these as patterns, not assumptions:
 
 - **Overview:** volume, errors, freshness, top dimensions, recent events.
-- **Operations:** service/route/job/processor health, latency, error rates, throughput.
+- **Operations:** service/route/job/materializer health, latency, error rates, throughput.
 - **Entity lifecycle:** state transitions, churn, upgrades, risk changes, status changes.
 - **Revenue/product:** conversion, orders, checkout, payment, usage, billing, value metrics.
 - **Trace/workflow:** traces, spans, stages, critical path, flamegraph, waterfall.

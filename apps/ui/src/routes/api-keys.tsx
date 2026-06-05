@@ -386,7 +386,7 @@ async function revokeApiKey({
 
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/api-keys` : '/api-keys'
+  return base ? `${base}/v1/api-keys` : '/v1/api-keys'
 }
 
 function errorMessage(error: unknown) {

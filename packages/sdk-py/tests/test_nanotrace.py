@@ -22,12 +22,32 @@ class RecordingTransport:
         self.events.append(event)
 
 
+class BatchRecordingTransport(RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[dict]] = []
+
+    def send_batch(self, events: list[dict]) -> None:
+        self.batches.append(events)
+        self.events.extend(events)
+
+
 class AsyncRecordingTransport:
     def __init__(self) -> None:
         self.events: list[dict] = []
 
     async def send(self, event: dict) -> None:
         self.events.append(event)
+
+
+class AsyncBatchRecordingTransport(AsyncRecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[dict]] = []
+
+    async def send_batch(self, events: list[dict]) -> None:
+        self.batches.append(events)
+        self.events.extend(events)
 
 
 class FailingTransport:
@@ -108,6 +128,29 @@ class NanotraceTests(unittest.TestCase):
         self.assertEqual(data["llm.model"], "gpt-test")
         self.assertEqual(data["tool_name"], "shell")
 
+    def test_http_server_request_shapes_status_fields(self) -> None:
+        transport = RecordingTransport()
+        nt = create_nanotrace(transport)
+
+        nt.http_server_request(
+            method="GET",
+            route="/users/{id}",
+            path="/users/1",
+            status_code=503,
+            duration_ms=12.5,
+            tenant_id="tenant_1",
+        )
+        nt.flush()
+
+        data = transport.events[0]["data"]
+        self.assertEqual(data["event_type"], "span")
+        self.assertEqual(data["name"], "GET /users/{id}")
+        self.assertEqual(data["span_kind"], "server")
+        self.assertEqual(data["http.status_code"], 503)
+        self.assertEqual(data["http.response.status_code"], 503)
+        self.assertEqual(data["is_error"], 1)
+        self.assertEqual(data["tenant_id"], "tenant_1")
+
     def test_http_transports_use_supported_ingest_paths(self) -> None:
         self.assertEqual(http_transport("https://api.example.com", "key").events_url, "https://api.example.com/v1/events")
         self.assertEqual(sidecar_http_transport("http://127.0.0.1:4320").events_url, "http://127.0.0.1:4320/events")
@@ -119,6 +162,39 @@ class NanotraceTests(unittest.TestCase):
 
         with self.assertRaises(NanotraceFlushError):
             nt.flush()
+
+    def test_flush_sends_batch_when_transport_supports_it(self) -> None:
+        transport = BatchRecordingTransport()
+        nt = create_nanotrace(transport, service="api")
+
+        nt.info("one")
+        nt.info("two")
+        nt.flush()
+
+        self.assertEqual(len(transport.batches), 1)
+        self.assertEqual(len(transport.batches[0]), 2)
+        self.assertEqual([event["data"]["body"] for event in transport.events], ["one", "two"])
+
+    def test_batch_threshold_flushes_without_waiting_for_flush_call(self) -> None:
+        transport = BatchRecordingTransport()
+        nt = create_nanotrace(transport, batch_max_events=2)
+
+        nt.info("one")
+        nt.info("two")
+        nt.flush()
+
+        self.assertEqual(len(transport.batches), 1)
+        self.assertEqual(len(transport.batches[0]), 2)
+
+    def test_custom_single_event_transport_still_works(self) -> None:
+        transport = RecordingTransport()
+        nt = create_nanotrace(transport)
+
+        nt.info("one")
+        nt.info("two")
+        nt.flush()
+
+        self.assertEqual([event["data"]["body"] for event in transport.events], ["one", "two"])
 
 
 class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
@@ -153,6 +229,28 @@ class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end["data"]["custom"], "value")
         self.assertEqual(end["data"]["span_status_code"], "ok")
 
+    async def test_async_http_client_request_uses_shared_shape(self) -> None:
+        transport = AsyncRecordingTransport()
+        nt = create_async_nanotrace(transport)
+
+        nt.http_client_request(
+            method="POST",
+            url="https://api.example.com/v1/events",
+            statusCode=201,
+            duration_ms=3.5,
+            request_id="req_1",
+        )
+        await nt.flush()
+
+        data = transport.events[0]["data"]
+        self.assertEqual(data["event_type"], "span")
+        self.assertEqual(data["name"], "POST https://api.example.com/v1/events")
+        self.assertEqual(data["span_kind"], "client")
+        self.assertEqual(data["http.status_code"], 201)
+        self.assertEqual(data["http.response.status_code"], 201)
+        self.assertEqual(data["is_error"], 0)
+        self.assertEqual(data["request_id"], "req_1")
+
     async def test_async_flush_surfaces_delivery_errors(self) -> None:
         nt = create_async_nanotrace(AsyncFailingTransport())
 
@@ -160,6 +258,28 @@ class AsyncNanotraceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(NanotraceFlushError):
             await nt.flush()
+
+    async def test_async_flush_sends_batch_when_transport_supports_it(self) -> None:
+        transport = AsyncBatchRecordingTransport()
+        nt = create_async_nanotrace(transport, service="api")
+
+        nt.info("one")
+        nt.info("two")
+        await nt.flush()
+
+        self.assertEqual(len(transport.batches), 1)
+        self.assertEqual(len(transport.batches[0]), 2)
+        self.assertEqual([event["data"]["body"] for event in transport.events], ["one", "two"])
+
+    async def test_async_custom_single_event_transport_still_works(self) -> None:
+        transport = AsyncRecordingTransport()
+        nt = create_async_nanotrace(transport)
+
+        nt.info("one")
+        nt.info("two")
+        await nt.flush()
+
+        self.assertEqual([event["data"]["body"] for event in transport.events], ["one", "two"])
 
 
 if __name__ == "__main__":
