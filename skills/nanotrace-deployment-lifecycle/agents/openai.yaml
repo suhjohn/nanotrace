@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nanotrace Deployment Lifecycle"
+  short_description: "Multi-turn Nanotrace deployment guide"
+  default_prompt: "Use $nanotrace-deployment-lifecycle to guide me one checkpoint at a time through a Nanotrace deployment."
