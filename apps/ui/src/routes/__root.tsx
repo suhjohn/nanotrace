@@ -20,6 +20,8 @@ export const Route = createRootRoute({
 })
 
 function RootDocument() {
+  const pathname = useRouterState({ select: state => state.location.pathname })
+  const isPublicLanding = pathname === '/'
   const [queryClient] = useState(
     () =>
       new QueryClient({
@@ -39,11 +41,15 @@ function RootDocument() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <AuthGate>
-        <AppShell>
-          <Outlet />
-        </AppShell>
-      </AuthGate>
+      {isPublicLanding ? (
+        <Outlet />
+      ) : (
+        <AuthGate>
+          <AppShell>
+            <Outlet />
+          </AppShell>
+        </AuthGate>
+      )}
       <TanStackRouterDevtools position="bottom-right" />
     </QueryClientProvider>
   )
@@ -301,6 +307,7 @@ function AppShell({ children }: { children: ReactNode }) {
   const isSchema = pathname.startsWith('/schema')
   const isApiKeys = pathname.startsWith('/settings/api-keys')
   const isOrganization = pathname.startsWith('/settings/organization')
+  const isLogs = pathname.startsWith('/logs') || (!isSchema && !isApiKeys && !isOrganization)
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => readSidebarMode())
   const [dragWidth, setDragWidth] = useState<number | null>(null)
   const sidebarVisible = sidebarMode !== 'closed' || dragWidth !== null
@@ -386,7 +393,7 @@ function AppShell({ children }: { children: ReactNode }) {
             {sidebarExpanded ? (
               <>
                 <nav className="flex flex-1 flex-col gap-1">
-                  <NavItem active={!isSchema && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isLogs} label="Logs" to="/logs" icon={<ListTree size={17} strokeWidth={1.8} />} />
                   <NavItem active={isSchema} label="Schema" to="/schema" icon={<Database size={17} strokeWidth={1.8} />} />
                   <NavItem active={isOrganization} label="Organization" to="/settings/organization" icon={<Users size={17} strokeWidth={1.8} />} />
                   <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
@@ -758,7 +765,7 @@ function NavItem({
   active: boolean
   icon: ReactNode
   label: string
-  to: '/' | '/schema' | '/settings/api-keys' | '/settings/organization'
+  to: '/logs' | '/schema' | '/settings/api-keys' | '/settings/organization'
 }) {
   return (
     <Link

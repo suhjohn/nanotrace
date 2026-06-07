@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { Link, createFileRoute, useNavigate } from '@tanstack/react-router'
 import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
@@ -21,12 +21,118 @@ import {
 } from '../lib/nanotrace-api'
 
 export const Route = createFileRoute('/')({
-  validateSearch: parseObservatorySearch,
   component: IndexRoute
 })
 
 function IndexRoute() {
-  const search = Route.useSearch()
+  return <LandingPage />
+}
+
+function LandingPage() {
+  return (
+    <main className="min-h-screen overflow-x-hidden bg-black text-neutral-100">
+      <section className="relative flex min-h-[88svh] items-stretch overflow-hidden border-b border-neutral-900">
+        <LandingConsoleBackdrop />
+        <div className="relative z-10 flex w-full flex-col">
+          <header className="mx-auto flex h-14 w-full max-w-6xl items-center justify-between px-4 sm:px-6">
+            <div className="font-mono text-[13px] font-semibold tracking-tight text-white">Nanotrace</div>
+            <nav className="flex items-center gap-2">
+              <Link
+                className="inline-flex h-8 items-center justify-center border border-neutral-800 bg-black/70 px-3 text-[12px] text-neutral-300 backdrop-blur hover:border-neutral-600 hover:text-white"
+                to="/logs"
+              >
+                Open console
+              </Link>
+            </nav>
+          </header>
+          <div className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 pb-16 pt-10 sm:px-6">
+            <div className="max-w-2xl">
+              <h1 className="text-balance text-[clamp(44px,7vw,84px)] font-medium leading-[0.94] tracking-normal text-white">
+                Nanotrace
+              </h1>
+              <p className="mt-5 max-w-xl text-balance text-[17px] leading-7 text-neutral-300 sm:text-[19px]">
+                One event timeline for product behavior, infrastructure signals, and AI agent execution.
+              </p>
+              <div className="mt-8 flex flex-wrap items-center gap-3">
+                <Link
+                  className="inline-flex h-10 items-center justify-center border border-white bg-white px-4 text-[13px] font-medium text-black hover:bg-neutral-200"
+                  to="/logs"
+                >
+                  Explore events
+                </Link>
+                <a
+                  className="inline-flex h-10 items-center justify-center border border-neutral-800 bg-black/70 px-4 text-[13px] text-neutral-300 backdrop-blur hover:border-neutral-600 hover:text-white"
+                  href="#overview"
+                >
+                  View overview
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="overview" className="bg-neutral-950">
+        <div className="mx-auto grid max-w-6xl gap-px border-x border-neutral-900 bg-neutral-900 md:grid-cols-3">
+          {[
+            ['Unified', 'Logs, spans, metrics, product actions, and agent events share one query surface.'],
+            ['Queryable', 'Raw JSON stays intact while scalar fields become immediately filterable.'],
+            ['Promotable', 'Repeated paths can become definitions, reports, and materialized views.']
+          ].map(([title, body]) => (
+            <div key={title} className="bg-neutral-950 p-5 sm:p-6">
+              <h2 className="text-[13px] font-medium text-white">{title}</h2>
+              <p className="mt-2 text-[13px] leading-6 text-neutral-500">{body}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+    </main>
+  )
+}
+
+function LandingConsoleBackdrop() {
+  const rows = [
+    ['12:40:04.210', 'llm.call', 'agent-runtime', 'ok'],
+    ['12:40:04.415', 'tool.call', 'retrieval', 'ok'],
+    ['12:40:05.102', 'span.end', 'checkout', '481ms'],
+    ['12:40:06.344', 'eval.score', 'answer_quality', '0.92'],
+    ['12:40:07.018', 'state.change', 'account.plan', 'pro']
+  ]
+
+  return (
+    <div aria-hidden="true" className="absolute inset-0">
+      <div className="absolute inset-0 bg-black" />
+      <div className="absolute right-[-180px] top-20 w-[760px] max-w-none rotate-[-6deg] opacity-55 blur-[0.2px] max-lg:right-[-360px] max-sm:right-[-520px]">
+        <div className="border border-neutral-800 bg-neutral-950 shadow-2xl shadow-black">
+          <div className="grid h-8 grid-cols-[180px_1fr_140px] border-b border-neutral-800 text-[10px] uppercase text-neutral-600">
+            <div className="border-r border-neutral-800 px-3 py-2">timeline</div>
+            <div className="border-r border-neutral-800 px-3 py-2">event</div>
+            <div className="px-3 py-2">status</div>
+          </div>
+          {rows.map(([time, name, source, state]) => (
+            <div key={`${time}-${name}`} className="grid h-12 grid-cols-[180px_1fr_140px] border-b border-neutral-900 text-[12px] last:border-b-0">
+              <div className="border-r border-neutral-900 px-3 py-3 font-mono text-neutral-500">{time}</div>
+              <div className="min-w-0 border-r border-neutral-900 px-3 py-3">
+                <div className="truncate font-mono text-neutral-200">{name}</div>
+                <div className="mt-0.5 truncate text-[11px] text-neutral-600">{source}</div>
+              </div>
+              <div className="px-3 py-3 font-mono text-neutral-400">{state}</div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 h-28 border border-neutral-800 bg-neutral-950 p-3">
+          <div className="flex h-full items-end gap-1">
+            {[18, 42, 28, 64, 48, 78, 44, 32, 58, 90, 52, 38, 68, 46, 72, 35, 54, 82].map((height, index) => (
+              <div key={index} className="flex-1 bg-neutral-700/70" style={{ height: `${height}%` }} />
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="absolute inset-0 bg-[linear-gradient(90deg,#000_0%,rgba(0,0,0,0.92)_32%,rgba(0,0,0,0.52)_68%,#000_100%)]" />
+    </div>
+  )
+}
+
+export function LogsRoute({ search }: { search: ObservatorySearch }) {
   return (
     <ObservatoryHome
       eventFilterSearchText={search.filter}
@@ -1027,7 +1133,7 @@ export function ObservatoryHome({
 
   function navigateRootSearch(patch: Partial<ObservatorySearch>) {
     void navigate({
-      to: '/',
+      to: '/logs',
       search: (current: ObservatorySearch) => ({
         ...current,
         ...patch
