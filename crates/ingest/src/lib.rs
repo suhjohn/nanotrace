@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_INGEST_TOPIC: &str = "events.ingest.v1";
 pub const DEFAULT_NORMALIZED_TOPIC: &str = "events.normalized.v1";
+pub const DEFAULT_TABLEFLOW_TOPIC: &str = "events.tableflow.batches.v1";
 pub const DEFAULT_INVALID_TOPIC: &str = "events.invalid.v1";
 
 pub const HEADER_TENANT_ID: &str = "nanotrace-tenant-id";

@@ -8,7 +8,6 @@ license.workspace = true
 anyhow = "1"
 chrono = "0.4"
 nanotrace-ingest = { path = "../../crates/ingest" }
-nanotrace-lakehouse = { path = "../../crates/lakehouse" }
 rdkafka = { version = "0.37", features = ["cmake-build", "ssl-vendored", "zstd"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

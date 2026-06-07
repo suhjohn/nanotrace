@@ -45,6 +45,7 @@
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeSubnets",
         "ec2:DescribeTags",
+        "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "elasticloadbalancing:DescribeListeners",
         "elasticloadbalancing:DescribeListenerAttributes",
@@ -105,6 +106,7 @@
         "ec2:DeleteSubnet",
         "ec2:DeleteTags",
         "ec2:DeleteVpc",
+        "ec2:DeleteVpcEndpoints",
         "ec2:DetachInternetGateway",
         "ec2:DisassociateRouteTable",
         "ec2:RevokeSecurityGroupEgress",
@@ -116,7 +118,8 @@
         "arn:aws:ec2:*:*:route-table/*",
         "arn:aws:ec2:*:*:internet-gateway/*",
         "arn:aws:ec2:*:*:security-group/*",
-        "arn:aws:ec2:*:*:launch-template/*"
+        "arn:aws:ec2:*:*:launch-template/*",
+        "arn:aws:ec2:*:*:vpc-endpoint/*"
       ]
     },
     {

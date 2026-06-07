@@ -24,6 +24,7 @@
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeSubnets",
         "ec2:DescribeTags",
+        "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "elasticloadbalancing:DescribeListeners",
         "elasticloadbalancing:DescribeListenerAttributes",
@@ -34,8 +35,6 @@
         "kms:GetKeyRotationStatus",
         "kms:ListAliases",
         "kms:ListResourceTags",
-        "rds:DescribeDBInstances",
-        "rds:DescribeDBSubnetGroups",
         "route53:GetHostedZone",
         "route53:ListHostedZones",
         "route53:ListHostedZonesByName",
@@ -43,15 +42,6 @@
         "route53:ListTagsForResource"
       ],
       "Resource": "*"
-    },
-    {
-      "Sid": "ObserveNanotracePostgres",
-      "Effect": "Allow",
-      "Action": "rds:ListTagsForResource",
-      "Resource": [
-        "arn:aws:rds:*:*:db:nanotrace-*",
-        "arn:aws:rds:*:*:subgrp:nanotrace-*"
-      ]
     },
     {
       "Sid": "ListCloudWatchLogGroups",

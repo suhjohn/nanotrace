@@ -23,16 +23,18 @@ Do not ask the user to run a deploy, destroy, scale, or prod-changing command un
 Use this map to order the multi-turn flow:
 
 1. Local prerequisites: Node, AWS auth, Pulumi CLI, Docker/buildx, selected repo branch.
-2. External services: Kafka, ClickHouse, Iceberg catalog, DNS, email, Postgres decision.
-3. Staging stack config: Pulumi stack, environment variables, secrets source.
+2. Environment checklist: required deploy env names present, no obvious placeholders, no secrets pasted.
+3. External services: WarpStream Kafka topics, ClickHouse, DNS, email, PlanetScale Postgres.
 4. Preview: review expected resources and failures.
-5. First staging deploy: run roll only after explicit approval.
-6. Staging verification: health, readiness, login/email, E2E, query.
-7. CI identity: GitHub OIDC role and scoped AWS policies.
-8. CI secrets/environments: staging first, prod protected.
-9. CI staging deploy: clean checkout deploy and E2E.
-10. Prod stack: configure, preview, manually approve, deploy, E2E.
-11. Ops hardening: alarms, dashboards, backups, runbooks, rollback drills.
+5. First deploy: run roll only after explicit approval.
+6. Post-deploy outputs: bucket, URLs, DNS/email outputs, ASG names.
+7. WarpStream Tableflow: configure destination bucket, source topic, schema, agent env, and S3 access.
+8. Verification: health, readiness, login/email, event ingest, Tableflow, E2E/query.
+9. CI identity: GitHub OIDC role and scoped AWS policies.
+10. CI secrets/environments: staging first, prod protected.
+11. CI staging deploy: clean checkout deploy and E2E.
+12. Prod stack: configure, preview, manually approve, deploy, E2E.
+13. Ops hardening: alarms, dashboards, backups, runbooks, rollback drills.
 
 ## Phase 1: Bootstrap
 
@@ -54,19 +56,57 @@ git status --short
 
 Ask them to bring back versions, AWS account ID, active branch, and whether the worktree has unrelated changes.
 
-Checkpoint 2: external service choices.
+Checkpoint 2: environment checklist.
+
+Validate `.env` or the active secret-manager environment by variable name only. Never print secret values.
+
+Required deploy names:
+
+- `AWS_REGION`
+- One AWS auth method: `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY`.
+- `NANOTRACE_DOMAIN_NAME`
+- `DATABASE_URL`
+- `PLANETSCALE_PRIVATELINK_SERVICE_NAME`
+- `CLICKHOUSE_URL`
+- `CLICKHOUSE_USER`
+- `CLICKHOUSE_PASSWORD`
+- `CLICKHOUSE_DATABASE`
+- `NANOTRACE_KAFKA_BROKERS`
+- `NANOTRACE_KAFKA_SECURITY_PROTOCOL`
+- `NANOTRACE_KAFKA_SASL_MECHANISM`
+- `NANOTRACE_KAFKA_SASL_USERNAME`
+- `NANOTRACE_KAFKA_SASL_PASSWORD`
+
+Recommended or conditional:
+
+- `NANOTRACE_AWS_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` when using Cloudflare DNS.
+- `NANOTRACE_EMAIL_FROM` only when overriding the default `login@mail.<domain>`.
+- `NANOTRACE_GOOGLE_OAUTH_CLIENT_ID`, `NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET`, and optionally `NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI` when enabling Google login.
+- `NANOTRACE_KAFKA_TABLEFLOW_TOPIC` only when overriding `events.tableflow.batches.v1`.
+
+Ask the user to bring back only missing variable names, placeholder warnings, and selected DNS provider.
+
+Checkpoint 3: external service setup.
 
 - Confirm external service choices:
-  - Kafka: WarpStream, Confluent Cloud, or MSK.
+  - Kafka: WarpStream.
+  - Iceberg: WarpStream Tableflow managed table over the Tableflow Kafka topic.
   - ClickHouse: ClickHouse Cloud.
-  - Iceberg: REST catalog plus S3 warehouse.
   - DNS: Cloudflare or Route53.
-  - Postgres: Pulumi-managed RDS unless an existing managed Postgres is clearly preferred.
+  - Postgres: PlanetScale Postgres over PrivateLink.
   - Email: SES for magic-link login.
+- In WarpStream Kafka, confirm topics exist:
+  - `events.ingest.v1`
+  - `events.normalized.v1`
+  - `events.invalid.v1`
+  - `events.tableflow.batches.v1`
+- If WarpStream ACLs are disabled, no ACL rules are needed. If enabling ACLs, configure topic and consumer-group ACLs before enabling; otherwise non-superuser clients will be blocked.
+- Create a WarpStream Tableflow cluster, but expect to finish the Tableflow destination bucket after Nanotrace deploy outputs the S3 bucket.
 
 Ask the user to bring back service endpoints and whether credentials are available in a secret manager or shell environment. Do not ask them to paste secrets.
 
-Checkpoint 3: staging stack config.
+Checkpoint 4: stack config.
 
 - Create/select Pulumi stack:
 
@@ -77,20 +117,18 @@ pulumi stack select staging
 ```
 
 - Populate environment from `.env.example`; minimum important variables:
-  - `AWS_REGION`
-  - `NANOTRACE_DOMAIN_NAME`
-  - `NANOTRACE_ADMIN_EMAILS`
-  - `CLICKHOUSE_URL`
-  - `CLICKHOUSE_USER`
-  - `CLICKHOUSE_PASSWORD`
-  - `NANOTRACE_KAFKA_BROKERS`
-  - Kafka TLS/SASL variables when required.
-  - `NANOTRACE_ICEBERG_REST_URI`
-  - DNS provider credentials such as `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` when using Cloudflare.
+  - Use the names from checkpoint 2.
+  - Deploy commands read process env, not `.env` automatically:
+
+```sh
+set -a
+source .env
+set +a
+```
 
 Ask them to bring back `pulumi stack --show-name`, the non-secret environment variable names they set, and any missing required values.
 
-Checkpoint 4: staging preview.
+Checkpoint 5: preview.
 
 - Preview before any apply:
 
@@ -101,7 +139,7 @@ npm run deploy:preview
 
 Ask them to bring back the final preview summary and any errors. Review the diff before moving to deploy.
 
-Checkpoint 5: first staging deploy.
+Checkpoint 6: first deploy.
 
 - Deploy only after the user explicitly wants to mutate cloud resources:
 
@@ -112,12 +150,82 @@ npm run e2e:pulumi
 
 Ask them to bring back the deploy roll final status, exported URLs, ASG refresh status if shown, and E2E final lines.
 
+Checkpoint 7: post-deploy outputs.
+
+Collect outputs needed by external systems:
+
+```sh
+pulumi -C deploy/pulumi/nanotrace stack output
+pulumi -C deploy/pulumi/nanotrace stack output bucketName
+pulumi -C deploy/pulumi/nanotrace stack output manualDnsRecordsOutput
+```
+
+Ask the user to bring back output names and non-secret values such as URLs, bucket name, DNS record names, and current email verification status.
+
+Checkpoint 8: WarpStream Tableflow configuration.
+
+In the Tableflow Configuration editor, define the source cluster, source topic, table schema, and destination bucket. Use the bucket from checkpoint 7.
+
+Current canonical source topic:
+
+```yaml
+source_topic: events.tableflow.batches.v1
+```
+
+Minimal YAML shape:
+
+```yaml
+source_clusters:
+  - name: nanotrace_prod
+    bootstrap_brokers:
+      - hostname: <warpstream-bootstrap-host>
+        port: 9092
+    credentials:
+      use_tls: true
+      sasl_mechanism: scram-512
+      sasl_username_env: KAFKA_SASL_USERNAME
+      sasl_password_env: KAFKA_SASL_PASSWORD
+
+tables:
+  - source_cluster_name: nanotrace_prod
+    source_topic: events.tableflow.batches.v1
+    source_format: json
+    schema_mode: inline
+    partitioning_scheme: hour
+    dlq_mode: stop
+    compression: zstd
+    schema:
+      fields:
+        - { name: schema_version, id: 1, type: int }
+        - { name: batch_id, id: 2, type: string }
+        - { name: tenant_id, id: 3, type: string }
+        - { name: organization_id, id: 4, type: string }
+        - { name: received_at, id: 5, type: string }
+        - { name: source_topic, id: 6, type: string }
+        - { name: source_partition, id: 7, type: int }
+        - { name: source_offset, id: 8, type: long }
+        - { name: source_file, id: 9, type: string }
+        - { name: event_count, id: 10, type: int }
+
+destination_bucket_url: s3://<bucketName>?region=<AWS_REGION>
+```
+
+Important operational notes:
+
+- The source cluster credentials env names are identifiers. WarpStream Tableflow agents read them with the `TABLEFLOW_` prefix, so the agent environment must include `TABLEFLOW_KAFKA_SASL_USERNAME` and `TABLEFLOW_KAFKA_SASL_PASSWORD`.
+- Tableflow agents need S3 access to `s3://<bucketName>/warpstream/_tableflow/*` and relevant bucket list/read/write permissions.
+- Current Nanotrace emits batch-oriented JSON. This initial Tableflow table is a batch metadata table unless the producer is changed to emit one event per Kafka record or the Tableflow transform/schema is expanded to flatten nested events.
+
+Ask the user to bring back the Tableflow preview/save result, agent health, and any schema or permissions error.
+
 Completion criteria:
 
 - ALB/API URL is reachable.
 - UI URL is reachable.
 - Login email/DNS path is understood or verified.
 - `POST /v1/events` returns `202` with a valid key.
+- Normalizer publishes to `events.tableflow.batches.v1`.
+- Tableflow agents are healthy and writing Iceberg files under the configured bucket prefix.
 - E2E event reaches ClickHouse and query paths work.
 
 ## Phase 2: Working Deploy
@@ -189,9 +297,9 @@ Checkpoint 2: secrets and config.
   - Pulumi backend/access token.
   - ClickHouse URL/user/password.
   - Kafka brokers and credentials.
-  - Iceberg REST URI and warehouse settings if externally provided.
+  - WarpStream Tableflow cluster/configuration credentials if managed through CI.
   - DNS provider credentials.
-  - Nanotrace domain/admin/email settings.
+  - Nanotrace domain, email sender, OAuth, and session settings.
 
 Ask the user to bring back only the secret names configured, not secret values.
 
@@ -231,10 +339,11 @@ Add monitoring and alarms for:
 - EC2 ASG instance refresh failure and unhealthy instance count.
 - Server `/healthz`, `/readyz`, and `/metrics` availability.
 - Kafka broker availability, produce errors, consumer lag for normalizer and alerts.
+- WarpStream Tableflow lag and bad-record/error status.
 - ClickHouse insert errors, query failures, slow queries, bytes read limits, and storage growth.
 - Materializer/rebuild loop freshness and serving watermarks.
-- RDS CPU, storage, connections, and backup status.
-- S3/Iceberg warehouse object growth and small-file pressure.
+- PlanetScale connection health and backup status.
+- Tableflow object-storage growth and managed Iceberg table health.
 - SES bounce/complaint rate and login email delivery failures.
 
 Create runbooks for:
@@ -245,8 +354,8 @@ Create runbooks for:
 - Kafka ingest accepted but no ClickHouse row appears.
 - ClickHouse reachable but `/v1/query` fails.
 - Magic-link login email not delivered.
-- RDS restore or credential rotation.
-- Iceberg catalog/warehouse outage.
+- PlanetScale restore or credential rotation.
+- WarpStream Tableflow or object-storage outage.
 
 Access hardening:
 
@@ -268,9 +377,9 @@ Start with the symptom and isolate the layer:
 
 - API unreachable: DNS, TLS, ALB listener, target health, security groups, ASG.
 - `POST /v1/events` not `202`: auth/API key, server config, Kafka brokers/credentials/topic.
-- `202` accepted but no row: normalizer lag/error, Iceberg commit, materializer, ClickHouse insert.
+- `202` accepted but no row: normalizer lag/error, Tableflow topic lag, materializer, ClickHouse insert.
 - Query broken but rows exist: query ASG, ClickHouse credentials, schema drift, freshness/watermark checks.
 - UI broken but API works: S3 UI bucket, CloudFront distribution, invalidation, `VITE_NANOTRACE_URL`, CORS/session settings.
-- Login broken: SES identity/DKIM/Mail From, DNS records, admin/allowed email config, session cookie settings.
+- Login broken: SES identity/DKIM/Mail From, DNS records, database auth state, session cookie settings.
 
 Prefer read-only commands first: `pulumi stack output`, AWS describe APIs, ClickHouse SELECTs, Kafka lag tools, and HTTP health checks. Escalate to deploy/rollback only after identifying the failing layer.

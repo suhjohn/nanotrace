@@ -23,6 +23,8 @@ pub struct Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("{key} is required")]
+    Missing { key: &'static str },
     #[error("{key} must be a valid {kind}: {value}")]
     Invalid {
         key: &'static str,
@@ -72,8 +74,11 @@ impl Config {
             "NANOTRACE_API_KEY_CACHE_REFRESH_SECS",
             api_key_cache_refresh_secs,
         )?;
+        let database_url = optional_string("DATABASE_URL").ok_or(ConfigError::Missing {
+            key: "DATABASE_URL",
+        })?;
         let auth = AuthConfig {
-            postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
+            postgres_url: Some(database_url),
             public_base_url,
             api_key_cache_refresh_interval: Duration::from_secs(api_key_cache_refresh_secs),
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
@@ -84,8 +89,6 @@ impl Config {
             session_ttl: Duration::from_secs(session_ttl_secs),
             session_secure,
             magic_link_ttl: Duration::from_secs(magic_link_ttl_secs),
-            allowed_emails: parse_list_env("NANOTRACE_ALLOWED_EMAILS"),
-            admin_emails: parse_list_env("NANOTRACE_ADMIN_EMAILS"),
         };
 
         Ok(Self {

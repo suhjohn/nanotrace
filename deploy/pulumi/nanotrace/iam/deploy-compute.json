@@ -26,7 +26,8 @@
         "ec2:CreateRouteTable",
         "ec2:CreateSecurityGroup",
         "ec2:CreateSubnet",
-        "ec2:CreateVpc"
+        "ec2:CreateVpc",
+        "ec2:CreateVpcEndpoint"
       ],
       "Resource": [
         "arn:aws:ec2:*:*:vpc/*",
@@ -34,7 +35,8 @@
         "arn:aws:ec2:*:*:route-table/*",
         "arn:aws:ec2:*:*:internet-gateway/*",
         "arn:aws:ec2:*:*:security-group/*",
-        "arn:aws:ec2:*:*:launch-template/*"
+        "arn:aws:ec2:*:*:launch-template/*",
+        "arn:aws:ec2:*:*:vpc-endpoint/*"
       ],
       "Condition": { "StringEquals": { "aws:RequestTag/Project": "nanotrace" } }
     },
@@ -60,7 +62,8 @@
         "arn:aws:ec2:*:*:launch-template/*",
         "arn:aws:ec2:*:*:instance/*",
         "arn:aws:ec2:*:*:network-interface/*",
-        "arn:aws:ec2:*:*:volume/*"
+        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*:*:vpc-endpoint/*"
       ],
       "Condition": {
         "StringEquals": {
@@ -71,6 +74,7 @@
             "CreateSecurityGroup",
             "CreateSubnet",
             "CreateVpc",
+            "CreateVpcEndpoint",
             "RunInstances"
           ]
         }
@@ -94,10 +98,12 @@
         "ec2:DeleteSubnet",
         "ec2:DeleteTags",
         "ec2:DeleteVpc",
+        "ec2:DeleteVpcEndpoints",
         "ec2:DetachInternetGateway",
         "ec2:DisassociateRouteTable",
         "ec2:ModifyLaunchTemplate",
         "ec2:ModifySubnetAttribute",
+        "ec2:ModifyVpcEndpoint",
         "ec2:ModifyVpcAttribute",
         "ec2:ReplaceRoute",
         "ec2:ReplaceRouteTableAssociation",
@@ -110,7 +116,8 @@
         "arn:aws:ec2:*:*:route-table/*",
         "arn:aws:ec2:*:*:internet-gateway/*",
         "arn:aws:ec2:*:*:security-group/*",
-        "arn:aws:ec2:*:*:launch-template/*"
+        "arn:aws:ec2:*:*:launch-template/*",
+        "arn:aws:ec2:*:*:vpc-endpoint/*"
       ],
       "Condition": { "StringEquals": { "ec2:ResourceTag/Project": "nanotrace" } }
     },

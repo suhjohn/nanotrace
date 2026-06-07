@@ -1,15 +1,14 @@
 use std::{
     collections::HashSet,
     env,
-    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use nanotrace_ingest::{
-    DEFAULT_INGEST_TOPIC, DEFAULT_INVALID_TOPIC, DEFAULT_NORMALIZED_TOPIC, HEADER_ORGANIZATION_ID,
-    HEADER_RECEIVED_AT, HEADER_TENANT_ID, ManagedDefinitionSpec, consumer, count_ndjson_rows,
-    header_value, normalize_json_batch, producer, subscribe,
+    DEFAULT_INGEST_TOPIC, DEFAULT_INVALID_TOPIC, DEFAULT_NORMALIZED_TOPIC, DEFAULT_TABLEFLOW_TOPIC,
+    HEADER_ORGANIZATION_ID, HEADER_RECEIVED_AT, HEADER_TENANT_ID, ManagedDefinitionSpec, consumer,
+    count_ndjson_rows, header_value, normalize_json_batch, producer, subscribe,
 };
 use rdkafka::{
     Message,
@@ -17,7 +16,6 @@ use rdkafka::{
     producer::FutureRecord,
 };
 use reqwest::StatusCode;
-use serde::Serialize;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -27,6 +25,7 @@ struct Config {
     brokers: String,
     ingest_topic: String,
     normalized_topic: String,
+    tableflow_topic: String,
     invalid_topic: String,
     group_id: String,
     client_id: String,
@@ -35,36 +34,10 @@ struct Config {
     clickhouse_database: String,
     clickhouse_invalid_table: String,
     clickhouse_definitions_table: String,
-    clickhouse_lakehouse_commits_table: String,
     clickhouse_user: Option<String>,
     clickhouse_password: Option<String>,
     request_timeout: Duration,
     fail_after_clickhouse_insert: bool,
-    lakehouse_enabled: bool,
-    lakehouse_warehouse_dir: PathBuf,
-    lakehouse_namespace: String,
-    lakehouse_table: String,
-    lakehouse_target_file_size_bytes: u64,
-    lakehouse_min_snapshots_to_keep: u64,
-    lakehouse_max_snapshot_age_ms: u64,
-    lakehouse_metadata_previous_versions_max: u64,
-    iceberg_rest_catalog: Option<nanotrace_lakehouse::LakehouseRestCatalogConfig>,
-}
-
-#[derive(Debug, Serialize)]
-struct LakehouseCommitRow<'a> {
-    namespace: &'a str,
-    table_name: &'a str,
-    snapshot_id: &'a str,
-    sequence_number: u64,
-    committed_at_ms: u64,
-    data_file: &'a str,
-    data_files: &'a [String],
-    record_count: u64,
-    content_sha256: &'a str,
-    metadata_location: &'a str,
-    source_batch_id: &'a str,
-    deduplicated: u8,
 }
 
 #[tokio::main]
@@ -90,13 +63,9 @@ async fn main() -> Result<()> {
         brokers = cfg.brokers,
         ingest_topic = cfg.ingest_topic,
         normalized_topic = cfg.normalized_topic,
+        tableflow_topic = cfg.tableflow_topic,
         invalid_topic = cfg.invalid_topic,
         clickhouse_enabled = cfg.clickhouse_url.is_some(),
-        lakehouse_enabled = cfg.lakehouse_enabled,
-        lakehouse_namespace = cfg.lakehouse_namespace,
-        lakehouse_table = cfg.lakehouse_table,
-        lakehouse_warehouse_dir = %cfg.lakehouse_warehouse_dir.display(),
-        iceberg_rest_catalog = cfg.iceberg_rest_catalog.is_some(),
         "nanotrace normalizer starting"
     );
 
@@ -173,18 +142,29 @@ async fn process_message(
         cfg.max_event_bytes,
     );
 
-    let mut lakehouse_commit = None;
-    let mut lakehouse_commit_ms = 0_u64;
-    let mut lakehouse_metadata_insert_ms = 0_u64;
+    let mut tableflow_publish_ms = 0_u64;
     let mut invalid_insert_ms = 0_u64;
     let mut clickhouse_inserted = false;
 
     if !batch.normalized.is_empty() {
-        let commit_started = Instant::now();
-        lakehouse_commit = commit_lakehouse(cfg, &batch.normalized, &token_prefix)
-            .await
-            .context("commit normalized batch to lakehouse")?;
-        lakehouse_commit_ms = elapsed_ms(commit_started.elapsed());
+        let publish_started = Instant::now();
+        let tableflow_payload = tableflow_batch_payload(
+            &batch.normalized,
+            message,
+            &tenant_id,
+            &organization_id,
+            &received_at,
+        )
+        .context("build Tableflow batch payload")?;
+        produce_bytes(
+            producer,
+            &cfg.tableflow_topic,
+            &tenant_id,
+            &tableflow_payload,
+        )
+        .await
+        .context("produce Tableflow batch")?;
+        tableflow_publish_ms = elapsed_ms(publish_started.elapsed());
     }
     if !batch.invalid.is_empty() {
         let invalid_dedupe_token = format!("{token_prefix}:invalid");
@@ -198,14 +178,6 @@ async fn process_message(
         )
         .await?;
         invalid_insert_ms = elapsed_ms(insert_started.elapsed());
-        clickhouse_inserted = cfg.clickhouse_url.is_some();
-    }
-    if let Some(commit) = lakehouse_commit.as_ref() {
-        let insert_started = Instant::now();
-        insert_lakehouse_commit_metadata(cfg, http, commit, &token_prefix)
-            .await
-            .context("insert lakehouse commit metadata")?;
-        lakehouse_metadata_insert_ms = elapsed_ms(insert_started.elapsed());
         clickhouse_inserted = cfg.clickhouse_url.is_some();
     }
     if cfg.fail_after_clickhouse_insert && clickhouse_inserted {
@@ -244,100 +216,12 @@ async fn process_message(
         managed_definitions = batch.managed_definitions.len(),
         normalized_bytes = batch.normalized.len(),
         invalid_bytes = batch.invalid.len(),
-        lakehouse_enabled = cfg.lakehouse_enabled,
-        lakehouse_snapshot_id = lakehouse_commit
-            .as_ref()
-            .map(|commit| commit.snapshot_id.as_str()),
-        lakehouse_sequence_number = lakehouse_commit
-            .as_ref()
-            .map(|commit| commit.sequence_number),
-        lakehouse_deduplicated = lakehouse_commit.as_ref().map(|commit| commit.deduplicated),
-        lakehouse_commit_ms,
-        lakehouse_metadata_insert_ms,
+        tableflow_topic = cfg.tableflow_topic,
+        tableflow_publish_ms,
         invalid_insert_ms,
         elapsed_ms = started_at.elapsed().as_millis(),
         "normalized ingest message"
     );
-    Ok(())
-}
-
-async fn commit_lakehouse(
-    cfg: &Config,
-    normalized: &[u8],
-    source_batch_id: &str,
-) -> Result<Option<nanotrace_lakehouse::LakehouseCommit>> {
-    if !cfg.lakehouse_enabled || normalized.is_empty() {
-        return Ok(None);
-    }
-
-    let mut lakehouse_cfg =
-        nanotrace_lakehouse::LakehouseConfig::events_table(cfg.lakehouse_warehouse_dir.clone())
-            .with_write_target_file_size_bytes(cfg.lakehouse_target_file_size_bytes)
-            .with_snapshot_retention(
-                cfg.lakehouse_min_snapshots_to_keep,
-                cfg.lakehouse_max_snapshot_age_ms,
-                cfg.lakehouse_metadata_previous_versions_max,
-            );
-    lakehouse_cfg.namespace = cfg.lakehouse_namespace.clone();
-    lakehouse_cfg.table = cfg.lakehouse_table.clone();
-    if let Some(rest) = cfg.iceberg_rest_catalog.clone() {
-        lakehouse_cfg = lakehouse_cfg.with_rest_catalog(rest);
-    }
-
-    let normalized = normalized.to_vec();
-    let source_batch_id = source_batch_id.to_string();
-    let commit = tokio::task::spawn_blocking(move || {
-        nanotrace_lakehouse::commit_events_ndjson_with_source(
-            &lakehouse_cfg,
-            &normalized,
-            Some(&source_batch_id),
-        )
-    })
-    .await
-    .context("join lakehouse commit task")?
-    .context("commit events to lakehouse")?;
-    Ok(Some(commit))
-}
-
-async fn insert_lakehouse_commit_metadata(
-    cfg: &Config,
-    http: &reqwest::Client,
-    commit: &nanotrace_lakehouse::LakehouseCommit,
-    token_prefix: &str,
-) -> Result<()> {
-    if cfg.clickhouse_url.is_none() {
-        return Ok(());
-    }
-
-    let commit_row = LakehouseCommitRow {
-        namespace: &commit.namespace,
-        table_name: &commit.table,
-        snapshot_id: &commit.snapshot_id,
-        sequence_number: commit.sequence_number,
-        committed_at_ms: commit.committed_at_ms.try_into().unwrap_or(0),
-        data_file: &commit.data_file,
-        data_files: &commit.data_files,
-        record_count: commit.record_count.try_into().unwrap_or(u64::MAX),
-        content_sha256: &commit.content_sha256,
-        metadata_location: &commit.metadata_location,
-        source_batch_id: commit.source_batch_id.as_deref().unwrap_or(""),
-        deduplicated: u8::from(commit.deduplicated),
-    };
-
-    let mut commit_body = Vec::new();
-    serde_json::to_writer(&mut commit_body, &commit_row)
-        .context("serialize lakehouse commit row")?;
-    commit_body.push(b'\n');
-
-    let lakehouse_commits_token = format!("{token_prefix}:lakehouse_commits");
-    insert_clickhouse(
-        cfg,
-        http,
-        &cfg.clickhouse_lakehouse_commits_table,
-        &commit_body,
-        Some(&lakehouse_commits_token),
-    )
-    .await?;
     Ok(())
 }
 
@@ -464,6 +348,7 @@ impl Config {
             brokers,
             ingest_topic: env_or("NANOTRACE_KAFKA_INGEST_TOPIC", DEFAULT_INGEST_TOPIC),
             normalized_topic: env_or("NANOTRACE_KAFKA_NORMALIZED_TOPIC", DEFAULT_NORMALIZED_TOPIC),
+            tableflow_topic: env_or("NANOTRACE_KAFKA_TABLEFLOW_TOPIC", DEFAULT_TABLEFLOW_TOPIC),
             invalid_topic: env_or("NANOTRACE_KAFKA_INVALID_TOPIC", DEFAULT_INVALID_TOPIC),
             group_id: env_or("NANOTRACE_NORMALIZER_GROUP_ID", "nanotrace-normalizer"),
             client_id: env_or("NANOTRACE_NORMALIZER_CLIENT_ID", "nanotrace-normalizer"),
@@ -472,10 +357,6 @@ impl Config {
             clickhouse_database: env_or("CLICKHOUSE_DATABASE", "observatory"),
             clickhouse_invalid_table: env_or("CLICKHOUSE_INVALID_EVENTS_TABLE", "invalid_events"),
             clickhouse_definitions_table: env_or("CLICKHOUSE_DEFINITIONS_TABLE", "definitions"),
-            clickhouse_lakehouse_commits_table: env_or(
-                "CLICKHOUSE_LAKEHOUSE_COMMITS_TABLE",
-                "lakehouse_commits",
-            ),
             clickhouse_user: optional("CLICKHOUSE_USER")
                 .or_else(|| optional("CLICKHOUSE_USERNAME")),
             clickhouse_password: optional("CLICKHOUSE_PASSWORD"),
@@ -486,30 +367,6 @@ impl Config {
             fail_after_clickhouse_insert: env_bool(
                 "NANOTRACE_NORMALIZER_FAIL_AFTER_CLICKHOUSE_INSERT",
             ),
-            lakehouse_enabled: env_bool_default("NANOTRACE_LAKEHOUSE_ENABLED", true),
-            lakehouse_warehouse_dir: PathBuf::from(env_or(
-                "NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR",
-                "/var/lib/nanotrace/lakehouse",
-            )),
-            lakehouse_namespace: env_or("NANOTRACE_LAKEHOUSE_NAMESPACE", "nanotrace"),
-            lakehouse_table: env_or("NANOTRACE_LAKEHOUSE_TABLE", "events"),
-            lakehouse_target_file_size_bytes: parse_env(
-                "NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES",
-                512_u64 * 1024 * 1024,
-            )?,
-            lakehouse_min_snapshots_to_keep: parse_env(
-                "NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP",
-                10_000_u64,
-            )?,
-            lakehouse_max_snapshot_age_ms: parse_env(
-                "NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS",
-                7_u64 * 24 * 60 * 60 * 1000,
-            )?,
-            lakehouse_metadata_previous_versions_max: parse_env(
-                "NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX",
-                100_u64,
-            )?,
-            iceberg_rest_catalog: iceberg_rest_catalog_from_env()?,
         })
     }
 }
@@ -541,28 +398,6 @@ fn matches_bool(value: &str) -> bool {
 
 fn env_or(key: &str, fallback: &str) -> String {
     optional(key).unwrap_or_else(|| fallback.to_string())
-}
-
-fn iceberg_rest_catalog_from_env() -> Result<Option<nanotrace_lakehouse::LakehouseRestCatalogConfig>>
-{
-    let Some(uri) = optional("NANOTRACE_ICEBERG_REST_URI") else {
-        return Ok(None);
-    };
-    let warehouse = required("NANOTRACE_ICEBERG_WAREHOUSE").context(
-        "NANOTRACE_ICEBERG_WAREHOUSE is required when NANOTRACE_ICEBERG_REST_URI is set",
-    )?;
-    let catalog_name = env_or("NANOTRACE_ICEBERG_CATALOG_NAME", "nanotrace");
-    let mut properties = std::collections::HashMap::new();
-    if let Some(prefix) = optional("NANOTRACE_ICEBERG_REST_PREFIX") {
-        properties.insert("prefix".to_string(), prefix);
-    }
-
-    Ok(Some(nanotrace_lakehouse::LakehouseRestCatalogConfig {
-        catalog_name,
-        uri,
-        warehouse,
-        properties,
-    }))
 }
 
 fn parse_env<T>(key: &str, fallback: T) -> Result<T>
@@ -599,6 +434,41 @@ fn unix_millis() -> u64 {
 
 fn elapsed_ms(elapsed: Duration) -> u64 {
     elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn tableflow_batch_payload(
+    normalized_ndjson: &[u8],
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    tenant_id: &str,
+    organization_id: &str,
+    received_at: &str,
+) -> Result<Vec<u8>> {
+    let mut events = Vec::new();
+    for line in normalized_ndjson
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event = serde_json::from_slice::<serde_json::Value>(line)
+            .context("parse normalized event row for Tableflow")?;
+        events.push(event);
+    }
+
+    let row = serde_json::json!({
+        "schema_version": 1,
+        "batch_id": format!("{}:{}:{}", message.topic(), message.partition(), message.offset()),
+        "tenant_id": tenant_id,
+        "organization_id": organization_id,
+        "received_at": received_at,
+        "source_topic": message.topic(),
+        "source_partition": message.partition(),
+        "source_offset": message.offset(),
+        "source_file": format!("kafka://{}/{}/{}", message.topic(), message.partition(), message.offset()),
+        "event_count": events.len(),
+        "events": events,
+    });
+    let mut output = serde_json::to_vec(&row).context("serialize Tableflow batch row")?;
+    output.push(b'\n');
+    Ok(output)
 }
 
 async fn shutdown_signal() {

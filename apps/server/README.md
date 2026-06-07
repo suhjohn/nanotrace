@@ -18,8 +18,8 @@ POST /v1/events
 
 Requests without a valid service/admin API key are rejected before Kafka
 produce. The normalizer owns JSON parsing, tenant stamping, invalid-event
-handling, generic KV indexing, typed SDK-managed metric definitions, Iceberg
-commits, and ClickHouse inserts.
+handling, typed SDK-managed metric definitions, and publishing the
+Tableflow-ready Kafka topic. WarpStream Tableflow owns Iceberg writes.
 
 Kafka message metadata
 
@@ -44,9 +44,9 @@ data: JSON object
 ```
 
 The normalizer stamps `tenant_id` and `organization_id` into `data`, serializes
-valid rows to Iceberg and ClickHouse JSONEachRow, and sends invalid rows to the
-invalid topic/table. Its Kafka offset advances only after the durable writes for
-that message succeed.
+valid rows to the Tableflow Kafka topic, and sends invalid rows to the invalid
+topic/table. Its Kafka offset advances only after the durable publishes for that
+message succeed.
 
 Runtime configuration
 
@@ -67,14 +67,12 @@ NANOTRACE_KAFKA_SECURITY_PROTOCOL
 NANOTRACE_KAFKA_SASL_MECHANISM
 NANOTRACE_KAFKA_SASL_USERNAME
 NANOTRACE_KAFKA_SASL_PASSWORD
-NANOTRACE_POSTGRES_URL
+DATABASE_URL
 NANOTRACE_PUBLIC_BASE_URL
 NANOTRACE_APP_BASE_URL
 NANOTRACE_EMAIL_FROM
 NANOTRACE_MAGIC_LINK_TTL_SECS
 NANOTRACE_API_KEY_CACHE_REFRESH_SECS
-NANOTRACE_ALLOWED_EMAILS
-NANOTRACE_ADMIN_EMAILS
 NANOTRACE_GOOGLE_OAUTH_CLIENT_ID
 NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET
 NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI

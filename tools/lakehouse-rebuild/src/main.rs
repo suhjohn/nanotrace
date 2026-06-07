@@ -14,12 +14,19 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use datafusion::{datasource::file_format::options::ParquetReadOptions, prelude::SessionContext};
-use nanotrace_ingest::{event_kv_index_rows, event_search_term_rows, event_text_index_rows};
+use nanotrace_ingest::{
+    DEFAULT_TABLEFLOW_TOPIC, consumer, event_kv_index_rows, event_search_term_rows,
+    event_text_index_rows, subscribe,
+};
 use nanotrace_lakehouse::{
     LakehouseCommit, LakehouseCompactionOptions, LakehouseCompactionResult, LakehouseConfig,
     compact_events_iceberg,
 };
 use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::reader::ChunkReader};
+use rdkafka::{
+    Message,
+    consumer::{CommitMode, Consumer},
+};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,6 +35,10 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 struct Config {
+    kafka_brokers: String,
+    tableflow_topic: String,
+    tableflow_materializer_group_id: String,
+    tableflow_materializer_client_id: String,
     warehouse_dir: PathBuf,
     namespace: String,
     source_table: String,
@@ -58,6 +69,7 @@ struct Config {
     incremental_materialize: bool,
     materialize_loop: bool,
     materialization_queue_executor: bool,
+    tableflow_materializer_mode: TableflowMaterializerMode,
     materialization_queue_max_chunks: usize,
     materialization_queue_lease_secs: u64,
     materialization_queue_worker_id: String,
@@ -87,6 +99,31 @@ struct Config {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableflowMaterializerMode {
+    Disabled,
+    Loop,
+    Once { idle_timeout: Duration },
+}
+
+impl TableflowMaterializerMode {
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    fn is_once(self) -> bool {
+        matches!(self, Self::Once { .. })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Loop => "loop",
+            Self::Once { .. } => "once",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitSource {
     Local,
     ClickHouse,
@@ -110,16 +147,33 @@ enum DataFileLocation {
     S3 { bucket: String, key: String },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct EventInsertRow {
     event_id: String,
     timestamp: String,
+    #[serde(default)]
     observed_timestamp: String,
+    #[serde(default)]
     ingested_timestamp: String,
     source_file: String,
     source_offset: u64,
     source_length: u32,
     data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct TableflowBatchRecord {
+    schema_version: u16,
+    batch_id: String,
+    tenant_id: String,
+    organization_id: String,
+    received_at: String,
+    source_topic: String,
+    source_partition: i32,
+    source_offset: i64,
+    source_file: String,
+    event_count: usize,
+    events: Vec<EventInsertRow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,7 +528,7 @@ impl MaterializeTargets {
 
     fn all() -> Self {
         Self {
-            events: false,
+            events: true,
             event_text_index: true,
             event_search_terms: true,
             event_kv_index: true,
@@ -909,6 +963,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cfg.tableflow_materializer_mode.is_enabled() {
+        run_tableflow_materializer(&client, &cfg).await?;
+        return Ok(());
+    }
+
     if cfg.materialize_loop {
         if cfg.materialization_queue_executor {
             run_materialization_queue_loop(&client, &lakehouse_reader, &cfg).await?;
@@ -1148,6 +1207,16 @@ impl Config {
         )?;
 
         Ok(Self {
+            kafka_brokers: env_or("NANOTRACE_KAFKA_BROKERS", "redpanda:9092"),
+            tableflow_topic: env_or("NANOTRACE_KAFKA_TABLEFLOW_TOPIC", DEFAULT_TABLEFLOW_TOPIC),
+            tableflow_materializer_group_id: env_or(
+                "NANOTRACE_TABLEFLOW_MATERIALIZER_GROUP_ID",
+                "nanotrace-tableflow-materializer",
+            ),
+            tableflow_materializer_client_id: env_or(
+                "NANOTRACE_TABLEFLOW_MATERIALIZER_CLIENT_ID",
+                "nanotrace-tableflow-materializer",
+            ),
             warehouse_dir: PathBuf::from(env_or(
                 "NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR",
                 "/var/lib/nanotrace/lakehouse",
@@ -1181,6 +1250,7 @@ impl Config {
             incremental_materialize: env_bool("NANOTRACE_MATERIALIZE_INCREMENTAL"),
             materialize_loop: env_bool("NANOTRACE_MATERIALIZE_LOOP"),
             materialization_queue_executor: env_bool("NANOTRACE_MATERIALIZATION_QUEUE_EXECUTOR"),
+            tableflow_materializer_mode: tableflow_materializer_mode_from_env()?,
             materialization_queue_max_chunks: optional_usize(
                 "NANOTRACE_MATERIALIZATION_QUEUE_MAX_CHUNKS",
                 10,
@@ -1396,6 +1466,19 @@ impl Config {
     fn qualified_pipeline_metrics_table(&self) -> String {
         format!("{}.pipeline_metrics", self.clickhouse_database)
     }
+}
+
+fn tableflow_materializer_mode_from_env() -> Result<TableflowMaterializerMode> {
+    if env_bool("NANOTRACE_TABLEFLOW_MATERIALIZE_ONCE") {
+        let idle_secs = optional_u64("NANOTRACE_TABLEFLOW_MATERIALIZE_IDLE_SECS", 5)?;
+        return Ok(TableflowMaterializerMode::Once {
+            idle_timeout: Duration::from_secs(idle_secs),
+        });
+    }
+    if env_bool("NANOTRACE_TABLEFLOW_MATERIALIZE_LOOP") {
+        return Ok(TableflowMaterializerMode::Loop);
+    }
+    Ok(TableflowMaterializerMode::Disabled)
 }
 
 fn s3_client(config: &aws_config::SdkConfig) -> S3Client {
@@ -1730,6 +1813,185 @@ async fn run_materializer_pass(
         definitions.cohorts.len()
     );
     run_incremental_materialize(client, lakehouse_reader, cfg, &commits, &definitions).await
+}
+
+async fn run_tableflow_materializer(client: &Client, cfg: &Config) -> Result<()> {
+    let consumer = consumer(
+        &cfg.kafka_brokers,
+        &cfg.tableflow_materializer_group_id,
+        &cfg.tableflow_materializer_client_id,
+    )
+    .context("create Tableflow materializer Kafka consumer")?;
+    subscribe(&consumer, &cfg.tableflow_topic).context("subscribe to Tableflow topic")?;
+    println!(
+        "tableflow materializer starting topic={} group={} mode={}",
+        cfg.tableflow_topic,
+        cfg.tableflow_materializer_group_id,
+        cfg.tableflow_materializer_mode.label()
+    );
+
+    loop {
+        let message = match cfg.tableflow_materializer_mode {
+            TableflowMaterializerMode::Disabled => return Ok(()),
+            TableflowMaterializerMode::Once { idle_timeout } => {
+                match tokio::time::timeout(idle_timeout, consumer.recv()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        println!("tableflow materializer idle; stopping");
+                        return Ok(());
+                    }
+                }
+            }
+            TableflowMaterializerMode::Loop => {
+                tokio::select! {
+                    message = consumer.recv() => message,
+                    _ = shutdown_signal() => {
+                        println!("tableflow materializer stopping");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        match message {
+            Ok(message) => {
+                if let Err(err) = process_tableflow_message(client, cfg, &message).await {
+                    eprintln!("tableflow materializer message failed: {err:?}");
+                    if cfg.tableflow_materializer_mode.is_once() {
+                        return Err(err);
+                    }
+                } else {
+                    consumer
+                        .commit_message(&message, CommitMode::Sync)
+                        .context("commit Tableflow materializer Kafka offset")?;
+                }
+            }
+            Err(err) => {
+                eprintln!("tableflow materializer Kafka receive failed: {err}");
+                if cfg.tableflow_materializer_mode.is_once() {
+                    return Err(anyhow!(
+                        "Tableflow materializer Kafka receive failed: {err}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn process_tableflow_message(
+    client: &Client,
+    cfg: &Config,
+    message: &rdkafka::message::BorrowedMessage<'_>,
+) -> Result<()> {
+    let payload = message.payload().unwrap_or_default();
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let mut batch: TableflowBatchRecord =
+        serde_json::from_slice(payload).context("parse Tableflow batch payload")?;
+    if batch.schema_version != 1 {
+        bail!(
+            "unsupported Tableflow batch schema_version={}",
+            batch.schema_version
+        );
+    }
+    if batch.event_count != batch.events.len() {
+        bail!(
+            "Tableflow batch {} event_count={} but events.len()={}",
+            batch.batch_id,
+            batch.event_count,
+            batch.events.len()
+        );
+    }
+    if batch.events.is_empty() {
+        return Ok(());
+    }
+    for row in &mut batch.events {
+        if row.observed_timestamp.trim().is_empty() {
+            row.observed_timestamp.clone_from(&row.timestamp);
+        }
+        if row.ingested_timestamp.trim().is_empty() {
+            row.ingested_timestamp.clone_from(&batch.received_at);
+        }
+    }
+
+    let definitions = active_definitions(client, cfg)
+        .await
+        .context("load active materialization definitions")?;
+    let commit = tableflow_batch_commit(&batch, payload);
+    let counts = materialize_rows(
+        client,
+        cfg,
+        &commit,
+        &batch.events,
+        &definitions,
+        MaterializeOptions {
+            file_index: 0,
+            targets: MaterializeTargets::all(),
+            token_namespace: "tableflow-materialize",
+        },
+    )
+    .await
+    .context("materialize Tableflow batch rows")?;
+    insert_incremental_materialization_metadata(
+        client,
+        cfg,
+        &commit,
+        &counts,
+        MaterializeTargets::all(),
+    )
+    .await
+    .context("insert Tableflow materialization metadata")?;
+
+    println!(
+        "tableflow materialized batch={} tenant={} org={} received_at={} source={}/{}:{} rows={} event_rows={} event_kv_index_rows={} field_index_rows={} event_measure_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
+        batch.batch_id,
+        batch.tenant_id,
+        batch.organization_id,
+        batch.received_at,
+        batch.source_topic,
+        batch.source_partition,
+        batch.source_offset,
+        batch.events.len(),
+        counts.events,
+        counts.event_kv_index,
+        counts.field_index,
+        counts.event_measures,
+        counts.report_results,
+        counts.sequence_report_results,
+        counts.cohort_memberships
+    );
+    Ok(())
+}
+
+fn tableflow_batch_commit(batch: &TableflowBatchRecord, payload: &[u8]) -> LakehouseCommit {
+    let sequence_number = tableflow_sequence_number(batch.source_partition, batch.source_offset);
+    LakehouseCommit {
+        namespace: "nanotrace".to_string(),
+        table: "events".to_string(),
+        snapshot_id: format!(
+            "tableflow-{}-{}-{}",
+            batch.source_topic, batch.source_partition, batch.source_offset
+        ),
+        sequence_number,
+        committed_at_ms: chrono::Utc::now().timestamp_millis(),
+        data_file: batch.source_file.clone(),
+        data_files: vec![batch.source_file.clone()],
+        record_count: batch.events.len(),
+        content_sha256: hex_sha256(payload),
+        metadata_location: format!(
+            "kafka://{}/{}/{}",
+            batch.source_topic, batch.source_partition, batch.source_offset
+        ),
+        source_batch_id: Some(batch.batch_id.clone()),
+        deduplicated: false,
+    }
+}
+
+fn tableflow_sequence_number(partition: i32, offset: i64) -> u64 {
+    let partition = u64::try_from(partition.max(0)).unwrap_or(0);
+    let offset = u64::try_from(offset.max(0)).unwrap_or(0);
+    (partition << 48) | (offset & ((1_u64 << 48) - 1))
 }
 
 async fn run_lakehouse_maintenance(
@@ -6498,6 +6760,10 @@ fn insert_deduplication_token(prefix: &str, table: &str, chunk_index: usize) -> 
     format!("{:x}", hasher.finalize())
 }
 
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn quote_ident(value: &str) -> Result<String> {
     if value
         .chars()
@@ -7741,6 +8007,7 @@ mod tests {
             incremental_materialize: false,
             materialize_loop: false,
             materialization_queue_executor: false,
+            tableflow_materializer_mode: TableflowMaterializerMode::Disabled,
             materialization_queue_max_chunks: 10,
             materialization_queue_lease_secs: 300,
             materialization_queue_worker_id: "test-worker".to_string(),

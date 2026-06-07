@@ -2,7 +2,6 @@ import * as aws from '@pulumi/aws'
 import * as cloudflare from '@pulumi/cloudflare'
 import * as command from '@pulumi/command'
 import * as pulumi from '@pulumi/pulumi'
-import * as random from '@pulumi/random'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
@@ -85,6 +84,10 @@ const kafkaNormalizedTopic =
   cfg.get('kafkaNormalizedTopic') ??
   process.env.NANOTRACE_KAFKA_NORMALIZED_TOPIC ??
   'events.normalized.v1'
+const kafkaTableflowTopic =
+  cfg.get('kafkaTableflowTopic') ??
+  process.env.NANOTRACE_KAFKA_TABLEFLOW_TOPIC ??
+  'events.tableflow.batches.v1'
 const kafkaInvalidTopic =
   cfg.get('kafkaInvalidTopic') ??
   process.env.NANOTRACE_KAFKA_INVALID_TOPIC ??
@@ -119,107 +122,29 @@ const normalizerClientId =
   cfg.get('normalizerClientId') ??
   process.env.NANOTRACE_NORMALIZER_CLIENT_ID ??
   `${name}-normalizer`
-const lakehouseEnabled =
-  cfg.getBoolean('lakehouseEnabled') ??
-  booleanEnv('NANOTRACE_LAKEHOUSE_ENABLED', true)
-const lakehouseWarehouseDir =
-  cfg.get('lakehouseWarehouseDir') ??
-  process.env.NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR ??
-  '/var/lib/nanotrace/lakehouse'
-const lakehouseNamespace =
-  cfg.get('lakehouseNamespace') ??
-  process.env.NANOTRACE_LAKEHOUSE_NAMESPACE ??
-  'nanotrace'
-const lakehouseTable =
-  cfg.get('lakehouseTable') ??
-  process.env.NANOTRACE_LAKEHOUSE_TABLE ??
-  'events'
-const icebergRestUri =
-  cfg.get('icebergRestUri') ??
-  process.env.NANOTRACE_ICEBERG_REST_URI ??
-  ''
-if (lakehouseEnabled && !icebergRestUri) {
-  throw new Error('icebergRestUri or NANOTRACE_ICEBERG_REST_URI is required for deployed shared Iceberg object storage')
-}
-const configuredIcebergWarehouse =
-  cfg.get('icebergWarehouse') ??
-  process.env.NANOTRACE_ICEBERG_WAREHOUSE ??
-  ''
-const icebergWarehousePrefix =
-  cfg.get('icebergWarehousePrefix') ??
-  process.env.NANOTRACE_ICEBERG_WAREHOUSE_PREFIX ??
-  'iceberg'
-const normalizedIcebergWarehousePrefix =
-  icebergWarehousePrefix.replace(/^\/+|\/+$/g, '') || 'iceberg'
-const configuredIcebergWarehouseS3 = configuredIcebergWarehouse
-  ? parseS3Uri(configuredIcebergWarehouse)
-  : undefined
-if (configuredIcebergWarehouse && !configuredIcebergWarehouseS3) {
-  throw new Error('nanotrace:icebergWarehouse / NANOTRACE_ICEBERG_WAREHOUSE must be an s3:// or s3a:// URI in this Pulumi stack')
-}
-const icebergCatalogName =
-  cfg.get('icebergCatalogName') ??
-  process.env.NANOTRACE_ICEBERG_CATALOG_NAME ??
-  'nanotrace'
-const icebergRestPrefix =
-  cfg.get('icebergRestPrefix') ??
-  process.env.NANOTRACE_ICEBERG_REST_PREFIX ??
-  ''
-const icebergTargetFileSizeBytes =
-  cfg.getNumber('icebergTargetFileSizeBytes') ??
-  numberEnv('NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES', 512 * 1024 * 1024)
-const icebergMinSnapshotsToKeep =
-  cfg.getNumber('icebergMinSnapshotsToKeep') ??
-  numberEnv('NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP', 10_000)
-const icebergMaxSnapshotAgeMs =
-  cfg.getNumber('icebergMaxSnapshotAgeMs') ??
-  numberEnv('NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS', 7 * 24 * 60 * 60 * 1000)
-const icebergMetadataPreviousVersionsMax =
-  cfg.getNumber('icebergMetadataPreviousVersionsMax') ??
-  numberEnv('NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX', 100)
-const materializePollSecs =
-  cfg.getNumber('materializePollSecs') ??
-  numberEnv('NANOTRACE_MATERIALIZE_POLL_SECS', 5)
-const postgresMode =
-  cfg.get('postgresMode') ??
-  process.env.NANOTRACE_POSTGRES_MODE ??
-  'managed'
-if (postgresMode !== 'managed' && postgresMode !== 'external') {
-  throw new Error('nanotrace:postgresMode must be managed or external')
-}
-const postgresPrivateConnect =
-  cfg.get('postgresPrivateConnect') ??
-  process.env.NANOTRACE_POSTGRES_PRIVATE_CONNECT ??
-  'none'
-if (postgresPrivateConnect !== 'none' && postgresPrivateConnect !== 'aws-privatelink') {
-  throw new Error('nanotrace:postgresPrivateConnect must be none or aws-privatelink')
-}
-const externalPostgresUrl =
-  cfg.getSecret('postgresUrl') ??
-  (process.env.NANOTRACE_POSTGRES_URL
-    ? pulumi.secret(process.env.NANOTRACE_POSTGRES_URL)
+const tableflowMaterializerGroupId =
+  cfg.get('tableflowMaterializerGroupId') ??
+  process.env.NANOTRACE_TABLEFLOW_MATERIALIZER_GROUP_ID ??
+  `${name}-tableflow-materializer`
+const tableflowMaterializerClientId =
+  cfg.get('tableflowMaterializerClientId') ??
+  process.env.NANOTRACE_TABLEFLOW_MATERIALIZER_CLIENT_ID ??
+  `${name}-tableflow-materializer`
+const databaseUrl =
+  cfg.getSecret('databaseUrl') ??
+  (process.env.DATABASE_URL
+    ? pulumi.secret(process.env.DATABASE_URL)
     : undefined)
-const postgresPrivateLinkServiceName =
-  cfg.get('postgresPrivateLinkServiceName') ??
-  process.env.NANOTRACE_POSTGRES_PRIVATELINK_SERVICE_NAME ??
+if (!databaseUrl) {
+  throw new Error('DATABASE_URL is required')
+}
+const planetScalePrivateLinkServiceName =
+  cfg.get('planetScalePrivateLinkServiceName') ??
+  process.env.PLANETSCALE_PRIVATELINK_SERVICE_NAME ??
   ''
-const databaseName = cfg.get('databaseName') ?? 'nanotrace'
-const databaseUsername = cfg.get('databaseUsername') ?? 'nanotrace'
-const databaseInstanceClass = cfg.get('databaseInstanceClass') ?? 'db.t4g.micro'
-const databaseAllocatedStorageGb =
-  cfg.getNumber('databaseAllocatedStorageGb') ?? 20
-const databaseBackupRetentionDays =
-  cfg.getNumber('databaseBackupRetentionDays') ?? 1
-const databaseSkipFinalSnapshot =
-  cfg.getBoolean('databaseSkipFinalSnapshot') ?? true
-const databaseDeletionProtection =
-  cfg.getBoolean('databaseDeletionProtection') ?? false
-const allowedEmails =
-  cfg.get('allowedEmails') ??
-  process.env.NANOTRACE_ALLOWED_EMAILS ??
-  ''
-const adminEmails =
-  cfg.get('adminEmails') ?? process.env.NANOTRACE_ADMIN_EMAILS ?? ''
+if (!planetScalePrivateLinkServiceName.trim()) {
+  throw new Error('PLANETSCALE_PRIVATELINK_SERVICE_NAME is required')
+}
 const domainName = normalizeDomainName(
   requireConfigOrEnv('domainName', 'NANOTRACE_DOMAIN_NAME')
 )
@@ -240,6 +165,26 @@ const appBaseUrl =
   cfg.get('appBaseUrl') ??
   process.env.NANOTRACE_APP_BASE_URL ??
   `https://${domainName}`
+const googleOauthClientId =
+  cfg.get('googleOauthClientId') ??
+  process.env.NANOTRACE_GOOGLE_OAUTH_CLIENT_ID ??
+  ''
+const configuredGoogleOauthClientSecret = cfg.getSecret('googleOauthClientSecret')
+const googleOauthClientSecret =
+  configuredGoogleOauthClientSecret ??
+  (process.env.NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET
+    ? pulumi.secret(process.env.NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET)
+    : pulumi.secret(''))
+const googleOauthClientSecretConfigured =
+  Boolean(configuredGoogleOauthClientSecret) ||
+  Boolean(process.env.NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET)
+if (Boolean(googleOauthClientId.trim()) !== googleOauthClientSecretConfigured) {
+  throw new Error('Google OAuth deploy config requires both NANOTRACE_GOOGLE_OAUTH_CLIENT_ID and NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET')
+}
+const googleOauthRedirectUri =
+  cfg.get('googleOauthRedirectUri') ??
+  process.env.NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI ??
+  ''
 const apiBaseUrl =
   cfg.get('apiBaseUrl') ??
   process.env.NANOTRACE_API_BASE_URL ??
@@ -362,13 +307,6 @@ const managedLoginEmailMailFrom = managedLoginEmailIdentity
   })
   : undefined
 
-const databasePassword = postgresMode === 'managed'
-  ? (cfg.getSecret('databasePassword') ??
-    new random.RandomPassword(`${name}-database-password`, {
-      length: 32,
-      special: false
-    }).result)
-  : pulumi.secret('')
 const configuredDataKmsKeyArn =
   cfg.get('dataKmsKeyArn') ??
   process.env.NANOTRACE_DATA_KMS_KEY_ARN ??
@@ -476,19 +414,6 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
   versioningConfiguration: { status: 'Enabled' }
 })
 
-const icebergWarehouse = configuredIcebergWarehouse
-  ? pulumi.output(configuredIcebergWarehouse)
-  : pulumi.interpolate`s3://${bucket.bucket}/${normalizedIcebergWarehousePrefix}`
-const icebergWarehouseBucketArn = configuredIcebergWarehouseS3
-  ? pulumi.output(configuredIcebergWarehouseS3.bucketArn)
-  : bucket.arn
-const icebergWarehouseObjectArn = configuredIcebergWarehouseS3
-  ? pulumi.output(configuredIcebergWarehouseS3.objectArn)
-  : pulumi.interpolate`${bucket.arn}/${normalizedIcebergWarehousePrefix}/*`
-const icebergWarehouseListPrefix = configuredIcebergWarehouseS3
-  ? configuredIcebergWarehouseS3.listPrefix
-  : normalizedIcebergWarehousePrefix
-
 const repository = new aws.ecr.Repository(`${name}-server`, {
   forceDelete: cfg.getBoolean('forceDeleteRepository') ?? false,
   imageScanningConfiguration: { scanOnPush: true },
@@ -584,11 +509,9 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
     .all([
       bucket.arn,
       repository.arn,
-      dataKmsKeyArn ?? pulumi.output(''),
-      icebergWarehouseBucketArn,
-      icebergWarehouseObjectArn
+      dataKmsKeyArn ?? pulumi.output('')
     ])
-    .apply(([bucketArn, repositoryArn, kmsKeyArn, warehouseBucketArn, warehouseObjectArn]) =>
+    .apply(([bucketArn, repositoryArn, kmsKeyArn]) =>
       JSON.stringify(
         {
           Version: '2012-10-17',
@@ -608,31 +531,6 @@ const instancePolicy = new aws.iam.RolePolicy(`${name}-instance-policy`, {
                   }
                 ]
               : []),
-            {
-              Sid: 'ListIcebergWarehousePrefix',
-              Effect: 'Allow',
-              Action: 's3:ListBucket',
-              Resource: warehouseBucketArn,
-              Condition: {
-                StringLike: {
-                  's3:prefix': [
-                    icebergWarehouseListPrefix,
-                    `${icebergWarehouseListPrefix}/*`
-                  ]
-                }
-              }
-            },
-            {
-              Sid: 'ReadWriteIcebergWarehouseObjects',
-              Effect: 'Allow',
-              Action: [
-                's3:GetObject',
-                's3:PutObject',
-                's3:DeleteObject',
-                's3:AbortMultipartUpload'
-              ],
-              Resource: warehouseObjectArn
-            },
             {
               Sid: 'WriteBootstrapDebugObjects',
               Effect: 'Allow',
@@ -756,103 +654,42 @@ const instanceSg = new aws.ec2.SecurityGroup(`${name}-instance-sg`, {
   tags: { ...tags, Name: `${name}-instance-sg` }
 })
 
-const createManagedPostgres = postgresMode === 'managed'
-const createPostgresPrivateLink =
-  postgresMode === 'external' && postgresPrivateConnect === 'aws-privatelink'
-if (createPostgresPrivateLink && !postgresPrivateLinkServiceName.trim()) {
-  throw new Error('NANOTRACE_POSTGRES_PRIVATELINK_SERVICE_NAME is required for aws-privatelink')
-}
-if (postgresMode === 'external' && !externalPostgresUrl) {
-  throw new Error('NANOTRACE_POSTGRES_URL is required when NANOTRACE_POSTGRES_MODE=external')
-}
+const planetScaleEndpointSg = new aws.ec2.SecurityGroup(`${name}-planetscale-endpoint-sg`, {
+  vpcId: vpc.id,
+  ingress: [
+    {
+      protocol: 'tcp',
+      fromPort: 5432,
+      toPort: 5432,
+      securityGroups: [instanceSg.id]
+    },
+    {
+      protocol: 'tcp',
+      fromPort: 6432,
+      toPort: 6432,
+      securityGroups: [instanceSg.id]
+    }
+  ],
+  egress: [
+    {
+      protocol: '-1',
+      fromPort: 0,
+      toPort: 0,
+      cidrBlocks: ['0.0.0.0/0']
+    }
+  ],
+  tags: { ...tags, Name: `${name}-planetscale-endpoint-sg` }
+})
 
-const databaseSg = !createManagedPostgres
-  ? undefined
-  : new aws.ec2.SecurityGroup(`${name}-postgres-sg`, {
-      vpcId: vpc.id,
-      ingress: [
-        {
-          protocol: 'tcp',
-          fromPort: 5432,
-          toPort: 5432,
-          securityGroups: [instanceSg.id]
-        }
-      ],
-      egress: [
-        {
-          protocol: '-1',
-          fromPort: 0,
-          toPort: 0,
-          cidrBlocks: ['0.0.0.0/0']
-        }
-      ],
-      tags: { ...tags, Name: `${name}-postgres-sg` }
-    })
-
-const postgresEndpointSg = !createPostgresPrivateLink
-  ? undefined
-  : new aws.ec2.SecurityGroup(`${name}-postgres-endpoint-sg`, {
-      vpcId: vpc.id,
-      ingress: [
-        {
-          protocol: 'tcp',
-          fromPort: 5432,
-          toPort: 5432,
-          securityGroups: [instanceSg.id]
-        }
-      ],
-      egress: [
-        {
-          protocol: '-1',
-          fromPort: 0,
-          toPort: 0,
-          cidrBlocks: ['0.0.0.0/0']
-        }
-      ],
-      tags: { ...tags, Name: `${name}-postgres-endpoint-sg` }
-    })
-
-const postgresPrivateLinkEndpoint = !createPostgresPrivateLink
-  ? undefined
-  : new aws.ec2.VpcEndpoint(`${name}-postgres-privatelink`, {
-      privateDnsEnabled: true,
-      securityGroupIds: [postgresEndpointSg!.id],
-      serviceName: postgresPrivateLinkServiceName,
-      subnetIds: subnets.map(subnet => subnet.id),
-      vpcEndpointType: 'Interface',
-      vpcId: vpc.id,
-      tags: { ...tags, Name: `${name}-postgres-privatelink` }
-    })
-
-const databaseSubnetGroup = !createManagedPostgres
-  ? undefined
-  : new aws.rds.SubnetGroup(`${name}-postgres-subnets`, {
-      subnetIds: subnets.map(subnet => subnet.id),
-      tags
-    })
-
-const database = !createManagedPostgres
-  ? undefined
-  : new aws.rds.Instance(`${name}-postgres`, {
-      allocatedStorage: databaseAllocatedStorageGb,
-      autoMinorVersionUpgrade: true,
-      backupRetentionPeriod: databaseBackupRetentionDays,
-      dbName: databaseName,
-      dbSubnetGroupName: databaseSubnetGroup!.name,
-      deletionProtection: databaseDeletionProtection,
-      engine: 'postgres',
-      identifier: `${name}-postgres`,
-      instanceClass: databaseInstanceClass,
-      kmsKeyId: dataKmsKeyArn,
-      multiAz: false,
-      password: databasePassword,
-      publiclyAccessible: false,
-      skipFinalSnapshot: databaseSkipFinalSnapshot,
-      storageEncrypted: true,
-      username: databaseUsername,
-      vpcSecurityGroupIds: [databaseSg!.id],
-      tags
-    })
+const planetScalePrivateLinkEndpoint = new aws.ec2.VpcEndpoint(`${name}-planetscale-privatelink`, {
+  privateDnsEnabled: true,
+  securityGroupIds: [planetScaleEndpointSg.id],
+  serviceName: planetScalePrivateLinkServiceName,
+  subnetIds: subnets.map(subnet => subnet.id),
+  vpcEndpointType: 'Interface',
+  vpcId: vpc.id,
+  tags: { ...tags, Name: `${name}-planetscale-privatelink` }
+})
 
 const lb = new aws.lb.LoadBalancer(`${name}-alb`, {
   loadBalancerType: 'application',
@@ -1404,10 +1241,6 @@ const publicBaseUrl =
   cfg.get('publicBaseUrl') ??
   process.env.NANOTRACE_PUBLIC_BASE_URL ??
   apiBaseUrl
-const databaseUrl = database
-  ? pulumi.interpolate`postgres://${databaseUsername}:${databasePassword}@${database.address}:5432/${databaseName}`
-  : externalPostgresUrl ?? pulumi.output('')
-
 new aws.lb.ListenerRule(`${name}-query-route`, {
   listenerArn: listener.arn,
   priority: 10,
@@ -1456,9 +1289,9 @@ const userData = pulumi
     clickhousePassword,
     databaseUrl,
     publicBaseUrl,
-    icebergWarehouse,
     kafkaSaslUsername,
-    kafkaSaslPassword
+    kafkaSaslPassword,
+    googleOauthClientSecret
   ])
   .apply(
     ([
@@ -1469,13 +1302,12 @@ const userData = pulumi
       resolvedClickhousePassword,
       resolvedDatabaseUrl,
       resolvedPublicBaseUrl,
-      resolvedIcebergWarehouse,
       resolvedKafkaSaslUsername,
-      resolvedKafkaSaslPassword
+      resolvedKafkaSaslPassword,
+      resolvedGoogleOauthClientSecret
     ]) =>
       renderUserData({
         bucketName,
-        adminEmails,
         clickhouseDatabase,
         clickhousePassword: resolvedClickhousePassword,
         clickhouseTable,
@@ -1487,37 +1319,29 @@ const userData = pulumi
         kafkaBrokers,
         kafkaIngestTopic,
         kafkaInvalidTopic,
+        kafkaTableflowTopic,
         kafkaSaslMechanism,
         kafkaSaslPassword: resolvedKafkaSaslPassword,
         kafkaSaslUsername: resolvedKafkaSaslUsername,
         kafkaSecurityProtocol,
-        icebergCatalogName,
-        icebergMaxSnapshotAgeMs,
-        icebergMetadataPreviousVersionsMax,
-        icebergMinSnapshotsToKeep,
-        icebergRestPrefix,
-        icebergRestUri,
-        icebergTargetFileSizeBytes,
-        icebergWarehouse: resolvedIcebergWarehouse,
         kafkaNormalizedTopic,
         kafkaServerClientId,
-        lakehouseEnabled,
-        lakehouseNamespace,
-        lakehouseTable,
-        lakehouseWarehouseDir,
         normalizerGroupId,
         normalizerClientId,
+        tableflowMaterializerGroupId,
+        tableflowMaterializerClientId,
         maxEventBytes,
         maxRequestBytes,
-        materializePollSecs,
         port,
         prefix,
         region,
         databaseUrl: resolvedDatabaseUrl,
-        allowedEmails,
         appBaseUrl,
         corsAllowedOrigins,
         emailFrom,
+        googleOauthClientId,
+        googleOauthClientSecret: resolvedGoogleOauthClientSecret,
+        googleOauthRedirectUri,
         publicBaseUrl: resolvedPublicBaseUrl,
         sessionSecure,
         sessionSameSite,
@@ -1690,20 +1514,12 @@ export const kafkaBrokersOutput = kafkaBrokers
 export const kafkaIngestTopicOutput = kafkaIngestTopic
 export const kafkaNormalizedTopicOutput = kafkaNormalizedTopic
 export const kafkaInvalidTopicOutput = kafkaInvalidTopic
-export const lakehouseEnabledOutput = lakehouseEnabled
-export const lakehouseWarehouseDirOutput = lakehouseWarehouseDir
-export const icebergRestUriOutput = icebergRestUri
-export const icebergWarehouseOutput = icebergWarehouse
+export const kafkaTableflowTopicOutput = kafkaTableflowTopic
 export const clickhouseUrlOutput = clickhouseUrl
 export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
 export const clickhouseTableOutput = clickhouseTable
-export const databaseEndpoint = database ? database.address : ''
-export const postgresModeOutput = postgresMode
-export const postgresPrivateConnectOutput = postgresPrivateConnect
-export const postgresPrivateLinkEndpointId = postgresPrivateLinkEndpoint
-  ? postgresPrivateLinkEndpoint.id
-  : ''
+export const planetScalePrivateLinkEndpointId = planetScalePrivateLinkEndpoint.id
 export const loginEmailIdentity = managedLoginEmailIdentity
   ? managedLoginEmailIdentity.emailIdentity
   : ''
@@ -1722,7 +1538,6 @@ export const serverImageUri = imageUri
 
 interface UserDataArgs {
   bucketName: string
-  adminEmails: string
   clickhouseDatabase: string
   clickhousePassword: string
   clickhouseTable: string
@@ -1735,36 +1550,28 @@ interface UserDataArgs {
   kafkaIngestTopic: string
   kafkaInvalidTopic: string
   kafkaNormalizedTopic: string
+  kafkaTableflowTopic: string
   kafkaSaslMechanism: string
   kafkaSaslPassword: string
   kafkaSaslUsername: string
   kafkaServerClientId: string
   kafkaSecurityProtocol: string
-  lakehouseEnabled: boolean
-  lakehouseWarehouseDir: string
-  lakehouseNamespace: string
-  lakehouseTable: string
-  icebergRestUri: string
-  icebergWarehouse: string
-  icebergCatalogName: string
-  icebergRestPrefix: string
-  icebergTargetFileSizeBytes: number
-  icebergMinSnapshotsToKeep: number
-  icebergMaxSnapshotAgeMs: number
-  icebergMetadataPreviousVersionsMax: number
   normalizerGroupId: string
   normalizerClientId: string
+  tableflowMaterializerGroupId: string
+  tableflowMaterializerClientId: string
   maxEventBytes: number
   maxRequestBytes: number
-  materializePollSecs: number
   port: number
   prefix: string
   region: string
   databaseUrl: string
-  allowedEmails: string
   appBaseUrl: string
   corsAllowedOrigins: string
   emailFrom: string
+  googleOauthClientId: string
+  googleOauthClientSecret: string
+  googleOauthRedirectUri: string
   publicBaseUrl: string
   sessionSecure: boolean
   sessionSameSite: string
@@ -1831,7 +1638,6 @@ dnf update -y
 dnf install -y docker awscli amazon-ssm-agent
 systemctl enable --now docker
 systemctl enable --now amazon-ssm-agent || true
-mkdir -p /var/lib/nanotrace/lakehouse
 
 aws ecr get-login-password --region ${shellQuote(
     args.region
@@ -1844,22 +1650,23 @@ docker rm -f nanotrace-normalizer >/dev/null 2>&1 || true
 docker rm -f nanotrace-materializer >/dev/null 2>&1 || true
 docker run -d --name nanotrace-server --restart unless-stopped \\
   -p ${args.port}:${args.port} \\
-  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e PORT=${args.port} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
-  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
+  -e DATABASE_URL=${shellQuote(args.databaseUrl)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
   -e NANOTRACE_SESSION_SAME_SITE=${shellQuote(args.sessionSameSite)} \\
   -e NANOTRACE_MAGIC_LINK_TTL_SECS=${args.magicLinkTtlSecs} \\
   -e NANOTRACE_EMAIL_FROM=${shellQuote(args.emailFrom)} \\
-  -e NANOTRACE_ALLOWED_EMAILS=${shellQuote(args.allowedEmails)} \\
-  -e NANOTRACE_ADMIN_EMAILS=${shellQuote(args.adminEmails)} \\
+  -e NANOTRACE_GOOGLE_OAUTH_CLIENT_ID=${shellQuote(args.googleOauthClientId)} \\
+  -e NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET=${shellQuote(args.googleOauthClientSecret)} \\
+  -e NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI=${shellQuote(args.googleOauthRedirectUri)} \\
   -e NANOTRACE_CORS_ALLOWED_ORIGINS=${shellQuote(args.corsAllowedOrigins)} \\
   -e NANOTRACE_KAFKA_BROKERS=${shellQuote(args.kafkaBrokers)} \\
   -e NANOTRACE_KAFKA_INGEST_TOPIC=${shellQuote(args.kafkaIngestTopic)} \\
+  -e NANOTRACE_KAFKA_TABLEFLOW_TOPIC=${shellQuote(args.kafkaTableflowTopic)} \\
   -e NANOTRACE_KAFKA_CLIENT_ID=${shellQuote(args.kafkaServerClientId)} \\
   -e NANOTRACE_KAFKA_SECURITY_PROTOCOL=${shellQuote(args.kafkaSecurityProtocol)} \\
   -e NANOTRACE_KAFKA_SASL_MECHANISM=${shellQuote(args.kafkaSaslMechanism)} \\
@@ -1874,12 +1681,12 @@ docker run -d --name nanotrace-server --restart unless-stopped \\
   -e MAX_REQUEST_BYTES=${args.maxRequestBytes} \\
   ${shellQuote(args.imageUri)}
 docker run -d --name nanotrace-normalizer --restart unless-stopped \\
-  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
   -e NANOTRACE_KAFKA_BROKERS=${shellQuote(args.kafkaBrokers)} \\
   -e NANOTRACE_KAFKA_INGEST_TOPIC=${shellQuote(args.kafkaIngestTopic)} \\
   -e NANOTRACE_KAFKA_NORMALIZED_TOPIC=${shellQuote(args.kafkaNormalizedTopic)} \\
+  -e NANOTRACE_KAFKA_TABLEFLOW_TOPIC=${shellQuote(args.kafkaTableflowTopic)} \\
   -e NANOTRACE_KAFKA_INVALID_TOPIC=${shellQuote(args.kafkaInvalidTopic)} \\
   -e NANOTRACE_NORMALIZER_GROUP_ID=${shellQuote(args.normalizerGroupId)} \\
   -e NANOTRACE_NORMALIZER_CLIENT_ID=${shellQuote(args.normalizerClientId)} \\
@@ -1887,18 +1694,6 @@ docker run -d --name nanotrace-normalizer --restart unless-stopped \\
   -e NANOTRACE_KAFKA_SASL_MECHANISM=${shellQuote(args.kafkaSaslMechanism)} \\
   -e NANOTRACE_KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
   -e NANOTRACE_KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
-  -e NANOTRACE_LAKEHOUSE_ENABLED=${args.lakehouseEnabled ? 'true' : 'false'} \\
-  -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
-  -e NANOTRACE_LAKEHOUSE_NAMESPACE=${shellQuote(args.lakehouseNamespace)} \\
-  -e NANOTRACE_LAKEHOUSE_TABLE=${shellQuote(args.lakehouseTable)} \\
-  -e NANOTRACE_ICEBERG_REST_URI=${shellQuote(args.icebergRestUri)} \\
-  -e NANOTRACE_ICEBERG_WAREHOUSE=${shellQuote(args.icebergWarehouse)} \\
-  -e NANOTRACE_ICEBERG_CATALOG_NAME=${shellQuote(args.icebergCatalogName)} \\
-  -e NANOTRACE_ICEBERG_REST_PREFIX=${shellQuote(args.icebergRestPrefix)} \\
-  -e NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES=${args.icebergTargetFileSizeBytes} \\
-  -e NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP=${args.icebergMinSnapshotsToKeep} \\
-  -e NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS=${args.icebergMaxSnapshotAgeMs} \\
-  -e NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX=${args.icebergMetadataPreviousVersionsMax} \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
@@ -1908,22 +1703,22 @@ docker run -d --name nanotrace-normalizer --restart unless-stopped \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-normalizer
 docker run -d --name nanotrace-materializer --restart unless-stopped \\
-  -v /var/lib/nanotrace/lakehouse:${shellQuote(args.lakehouseWarehouseDir)} \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
+  -e NANOTRACE_KAFKA_BROKERS=${shellQuote(args.kafkaBrokers)} \\
+  -e NANOTRACE_KAFKA_TABLEFLOW_TOPIC=${shellQuote(args.kafkaTableflowTopic)} \\
+  -e NANOTRACE_KAFKA_SECURITY_PROTOCOL=${shellQuote(args.kafkaSecurityProtocol)} \\
+  -e NANOTRACE_KAFKA_SASL_MECHANISM=${shellQuote(args.kafkaSaslMechanism)} \\
+  -e NANOTRACE_KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
+  -e NANOTRACE_KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
+  -e NANOTRACE_TABLEFLOW_MATERIALIZER_GROUP_ID=${shellQuote(args.tableflowMaterializerGroupId)} \\
+  -e NANOTRACE_TABLEFLOW_MATERIALIZER_CLIENT_ID=${shellQuote(args.tableflowMaterializerClientId)} \\
+  -e NANOTRACE_TABLEFLOW_MATERIALIZE_LOOP=true \\
   -e CLICKHOUSE_URL=${shellQuote(args.clickhouseUrl)} \\
   -e CLICKHOUSE_USER=${shellQuote(args.clickhouseUser)} \\
   -e CLICKHOUSE_PASSWORD=${shellQuote(args.clickhousePassword)} \\
   -e CLICKHOUSE_DATABASE=${shellQuote(args.clickhouseDatabase)} \\
   -e CLICKHOUSE_TABLE=${shellQuote(args.clickhouseTable)} \\
-  -e NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR=${shellQuote(args.lakehouseWarehouseDir)} \\
-  -e NANOTRACE_LAKEHOUSE_NAMESPACE=${shellQuote(args.lakehouseNamespace)} \\
-  -e NANOTRACE_LAKEHOUSE_TABLE=${shellQuote(args.lakehouseTable)} \\
-  -e NANOTRACE_MATERIALIZE_LOOP=true \\
-  -e NANOTRACE_MATERIALIZE_POLL_SECS=${args.materializePollSecs} \\
-  -e NANOTRACE_REBUILD_COMMIT_SOURCE=clickhouse \\
-  -e NANOTRACE_REBUILD_RAW=false \\
-  -e NANOTRACE_REBUILD_DERIVED=true \\
   ${shellQuote(args.imageUri)} \\
   /usr/local/bin/nanotrace-lakehouse-rebuild
 `
@@ -1975,7 +1770,7 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
   -e AWS_REGION=${shellQuote(args.region)} \\
   -e PORT=${args.port} \\
   -e NANOTRACE_IMAGE_BUILD_ID=${shellQuote(args.imageBuildId)} \\
-  -e NANOTRACE_POSTGRES_URL=${shellQuote(args.databaseUrl)} \\
+  -e DATABASE_URL=${shellQuote(args.databaseUrl)} \\
   -e NANOTRACE_PUBLIC_BASE_URL=${shellQuote(args.publicBaseUrl)} \\
   -e NANOTRACE_APP_BASE_URL=${shellQuote(args.appBaseUrl)} \\
   -e NANOTRACE_SESSION_SECURE=${args.sessionSecure ? 'true' : 'false'} \\
@@ -1996,26 +1791,6 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
 
 function shellQuote (value: unknown): string {
   return `'${String(value).replaceAll("'", "'\\''")}'`
-}
-
-function parseS3Uri (uri: string): undefined | {
-  bucketArn: string
-  objectArn: string
-  listPrefix: string
-} {
-  const match = uri.match(/^s3a?:\/\/([^/]+)\/?(.*)$/)
-  if (!match) {
-    return undefined
-  }
-  const bucket = match[1]
-  const prefix = match[2].replace(/^\/+|\/+$/g, '')
-  return {
-    bucketArn: `arn:aws:s3:::${bucket}`,
-    objectArn: prefix
-      ? `arn:aws:s3:::${bucket}/${prefix}/*`
-      : `arn:aws:s3:::${bucket}/*`,
-    listPrefix: prefix || '*'
-  }
 }
 
 function requireEnv (key: string): string {

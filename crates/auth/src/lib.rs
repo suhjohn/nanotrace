@@ -11,7 +11,6 @@ use http::{
     header::{AUTHORIZATION, COOKIE, SET_COOKIE},
 };
 use rand::RngCore;
-use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -29,8 +28,6 @@ pub struct AuthConfig {
     pub session_ttl: Duration,
     pub session_secure: bool,
     pub magic_link_ttl: Duration,
-    pub allowed_emails: Vec<String>,
-    pub admin_emails: Vec<String>,
 }
 
 impl AuthConfig {
@@ -233,7 +230,6 @@ impl AuthStore {
             "NANOTRACE_PUBLIC_BASE_URL",
         )?;
         let email = normalize_email(email)?;
-        self.ensure_email_allowed(&email)?;
         let token = random_token();
         let token_hash = token_hash(&token);
         let expires_at = Utc::now()
@@ -373,14 +369,8 @@ impl AuthStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        self.ensure_email_allowed(&email)?;
-        let user_role = if self.is_admin_email(&email) {
-            AuthRole::Admin
-        } else {
-            AuthRole::Viewer
-        };
         let subject = format!("email:{email}");
-        self.upsert_user(&subject, &email, name.as_deref(), user_role)
+        self.upsert_user(&subject, &email, name.as_deref(), AuthRole::Viewer)
             .await?;
         let memberships = self.memberships_for_subject(&subject).await?;
         let pending_invites = self.pending_invitations_for_email(&email).await?;
@@ -425,7 +415,7 @@ impl AuthStore {
                 &subject,
                 &email,
                 name.as_deref(),
-                user_role,
+                AuthRole::Viewer,
                 active_organization_id.as_deref(),
             )
             .await?;
@@ -1673,29 +1663,6 @@ impl AuthStore {
         Ok(token_hash(&token))
     }
 
-    fn ensure_email_allowed(&self, email: &str) -> Result<(), AuthError> {
-        if self.cfg.allowed_emails.is_empty() {
-            return Ok(());
-        }
-        if self
-            .cfg
-            .allowed_emails
-            .iter()
-            .any(|pattern| email_matches_pattern(email, pattern))
-        {
-            Ok(())
-        } else {
-            Err(AuthError::Forbidden)
-        }
-    }
-
-    fn is_admin_email(&self, email: &str) -> bool {
-        self.cfg
-            .admin_emails
-            .iter()
-            .any(|admin| admin.eq_ignore_ascii_case(email))
-    }
-
     fn cookie_header(&self, name: &str, value: &str, max_age_secs: u64, http_only: bool) -> String {
         let mut parts = vec![
             format!("{name}={value}"),
@@ -2214,28 +2181,6 @@ fn parse_role(value: &str) -> AuthRole {
     }
 }
 
-fn email_matches_pattern(email: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() {
-        return false;
-    }
-    if let Some(regex) = pattern
-        .strip_prefix('/')
-        .and_then(|value| value.strip_suffix('/'))
-    {
-        return Regex::new(regex)
-            .map(|regex| regex.is_match(email))
-            .unwrap_or(false);
-    }
-    if let Some(domain) = pattern.strip_prefix("*@") {
-        return email
-            .rsplit_once('@')
-            .map(|(_, email_domain)| email_domain.eq_ignore_ascii_case(domain))
-            .unwrap_or(false);
-    }
-    email.eq_ignore_ascii_case(pattern)
-}
-
 pub fn is_admin(identity: &AuthIdentity) -> bool {
     matches!(identity.role, AuthRole::Admin)
 }
@@ -2290,8 +2235,6 @@ mod tests {
                 session_ttl: Duration::from_secs(3600),
                 session_secure: false,
                 magic_link_ttl: Duration::from_secs(600),
-                allowed_emails: Vec::new(),
-                admin_emails: Vec::new(),
             },
             pool,
             api_key_cache: Arc::new(RwLock::new(ApiKeyCache::default())),

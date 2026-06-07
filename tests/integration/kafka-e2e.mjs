@@ -5,7 +5,7 @@ Integration scenarios covered by this file:
 1. Tenant bootstrap and API key isolation.
 2. Kafka ingest returns accepted mode.
 3. ClickHouse raw event persistence.
-4. Iceberg/normalizer serving watermarks.
+4. Tableflow topic materialization and serving watermarks.
 5. Tenant stamping overrides spoofed tenant fields.
 6. SQL query tenant isolation.
 7. SDK metric definitions are tenant-local.
@@ -13,7 +13,7 @@ Integration scenarios covered by this file:
 9. Nested KV indexing covers nested objects, scalar arrays, and arrays of objects.
 10. Structured KV filters match raw event_kv_index parity.
 11. Explicit field definition backfill writes field_index.
-12. Replay after injected normalizer crash does not duplicate serving rows.
+12. Re-running Tableflow materialization does not duplicate serving rows.
 13. Deterministic 10k+ synthetic SDK-like events are generated.
 14. Measure cube p90/count/sum/min/max/avg by [service], [plan],
     [service, route, status], and [plan, country, llm.model].
@@ -91,7 +91,7 @@ async function main() {
   await assertArbitraryKvFilters();
   await assertRawKvQueryParity();
   await assertBackfilledDefinitionWatermark();
-  await assertNormalizerReplayAfterInjectedCrash();
+  await assertTableflowMaterializerReplayIsIdempotent();
   await assertSyntheticAnalyticsOracle();
 
   console.log("integrationResult=ok");
@@ -769,38 +769,15 @@ WHERE tenant_id = {tenant_id:String}
   assert(count === 1, `strict product_id query should find 1 indexed row, got ${count}`);
 }
 
-async function assertNormalizerReplayAfterInjectedCrash() {
+async function assertTableflowMaterializerReplayIsIdempotent() {
   const restartMaterializer = composeServiceRunning("materializer");
-  const startingSequence = await latestLakehouseSequence();
   if (restartMaterializer) {
     dockerCompose(["stop", "materializer"]);
   }
   try {
-    try {
-      dockerCompose(["stop", "normalizer"]);
-      await postEvents(keyA, replayTenantAEvents());
-      let failed = false;
-      try {
-        dockerCompose(
-          [
-            "run",
-            "--rm",
-            "-e",
-            "NANOTRACE_NORMALIZER_FAIL_AFTER_CLICKHOUSE_INSERT=1",
-            "normalizer",
-          ],
-          { timeout: 90_000, stdio: ["ignore", "inherit", "inherit"] },
-        );
-      } catch {
-        failed = true;
-      }
-      assert(failed, "injected normalizer run should fail after ClickHouse insert");
-    } finally {
-      dockerCompose(["up", "-d", "normalizer"]);
-    }
-
-    await waitForLakehouseCommitRowsSince(startingSequence, 1);
-    runIncrementalMaterializer();
+    await postEvents(keyA, replayTenantAEvents());
+    runTableflowMaterializerOnce();
+    runTableflowMaterializerOnce();
 
     const kvRows = await clickhouseJson(`
 SELECT count() AS count
@@ -832,12 +809,10 @@ async function assertSyntheticAnalyticsOracle() {
     dockerCompose(["stop", "materializer"]);
   }
   try {
-    const startingSequence = await latestLakehouseSequence();
     const definitions = await createSyntheticDefinitions();
     await postEventBatches(keyA, synthetic.batches);
-    await waitForLakehouseCommitRowsSince(startingSequence, synthetic.expected.totalEvents);
 
-    runIncrementalMaterializer();
+    runTableflowMaterializerOnce();
     await waitForSyntheticEventRows(synthetic.expected.totalEvents);
     await waitForSyntheticKvIndex(synthetic.expected.sampleRequestId);
     await waitForSyntheticMaterialization(definitions, synthetic.expected);
@@ -1086,31 +1061,6 @@ FORMAT JSON
   }, "synthetic request_id KV index row", 300_000, 2_000);
 }
 
-async function latestLakehouseSequence() {
-  const rows = await clickhouseJson(`
-SELECT max(sequence_number) AS sequence_number
-FROM ${ident(clickhouseDatabase)}.${ident("lakehouse_commits")}
-WHERE namespace = 'nanotrace'
-  AND table_name = 'events'
-FORMAT JSON
-`);
-  return Number(rows[0]?.sequence_number || 0);
-}
-
-async function waitForLakehouseCommitRowsSince(sequenceNumber, expectedRows) {
-  await waitUntil(async () => {
-    const rows = await clickhouseJson(`
-SELECT sum(record_count) AS count
-FROM ${ident(clickhouseDatabase)}.${ident("lakehouse_commits")}
-WHERE namespace = 'nanotrace'
-  AND table_name = 'events'
-  AND sequence_number > ${Number(sequenceNumber)}
-FORMAT JSON
-`);
-    return Number(rows[0]?.count || 0) >= expectedRows ? true : null;
-  }, `${expectedRows} lakehouse committed rows`, 300_000, 2_000);
-}
-
 async function createSyntheticDefinitions() {
   const measure = await createDefinition(keyA, {
     name: syntheticMeasureName,
@@ -1215,20 +1165,20 @@ async function createSyntheticDefinitions() {
   };
 }
 
-function runIncrementalMaterializer() {
+function runTableflowMaterializerOnce() {
   dockerCompose(
     [
       "run",
       "--rm",
       "--no-deps",
       "-e",
-      "NANOTRACE_MATERIALIZE_INCREMENTAL=true",
+      "NANOTRACE_TABLEFLOW_MATERIALIZE_ONCE=true",
       "-e",
-      "NANOTRACE_REBUILD_RAW=true",
+      "NANOTRACE_TABLEFLOW_MATERIALIZE_IDLE_SECS=15",
       "-e",
-      "NANOTRACE_REBUILD_DERIVED=true",
+      "NANOTRACE_TABLEFLOW_MATERIALIZER_GROUP_ID=nanotrace-tableflow-materializer-dev",
       "-e",
-      "NANOTRACE_REBUILD_ALLOW_NON_EMPTY=true",
+      "NANOTRACE_TABLEFLOW_MATERIALIZER_CLIENT_ID=nanotrace-tableflow-materializer-once",
       "server",
       "/usr/local/bin/nanotrace-lakehouse-rebuild",
     ],

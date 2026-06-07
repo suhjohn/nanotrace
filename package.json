@@ -22,8 +22,8 @@
     "dev:logs": "docker compose -f docker-compose.dev.yml logs -f",
     "dev:seed-auth": "node scripts/seed-dev-auth.mjs",
     "dev:schema:reset": "CLICKHOUSE_RESET_DATABASE=true docker compose -f docker-compose.dev.yml run --rm clickhouse-schema",
-    "lakehouse:rebuild:local": "docker compose -f docker-compose.dev.yml run --rm --no-deps server /usr/local/bin/nanotrace-lakehouse-rebuild",
-    "lakehouse:materializer:local": "NANOTRACE_MATERIALIZE_LOOP=true docker compose -f docker-compose.dev.yml run -d --name nanotrace-dev-materializer --no-deps server /usr/local/bin/nanotrace-lakehouse-rebuild",
+    "tableflow:materialize:local": "docker compose -f docker-compose.dev.yml run --rm --no-deps -e NANOTRACE_TABLEFLOW_MATERIALIZE_ONCE=true -e NANOTRACE_TABLEFLOW_MATERIALIZE_IDLE_SECS=15 server /usr/local/bin/nanotrace-lakehouse-rebuild",
+    "tableflow:materializer:local": "docker compose -f docker-compose.dev.yml run -d --name nanotrace-dev-tableflow-materializer --no-deps -e NANOTRACE_TABLEFLOW_MATERIALIZE_LOOP=true server /usr/local/bin/nanotrace-lakehouse-rebuild",
     "loadtest:local": "NANOTRACE_INGEST_URL=${NANOTRACE_INGEST_URL:-http://localhost:18473} NANOTRACE_API_KEY=${NANOTRACE_API_KEY:-ntak_dev} CLICKHOUSE_URL=${CLICKHOUSE_URL:-http://localhost:18123} CLICKHOUSE_USER=${CLICKHOUSE_USER:-default} CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-nanotrace} CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-observatory} CLICKHOUSE_TABLE=${CLICKHOUSE_TABLE:-events} cargo run --release -p nanotrace-loadtest --",
     "materialization:loadtest": "node scripts/materialization-loadtest.mjs",
     "dev:rewrite:loadtest": "npm run dev:schema:reset && NANOTRACE_LOADTEST_RUN_ID=${NANOTRACE_LOADTEST_RUN_ID:-loadtest-local} NANOTRACE_LOADTEST_TOTAL_EVENTS=${NANOTRACE_LOADTEST_TOTAL_EVENTS:-1000} NANOTRACE_LOADTEST_BATCH_SIZES=${NANOTRACE_LOADTEST_BATCH_SIZES:-100} npm run loadtest:local",
@@ -48,7 +48,6 @@
     "@pulumi/cloudflare": "^6.15.0",
     "@pulumi/command": "^1.2.1",
     "@pulumi/pulumi": "^3.236.0",
-    "@pulumi/random": "^4.19.2",
     "@types/node": "^25.6.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"

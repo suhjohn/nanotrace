@@ -1,6 +1,6 @@
 # Nanotrace IAM Policies
 
-These policies support the Pulumi EC2/S3/ECR/RDS/KMS deployment in
+These policies support the Pulumi EC2/S3/ECR/KMS deployment in
 `deploy/pulumi/nanotrace`. ClickHouse Cloud is expected to exist before deploy;
 Pulumi only applies the Nanotrace schema to it.
 
@@ -16,8 +16,8 @@ Pulumi only applies the Nanotrace schema to it.
   Nanotrace resources.
 
 The deployed app no longer uses object notifications as an ingest path. S3
-access that remains is for the Iceberg warehouse, static UI hosting, debug
-artifacts, and deployment operations.
+access that remains is for static UI hosting, debug artifacts, deployment
+operations, and any separately configured WarpStream Tableflow bucket policy.
 
 The resource scope intentionally uses `nanotrace-*` names because this stack
 creates unique physical names with Pulumi suffixes, for example

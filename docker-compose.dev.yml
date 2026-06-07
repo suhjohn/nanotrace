@@ -16,19 +16,16 @@ x-app-env: &app-env
   CLICKHOUSE_EVENT_MEASURES_TABLE: event_measures
   CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE: entity_state_updates
   CLICKHOUSE_ENTITY_STATE_CURRENT_TABLE: entity_state_current
-  NANOTRACE_POSTGRES_URL: postgres://nanotrace:nanotrace@postgres:5432/nanotrace
+  DATABASE_URL: postgres://nanotrace:nanotrace@postgres:5432/nanotrace
   NANOTRACE_PUBLIC_BASE_URL: http://localhost:18473
   NANOTRACE_APP_BASE_URL: http://localhost:41233
   NANOTRACE_SESSION_SECURE: "false"
-  NANOTRACE_ALLOWED_EMAILS: "*"
-  NANOTRACE_ADMIN_EMAILS: dev@localhost
   NANOTRACE_CORS_ALLOWED_ORIGINS: http://localhost:41233,http://127.0.0.1:41233,http://localhost:41234,http://127.0.0.1:41234
   NANOTRACE_KAFKA_BROKERS: redpanda:9092
   NANOTRACE_KAFKA_INGEST_TOPIC: events.ingest.v1
   NANOTRACE_KAFKA_NORMALIZED_TOPIC: events.normalized.v1
+  NANOTRACE_KAFKA_TABLEFLOW_TOPIC: events.tableflow.batches.v1
   NANOTRACE_KAFKA_INVALID_TOPIC: events.invalid.v1
-  NANOTRACE_LAKEHOUSE_ENABLED: "true"
-  NANOTRACE_LAKEHOUSE_WAREHOUSE_DIR: /var/lib/nanotrace/lakehouse
   RUST_LOG: info
 
 services:
@@ -152,8 +149,6 @@ services:
       PORT: "18473"
     ports:
       - "18473:18473"
-    volumes:
-      - lakehouse-data:/var/lib/nanotrace/lakehouse
 
   normalizer:
     image: nanotrace-dev-app:latest
@@ -166,8 +161,6 @@ services:
       <<: *app-env
       NANOTRACE_NORMALIZER_GROUP_ID: nanotrace-normalizer-dev
       NANOTRACE_NORMALIZER_CLIENT_ID: nanotrace-normalizer-dev
-    volumes:
-      - lakehouse-data:/var/lib/nanotrace/lakehouse
     command: ["/usr/local/bin/nanotrace-normalizer"]
 
   alerts:
@@ -204,11 +197,9 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *app-env
-      NANOTRACE_MATERIALIZE_LOOP: "true"
-      NANOTRACE_REBUILD_COMMIT_SOURCE: local
-      NANOTRACE_MATERIALIZE_POLL_SECS: "2"
-    volumes:
-      - lakehouse-data:/var/lib/nanotrace/lakehouse
+      NANOTRACE_TABLEFLOW_MATERIALIZE_LOOP: "true"
+      NANOTRACE_TABLEFLOW_MATERIALIZER_GROUP_ID: nanotrace-tableflow-materializer-dev
+      NANOTRACE_TABLEFLOW_MATERIALIZER_CLIENT_ID: nanotrace-tableflow-materializer-dev
     command: ["/usr/local/bin/nanotrace-lakehouse-rebuild"]
 
   ui:
@@ -234,7 +225,6 @@ services:
 volumes:
   clickhouse-data:
   localstack-data:
-  lakehouse-data:
   postgres-data:
   redpanda-data:
   ui-node-modules:

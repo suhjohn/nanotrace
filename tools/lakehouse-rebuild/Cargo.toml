@@ -16,6 +16,7 @@ datafusion = { version = "52.0.0", default-features = false, features = ["parque
 nanotrace-ingest = { path = "../../crates/ingest" }
 nanotrace-lakehouse = { path = "../../crates/lakehouse" }
 parquet = { version = "57.3", default-features = false, features = ["arrow", "zstd"] }
+rdkafka = { version = "0.37", features = ["cmake-build", "ssl-vendored", "zstd"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

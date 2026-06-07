@@ -1,10 +1,11 @@
 # Nanotrace Iceberg Final Design
 
-This document describes the target Iceberg-native design and the current
-implementation slice. Today, the local/default hot path is HTTP ingest to
-Kafka/Redpanda, normalizer, Iceberg commit, and materializer-driven ClickHouse
-serving catch-up. The implemented lakehouse tools are also available for
-replay, rebuild, and materialization work.
+This document is retained as the legacy self-managed Iceberg design record. The
+current production write path uses WarpStream Tableflow: HTTP ingest to Kafka,
+normalizer to a Tableflow-ready topic, Tableflow-managed Iceberg writes, and
+materializer-driven ClickHouse serving catch-up. The implemented local
+lakehouse tools remain available for offline replay, rebuild, and
+materialization work.
 
 ## Goal
 
@@ -29,10 +30,11 @@ truth.
 
 - Ingest API: authenticates, stamps tenant identity, validates event envelopes,
   and writes raw requests to Kafka/Redpanda.
-- Normalizer: consumes Kafka, validates and tenant-stamps events, commits valid
-  rows to Iceberg, records invalid rows, and advances offsets after durable work
-  succeeds.
-- Serving materializer: tails committed lakehouse snapshots and writes
+- Normalizer: consumes Kafka, validates and tenant-stamps events, emits valid
+  rows to the Tableflow Kafka topic, records invalid rows, and advances offsets
+  after durable work succeeds.
+- Serving materializer: consumes the Tableflow topic locally or reads managed
+  Iceberg for rebuild workflows and writes
   ClickHouse `events`, `event_kv_index`, promoted indexes, measures, states,
   reports, sequences, and cohorts.
 - Materializers: build promoted fields, measures, states, reports, cohorts,
@@ -151,9 +153,9 @@ large joins with external datasets
 millisecond streaming alerts
 ```
 
-## Current Implementation Slice
+## Legacy Implementation Slice
 
-The current implementation includes the first Iceberg vertical slice:
+The legacy self-managed Iceberg implementation includes:
 
 - `crates/lakehouse` writes canonical events to Apache Iceberg V2 table
   metadata and field-id Parquet data files through the official Rust Iceberg
@@ -161,13 +163,11 @@ The current implementation includes the first Iceberg vertical slice:
 - Local development uses a filesystem-backed Iceberg table plus a small
   Nanotrace catalog pointer so repeated normalizer batches append to the same
   table.
-- Production deployments can set `NANOTRACE_ICEBERG_REST_URI` and
-  `NANOTRACE_ICEBERG_WAREHOUSE` to commit through an Iceberg REST catalog and
-  object-store-backed warehouse.
-- `nanotrace-normalizer` commits normalized Kafka batches to the lakehouse
-  before committing Kafka offsets. It records invalid rows and lakehouse commit
-  metadata, but raw ClickHouse serving rows and serving indexes are loaded by
-  the materializer.
+- Production deployments do not use this writer path. WarpStream Tableflow owns
+  Iceberg writes, compaction, and table maintenance.
+- `nanotrace-normalizer` publishes normalized Kafka batches to the Tableflow
+  topic before committing Kafka offsets. It records invalid rows, but raw
+  ClickHouse serving rows and serving indexes are loaded by the materializer.
 - Normalizer commits include a deterministic `nanotrace.source-batch-id`
   snapshot property based on the Kafka topic/partition/offset. Redelivered
   batches reuse the existing Iceberg snapshot instead of appending duplicate
@@ -209,17 +209,13 @@ The current implementation includes the first Iceberg vertical slice:
   this shared source preserves multi-file Iceberg snapshots.
 - Lakehouse table creation and existing-table loads enforce table properties
   for ZSTD Parquet writes, target file sizing, metadata cleanup, and snapshot
-  retention. The normalizer and rebuild tooling expose these as
-  `NANOTRACE_ICEBERG_TARGET_FILE_SIZE_BYTES`,
-  `NANOTRACE_ICEBERG_MIN_SNAPSHOTS_TO_KEEP`,
-  `NANOTRACE_ICEBERG_MAX_SNAPSHOT_AGE_MS`, and
-  `NANOTRACE_ICEBERG_METADATA_PREVIOUS_VERSIONS_MAX`.
+  retention in legacy/offline tool paths. Production sizing and maintenance are
+  configured in WarpStream Tableflow.
 - Query reads inspect their source tables and compare raw/promoted serving
   watermarks to the latest lakehouse commit. Stale reads are rejected by
   default, with an explicit `allow_stale_serving` override for diagnostic or
   operator workflows.
-- Local Docker Compose enables the normalizer lakehouse writer by default and
-  stores warehouse files in the `lakehouse-data` volume.
+- Local Docker Compose uses the Tableflow topic materializer by default.
 
 Lakehouse maintenance is exposed as an operator mode in
 `nanotrace-lakehouse-rebuild`. It audits snapshot/data-file pressure, writes

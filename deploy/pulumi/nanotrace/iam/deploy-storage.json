@@ -51,34 +51,6 @@
       "Resource": "arn:aws:s3:::nanotrace-*/*"
     },
     {
-      "Sid": "ReadRdsForPulumiRefresh",
-      "Effect": "Allow",
-      "Action": [
-        "rds:DescribeDBInstances",
-        "rds:DescribeDBSubnetGroups"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "ManageNanotracePostgres",
-      "Effect": "Allow",
-      "Action": [
-        "rds:AddTagsToResource",
-        "rds:CreateDBInstance",
-        "rds:CreateDBSubnetGroup",
-        "rds:DeleteDBInstance",
-        "rds:DeleteDBSubnetGroup",
-        "rds:ListTagsForResource",
-        "rds:ModifyDBInstance",
-        "rds:ModifyDBSubnetGroup",
-        "rds:RemoveTagsFromResource"
-      ],
-      "Resource": [
-        "arn:aws:rds:*:*:db:nanotrace-*",
-        "arn:aws:rds:*:*:subgrp:nanotrace-*"
-      ]
-    },
-    {
       "Sid": "ManageNanotraceSesLoginIdentity",
       "Effect": "Allow",
       "Action": [
