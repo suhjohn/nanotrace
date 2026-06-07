@@ -14,7 +14,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use chrono::{DateTime, Utc};
 use nanotrace_auth::{AuthError, AuthIdentity, AuthRole, AuthStore};
@@ -81,10 +81,53 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/query/recommendations", get(list_query_recommendations))
         .route("/v1/query", post(post_query))
         .route("/auth/login", get(auth_login_form).post(auth_login))
+        .route("/auth/providers", get(auth_providers))
+        .route("/auth/google", get(auth_google_start))
+        .route("/auth/google/callback", get(auth_google_callback))
         .route("/auth/callback", get(auth_callback))
         .route("/auth/logout", post(auth_logout))
         .route("/auth/me", get(auth_me))
         .route("/v1/auth/me", get(auth_me))
+        .route(
+            "/v1/organizations",
+            get(list_organizations).post(create_organization),
+        )
+        .route(
+            "/v1/organizations/{organization_id}",
+            patch(update_organization).delete(archive_organization),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/switch",
+            post(switch_organization),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/leave",
+            post(leave_organization),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/members",
+            get(list_organization_members),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/members/{subject}",
+            patch(update_organization_member).delete(remove_organization_member),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/invitations",
+            get(list_organization_invitations).post(create_organization_invitation),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/invitations/{invitation_id}",
+            delete(revoke_organization_invitation),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/invitations/{invitation_id}/resend",
+            post(resend_organization_invitation),
+        )
+        .route(
+            "/v1/organization-invitations/accept",
+            post(accept_organization_invitation),
+        )
         .route("/v1/api-keys", get(list_api_keys).post(create_api_key))
         .route("/v1/api-keys/{id}", delete(revoke_api_key))
         .route("/openapi.json", get(openapi_json))
@@ -521,6 +564,18 @@ struct CallbackParams {
     token: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OAuthCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct AuthProvidersResponse {
+    google: bool,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateApiKeyRequest {
     name: String,
@@ -528,6 +583,99 @@ pub(crate) struct CreateApiKeyRequest {
     #[serde(default)]
     scopes: Vec<String>,
     expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateOrganizationRequest {
+    name: String,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct UpdateOrganizationRequest {
+    name: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct UpdateOrganizationMemberRequest {
+    role: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateOrganizationInvitationRequest {
+    email: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct AcceptOrganizationInvitationRequest {
+    token: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationListItem {
+    organization_id: String,
+    organization_name: String,
+    slug: Option<String>,
+    role: String,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+impl From<nanotrace_auth::OrganizationMembershipSummary> for OrganizationListItem {
+    fn from(value: nanotrace_auth::OrganizationMembershipSummary) -> Self {
+        Self {
+            organization_id: value.organization_id,
+            organization_name: value.organization_name,
+            slug: Some(value.slug),
+            role: role_name(value.role).to_string(),
+            created_at: Some(value.created_at),
+            updated_at: Some(value.updated_at),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationListApiResponse {
+    active_organization_id: Option<String>,
+    organizations: Vec<OrganizationListItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationResponse {
+    #[schema(value_type = serde_json::Value)]
+    organization: nanotrace_auth::OrganizationRecord,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationMemberResponse {
+    #[schema(value_type = serde_json::Value)]
+    member: nanotrace_auth::OrganizationMemberRecord,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationMembersResponse {
+    #[schema(value_type = Vec<serde_json::Value>)]
+    members: Vec<nanotrace_auth::OrganizationMemberRecord>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationMembershipResponse {
+    #[schema(value_type = serde_json::Value)]
+    organization: nanotrace_auth::OrganizationMembershipSummary,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationInvitationResponse {
+    #[schema(value_type = serde_json::Value)]
+    invitation: nanotrace_auth::OrganizationInvitationRecord,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OrganizationInvitationsResponse {
+    #[schema(value_type = Vec<serde_json::Value>)]
+    invitations: Vec<nanotrace_auth::OrganizationInvitationRecord>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -561,6 +709,83 @@ async fn auth_login_form(Query(params): Query<LoginParams>) -> Html<String> {
 }
 
 #[utoipa::path(
+    get,
+    path = "/auth/providers",
+    responses((status = 200, description = "Configured browser auth providers.", body = AuthProvidersResponse)),
+    tag = "Auth"
+)]
+pub(crate) async fn auth_providers(State(state): State<AppState>) -> Json<AuthProvidersResponse> {
+    Json(AuthProvidersResponse {
+        google: state.cfg.google_oauth.is_some(),
+    })
+}
+
+async fn auth_google_start(
+    State(state): State<AppState>,
+    Query(params): Query<LoginParams>,
+) -> Result<Response, ApiError> {
+    let auth = auth_store(&state)?;
+    let google = state
+        .cfg
+        .google_oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("Google OAuth is not configured".to_string()))?;
+    let redirect_uri = google_redirect_uri(&state.cfg)?;
+    let oauth = auth
+        .start_oauth_login("google", params.return_to.as_deref())
+        .await?;
+    let authorize_url = google_authorize_url(&google.client_id, &redirect_uri, &oauth.state);
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        authorize_url
+            .parse()
+            .map_err(|err| ApiError::Header(format!("invalid google authorize URL: {err}")))?,
+    );
+    Ok(response)
+}
+
+async fn auth_google_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<OAuthCallbackParams>,
+) -> Result<Response, ApiError> {
+    if let Some(error) = params.error.as_deref() {
+        return Err(ApiError::BadRequest(format!("Google OAuth error: {error}")));
+    }
+    let code = params
+        .code
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::BadRequest("Google OAuth code is required".to_string()))?;
+    let state_token = params
+        .state
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::BadRequest("Google OAuth state is required".to_string()))?;
+    let auth = auth_store(&state)?;
+    let return_to = auth.consume_oauth_state("google", state_token).await?;
+    let google = state
+        .cfg
+        .google_oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("Google OAuth is not configured".to_string()))?;
+    let redirect_uri = google_redirect_uri(&state.cfg)?;
+    let token = exchange_google_code(google, &redirect_uri, code).await?;
+    let profile = verify_google_id_token(&google.client_id, &token.id_token).await?;
+    let login = auth
+        .complete_external_login(
+            &profile.email,
+            profile.name.as_deref(),
+            &return_to,
+            Some(&headers),
+            "google_oauth",
+        )
+        .await?;
+    browser_login_response(&state, login).await
+}
+
+#[utoipa::path(
     post,
     path = "/auth/login",
     request_body = LoginRequest,
@@ -581,10 +806,23 @@ pub(crate) async fn auth_login(
 
 async fn auth_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response, ApiError> {
     let auth = auth_store(&state)?;
-    let login = auth.complete_login(&params.token).await?;
+    let login = auth.complete_login(&params.token, Some(&headers)).await?;
+    browser_login_response(&state, login).await
+}
+
+async fn browser_login_response(
+    state: &AppState,
+    login: nanotrace_auth::LoginComplete,
+) -> Result<Response, ApiError> {
+    if let Some(organization_id) = login.created_organization_id.as_deref()
+        && state.cfg.clickhouse_url.is_some()
+    {
+        state.definitions.seed_sdk_defaults(organization_id).await?;
+    }
     let mut response = StatusCode::FOUND.into_response();
     let return_to = callback_return_to(&state.cfg, &login.return_to);
     response.headers_mut().insert(
@@ -601,6 +839,141 @@ async fn auth_callback(
             .map_err(|err| ApiError::Header(format!("invalid session cookie header: {err}")))?,
     );
     Ok(response)
+}
+
+fn google_redirect_uri(cfg: &Config) -> Result<String, ApiError> {
+    if let Some(redirect_uri) = cfg
+        .google_oauth
+        .as_ref()
+        .and_then(|config| config.redirect_uri.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(redirect_uri.to_string());
+    }
+    let base_url = cfg.auth.public_base_url.as_deref().ok_or_else(|| {
+        ApiError::Unavailable("NANOTRACE_PUBLIC_BASE_URL is required for Google OAuth".to_string())
+    })?;
+    Ok(format!(
+        "{}/auth/google/callback",
+        base_url.trim_end_matches('/')
+    ))
+}
+
+fn google_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+    let params = [
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("response_type", "code"),
+        ("scope", "openid email profile"),
+        ("state", state),
+        ("prompt", "select_account"),
+    ];
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("https://accounts.google.com/o/oauth2/v2/auth?{query}")
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTokenResponse {
+    id_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTokenInfo {
+    aud: String,
+    email: String,
+    #[serde(default)]
+    email_verified: serde_json::Value,
+    name: Option<String>,
+}
+
+struct GoogleProfile {
+    email: String,
+    name: Option<String>,
+}
+
+async fn exchange_google_code(
+    google: &crate::config::GoogleOAuthConfig,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<GoogleTokenResponse, ApiError> {
+    let response = reqwest::Client::new()
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", google.client_id.as_str()),
+            ("client_secret", google.client_secret.as_str()),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|err| {
+            ApiError::Unavailable(format!("Google OAuth token exchange failed: {err}"))
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ApiError::Unavailable(format!("Google OAuth token response failed: {err}"))
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::BadRequest(format!(
+            "Google OAuth token exchange failed: {body}"
+        )));
+    }
+    serde_json::from_str::<GoogleTokenResponse>(&body).map_err(|err| {
+        ApiError::Unavailable(format!("Google OAuth token response was invalid: {err}"))
+    })
+}
+
+async fn verify_google_id_token(
+    client_id: &str,
+    id_token: &str,
+) -> Result<GoogleProfile, ApiError> {
+    let response = reqwest::Client::new()
+        .get("https://oauth2.googleapis.com/tokeninfo")
+        .query(&[("id_token", id_token)])
+        .send()
+        .await
+        .map_err(|err| {
+            ApiError::Unavailable(format!("Google OAuth token verification failed: {err}"))
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ApiError::Unavailable(format!("Google OAuth tokeninfo response failed: {err}"))
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::BadRequest(format!(
+            "Google OAuth token verification failed: {body}"
+        )));
+    }
+    let token = serde_json::from_str::<GoogleTokenInfo>(&body).map_err(|err| {
+        ApiError::Unavailable(format!(
+            "Google OAuth tokeninfo response was invalid: {err}"
+        ))
+    })?;
+    if token.aud != client_id {
+        return Err(ApiError::Unauthorized);
+    }
+    if !json_truthy(&token.email_verified) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(GoogleProfile {
+        email: token.email,
+        name: token.name,
+    })
+}
+
+fn json_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::String(value) => value.eq_ignore_ascii_case("true") || value == "1",
+        serde_json::Value::Number(value) => value.as_i64() == Some(1),
+        _ => false,
+    }
 }
 
 fn callback_return_to(cfg: &Config, return_to: &str) -> String {
@@ -621,6 +994,39 @@ async fn send_login_email(state: &AppState, email: &str, login_url: &str) -> Res
         "Your Nanotrace login link",
         &format!(
             "Use this link to sign in to Nanotrace:\n\n{login_url}\n\nThis link expires soon and can only be used once."
+        ),
+    )
+    .await
+}
+
+async fn send_invitation_email(state: &AppState, email: &str, token: &str) -> Result<(), ApiError> {
+    let base_url = state
+        .cfg
+        .app_base_url
+        .as_deref()
+        .or(state.cfg.auth.public_base_url.as_deref())
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let path = format!("/settings/organization?invite_token={token}");
+    let accept_url = if base_url.is_empty() {
+        path
+    } else {
+        format!("{base_url}{path}")
+    };
+    if state.cfg.email_from.is_none() {
+        tracing::info!(
+            target_email = %email,
+            accept_url = %accept_url,
+            "NANOTRACE_EMAIL_FROM is not configured; logging invitation accept link"
+        );
+        return Ok(());
+    }
+    send_text_email(
+        state,
+        email,
+        "You have been invited to Nanotrace",
+        &format!(
+            "Use this link to accept your Nanotrace organization invitation:\n\n{accept_url}\n\nSign in with this email address before accepting."
         ),
     )
     .await
@@ -715,6 +1121,519 @@ pub(crate) async fn auth_me(
 
 #[utoipa::path(
     get,
+    path = "/v1/organizations",
+    responses((status = 200, description = "Organizations for the authenticated identity.", body = OrganizationListApiResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn list_organizations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<OrganizationListApiResponse>, ApiError> {
+    let identity = authorize_any(&state, &headers).await?;
+    if matches!(identity.auth_type, nanotrace_auth::AuthType::ApiKey) {
+        return Ok(Json(OrganizationListApiResponse {
+            active_organization_id: Some(identity.organization_id.clone()),
+            organizations: vec![OrganizationListItem {
+                organization_id: identity.organization_id,
+                organization_name: identity.organization_name,
+                slug: None,
+                role: role_name(identity.role).to_string(),
+                created_at: None,
+                updated_at: None,
+            }],
+        }));
+    }
+    let response = auth_store(&state)?
+        .list_session_organizations(
+            &identity.subject,
+            (!identity.organization_id.is_empty()).then_some(identity.organization_id.as_str()),
+        )
+        .await?;
+    Ok(Json(OrganizationListApiResponse {
+        active_organization_id: response.active_organization_id,
+        organizations: response
+            .organizations
+            .into_iter()
+            .map(OrganizationListItem::from)
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organizations",
+    request_body = CreateOrganizationRequest,
+    responses((status = 200, description = "Created organization.", body = OrganizationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn create_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateOrganizationRequest>,
+) -> Result<Json<OrganizationResponse>, ApiError> {
+    let identity = authorize_session(&state, &headers).await?;
+    let organization = auth_store(&state)?
+        .create_organization_for_session(
+            &headers,
+            &identity.subject,
+            request.name,
+            request.slug.as_deref(),
+        )
+        .await?;
+    if state.cfg.clickhouse_url.is_some() {
+        state
+            .definitions
+            .seed_sdk_defaults(&organization.id)
+            .await?;
+    }
+    audit_account_event(
+        &state,
+        "organization.created",
+        &identity,
+        Some(&organization.id),
+        None,
+        None,
+        serde_json::json!({ "slug": &organization.slug, "name": &organization.name }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization.id,
+        "organization created"
+    );
+    Ok(Json(OrganizationResponse { organization }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/organizations/{organization_id}",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    request_body = UpdateOrganizationRequest,
+    responses((status = 200, description = "Updated organization.", body = OrganizationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn update_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+    Json(request): Json<UpdateOrganizationRequest>,
+) -> Result<Json<OrganizationResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let organization = auth_store(&state)?
+        .update_organization(&organization_id, request.name, request.slug.as_deref())
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.updated",
+        &identity,
+        Some(&organization.id),
+        None,
+        None,
+        serde_json::json!({ "slug": &organization.slug, "name": &organization.name }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization.id,
+        "organization updated"
+    );
+    Ok(Json(OrganizationResponse { organization }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/organizations/{organization_id}",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    responses((status = 200, description = "Archived organization.", body = OrganizationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn archive_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+) -> Result<Json<OrganizationResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let organization = auth_store(&state)?
+        .archive_organization(&organization_id)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.archived",
+        &identity,
+        Some(&organization.id),
+        None,
+        None,
+        serde_json::json!({ "slug": &organization.slug }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization.id,
+        "organization archived"
+    );
+    Ok(Json(OrganizationResponse { organization }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{organization_id}/switch",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    responses((status = 200, description = "Switched active organization.", body = OrganizationMembershipResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn switch_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+) -> Result<Json<OrganizationMembershipResponse>, ApiError> {
+    let identity = authorize_session(&state, &headers).await?;
+    let organization = auth_store(&state)?
+        .switch_session_organization(&headers, &organization_id)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.switched",
+        &identity,
+        Some(&organization.organization_id),
+        None,
+        None,
+        serde_json::json!({}),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization.organization_id,
+        "organization switched"
+    );
+    Ok(Json(OrganizationMembershipResponse { organization }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{organization_id}/leave",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    responses((status = 200, description = "Left organization.", body = OrganizationMemberResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn leave_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+) -> Result<Json<OrganizationMemberResponse>, ApiError> {
+    let identity = authorize_session(&state, &headers).await?;
+    let member = auth_store(&state)?
+        .remove_organization_member(&organization_id, &identity.subject)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.left",
+        &identity,
+        Some(&organization_id),
+        Some(&identity.subject),
+        identity.email.as_deref(),
+        serde_json::json!({}),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        "organization left"
+    );
+    Ok(Json(OrganizationMemberResponse { member }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{organization_id}/members",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    responses((status = 200, description = "Organization members.", body = OrganizationMembersResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn list_organization_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+) -> Result<Json<OrganizationMembersResponse>, ApiError> {
+    require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let members = auth_store(&state)?
+        .list_organization_members(&organization_id)
+        .await?;
+    Ok(Json(OrganizationMembersResponse { members }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/organizations/{organization_id}/members/{subject}",
+    params(
+        ("organization_id" = String, Path, description = "Organization id."),
+        ("subject" = String, Path, description = "Member subject.")
+    ),
+    request_body = UpdateOrganizationMemberRequest,
+    responses((status = 200, description = "Updated organization member.", body = OrganizationMemberResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn update_organization_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((organization_id, subject)): Path<(String, String)>,
+    Json(request): Json<UpdateOrganizationMemberRequest>,
+) -> Result<Json<OrganizationMemberResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let role = parse_member_role(&request.role)?;
+    let member = auth_store(&state)?
+        .set_organization_member_role(&organization_id, &subject, role)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.member_role_updated",
+        &identity,
+        Some(&organization_id),
+        Some(&member.subject),
+        Some(&member.email),
+        serde_json::json!({ "role": role_name(member.role) }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        target_subject = %member.subject,
+        role = role_name(member.role),
+        "organization member role updated"
+    );
+    Ok(Json(OrganizationMemberResponse { member }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/organizations/{organization_id}/members/{subject}",
+    params(
+        ("organization_id" = String, Path, description = "Organization id."),
+        ("subject" = String, Path, description = "Member subject.")
+    ),
+    responses((status = 200, description = "Removed organization member.", body = OrganizationMemberResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn remove_organization_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((organization_id, subject)): Path<(String, String)>,
+) -> Result<Json<OrganizationMemberResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let member = auth_store(&state)?
+        .remove_organization_member(&organization_id, &subject)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.member_removed",
+        &identity,
+        Some(&organization_id),
+        Some(&member.subject),
+        Some(&member.email),
+        serde_json::json!({}),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        target_subject = %member.subject,
+        "organization member removed"
+    );
+    Ok(Json(OrganizationMemberResponse { member }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{organization_id}/invitations",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    responses((status = 200, description = "Organization invitations.", body = OrganizationInvitationsResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn list_organization_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+) -> Result<Json<OrganizationInvitationsResponse>, ApiError> {
+    require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let invitations = auth_store(&state)?
+        .list_organization_invitations(&organization_id)
+        .await?;
+    Ok(Json(OrganizationInvitationsResponse { invitations }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{organization_id}/invitations",
+    params(("organization_id" = String, Path, description = "Organization id.")),
+    request_body = CreateOrganizationInvitationRequest,
+    responses((status = 200, description = "Created organization invitation.", body = OrganizationInvitationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn create_organization_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(organization_id): Path<String>,
+    Json(request): Json<CreateOrganizationInvitationRequest>,
+) -> Result<Json<OrganizationInvitationResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let role = parse_member_role(&request.role)?;
+    let created = auth_store(&state)?
+        .create_organization_invitation(&organization_id, &request.email, role, &identity.subject)
+        .await?;
+    if let Some(token) = created.token.as_deref() {
+        send_invitation_email(&state, &created.invitation.email, token).await?;
+    }
+    audit_account_event(
+        &state,
+        "organization.invitation_created",
+        &identity,
+        Some(&organization_id),
+        None,
+        Some(&created.invitation.email),
+        serde_json::json!({ "role": role_name(created.invitation.role), "invitation_id": created.invitation.id }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        target_email = %created.invitation.email,
+        "organization invitation created"
+    );
+    Ok(Json(OrganizationInvitationResponse {
+        invitation: created.invitation,
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/organizations/{organization_id}/invitations/{invitation_id}",
+    params(
+        ("organization_id" = String, Path, description = "Organization id."),
+        ("invitation_id" = i64, Path, description = "Invitation id.")
+    ),
+    responses((status = 200, description = "Revoked organization invitation.", body = OrganizationInvitationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn revoke_organization_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((organization_id, invitation_id)): Path<(String, i64)>,
+) -> Result<Json<OrganizationInvitationResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let invitation = auth_store(&state)?
+        .revoke_organization_invitation(&organization_id, invitation_id)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.invitation_revoked",
+        &identity,
+        Some(&organization_id),
+        None,
+        Some(&invitation.email),
+        serde_json::json!({ "invitation_id": invitation.id }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        target_email = %invitation.email,
+        "organization invitation revoked"
+    );
+    Ok(Json(OrganizationInvitationResponse { invitation }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{organization_id}/invitations/{invitation_id}/resend",
+    params(
+        ("organization_id" = String, Path, description = "Organization id."),
+        ("invitation_id" = i64, Path, description = "Invitation id.")
+    ),
+    responses((status = 200, description = "Resent organization invitation.", body = OrganizationInvitationResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn resend_organization_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((organization_id, invitation_id)): Path<(String, i64)>,
+) -> Result<Json<OrganizationInvitationResponse>, ApiError> {
+    let identity = require_session_organization_admin(&state, &headers, &organization_id).await?;
+    let resent = auth_store(&state)?
+        .resend_organization_invitation(&organization_id, invitation_id)
+        .await?;
+    if let Some(token) = resent.token.as_deref() {
+        send_invitation_email(&state, &resent.invitation.email, token).await?;
+    }
+    audit_account_event(
+        &state,
+        "organization.invitation_resent",
+        &identity,
+        Some(&organization_id),
+        None,
+        Some(&resent.invitation.email),
+        serde_json::json!({ "invitation_id": resent.invitation.id }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization_id,
+        target_email = %resent.invitation.email,
+        "organization invitation resent"
+    );
+    Ok(Json(OrganizationInvitationResponse {
+        invitation: resent.invitation,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/organization-invitations/accept",
+    request_body = AcceptOrganizationInvitationRequest,
+    responses((status = 200, description = "Accepted organization invitation.", body = OrganizationMembershipResponse)),
+    security(("bearerAuth" = [])),
+    tag = "Organizations"
+)]
+pub(crate) async fn accept_organization_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AcceptOrganizationInvitationRequest>,
+) -> Result<Json<OrganizationMembershipResponse>, ApiError> {
+    let identity = authorize_session(&state, &headers).await?;
+    let organization = auth_store(&state)?
+        .accept_organization_invitation(&headers, &request.token)
+        .await?;
+    audit_account_event(
+        &state,
+        "organization.invitation_accepted",
+        &identity,
+        Some(&organization.organization_id),
+        Some(&identity.subject),
+        identity.email.as_deref(),
+        serde_json::json!({ "role": role_name(organization.role) }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %organization.organization_id,
+        "organization invitation accepted"
+    );
+    Ok(Json(OrganizationMembershipResponse { organization }))
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/api-keys",
     responses((status = 200, description = "API key list.", body = ApiKeysResponse)),
     security(("bearerAuth" = [])),
@@ -756,6 +1675,22 @@ pub(crate) async fn create_api_key(
             request.expires_at,
         )
         .await?;
+    audit_account_event(
+        &state,
+        "api_key.created",
+        &identity,
+        Some(&identity.organization_id),
+        None,
+        None,
+        serde_json::json!({ "api_key_id": created.api_key.id, "role": role_name(created.api_key.role) }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %identity.organization_id,
+        api_key_id = created.api_key.id,
+        "api key created"
+    );
     Ok(Json(created))
 }
 
@@ -776,6 +1711,22 @@ pub(crate) async fn revoke_api_key(
     let api_key = auth_store(&state)?
         .revoke_api_key(&identity.organization_id, id)
         .await?;
+    audit_account_event(
+        &state,
+        "api_key.revoked",
+        &identity,
+        Some(&identity.organization_id),
+        None,
+        None,
+        serde_json::json!({ "api_key_id": api_key.id }),
+    )
+    .await?;
+    tracing::info!(
+        actor_subject = %identity.subject,
+        organization_id = %identity.organization_id,
+        api_key_id = api_key.id,
+        "api key revoked"
+    );
     Ok(Json(serde_json::json!({ "api_key": api_key })))
 }
 
@@ -794,6 +1745,57 @@ async fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthId
     } else {
         Err(ApiError::Forbidden)
     }
+}
+
+async fn authorize_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthIdentity, ApiError> {
+    let identity = authorize_any(state, headers).await?;
+    if matches!(identity.auth_type, nanotrace_auth::AuthType::Session) {
+        Ok(identity)
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+async fn require_session_organization_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    organization_id: &str,
+) -> Result<AuthIdentity, ApiError> {
+    let identity = authorize_session(state, headers).await?;
+    if auth_store(state)?
+        .is_organization_admin(organization_id, &identity.subject)
+        .await?
+    {
+        Ok(identity)
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+async fn audit_account_event(
+    state: &AppState,
+    event_type: &str,
+    identity: &AuthIdentity,
+    organization_id: Option<&str>,
+    target_subject: Option<&str>,
+    target_email: Option<&str>,
+    metadata: serde_json::Value,
+) -> Result<(), ApiError> {
+    auth_store(state)?
+        .record_account_audit_event(
+            event_type,
+            &identity.subject,
+            auth_type_name(identity.auth_type),
+            organization_id,
+            target_subject,
+            target_email,
+            metadata,
+        )
+        .await?;
+    Ok(())
 }
 
 async fn authorize_scope(
@@ -849,6 +1851,31 @@ fn parse_requested_role(value: Option<&str>) -> Result<AuthRole, ApiError> {
         other => Err(ApiError::BadRequest(format!(
             "invalid API key role: {other}"
         ))),
+    }
+}
+
+fn parse_member_role(value: &str) -> Result<AuthRole, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "admin" => Ok(AuthRole::Admin),
+        "viewer" => Ok(AuthRole::Viewer),
+        other => Err(ApiError::BadRequest(format!(
+            "invalid organization member role: {other}"
+        ))),
+    }
+}
+
+fn role_name(role: AuthRole) -> &'static str {
+    match role {
+        AuthRole::Admin => "admin",
+        AuthRole::Service => "service",
+        AuthRole::Viewer => "viewer",
+    }
+}
+
+fn auth_type_name(auth_type: nanotrace_auth::AuthType) -> &'static str {
+    match auth_type {
+        nanotrace_auth::AuthType::ApiKey => "api_key",
+        nanotrace_auth::AuthType::Session => "session",
     }
 }
 

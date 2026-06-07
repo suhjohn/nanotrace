@@ -29,6 +29,11 @@ type CreatedApiKey = {
   api_key: ApiKeyRecord
 }
 
+type AuthIdentity = {
+  organization_id: string
+  organization_name: string
+}
+
 type HTTPErrorInit = {
   message: string
   status: number
@@ -59,7 +64,13 @@ function ApiKeysRoute() {
     queryFn: () => fetchApiKeys({ apiBaseUrl: observatoryUrl }),
     retry: false
   })
+  const authQuery = useQuery({
+    queryKey: ['auth', observatoryUrl, 'me'],
+    queryFn: () => fetchAuthMe({ apiBaseUrl: observatoryUrl }),
+    retry: false
+  })
   const apiKeys = apiKeysQuery.data?.api_keys ?? []
+  const organizationName = authQuery.data?.organization_name || 'selected organization'
   const activeCount = useMemo(() => apiKeys.filter(isActiveApiKey).length, [apiKeys])
 
   const createMutation = useMutation({
@@ -119,7 +130,7 @@ function ApiKeysRoute() {
                 ) : null}
                 <div className="min-w-0">
                   <h1 className="truncate text-[13px] font-medium text-white">Create API key</h1>
-                  <p className="mt-0.5 text-[11px] text-neutral-600">The secret is shown once after creation.</p>
+                  <p className="mt-0.5 text-[11px] text-neutral-600">Keys belong only to {organizationName}. The secret is shown once.</p>
                 </div>
               </div>
             </div>
@@ -206,7 +217,7 @@ function ApiKeysRoute() {
             <div className="flex items-center justify-between gap-2 border-b border-neutral-800 px-3 py-2">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="text-[13px] font-medium text-white">Keys</h2>
-                <span className="text-[11px] text-neutral-600">{headerStatus}</span>
+                <span className="truncate text-[11px] text-neutral-600">{organizationName} · {headerStatus}</span>
               </div>
               <button
                 className="h-7 shrink-0 border border-neutral-800 bg-black px-2 text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
@@ -335,6 +346,19 @@ async function fetchApiKeys({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ a
   return (await response.json()) as { api_keys: ApiKeyRecord[] }
 }
 
+async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthIdentity> {
+  const response = await fetch(authUrl(apiBaseUrl, '/me'), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as AuthIdentity
+}
+
 async function createApiKey({
   apiBaseUrl,
   expiresAt,
@@ -387,6 +411,11 @@ async function revokeApiKey({
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/v1/api-keys` : '/v1/api-keys'
+}
+
+function authUrl(apiBaseUrl: string, path: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/auth${path}` : `/auth${path}`
 }
 
 function errorMessage(error: unknown) {

@@ -14,6 +14,7 @@ use nanotrace_auth::AuthStore;
 pub struct ServerMetrics {
     started_at: Instant,
     http: Mutex<BTreeMap<HttpMetricKey, DurationStats>>,
+    account_failures: Mutex<BTreeMap<AccountFailureMetricKey, u64>>,
     queries: Mutex<BTreeMap<QueryMetricKey, DurationStats>>,
     ingest_batches_accepted: AtomicU64,
     ingest_bytes_accepted: AtomicU64,
@@ -25,6 +26,12 @@ struct HttpMetricKey {
     method: String,
     route: String,
     status: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct AccountFailureMetricKey {
+    area: &'static str,
+    status_class: u16,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -44,6 +51,7 @@ impl ServerMetrics {
         Self {
             started_at: Instant::now(),
             http: Mutex::new(BTreeMap::new()),
+            account_failures: Mutex::new(BTreeMap::new()),
             queries: Mutex::new(BTreeMap::new()),
             ingest_batches_accepted: AtomicU64::new(0),
             ingest_bytes_accepted: AtomicU64::new(0),
@@ -59,6 +67,17 @@ impl ServerMetrics {
         };
         if let Ok(mut metrics) = self.http.lock() {
             metrics.entry(key).or_default().record(elapsed);
+        }
+        if status.is_client_error() || status.is_server_error() {
+            if let Some(area) = account_route_area(route) {
+                let key = AccountFailureMetricKey {
+                    area,
+                    status_class: status.as_u16() / 100,
+                };
+                if let Ok(mut metrics) = self.account_failures.lock() {
+                    *metrics.entry(key).or_default() += 1;
+                }
+            }
         }
     }
 
@@ -104,6 +123,7 @@ impl ServerMetrics {
         self.render_ingest_metrics(&mut output);
         self.render_query_metrics(&mut output);
         self.render_backfill_metrics(&mut output);
+        self.render_account_failure_metrics(&mut output);
         render_auth_metrics(&mut output, auth);
         output
     }
@@ -208,6 +228,24 @@ impl ServerMetrics {
             self.backfills_created.load(Ordering::Relaxed)
         ));
     }
+
+    fn render_account_failure_metrics(&self, output: &mut String) {
+        push_metric_help(
+            output,
+            "nanotrace_account_api_failures_total",
+            "Account and organization API failures by area and status class.",
+            "counter",
+        );
+        let Ok(metrics) = self.account_failures.lock() else {
+            return;
+        };
+        for (key, count) in metrics.iter() {
+            output.push_str(&format!(
+                "nanotrace_account_api_failures_total{{area=\"{}\",status_class=\"{}xx\"}} {}\n",
+                key.area, key.status_class, count
+            ));
+        }
+    }
 }
 
 impl DurationStats {
@@ -255,6 +293,18 @@ fn render_auth_metrics(output: &mut String, auth: Option<&AuthStore>) {
             "nanotrace_auth_api_key_cache_age_seconds {:.3}\n",
             age.as_secs_f64()
         ));
+    }
+}
+
+fn account_route_area(route: &str) -> Option<&'static str> {
+    if route.starts_with("/v1/organizations") || route.starts_with("/v1/organization-invitations") {
+        Some("organizations")
+    } else if route.starts_with("/v1/api-keys") {
+        Some("api_keys")
+    } else if route.starts_with("/auth/") || route.starts_with("/v1/auth/") {
+        Some("auth")
+    } else {
+        None
     }
 }
 

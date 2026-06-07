@@ -25,9 +25,24 @@ use utoipa::{
         crate::http::list_backfill_jobs,
         crate::http::create_definition_backfill,
         crate::http::get_backfill_job,
+        crate::http::auth_providers,
         crate::http::auth_login,
         crate::http::auth_logout,
         crate::http::auth_me,
+        crate::http::list_organizations,
+        crate::http::create_organization,
+        crate::http::update_organization,
+        crate::http::archive_organization,
+        crate::http::switch_organization,
+        crate::http::leave_organization,
+        crate::http::list_organization_members,
+        crate::http::update_organization_member,
+        crate::http::remove_organization_member,
+        crate::http::list_organization_invitations,
+        crate::http::create_organization_invitation,
+        crate::http::revoke_organization_invitation,
+        crate::http::resend_organization_invitation,
+        crate::http::accept_organization_invitation,
         crate::http::list_api_keys,
         crate::http::create_api_key,
         crate::http::revoke_api_key,
@@ -69,8 +84,21 @@ use utoipa::{
         crate::materializations::MaterializationChunkRecord,
         crate::materializations::BackfillJobResponse,
         crate::materializations::BackfillJobListResponse,
+        crate::http::AuthProvidersResponse,
         crate::http::LoginRequest,
         crate::http::LoginResponse,
+        crate::http::CreateOrganizationRequest,
+        crate::http::UpdateOrganizationRequest,
+        crate::http::OrganizationListApiResponse,
+        crate::http::OrganizationResponse,
+        crate::http::OrganizationMemberResponse,
+        crate::http::OrganizationMembersResponse,
+        crate::http::OrganizationMembershipResponse,
+        crate::http::OrganizationInvitationResponse,
+        crate::http::OrganizationInvitationsResponse,
+        crate::http::UpdateOrganizationMemberRequest,
+        crate::http::CreateOrganizationInvitationRequest,
+        crate::http::AcceptOrganizationInvitationRequest,
         crate::http::CreateApiKeyRequest,
         crate::http::ApiKeysResponse,
     )),
@@ -83,6 +111,7 @@ use utoipa::{
         (name = "Definitions", description = "Definition management and backfills"),
         (name = "Backfills", description = "Historical processing jobs for definition outputs"),
         (name = "Auth", description = "Browser session authentication"),
+        (name = "Organizations", description = "Organization lifecycle and membership management"),
         (name = "API Keys", description = "API key management")
     )
 )]
@@ -146,6 +175,15 @@ mod tests {
         assert!(!paths.contains_key("/v1/reports"));
         assert!(!paths.contains_key("/dashboards/{dashboard_id}/visualizations"));
         assert!(paths.contains_key("/v1/api-keys"));
+        assert!(paths.contains_key("/auth/providers"));
+        assert!(paths.contains_key("/v1/organizations"));
+        assert!(paths.contains_key("/v1/organizations/{organization_id}"));
+        assert!(paths.contains_key("/v1/organizations/{organization_id}/switch"));
+        assert!(paths.contains_key("/v1/organizations/{organization_id}/leave"));
+        assert!(paths.contains_key(
+            "/v1/organizations/{organization_id}/invitations/{invitation_id}/resend"
+        ));
+        assert!(paths.contains_key("/v1/organization-invitations/accept"));
         assert!(!paths.contains_key("/api-keys"));
         let components = spec.components.unwrap();
         assert!(components.security_schemes.contains_key("bearerAuth"));

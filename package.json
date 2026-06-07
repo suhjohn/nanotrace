@@ -20,6 +20,7 @@
     "dev:down": "docker compose -f docker-compose.dev.yml down",
     "dev:reset": "docker compose -f docker-compose.dev.yml down -v",
     "dev:logs": "docker compose -f docker-compose.dev.yml logs -f",
+    "dev:seed-auth": "node scripts/seed-dev-auth.mjs",
     "dev:schema:reset": "CLICKHOUSE_RESET_DATABASE=true docker compose -f docker-compose.dev.yml run --rm clickhouse-schema",
     "lakehouse:rebuild:local": "docker compose -f docker-compose.dev.yml run --rm --no-deps server /usr/local/bin/nanotrace-lakehouse-rebuild",
     "lakehouse:materializer:local": "NANOTRACE_MATERIALIZE_LOOP=true docker compose -f docker-compose.dev.yml run -d --name nanotrace-dev-materializer --no-deps server /usr/local/bin/nanotrace-lakehouse-rebuild",

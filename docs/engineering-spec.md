@@ -530,8 +530,9 @@ The UI calls:
 - `POST /v1/definitions/{definition_id}/backfills`,
   `GET /v1/backfills`, and `GET /v1/backfills/{job_id}` for report,
   sequence, and cohort definition backfills.
-- `GET /auth/me`, `GET/POST /auth/login`, `GET /auth/callback`,
-  `POST /auth/logout`.
+- `GET /auth/me`, `GET /auth/providers`, `GET/POST /auth/login`,
+  `GET /auth/callback`, `GET /auth/google`,
+  `GET /auth/google/callback`, `POST /auth/logout`.
 - `GET/POST/DELETE /v1/api-keys`.
 
 ## Detailed Flow: Definitions and Promotion
@@ -563,8 +564,9 @@ Definition storage:
   definition row, delete inserts a disabled/deleted version, and there is no
   in-place update endpoint.
 - SDK/default metric definitions are seeded automatically by the server at
-  startup for known organizations when ClickHouse is configured. With auth
-  disabled this falls back to `org_default`.
+  startup for known organizations and after account API organization creation
+  when ClickHouse is configured. With auth disabled, no organization-scoped
+  defaults are seeded.
 - The normalizer can insert managed metric rollup definitions discovered from
   metric events.
 
@@ -669,14 +671,18 @@ flowchart LR
   Scope --> Handler
 ```
 
-Auth tables are created by `crates/auth`:
+Auth tables are created and upgraded by versioned SQL migrations in
+`crates/auth/migrations`:
 
 - `nanotrace_organizations`
 - `nanotrace_auth_users`
 - `nanotrace_organization_members`
 - `nanotrace_auth_sessions`
 - `nanotrace_magic_links`
+- `nanotrace_oauth_states`
+- `nanotrace_organization_invitations`
 - `nanotrace_api_keys`
+- `nanotrace_account_audit_events`
 
 API key identities are loaded into an in-process `AuthStore` cache on startup.
 The cache is refreshed by a background Tokio task every
@@ -684,6 +690,15 @@ The cache is refreshed by a background Tokio task every
 API key validation reads this map in memory after the initial load; Postgres
 remains the source of truth for sessions, magic links, organizations, and API
 key mutations.
+
+Archived organizations are excluded from session membership resolution and API
+key cache loading. Archiving an organization revokes its API keys, revokes
+pending invitations, and clears active sessions for that organization. Account
+lifecycle mutations also write durable rows to
+`nanotrace_account_audit_events`.
+
+See [tenant-route-inventory.md](tenant-route-inventory.md) for the public route
+tenant source, role/scope, and coverage inventory.
 
 Default scopes:
 
@@ -775,9 +790,12 @@ Search query shape:
 
 | Method | Path | Notes |
 | --- | --- | --- |
+| `GET` | `/auth/providers` | Returns configured browser login providers. |
 | `GET` | `/auth/login` | Login form. |
 | `POST` | `/auth/login` | Starts magic-link login. |
 | `GET` | `/auth/callback` | Completes magic-link login and sets session cookie. |
+| `GET` | `/auth/google` | Starts Google OAuth when configured. |
+| `GET` | `/auth/google/callback` | Completes Google OAuth and sets session cookie. |
 | `POST` | `/auth/logout` | Deletes session and expires cookie. |
 | `GET` | `/auth/me` | Returns current identity. |
 | `GET` | `/v1/auth/me` | API identity endpoint for the current session or API key. |
@@ -980,6 +998,7 @@ Local scripts from `package.json`:
 
 - `npm run dev:up`
 - `npm run dev:up:detached`
+- `npm run dev:seed-auth`
 - `npm run dev:down`
 - `npm run dev:reset`
 - `npm run dev:schema:reset`

@@ -1,7 +1,7 @@
 import { Link, Outlet, createRootRoute, useRouterState } from '@tanstack/react-router'
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-import { Database, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle } from 'lucide-react'
+import { Building2, Check, Database, KeyRound, ListTree, LogOut, Mail, PanelLeftClose, Send, UserCircle, Users } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../lib/cn'
@@ -67,6 +67,14 @@ function AuthGate({ children }: { children: ReactNode }) {
   if (isUnauthorizedError(authQuery.error)) return <SignInScreen />
   if (authQuery.error) return <AuthErrorScreen error={authQuery.error} onRetry={() => void authQuery.refetch()} />
 
+  const identity = authQuery.data
+  if (identity?.auth_type === 'session' && (identity.pending_invitations?.length ?? 0) > 0) {
+    return <InvitationOnboarding identity={identity} />
+  }
+  if (identity?.auth_type === 'session' && (identity.organizations?.length ?? 0) === 0) {
+    return <CreateOrganizationOnboarding />
+  }
+
   return children
 }
 
@@ -103,6 +111,12 @@ function SignInScreen() {
   const queryClient = useQueryClient()
   const [loginEmail, setLoginEmail] = useState('')
   const [loginSent, setLoginSent] = useState(false)
+  const providersQuery = useQuery({
+    queryKey: ['auth', observatoryUrl, 'providers'],
+    queryFn: () => fetchAuthProviders({ apiBaseUrl: observatoryUrl }),
+    retry: false,
+    staleTime: 60_000
+  })
   const loginMutation = useMutation({
     mutationFn: () => requestLoginLink({ apiBaseUrl: observatoryUrl, email: loginEmail }),
     onSuccess: async () => {
@@ -129,6 +143,18 @@ function SignInScreen() {
             <p className="mt-0.5 text-[12px] text-neutral-500">Receive a magic link by email.</p>
           </div>
         </div>
+        {providersQuery.data?.google ? (
+          <button
+            className="inline-flex h-9 items-center justify-center gap-1.5 border border-neutral-700 bg-black px-3 text-[13px] font-medium text-neutral-100 hover:bg-white/[0.04]"
+            type="button"
+            onClick={() => {
+              window.location.assign(authUrl(observatoryUrl, `/google?return_to=${encodeURIComponent(currentReturnTo())}`))
+            }}
+          >
+            <KeyRound size={14} strokeWidth={1.8} />
+            Continue with Google
+          </button>
+        ) : null}
         <input
           autoComplete="email"
           autoFocus
@@ -158,10 +184,123 @@ function SignInScreen() {
   )
 }
 
+function InvitationOnboarding({ identity }: { identity: AuthIdentity }) {
+  const observatoryUrl = nanotraceApiBaseUrl()
+  const queryClient = useQueryClient()
+  const invites = identity.pending_invitations ?? []
+  const urlToken = typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('invite_token') || ''
+  const acceptMutation = useMutation({
+    mutationFn: (token: string) => acceptInvitation({ apiBaseUrl: observatoryUrl, token }),
+    onSuccess: async () => {
+      if (typeof window !== 'undefined' && urlToken) {
+        const url = new URL(window.location.href)
+        url.searchParams.delete('invite_token')
+        window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
+      }
+      await invalidateTenantQueries(queryClient, observatoryUrl)
+    }
+  })
+
+  useEffect(() => {
+    if (urlToken && !acceptMutation.isPending && !acceptMutation.isSuccess) {
+      acceptMutation.mutate(urlToken)
+    }
+  }, [acceptMutation, urlToken])
+
+  return (
+    <div className="fixed inset-0 grid place-items-center bg-black px-4 text-neutral-100">
+      <div className="grid w-full max-w-md gap-3 border border-neutral-800 bg-neutral-950 p-4">
+        <div className="flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center border border-neutral-800 bg-black text-neutral-400">
+            <Building2 size={15} strokeWidth={1.8} />
+          </div>
+          <div className="min-w-0">
+            <h1 className="truncate text-[14px] font-medium text-white">Organization invitations</h1>
+            <p className="mt-0.5 text-[12px] text-neutral-500">{identity.email}</p>
+          </div>
+        </div>
+        <div className="grid gap-2">
+          {invites.map(invite => (
+            <div key={invite.id} className="flex items-center justify-between gap-3 border border-neutral-800 bg-black p-2">
+              <div className="min-w-0">
+                <div className="truncate text-[12px] text-white">{invite.organization_name}</div>
+                <div className="text-[11px] text-neutral-600">{invite.role}</div>
+              </div>
+              <button
+                className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 border border-neutral-700 bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700"
+                disabled={!urlToken || acceptMutation.isPending}
+                type="button"
+                onClick={() => acceptMutation.mutate(urlToken)}
+              >
+                <Check size={13} strokeWidth={1.8} />
+                Accept
+              </button>
+            </div>
+          ))}
+        </div>
+        {!urlToken ? <div className="text-[12px] text-neutral-500">Open the invite link from your email to accept.</div> : null}
+        {acceptMutation.error ? <div className="text-[12px] text-red-300">{errorMessage(acceptMutation.error)}</div> : null}
+      </div>
+    </div>
+  )
+}
+
+function CreateOrganizationOnboarding() {
+  const observatoryUrl = nanotraceApiBaseUrl()
+  const queryClient = useQueryClient()
+  const [name, setName] = useState('')
+  const createMutation = useMutation({
+    mutationFn: () => createOrganization({ apiBaseUrl: observatoryUrl, name }),
+    onSuccess: async () => {
+      setName('')
+      await invalidateTenantQueries(queryClient, observatoryUrl)
+    }
+  })
+
+  return (
+    <div className="fixed inset-0 grid place-items-center bg-black px-4 text-neutral-100">
+      <form
+        className="grid w-full max-w-sm gap-3 border border-neutral-800 bg-neutral-950 p-4"
+        onSubmit={event => {
+          event.preventDefault()
+          createMutation.mutate()
+        }}
+      >
+        <div className="flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center border border-neutral-800 bg-black text-neutral-400">
+            <Building2 size={15} strokeWidth={1.8} />
+          </div>
+          <div className="min-w-0">
+            <h1 className="truncate text-[14px] font-medium text-white">Create organization</h1>
+            <p className="mt-0.5 text-[12px] text-neutral-500">Choose the tenant for this workspace.</p>
+          </div>
+        </div>
+        <input
+          autoFocus
+          className="h-9 w-full border border-neutral-800 bg-black px-2 text-[13px] text-neutral-200 outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+          placeholder="organization name"
+          value={name}
+          onChange={event => setName(event.target.value)}
+        />
+        <button
+          className="inline-flex h-9 items-center justify-center gap-1.5 border border-neutral-700 bg-white px-3 text-[13px] font-medium text-black hover:bg-neutral-200 disabled:border-neutral-900 disabled:bg-black disabled:text-neutral-700"
+          disabled={!name.trim() || createMutation.isPending}
+          type="submit"
+        >
+          <Building2 size={14} strokeWidth={1.8} />
+          Create
+        </button>
+        {createMutation.error ? <div className="text-[12px] text-red-300">{errorMessage(createMutation.error)}</div> : null}
+      </form>
+    </div>
+  )
+}
+
 function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: state => state.location.pathname })
   const isSchema = pathname.startsWith('/schema')
   const isApiKeys = pathname.startsWith('/settings/api-keys')
+  const isOrganization = pathname.startsWith('/settings/organization')
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => readSidebarMode())
   const [dragWidth, setDragWidth] = useState<number | null>(null)
   const sidebarVisible = sidebarMode !== 'closed' || dragWidth !== null
@@ -249,6 +388,7 @@ function AppShell({ children }: { children: ReactNode }) {
                 <nav className="flex flex-1 flex-col gap-1">
                   <NavItem active={!isSchema && !isApiKeys} label="Logs" to="/" icon={<ListTree size={17} strokeWidth={1.8} />} />
                   <NavItem active={isSchema} label="Schema" to="/schema" icon={<Database size={17} strokeWidth={1.8} />} />
+                  <NavItem active={isOrganization} label="Organization" to="/settings/organization" icon={<Users size={17} strokeWidth={1.8} />} />
                   <NavItem active={isApiKeys} label="API keys" to="/settings/api-keys" icon={<KeyRound size={17} strokeWidth={1.8} />} />
                 </nav>
                 <AccountControl />
@@ -280,8 +420,34 @@ type AuthIdentity = {
   auth_type: 'api_key' | 'session'
   email?: string
   name?: string
-  role: 'admin' | 'service' | 'viewer'
+  role: AuthRole
   subject: string
+  organization_id: string
+  organization_name: string
+  organizations?: OrganizationMembershipSummary[]
+  pending_invitations?: PendingInvitationSummary[]
+}
+
+type AuthRole = 'admin' | 'service' | 'viewer'
+
+type AuthProviders = {
+  google: boolean
+}
+
+type OrganizationMembershipSummary = {
+  organization_id: string
+  organization_name: string
+  slug: string
+  role: AuthRole
+}
+
+type PendingInvitationSummary = {
+  id: number
+  organization_id: string
+  organization_name: string
+  email: string
+  role: AuthRole
+  expires_at: string
 }
 
 function AccountControl({ compact = false }: { compact?: boolean }) {
@@ -296,6 +462,16 @@ function AccountControl({ compact = false }: { compact?: boolean }) {
   const currentUser = authQuery.data ?? null
   const authLabel = currentUser?.email || currentUser?.name || currentUser?.subject || ''
   const accountInitial = identityInitial(authLabel || 'user')
+  const memberships = currentUser?.organizations ?? []
+  const activeOrganizationId = currentUser?.organization_id || ''
+  const activeMembership = memberships.find(membership => membership.organization_id === activeOrganizationId)
+  const switchMutation = useMutation({
+    mutationFn: (organizationId: string) => switchOrganization({ apiBaseUrl: observatoryUrl, organizationId }),
+    onSuccess: async () => {
+      await invalidateTenantQueries(queryClient, observatoryUrl)
+      setOpen(false)
+    }
+  })
 
   async function logout() {
     await fetch(authUrl(observatoryUrl, '/logout'), {
@@ -339,8 +515,42 @@ function AccountControl({ compact = false }: { compact?: boolean }) {
           <div className="grid gap-2">
             <div className="border-b border-neutral-800 px-2 pb-2">
               <div className="truncate text-[12px] text-white">{authLabel}</div>
-              <div className="text-[11px] text-neutral-600">{currentUser.role}</div>
+              <div className="truncate text-[11px] text-neutral-600">
+                {currentUser.organization_name || 'No organization'} {activeMembership ? `(${activeMembership.role})` : `(${currentUser.role})`}
+              </div>
             </div>
+            {memberships.length > 0 ? (
+              <div className="grid gap-1 border-b border-neutral-800 pb-2">
+                {memberships.map(membership => (
+                  <button
+                    key={membership.organization_id}
+                    className={cn(
+                      'flex min-w-0 items-center justify-between gap-2 border border-neutral-800 bg-black px-2 py-1.5 text-left hover:bg-white/[0.04]',
+                      membership.organization_id === activeOrganizationId && 'border-neutral-600'
+                    )}
+                    disabled={membership.organization_id === activeOrganizationId || switchMutation.isPending}
+                    type="button"
+                    onClick={() => switchMutation.mutate(membership.organization_id)}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-[12px] text-neutral-200">{membership.organization_name}</span>
+                      <span className="block truncate text-[10px] text-neutral-600">{membership.role}</span>
+                    </span>
+                    {membership.organization_id === activeOrganizationId ? (
+                      <Check className="shrink-0 text-emerald-300" size={13} strokeWidth={1.8} />
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            <Link
+              className="inline-flex h-8 items-center gap-2 border border-neutral-800 bg-black px-2 text-left text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
+              to="/settings/organization"
+              onClick={() => setOpen(false)}
+            >
+              <Users size={14} strokeWidth={1.8} />
+              Organization settings
+            </Link>
             <button
               className="inline-flex h-8 items-center gap-2 border border-neutral-800 bg-black px-2 text-left text-[12px] text-neutral-300 hover:bg-white/[0.04] hover:text-white"
               type="button"
@@ -349,6 +559,7 @@ function AccountControl({ compact = false }: { compact?: boolean }) {
               <LogOut size={14} strokeWidth={1.8} />
               Logout
             </button>
+            {switchMutation.error ? <div className="px-2 text-[11px] text-red-300">{errorMessage(switchMutation.error)}</div> : null}
           </div>
         </div>
       ) : null}
@@ -369,6 +580,19 @@ async function fetchAuthMe({ apiBaseUrl }: { apiBaseUrl: string }): Promise<Auth
   return (await response.json()) as AuthIdentity
 }
 
+async function fetchAuthProviders({ apiBaseUrl }: { apiBaseUrl: string }): Promise<AuthProviders> {
+  const response = await fetch(authUrl(apiBaseUrl, '/providers'), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'GET'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new HTTPError({ message: text || response.statusText, status: response.status })
+  }
+  return (await response.json()) as AuthProviders
+}
+
 async function requestLoginLink({
   apiBaseUrl,
   email
@@ -376,10 +600,7 @@ async function requestLoginLink({
   apiBaseUrl: string
   email: string
 }): Promise<{ ok: boolean }> {
-  const returnTo =
-    typeof window === 'undefined'
-      ? '/'
-      : `${window.location.pathname}${window.location.search}${window.location.hash}`
+  const returnTo = currentReturnTo()
   const response = await fetch(authUrl(apiBaseUrl, '/login'), {
     body: JSON.stringify({ email: email.trim(), return_to: returnTo }),
     credentials: 'include',
@@ -393,9 +614,81 @@ async function requestLoginLink({
   return (await response.json()) as { ok: boolean }
 }
 
+function currentReturnTo() {
+  return typeof window === 'undefined'
+    ? '/'
+    : `${window.location.pathname}${window.location.search}${window.location.hash}`
+}
+
+async function createOrganization({
+  apiBaseUrl,
+  name
+}: {
+  apiBaseUrl: string
+  name: string
+}) {
+  const response = await fetch(v1Url(apiBaseUrl, '/organizations'), {
+    body: JSON.stringify({ name: name.trim() }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) throw await httpError(response)
+  return (await response.json()) as unknown
+}
+
+async function switchOrganization({
+  apiBaseUrl,
+  organizationId
+}: {
+  apiBaseUrl: string
+  organizationId: string
+}) {
+  const response = await fetch(v1Url(apiBaseUrl, `/organizations/${encodeURIComponent(organizationId)}/switch`), {
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) throw await httpError(response)
+  return (await response.json()) as unknown
+}
+
+async function acceptInvitation({
+  apiBaseUrl,
+  token
+}: {
+  apiBaseUrl: string
+  token: string
+}) {
+  const response = await fetch(v1Url(apiBaseUrl, '/organization-invitations/accept'), {
+    body: JSON.stringify({ token }),
+    credentials: 'include',
+    headers: queryHeaders(),
+    method: 'POST'
+  })
+  if (!response.ok) throw await httpError(response)
+  return (await response.json()) as unknown
+}
+
+async function invalidateTenantQueries(queryClient: QueryClient, observatoryUrl: string) {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['auth', observatoryUrl, 'me'] }),
+    queryClient.invalidateQueries({ queryKey: ['api-keys', observatoryUrl] }),
+    queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] }),
+    queryClient.invalidateQueries({ queryKey: ['materialization-jobs', observatoryUrl] }),
+    queryClient.invalidateQueries({ queryKey: ['query-recommendations', observatoryUrl] }),
+    queryClient.invalidateQueries({ queryKey: ['logs', observatoryUrl] })
+  ])
+}
+
 function authUrl(apiBaseUrl: string, path: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/auth${path}` : `/auth${path}`
+}
+
+function v1Url(apiBaseUrl: string, path: string) {
+  const base = apiBaseUrl.trim().replace(/\/+$/, '')
+  return base ? `${base}/v1${path}` : `/v1${path}`
 }
 
 function sidebarWidth(mode: SidebarMode) {
@@ -434,6 +727,18 @@ function isUnauthorizedError(error: unknown) {
   return error instanceof HTTPError && error.status === 401
 }
 
+async function httpError(response: Response) {
+  const text = await response.text()
+  let message = text || response.statusText
+  try {
+    const body = JSON.parse(text) as { error?: unknown }
+    message = typeof body.error === 'string' ? body.error : JSON.stringify(body)
+  } catch {
+    // Keep the plain response body when the server did not return JSON.
+  }
+  return new HTTPError({ message: message || response.statusText, status: response.status })
+}
+
 class HTTPError extends Error {
   status: number
 
@@ -453,7 +758,7 @@ function NavItem({
   active: boolean
   icon: ReactNode
   label: string
-  to: '/' | '/schema' | '/settings/api-keys'
+  to: '/' | '/schema' | '/settings/api-keys' | '/settings/organization'
 }) {
   return (
     <Link

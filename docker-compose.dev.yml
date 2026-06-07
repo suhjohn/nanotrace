@@ -17,7 +17,6 @@ x-app-env: &app-env
   CLICKHOUSE_ENTITY_STATE_UPDATES_TABLE: entity_state_updates
   CLICKHOUSE_ENTITY_STATE_CURRENT_TABLE: entity_state_current
   NANOTRACE_POSTGRES_URL: postgres://nanotrace:nanotrace@postgres:5432/nanotrace
-  NANOTRACE_DEV_BOOTSTRAP_API_KEY: ntak_dev
   NANOTRACE_PUBLIC_BASE_URL: http://localhost:18473
   NANOTRACE_APP_BASE_URL: http://localhost:41233
   NANOTRACE_SESSION_SECURE: "false"
@@ -130,7 +129,6 @@ services:
       CLICKHOUSE_TABLE: events
       CLICKHOUSE_SCHEMA_PATH: deploy/clickhouse/schema.sql
       CLICKHOUSE_RESET_DATABASE: ${CLICKHOUSE_RESET_DATABASE:-false}
-      NANOTRACE_DEFAULT_TENANT_ID: org_default
     volumes:
       - .:/workspace:ro
     command: ["node", "scripts/apply-clickhouse-schema.mjs"]

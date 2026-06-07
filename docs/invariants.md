@@ -173,9 +173,10 @@ component's section states the contract.
 - Historical report, sequence, and cohort backfills are job-based. Creating a
   backfill inserts `materialization_jobs` and `materialization_chunks`; a queued
   executor claims chunks, writes outputs, and updates job/chunk state.
-- SDK/default metric definitions are tenant bootstrap data. The server seeds
-  them idempotently at startup for known organizations when ClickHouse is
-  configured; they should not be exposed as a public product endpoint.
+- SDK/default metric definitions are organization-local seed data. The server
+  seeds them idempotently at startup for known organizations and after account
+  API organization creation when ClickHouse is configured; they should not be
+  exposed as a public product endpoint.
 - Versioned outputs must publish enough lineage for typed reads to select a
   serving result: target type, target id, target version, source table/window,
   source snapshot or sequence, row counts, status, and completion time.
@@ -185,6 +186,15 @@ component's section states the contract.
 - Query-usage recommendations may suggest promotions, but they must not
   auto-create or auto-mutate definitions without an explicit product/user/admin
   action.
+- Archived organizations must not resolve as active session memberships or API
+  key identities. Archiving revokes organization API keys, revokes pending
+  invitations, and clears active sessions for that organization.
+- Account lifecycle mutations are auditable through
+  `nanotrace_account_audit_events`, including actor subject/auth type, target
+  organization, target subject/email, metadata, and timestamp.
+- Account API failures are exposed as
+  `nanotrace_account_api_failures_total` with route area and status-class
+  labels.
 
 ## Alerting And Notifications
 

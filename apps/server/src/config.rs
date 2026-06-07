@@ -24,6 +24,14 @@ pub struct Config {
     pub email_from: Option<String>,
     pub cors_allowed_origins: Vec<String>,
     pub app_base_url: Option<String>,
+    pub google_oauth: Option<GoogleOAuthConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoogleOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -84,9 +92,9 @@ impl Config {
         let session_ttl_secs: u64 = parse_env("NANOTRACE_SESSION_TTL_SECS", 7 * 24 * 60 * 60)?;
         let magic_link_ttl_secs: u64 = parse_env("NANOTRACE_MAGIC_LINK_TTL_SECS", 60 * 60)?;
         let api_key_cache_refresh_secs: u64 = parse_env("NANOTRACE_API_KEY_CACHE_REFRESH_SECS", 5)?;
+        let google_oauth = google_oauth_config()?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
-            bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),
             public_base_url,
             api_key_cache_refresh_interval: Duration::from_secs(api_key_cache_refresh_secs),
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")
@@ -140,8 +148,28 @@ impl Config {
             email_from: optional_string("NANOTRACE_EMAIL_FROM"),
             cors_allowed_origins,
             app_base_url,
+            google_oauth,
         })
     }
+}
+
+fn google_oauth_config() -> Result<Option<GoogleOAuthConfig>, ConfigError> {
+    let client_id = optional_string("NANOTRACE_GOOGLE_OAUTH_CLIENT_ID");
+    let client_secret = optional_string("NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET");
+    if client_id.is_none() && client_secret.is_none() {
+        return Ok(None);
+    }
+    let client_id = client_id.ok_or(ConfigError::Missing {
+        key: "NANOTRACE_GOOGLE_OAUTH_CLIENT_ID",
+    })?;
+    let client_secret = client_secret.ok_or(ConfigError::Missing {
+        key: "NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET",
+    })?;
+    Ok(Some(GoogleOAuthConfig {
+        client_id,
+        client_secret,
+        redirect_uri: optional_string("NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI"),
+    }))
 }
 
 fn optional_string(key: &'static str) -> Option<String> {

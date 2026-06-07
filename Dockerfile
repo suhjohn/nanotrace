@@ -26,6 +26,7 @@ COPY apps/query/src apps/query/src
 COPY apps/server/src apps/server/src
 COPY apps/sidecar/src apps/sidecar/src
 COPY crates/auth/src crates/auth/src
+COPY crates/auth/migrations crates/auth/migrations
 COPY crates/ingest/src crates/ingest/src
 COPY crates/lakehouse/src crates/lakehouse/src
 COPY crates/read/src crates/read/src

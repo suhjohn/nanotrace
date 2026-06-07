@@ -105,7 +105,8 @@ definitions, not from observed arbitrary payload shape. The Kafka consumer
 offset advances only after the durable ingest work for that message succeeds.
 SDK metric defaults are tenant bootstrap data: the server seeds them
 idempotently at startup for known organizations when ClickHouse is configured,
-not through a public `/v1/definitions/sdk-defaults` endpoint.
+and when a new organization is created through the account API. They are not
+exposed through a public `/v1/definitions/sdk-defaults` endpoint.
 
 ## Repository Layout
 
@@ -227,8 +228,14 @@ it through the normal ingest path with the loadtester:
 
 ```sh
 npm run dev:up:detached
+npm run dev:seed-auth
 npm run dev:rewrite:loadtest
 ```
+
+`dev:seed-auth` creates the local `org_dev` organization, a dev admin
+membership, and the `ntak_dev` API key in the migrated Postgres auth tables.
+The app server no longer creates hidden default tenants or bootstrap API keys
+at startup.
 
 `dev:rewrite:loadtest` runs the schema applicator with
 `CLICKHOUSE_RESET_DATABASE=true`, then posts generated events to
@@ -320,6 +327,8 @@ NANOTRACE_API_KEY=ntak_...
 NANOTRACE_EMAIL_FROM=nanotrace@example.com
 NANOTRACE_ALLOWED_EMAILS=alice@company.com,*@company.com,/^.+@engineering\\.company\\.com$/
 NANOTRACE_ADMIN_EMAILS=alice@company.com
+NANOTRACE_GOOGLE_OAUTH_CLIENT_ID=...
+NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET=...
 CLICKHOUSE_URL=https://...
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=...
@@ -339,10 +348,15 @@ WarpStream-compatible Kafka to the normalizer, then Iceberg object storage for
 accepted normalized events. A separate materializer container tails lakehouse
 commits and keeps ClickHouse serving tables current.
 
-Browser login uses one-time email links sent through AWS SES. The sender in
-`NANOTRACE_EMAIL_FROM` must be a verified SES identity in the deployment
-region; if the account is still in the SES sandbox, recipients must be verified
-too.
+Browser login supports one-time email links and optional Google OAuth. Email
+links are sent through AWS SES; the sender in `NANOTRACE_EMAIL_FROM` must be a
+verified SES identity in the deployment region, and sandbox accounts require
+verified recipients too. Google OAuth is enabled only when
+`NANOTRACE_GOOGLE_OAUTH_CLIENT_ID` and
+`NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET` are set. The default Google redirect URI
+is `${NANOTRACE_PUBLIC_BASE_URL}/auth/google/callback`; set
+`NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI` only when the OAuth client needs an
+explicit override.
 
 Deploy the ingest service:
 

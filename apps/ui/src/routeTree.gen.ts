@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiKeysRouteImport } from './routes/api-keys'
+import { Route as OrganizationRouteImport } from './routes/organization'
 import { Route as SchemaRouteImport } from './routes/schema'
 import { Route as FieldValueRouteImport } from './routes/$field/$value'
 
@@ -22,6 +23,11 @@ const IndexRoute = IndexRouteImport.update({
 const ApiKeysRoute = ApiKeysRouteImport.update({
   id: '/settings/api-keys',
   path: '/settings/api-keys',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OrganizationRoute = OrganizationRouteImport.update({
+  id: '/settings/organization',
+  path: '/settings/organization',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SchemaRoute = SchemaRouteImport.update({
@@ -38,12 +44,14 @@ const FieldValueRoute = FieldValueRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organization': typeof OrganizationRoute
   '/schema': typeof SchemaRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organization': typeof OrganizationRoute
   '/schema': typeof SchemaRoute
   '/$field/$value': typeof FieldValueRoute
 }
@@ -51,20 +59,22 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/settings/api-keys': typeof ApiKeysRoute
+  '/settings/organization': typeof OrganizationRoute
   '/schema': typeof SchemaRoute
   '/$field/$value': typeof FieldValueRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
+  fullPaths: '/' | '/settings/api-keys' | '/settings/organization' | '/schema' | '/$field/$value'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
-  id: '__root__' | '/' | '/settings/api-keys' | '/schema' | '/$field/$value'
+  to: '/' | '/settings/api-keys' | '/settings/organization' | '/schema' | '/$field/$value'
+  id: '__root__' | '/' | '/settings/api-keys' | '/settings/organization' | '/schema' | '/$field/$value'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiKeysRoute: typeof ApiKeysRoute
+  OrganizationRoute: typeof OrganizationRoute
   SchemaRoute: typeof SchemaRoute
   FieldValueRoute: typeof FieldValueRoute
 }
@@ -83,6 +93,13 @@ declare module '@tanstack/react-router' {
       path: '/settings/api-keys'
       fullPath: '/settings/api-keys'
       preLoaderRoute: typeof ApiKeysRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/organization': {
+      id: '/settings/organization'
+      path: '/settings/organization'
+      fullPath: '/settings/organization'
+      preLoaderRoute: typeof OrganizationRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/schema': {
@@ -105,6 +122,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiKeysRoute: ApiKeysRoute,
+  OrganizationRoute: OrganizationRoute,
   SchemaRoute: SchemaRoute,
   FieldValueRoute: FieldValueRoute,
 }

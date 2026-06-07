@@ -22,6 +22,8 @@ Integration scenarios covered by this file:
 17. Cohort membership for pro accounts that completed checkout.
 18. Cohort-scoped measure query using materialized cohort membership plus
     cube/raw drilldown as appropriate.
+19. Browser-session active organization switching scopes query, definitions,
+    and API keys.
 */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -41,6 +43,15 @@ const tenantA = `org_it_a_${suffix}`;
 const tenantB = `org_it_b_${suffix}`;
 const keyA = `ntak_it_a_${suffix}`;
 const keyB = `ntak_it_b_${suffix}`;
+const sessionToken = `nts_it_${suffix}`;
+const sessionSubject = `email:shared_${suffix}@example.com`;
+const sessionEmail = `shared_${suffix}@example.com`;
+const viewerSessionToken = `nts_viewer_${suffix}`;
+const viewerSubject = `email:viewer_${suffix}@example.com`;
+const viewerEmail = `viewer_${suffix}@example.com`;
+const outsiderSessionToken = `nts_outsider_${suffix}`;
+const outsiderSubject = `email:outsider_${suffix}@example.com`;
+const outsiderEmail = `outsider_${suffix}@example.com`;
 
 const sharedEventId = `evt_shared_${suffix}`;
 const spoofEventId = `evt_spoof_${suffix}`;
@@ -58,6 +69,7 @@ await main();
 
 async function main() {
   console.log(`integrationRun=${runId}`);
+  await waitForHealthz();
   seedTenants();
   await sleep(5500);
   await waitForServer();
@@ -72,6 +84,9 @@ async function main() {
   await assertApiTenantIsolationVariants();
   await assertUnifiedQuerySurface();
   await assertDefinitions();
+  await assertAccountRouteSessionAuthorization();
+  await assertSessionOrganizationSwitchIsolation();
+  await assertApiKeyCannotUseSessionOnlyOrgRoutes();
   await assertEventKvIndexRows();
   await assertArbitraryKvFilters();
   await assertRawKvQueryParity();
@@ -101,6 +116,36 @@ SET organization_id = EXCLUDED.organization_id,
     role = EXCLUDED.role,
     scopes = EXCLUDED.scopes,
     revoked_at = NULL;
+
+INSERT INTO nanotrace_auth_users (subject, email, name, role, updated_at)
+VALUES
+  (${q(sessionSubject)}, ${q(sessionEmail)}, 'Integration Shared User', 'viewer', now()),
+  (${q(viewerSubject)}, ${q(viewerEmail)}, 'Integration Viewer User', 'viewer', now()),
+  (${q(outsiderSubject)}, ${q(outsiderEmail)}, 'Integration Outsider User', 'viewer', now())
+ON CONFLICT (subject) DO UPDATE
+SET email = EXCLUDED.email,
+    name = EXCLUDED.name,
+    updated_at = now();
+
+INSERT INTO nanotrace_organization_members (organization_id, subject, role, updated_at)
+VALUES
+  (${q(tenantA)}, ${q(sessionSubject)}, 'admin', now()),
+  (${q(tenantB)}, ${q(sessionSubject)}, 'admin', now()),
+  (${q(tenantA)}, ${q(viewerSubject)}, 'viewer', now())
+ON CONFLICT (organization_id, subject) DO UPDATE
+SET role = EXCLUDED.role,
+    updated_at = now();
+
+INSERT INTO nanotrace_auth_sessions
+  (token_hash, subject, email, name, role, active_organization_id, expires_at)
+VALUES
+  (${q(tokenHash(sessionToken))}, ${q(sessionSubject)}, ${q(sessionEmail)}, 'Integration Shared User', 'viewer', ${q(tenantA)}, now() + interval '1 hour'),
+  (${q(tokenHash(viewerSessionToken))}, ${q(viewerSubject)}, ${q(viewerEmail)}, 'Integration Viewer User', 'viewer', ${q(tenantA)}, now() + interval '1 hour'),
+  (${q(tokenHash(outsiderSessionToken))}, ${q(outsiderSubject)}, ${q(outsiderEmail)}, 'Integration Outsider User', 'viewer', NULL, now() + interval '1 hour')
+ON CONFLICT (token_hash) DO UPDATE
+SET active_organization_id = EXCLUDED.active_organization_id,
+    expires_at = EXCLUDED.expires_at,
+    last_seen_at = now();
 `;
   execFileSync(
     "docker",
@@ -408,6 +453,175 @@ async function assertDefinitions() {
   assert(!hasDefinition(definitionsA, "measure", "duration_ms"), "plain span duration should stay unpromoted");
   console.log(`definitionsA=${definitionsA.length}`);
   console.log(`definitionsB=${definitionsB.definitions.length}`);
+}
+
+async function assertAccountRouteSessionAuthorization() {
+  const adminCookie = sessionCookie();
+  const viewerCookie = sessionCookie(viewerSessionToken);
+  const outsiderCookie = sessionCookie(outsiderSessionToken);
+
+  const viewerMembers = await fetch(`${baseUrl}/v1/organizations/${tenantA}/members`, {
+    headers: { cookie: viewerCookie },
+  });
+  assert(viewerMembers.status === 403, `viewer member listing should be forbidden, got ${viewerMembers.status}`);
+
+  const viewerInvite = await fetch(`${baseUrl}/v1/organizations/${tenantA}/invitations`, {
+    method: "POST",
+    headers: { cookie: viewerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ email: `viewer-forbidden-${suffix}@example.com`, role: "viewer" }),
+  });
+  assert(viewerInvite.status === 403, `viewer invite creation should be forbidden, got ${viewerInvite.status}`);
+
+  const outsiderMembers = await fetch(`${baseUrl}/v1/organizations/${tenantA}/members`, {
+    headers: { cookie: outsiderCookie },
+  });
+  assert(outsiderMembers.status === 403, `non-member listing should be forbidden, got ${outsiderMembers.status}`);
+
+  const removeViewer = await fetch(`${baseUrl}/v1/organizations/${tenantA}/members/${encodeURIComponent(viewerSubject)}`, {
+    method: "DELETE",
+    headers: { cookie: adminCookie },
+  });
+  const removeBody = await removeViewer.text();
+  assert(removeViewer.ok, `admin should remove viewer member, got ${removeViewer.status}: ${removeBody}`);
+
+  const viewerMe = await fetchJson(`${baseUrl}/v1/auth/me`, {
+    headers: { cookie: viewerCookie },
+  });
+  assert(viewerMe.organization_id === "", `removed viewer should have no active organization, got ${viewerMe.organization_id}`);
+  assert((viewerMe.organizations || []).length === 0, "removed viewer should have no memberships");
+
+  const viewerDefinitions = await fetch(`${baseUrl}/v1/definitions`, {
+    headers: { cookie: viewerCookie },
+  });
+  assert(viewerDefinitions.status === 403, `removed viewer data access should be forbidden, got ${viewerDefinitions.status}`);
+}
+
+async function assertSessionOrganizationSwitchIsolation() {
+  const cookie = sessionCookie();
+  const meA = await fetchJson(`${baseUrl}/v1/auth/me`, {
+    headers: { cookie },
+  });
+  assert(meA.organization_id === tenantA, `session should start in tenant A, got ${meA.organization_id}`);
+  assert((meA.organizations || []).length === 2, "shared session user should see two organization memberships");
+
+  const keysA = await fetchJson(`${baseUrl}/v1/api-keys`, {
+    headers: { cookie },
+  });
+  assert(
+    (keysA.api_keys || []).some((key) => key.organization_id === tenantA && key.prefix === keyA.slice(0, 16)),
+    "session in tenant A should list tenant A API keys",
+  );
+  assert(
+    !(keysA.api_keys || []).some((key) => key.organization_id === tenantB),
+    "session in tenant A should not list tenant B API keys",
+  );
+
+  const definitionsA = await fetchJson(`${baseUrl}/v1/definitions`, {
+    headers: { cookie },
+  });
+  assert(
+    (definitionsA.definitions || []).every((definition) => definition.tenant_id === tenantA),
+    "session in tenant A definitions leaked another tenant",
+  );
+  assert(
+    hasDefinition(definitionsA.definitions || [], "metric_rollup", "metric.checkout.latency"),
+    "session in tenant A should see tenant A managed metric definition",
+  );
+
+  const queryA = await postEventsQueryWithCookie(cookie, {
+    view: "summary",
+    filter: {
+      facets: [{ path: "_integration.run_id", operator: "eq", value: runId }],
+    },
+    allow_stale_serving: true,
+  });
+  const countA = Number((queryA.data || [])[0]?.count ?? 0);
+  assert(countA === 5, `session in tenant A query should see 5 rows, got ${countA}`);
+
+  await fetchJson(`${baseUrl}/v1/organizations/${tenantB}/switch`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+  });
+  const meB = await fetchJson(`${baseUrl}/v1/auth/me`, {
+    headers: { cookie },
+  });
+  assert(meB.organization_id === tenantB, `session should switch to tenant B, got ${meB.organization_id}`);
+
+  const keysB = await fetchJson(`${baseUrl}/v1/api-keys`, {
+    headers: { cookie },
+  });
+  assert(
+    (keysB.api_keys || []).some((key) => key.organization_id === tenantB && key.prefix === keyB.slice(0, 16)),
+    "session in tenant B should list tenant B API keys",
+  );
+  assert(
+    !(keysB.api_keys || []).some((key) => key.organization_id === tenantA),
+    "session in tenant B should not list tenant A API keys",
+  );
+
+  const definitionsB = await fetchJson(`${baseUrl}/v1/definitions`, {
+    headers: { cookie },
+  });
+  assert(
+    (definitionsB.definitions || []).every((definition) => definition.tenant_id === tenantB),
+    "session in tenant B definitions leaked another tenant",
+  );
+
+  const queryB = await postEventsQueryWithCookie(cookie, {
+    view: "summary",
+    filter: {
+      facets: [{ path: "_integration.run_id", operator: "eq", value: runId }],
+    },
+    allow_stale_serving: true,
+  });
+  const countB = Number((queryB.data || [])[0]?.count ?? 0);
+  assert(countB === 1, `session in tenant B query should see 1 row, got ${countB}`);
+}
+
+async function assertApiKeyCannotUseSessionOnlyOrgRoutes() {
+  const createResponse = await fetch(`${baseUrl}/v1/organizations`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${keyA}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: `API key forbidden ${suffix}` }),
+  });
+  assert(createResponse.status === 403, `API key org creation should be forbidden, got ${createResponse.status}`);
+
+  const switchResponse = await fetch(`${baseUrl}/v1/organizations/${tenantB}/switch`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${keyA}`,
+      "content-type": "application/json",
+    },
+  });
+  assert(switchResponse.status === 403, `API key org switch should be forbidden, got ${switchResponse.status}`);
+
+  const updateResponse = await fetch(`${baseUrl}/v1/organizations/${tenantA}`, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${keyA}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: `API key forbidden ${suffix}` }),
+  });
+  assert(updateResponse.status === 403, `API key org update should be forbidden, got ${updateResponse.status}`);
+
+  const membersResponse = await fetch(`${baseUrl}/v1/organizations/${tenantA}/members`, {
+    headers: { authorization: `Bearer ${keyA}` },
+  });
+  assert(membersResponse.status === 403, `API key member listing should be forbidden, got ${membersResponse.status}`);
+
+  const inviteResponse = await fetch(`${baseUrl}/v1/organizations/${tenantA}/invitations`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${keyA}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ email: `api-key-forbidden-${suffix}@example.com`, role: "viewer" }),
+  });
+  assert(inviteResponse.status === 403, `API key invite creation should be forbidden, got ${inviteResponse.status}`);
 }
 
 async function assertEventKvIndexRows() {
@@ -1343,6 +1557,17 @@ async function postEventsQuery(apiKey, body) {
   });
 }
 
+async function postEventsQueryWithCookie(cookie, body) {
+  return fetchJson(`${baseUrl}/v1/query`, {
+    method: "POST",
+    headers: {
+      cookie,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ type: "events", ...body }),
+  });
+}
+
 async function postMeasureQuery(apiKey, body) {
   return fetchJson(`${baseUrl}/v1/query`, {
     method: "POST",
@@ -1427,6 +1652,17 @@ async function waitForServer() {
       return null;
     }
   }, "server API");
+}
+
+async function waitForHealthz() {
+  await waitUntil(async () => {
+    try {
+      const response = await fetch(`${baseUrl}/healthz`);
+      return response.ok ? true : null;
+    } catch {
+      return null;
+    }
+  }, "server health");
 }
 
 async function waitForClickHouseRows(expected) {
@@ -1537,6 +1773,10 @@ function hasDefinition(definitions, kind, name) {
 
 function tokenHash(token) {
   return createHash("sha256").update(token).digest("hex");
+}
+
+function sessionCookie(token = sessionToken) {
+  return `nanotrace_session=${token}`;
 }
 
 function q(value) {

@@ -74,7 +74,6 @@ impl Config {
         )?;
         let auth = AuthConfig {
             postgres_url: optional_string("NANOTRACE_POSTGRES_URL"),
-            bootstrap_api_key: optional_string("NANOTRACE_DEV_BOOTSTRAP_API_KEY"),
             public_base_url,
             api_key_cache_refresh_interval: Duration::from_secs(api_key_cache_refresh_secs),
             session_cookie_name: env::var("NANOTRACE_SESSION_COOKIE")

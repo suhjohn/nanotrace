@@ -8,7 +8,7 @@ mod read;
 
 use std::sync::Arc;
 
-use nanotrace_auth::{AuthStore, DEFAULT_ORGANIZATION_ID};
+use nanotrace_auth::AuthStore;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -75,16 +75,22 @@ async fn seed_sdk_default_definitions(
     let tenant_ids = match auth {
         Some(auth) => match auth.list_organization_ids().await {
             Ok(ids) if !ids.is_empty() => ids,
-            Ok(_) => vec![DEFAULT_ORGANIZATION_ID.to_string()],
+            Ok(_) => {
+                info!("no organizations found; skipping SDK default definition seeding");
+                Vec::new()
+            }
             Err(err) => {
                 warn!(
                     error = %err,
                     "failed to list organizations for SDK default definition seeding"
                 );
-                vec![DEFAULT_ORGANIZATION_ID.to_string()]
+                Vec::new()
             }
         },
-        None => vec![DEFAULT_ORGANIZATION_ID.to_string()],
+        None => {
+            info!("auth is not configured; skipping SDK default definition seeding");
+            Vec::new()
+        }
     };
 
     for tenant_id in tenant_ids {
