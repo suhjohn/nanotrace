@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bootstrap"
+  short_description: "Guide first-time Nanotrace Pulumi setup"
+  default_prompt: "Use $bootstrap to guide me through Nanotrace Pulumi bootstrap one decision point at a time."
