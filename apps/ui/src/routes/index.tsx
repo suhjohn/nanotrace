@@ -31,21 +31,29 @@ function IndexRoute() {
 function LandingPage() {
   return (
     <main className="min-h-screen overflow-x-hidden bg-black text-neutral-100">
-      <section className="relative flex min-h-[88svh] items-stretch overflow-hidden border-b border-neutral-900">
+      <section className="relative flex min-h-screen items-stretch overflow-hidden">
         <LandingConsoleBackdrop />
         <div className="relative z-10 flex w-full flex-col">
           <header className="mx-auto flex h-14 w-full max-w-6xl items-center justify-between px-4 sm:px-6">
             <div className="font-mono text-[13px] font-semibold tracking-tight text-white">Nanotrace</div>
             <nav className="flex items-center gap-2">
-              <Link
+              <a
                 className="inline-flex h-8 items-center justify-center border border-neutral-800 bg-black/70 px-3 text-[12px] text-neutral-300 backdrop-blur hover:border-neutral-600 hover:text-white"
+                href="https://github.com/suhjohn/nanotrace"
+                rel="noreferrer"
+                target="_blank"
+              >
+                GitHub
+              </a>
+              <Link
+                className="inline-flex h-8 items-center justify-center border border-white bg-white px-3 text-[12px] font-medium text-black hover:bg-neutral-200"
                 to="/logs"
               >
-                Open console
+                Sign in
               </Link>
             </nav>
           </header>
-          <div className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 pb-16 pt-10 sm:px-6">
+          <div className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 py-16 sm:px-6">
             <div className="max-w-2xl">
               <h1 className="text-balance text-[clamp(44px,7vw,84px)] font-medium leading-[0.94] tracking-normal text-white">
                 Nanotrace
@@ -58,31 +66,19 @@ function LandingPage() {
                   className="inline-flex h-10 items-center justify-center border border-white bg-white px-4 text-[13px] font-medium text-black hover:bg-neutral-200"
                   to="/logs"
                 >
-                  Explore events
+                  Sign in
                 </Link>
                 <a
                   className="inline-flex h-10 items-center justify-center border border-neutral-800 bg-black/70 px-4 text-[13px] text-neutral-300 backdrop-blur hover:border-neutral-600 hover:text-white"
-                  href="#overview"
+                  href="https://github.com/suhjohn/nanotrace"
+                  rel="noreferrer"
+                  target="_blank"
                 >
-                  View overview
+                  GitHub
                 </a>
               </div>
             </div>
           </div>
-        </div>
-      </section>
-      <section id="overview" className="bg-neutral-950">
-        <div className="mx-auto grid max-w-6xl gap-px border-x border-neutral-900 bg-neutral-900 md:grid-cols-3">
-          {[
-            ['Unified', 'Logs, spans, metrics, product actions, and agent events share one query surface.'],
-            ['Queryable', 'Raw JSON stays intact while scalar fields become immediately filterable.'],
-            ['Promotable', 'Repeated paths can become definitions, reports, and materialized views.']
-          ].map(([title, body]) => (
-            <div key={title} className="bg-neutral-950 p-5 sm:p-6">
-              <h2 className="text-[13px] font-medium text-white">{title}</h2>
-              <p className="mt-2 text-[13px] leading-6 text-neutral-500">{body}</p>
-            </div>
-          ))}
         </div>
       </section>
     </main>

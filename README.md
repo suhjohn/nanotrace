@@ -312,6 +312,12 @@ NANOTRACE_KAFKA_SASL_PASSWORD=...
 NANOTRACE_KAFKA_TABLEFLOW_TOPIC=events.tableflow.batches.v1
 ```
 
+DNS is manual. After deploy, read `manualDnsRecordsOutput` and create those
+records in the DNS provider for `NANOTRACE_DOMAIN_NAME`. The UI custom domain is
+a two-pass flow: first deploy outputs the ACM validation CNAME; after DNS
+validation issues the certificate, rerun deploy to attach the domain to
+CloudFront.
+
 Configure WarpStream Tableflow to read `NANOTRACE_KAFKA_TABLEFLOW_TOPIC` and
 write the managed Iceberg table into the BYOC object-storage bucket. Nanotrace
 app containers do not write Iceberg files or require a writable Iceberg REST

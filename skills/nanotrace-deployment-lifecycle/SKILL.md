@@ -1,6 +1,6 @@
 ---
 name: nanotrace-deployment-lifecycle
-description: Run Nanotrace deployment as a multi-turn guided lifecycle from first cloud bootstrap through repeatable CI deploys and operational hardening. Use when Codex is asked how to deploy Nanotrace, bootstrap staging or prod, move deployment from a laptop to CI, configure Pulumi/AWS/Cloudflare or Route53/WarpStream Kafka and Tableflow/ClickHouse/PlanetScale Postgres, guide the user through intermediate deployment steps, resume from returned command output or process state, write or review deployment runbooks, add deployment automation, or tighten post-deploy observability and rollback practices.
+description: Run Nanotrace deployment as a multi-turn guided lifecycle from first cloud bootstrap through repeatable CI deploys and operational hardening. Use when Codex is asked how to deploy Nanotrace, bootstrap staging or prod, move deployment from a laptop to CI, configure Pulumi/AWS/manual DNS/WarpStream Kafka and Tableflow/ClickHouse/PlanetScale Postgres, guide the user through intermediate deployment steps, resume from returned command output or process state, write or review deployment runbooks, add deployment automation, or tighten post-deploy observability and rollback practices.
 ---
 
 # Nanotrace Deployment Lifecycle
@@ -70,7 +70,7 @@ For checkpoint ordering and what the user should bring back after each step, rea
 
 Use this as the recommended target unless repo code or user constraints say otherwise:
 
-- AWS Pulumi stack for VPC, ALB, EC2 Auto Scaling Groups, ECR, S3, CloudFront, IAM, ACM when applicable, Route53/Cloudflare/external DNS records, and SES email identity.
+- AWS Pulumi stack for VPC, ALB, EC2 Auto Scaling Groups, ECR, S3, CloudFront, IAM, manual DNS record outputs, and SES email identity.
 - WarpStream Kafka for ingest topics.
 - WarpStream Tableflow for managed Iceberg writes from `events.tableflow.batches.v1`; Nanotrace app containers do not write Iceberg or require writable Iceberg REST catalog envs.
 - External ClickHouse Cloud; the stack applies schema but does not provision the service.

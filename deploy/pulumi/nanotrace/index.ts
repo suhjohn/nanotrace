@@ -1,5 +1,4 @@
 import * as aws from '@pulumi/aws'
-import * as cloudflare from '@pulumi/cloudflare'
 import * as command from '@pulumi/command'
 import * as pulumi from '@pulumi/pulumi'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
@@ -215,44 +214,14 @@ const hostedZoneName = normalizeDomainName(
     process.env.NANOTRACE_HOSTED_ZONE_NAME ??
     domainName
 )
-const dnsProvider =
-  cfg.get('dnsProvider') ??
-  process.env.NANOTRACE_DNS_PROVIDER ??
-  (process.env.CLOUDFLARE_API_TOKEN ? 'cloudflare' : 'route53')
-if (dnsProvider !== 'cloudflare' && dnsProvider !== 'route53' && dnsProvider !== 'external') {
-  throw new Error('nanotrace:dnsProvider must be cloudflare, route53, or external')
-}
+const dnsProvider = 'external'
 const edgeTlsMode =
   cfg.get('edgeTlsMode') ??
   process.env.NANOTRACE_EDGE_TLS_MODE ??
-  (dnsProvider === 'route53'
-    ? 'alb'
-    : dnsProvider === 'cloudflare'
-      ? 'cloudflare-flexible'
-      : 'edge-flexible')
-if (edgeTlsMode !== 'alb' && edgeTlsMode !== 'cloudflare-flexible' && edgeTlsMode !== 'edge-flexible') {
-  throw new Error('nanotrace:edgeTlsMode must be alb, cloudflare-flexible, or edge-flexible')
+  'edge-flexible'
+if (edgeTlsMode !== 'edge-flexible') {
+  throw new Error('nanotrace:edgeTlsMode must be edge-flexible when DNS is manual')
 }
-if (dnsProvider === 'external' && edgeTlsMode === 'alb') {
-  throw new Error('nanotrace:edgeTlsMode=alb requires managed DNS for ACM validation; use edge-flexible with nanotrace:dnsProvider=external')
-}
-const hostedZoneIdOverride =
-  cfg.get('hostedZoneId') ?? process.env.NANOTRACE_HOSTED_ZONE_ID
-const cloudflareZoneIdOverride =
-  cfg.get('cloudflareZoneId') ?? process.env.CLOUDFLARE_ZONE_ID
-const usesEdgeFlexibleTls = edgeTlsMode === 'cloudflare-flexible' || edgeTlsMode === 'edge-flexible'
-const manageDns = edgeTlsMode === 'alb'
-const usesRoute53Dns = dnsProvider === 'route53' && (manageDns || manageLoginEmailDns || dnsProvider === 'route53')
-const usesCloudflareDns = dnsProvider === 'cloudflare' && (
-  manageDns ||
-  usesEdgeFlexibleTls ||
-  manageLoginEmailDns
-)
-const cloudflareProvider = usesCloudflareDns
-  ? new cloudflare.Provider(`${name}-cloudflare`, {
-    apiToken: requireConfigOrEnv('cloudflareApiToken', 'CLOUDFLARE_API_TOKEN')
-  })
-  : undefined
 const sessionSecure =
   cfg.getBoolean('sessionSecure') ??
   booleanEnv('NANOTRACE_SESSION_SECURE', true)
@@ -614,13 +583,7 @@ const albSg = new aws.ec2.SecurityGroup(`${name}-alb-sg`, {
       fromPort: 80,
       toPort: 80,
       cidrBlocks: ['0.0.0.0/0']
-    },
-    ...(edgeTlsMode === 'alb' ? [{
-      protocol: 'tcp',
-      fromPort: 443,
-      toPort: 443,
-      cidrBlocks: ['0.0.0.0/0']
-    }] : [])
+    }
   ],
   egress: [
     {
@@ -734,21 +697,6 @@ const queryTargetGroup = new aws.lb.TargetGroup(`${name}-query-tg`, {
   tags: { ...tags, Service: 'query' }
 })
 
-const hostedZone = usesRoute53Dns && !hostedZoneIdOverride
-  ? new aws.route53.Zone(`${name}-zone`, {
-    name: hostedZoneName,
-    tags
-  })
-  : undefined
-const hostedZoneId = hostedZoneIdOverride ?? hostedZone?.zoneId
-const cloudflareZone = usesCloudflareDns && !cloudflareZoneIdOverride
-  ? cloudflare.getZoneOutput(
-    { filter: { name: hostedZoneName } },
-    { provider: cloudflareProvider }
-  )
-  : undefined
-const cloudflareZoneId = cloudflareZoneIdOverride ?? cloudflareZone?.zoneId
-
 type ManualDnsRecord = {
   name: string | pulumi.Output<string>
   type: string | pulumi.Output<string>
@@ -759,6 +707,22 @@ type ManualDnsRecord = {
   purpose: string
 }
 const manualDnsRecords: ManualDnsRecord[] = []
+
+const issuedUiCertificateArn = await issuedAcmCertificateArn(domainName, usEast1)
+const uiCertificate = new aws.acm.Certificate(`${name}-ui-certificate`, {
+  domainName,
+  validationMethod: 'DNS',
+  tags
+}, { provider: usEast1 })
+const uiCertificateDomainValidationOption =
+  uiCertificate.domainValidationOptions.apply(options => {
+    return options?.[0] ?? {
+      domainName,
+      resourceRecordName: `_pending-validation.${domainName}`,
+      resourceRecordType: 'CNAME',
+      resourceRecordValue: 'pending-validation'
+    }
+  })
 
 const uiBucket = new aws.s3.BucketV2(`${name}-ui`, {
   forceDestroy: cfg.getBoolean('forceDestroyUiBucket') ?? false,
@@ -784,51 +748,6 @@ new aws.s3.BucketServerSideEncryptionConfigurationV2(`${name}-ui-encryption`, {
   ]
 })
 
-const uiCertificate = dnsProvider === 'external'
-  ? undefined
-  : new aws.acm.Certificate(`${name}-ui-certificate`, {
-      domainName,
-      validationMethod: 'DNS',
-      tags
-    }, { provider: usEast1 })
-
-const uiCertificateDomainValidationOption =
-  uiCertificate?.domainValidationOptions.apply(options => {
-    return options?.[0] ?? {
-      domainName,
-      resourceRecordName: `_pending-validation.${domainName}`,
-      resourceRecordType: 'CNAME',
-      resourceRecordValue: 'pending-validation'
-    }
-  })
-
-const uiCertificateValidationRecordFqdn = !uiCertificateDomainValidationOption
-  ? undefined
-  : dnsProvider === 'cloudflare'
-    ? new cloudflare.Record(`${name}-ui-certificate-validation`, {
-        content: uiCertificateDomainValidationOption.resourceRecordValue,
-        name: uiCertificateDomainValidationOption.resourceRecordName,
-        proxied: false,
-        ttl: 1,
-        type: 'CNAME',
-        zoneId: cloudflareZoneId
-      }, { provider: cloudflareProvider }).name
-    : new aws.route53.Record(`${name}-ui-certificate-validation`, {
-        allowOverwrite: true,
-        name: uiCertificateDomainValidationOption.resourceRecordName,
-        records: [uiCertificateDomainValidationOption.resourceRecordValue],
-        ttl: 60,
-        type: uiCertificateDomainValidationOption.resourceRecordType,
-        zoneId: hostedZoneId!
-      }).fqdn
-
-const uiCertificateValidation = uiCertificate && uiCertificateValidationRecordFqdn
-  ? new aws.acm.CertificateValidation(`${name}-ui-certificate-validation`, {
-      certificateArn: uiCertificate.arn,
-      validationRecordFqdns: [uiCertificateValidationRecordFqdn]
-    }, { provider: usEast1 })
-  : undefined
-
 const uiOriginAccessControl = new aws.cloudfront.OriginAccessControl(`${name}-ui-oac`, {
   description: `Private S3 access for ${domainName}`,
   originAccessControlOriginType: 's3',
@@ -838,7 +757,7 @@ const uiOriginAccessControl = new aws.cloudfront.OriginAccessControl(`${name}-ui
 
 const uiOriginId = `${name}-ui-origin`
 const uiDistribution = new aws.cloudfront.Distribution(`${name}-ui`, {
-  aliases: uiCertificateValidation ? [domainName] : [],
+  aliases: issuedUiCertificateArn ? [domainName] : [],
   comment: `${name} UI`,
   defaultCacheBehavior: {
     allowedMethods: ['GET', 'HEAD', 'OPTIONS'],
@@ -884,9 +803,9 @@ const uiDistribution = new aws.cloudfront.Distribution(`${name}-ui`, {
       restrictionType: 'none'
     }
   },
-  viewerCertificate: uiCertificateValidation
+  viewerCertificate: issuedUiCertificateArn
     ? {
-        acmCertificateArn: uiCertificateValidation.certificateArn,
+        acmCertificateArn: issuedUiCertificateArn,
         minimumProtocolVersion: 'TLSv1.2_2021',
         sslSupportMethod: 'sni-only'
       }
@@ -946,150 +865,34 @@ const uiBuild = buildUi
     )
   : undefined
 
-if (dnsProvider === 'external') {
-  manualDnsRecords.push(
-    {
-      name: domainName,
-      purpose: 'Point the Nanotrace UI domain at the CloudFront distribution. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex.',
-      ttl: 60,
-      type: domainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
-      value: uiDistribution.domainName
-    },
-    {
-      name: apiDomainName,
-      purpose: 'Point the Nanotrace API domain at the application load balancer. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex.',
-      ttl: 60,
-      type: apiDomainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
-      value: lb.dnsName
-    }
-  )
-}
-
-if (dnsProvider === 'cloudflare' && usesEdgeFlexibleTls) {
-  new cloudflare.Record(`${name}-api-cloudflare-flexible-alias`, {
-    content: lb.dnsName,
-    name: cloudflareRecordName(apiDomainName, hostedZoneName),
-    proxied: true,
-    ttl: 1,
-    type: 'CNAME',
-    zoneId: cloudflareZoneId
-  }, { provider: cloudflareProvider })
-}
-
-if (dnsProvider === 'cloudflare' && uiCertificateValidation) {
-  new cloudflare.Record(`${name}-ui-alias`, {
-    content: uiDistribution.domainName,
-    name: cloudflareRecordName(domainName, hostedZoneName),
-    proxied: false,
-    ttl: 1,
-    type: 'CNAME',
-    zoneId: cloudflareZoneId
-  }, { provider: cloudflareProvider })
-} else if (dnsProvider === 'route53' && uiCertificateValidation) {
-  new aws.route53.Record(`${name}-ui-alias`, {
-    aliases: [
-      {
-        evaluateTargetHealth: false,
-        name: uiDistribution.domainName,
-        zoneId: uiDistribution.hostedZoneId
-      }
-    ],
+manualDnsRecords.push(
+  {
     name: domainName,
-    type: 'A',
-    zoneId: hostedZoneId!
-  })
-}
-
-if (manageLoginEmailDns && dnsProvider === 'cloudflare' && managedLoginEmailIdentity) {
-  for (const index of [0, 1, 2]) {
-    const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
-      `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
-    )
-    const dkimTarget = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
-      `${tokens[index]}.dkim.amazonses.com`
-    )
-    new cloudflare.Record(`${name}-login-email-dkim-${index}`, {
-      content: dkimTarget,
-      name: dkimName,
-      proxied: false,
-      ttl: 1,
-      type: 'CNAME',
-      zoneId: cloudflareZoneId
-    }, { provider: cloudflareProvider })
+    purpose: issuedUiCertificateArn
+      ? 'Point the Nanotrace UI domain at the CloudFront distribution. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex.'
+      : 'Wait until the ACM validation CNAME below is published and the certificate is issued, then rerun deploy before pointing the UI domain at CloudFront.',
+    ttl: 60,
+    type: domainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
+    value: uiDistribution.domainName
+  },
+  {
+    name: apiDomainName,
+    purpose: 'Point the Nanotrace API domain at the application load balancer. Use ALIAS/ANAME where your DNS provider does not allow CNAME records at the zone apex. Put this behind an edge proxy that terminates HTTPS when using edge-flexible mode.',
+    ttl: 60,
+    type: apiDomainName === hostedZoneName ? 'CNAME/ALIAS' : 'CNAME',
+    value: lb.dnsName
   }
+)
 
-  new cloudflare.Record(`${name}-login-email-mail-from-mx`, {
-    content: `feedback-smtp.${region}.amazonses.com`,
-    name: loginEmailMailFromDomain,
-    priority: 10,
-    proxied: false,
-    ttl: 1,
-    type: 'MX',
-    zoneId: cloudflareZoneId
-  }, { provider: cloudflareProvider, dependsOn: managedLoginEmailMailFrom ? [managedLoginEmailMailFrom] : [] })
+manualDnsRecords.push({
+  name: uiCertificateDomainValidationOption.resourceRecordName,
+  purpose: 'Validate the ACM certificate for the Nanotrace UI custom domain. Add this record, wait for ACM to issue the certificate, then rerun deploy to attach the domain to CloudFront.',
+  ttl: 60,
+  type: uiCertificateDomainValidationOption.resourceRecordType,
+  value: uiCertificateDomainValidationOption.resourceRecordValue
+})
 
-  new cloudflare.Record(`${name}-login-email-mail-from-spf`, {
-    content: 'v=spf1 include:amazonses.com -all',
-    name: loginEmailMailFromDomain,
-    proxied: false,
-    ttl: 1,
-    type: 'TXT',
-    zoneId: cloudflareZoneId
-  }, { provider: cloudflareProvider })
-
-  new cloudflare.Record(`${name}-login-email-dmarc`, {
-    content: 'v=DMARC1; p=none',
-    name: `_dmarc.${loginEmailIdentityDomain}`,
-    proxied: false,
-    ttl: 1,
-    type: 'TXT',
-    zoneId: cloudflareZoneId
-  }, { provider: cloudflareProvider })
-} else if (manageLoginEmailDns && dnsProvider === 'route53' && managedLoginEmailIdentity) {
-  for (const index of [0, 1, 2]) {
-    const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
-      `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
-    )
-    const dkimTarget = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
-      `${tokens[index]}.dkim.amazonses.com`
-    )
-    new aws.route53.Record(`${name}-login-email-dkim-${index}`, {
-      allowOverwrite: true,
-      name: dkimName,
-      records: [dkimTarget],
-      ttl: 60,
-      type: 'CNAME',
-      zoneId: hostedZoneId!
-    })
-  }
-
-  new aws.route53.Record(`${name}-login-email-mail-from-mx`, {
-    allowOverwrite: true,
-    name: loginEmailMailFromDomain,
-    records: [`10 feedback-smtp.${region}.amazonses.com`],
-    ttl: 60,
-    type: 'MX',
-    zoneId: hostedZoneId!
-  }, { dependsOn: managedLoginEmailMailFrom ? [managedLoginEmailMailFrom] : [] })
-
-  new aws.route53.Record(`${name}-login-email-mail-from-spf`, {
-    allowOverwrite: true,
-    name: loginEmailMailFromDomain,
-    records: ['v=spf1 include:amazonses.com -all'],
-    ttl: 60,
-    type: 'TXT',
-    zoneId: hostedZoneId!
-  })
-
-  new aws.route53.Record(`${name}-login-email-dmarc`, {
-    allowOverwrite: true,
-    name: `_dmarc.${loginEmailIdentityDomain}`,
-    records: ['v=DMARC1; p=none'],
-    ttl: 60,
-    type: 'TXT',
-    zoneId: hostedZoneId!
-  })
-} else if (manageLoginEmailDns && dnsProvider === 'external' && managedLoginEmailIdentity) {
+if (manageLoginEmailDns && managedLoginEmailIdentity) {
   for (const index of [0, 1, 2]) {
     const dkimName = managedLoginEmailIdentity.dkimSigningAttributes.tokens.apply(tokens =>
       `${tokens[index]}._domainkey.${loginEmailIdentityDomain}`
@@ -1132,110 +935,14 @@ if (manageLoginEmailDns && dnsProvider === 'cloudflare' && managedLoginEmailIden
   )
 }
 
-let certificateValidation: aws.acm.CertificateValidation | undefined
-let certificateArn: pulumi.Output<string> | undefined
-if (edgeTlsMode === 'alb') {
-  const certificate = new aws.acm.Certificate(`${name}-certificate`, {
-    domainName: apiDomainName,
-    validationMethod: 'DNS',
-    tags
-  })
-  const certificateDomainValidationOption =
-    certificate.domainValidationOptions.apply(options => {
-      return options?.[0] ?? {
-        domainName: apiDomainName,
-        resourceRecordName: `_pending-validation.${apiDomainName}`,
-        resourceRecordType: 'CNAME',
-        resourceRecordValue: 'pending-validation'
-      }
-    })
-
-  const certificateValidationRecordFqdn =
-    dnsProvider === 'cloudflare'
-      ? new cloudflare.Record(`${name}-certificate-validation`, {
-        content: certificateDomainValidationOption.resourceRecordValue,
-        name: certificateDomainValidationOption.resourceRecordName,
-        proxied: false,
-        ttl: 1,
-        type: 'CNAME',
-        zoneId: cloudflareZoneId
-      }, { provider: cloudflareProvider }).name
-      : new aws.route53.Record(
-        `${name}-certificate-validation`,
-        {
-          allowOverwrite: true,
-          name: certificateDomainValidationOption.resourceRecordName,
-          records: [
-            certificateDomainValidationOption.resourceRecordValue
-          ],
-          ttl: 60,
-          type: certificateDomainValidationOption.resourceRecordType,
-          zoneId: hostedZoneId!
-        }
-      ).fqdn
-
-  certificateValidation = new aws.acm.CertificateValidation(
-    `${name}-certificate-validation`,
-    {
-      certificateArn: certificate.arn,
-      validationRecordFqdns: [certificateValidationRecordFqdn]
-    }
-  )
-  certificateArn = certificateValidation.certificateArn
-
-  if (dnsProvider === 'cloudflare') {
-    new cloudflare.Record(`${name}-api-alias`, {
-      content: lb.dnsName,
-      name: cloudflareRecordName(apiDomainName, hostedZoneName),
-      proxied: false,
-      ttl: 1,
-      type: 'CNAME',
-      zoneId: cloudflareZoneId
-    }, { provider: cloudflareProvider })
-  } else if (dnsProvider === 'route53') {
-    new aws.route53.Record(`${name}-api-alias`, {
-      aliases: [
-        {
-          evaluateTargetHealth: true,
-          name: lb.dnsName,
-          zoneId: lb.zoneId
-        }
-      ],
-      name: apiDomainName,
-      type: 'A',
-      zoneId: hostedZoneId!
-    })
-  }
-}
-
 const httpListener = new aws.lb.Listener(`${name}-http`, {
   loadBalancerArn: lb.arn,
   port: 80,
   protocol: 'HTTP',
-  defaultActions: edgeTlsMode === 'alb'
-    ? [
-      {
-        type: 'redirect',
-        redirect: {
-          port: '443',
-          protocol: 'HTTPS',
-          statusCode: 'HTTP_301'
-        }
-      }
-    ]
-    : [{ type: 'forward', targetGroupArn: targetGroup.arn }]
+  defaultActions: [{ type: 'forward', targetGroupArn: targetGroup.arn }]
 })
 
-const listener = edgeTlsMode === 'alb'
-  ? new aws.lb.Listener(`${name}-https`, {
-    certificateArn: certificateArn!,
-    loadBalancerArn: lb.arn,
-    port: 443,
-    protocol: 'HTTPS',
-    sslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
-    defaultActions: [{ type: 'forward', targetGroupArn: targetGroup.arn }]
-  })
-  : httpListener
+const listener = httpListener
 
 const publicBaseUrl =
   cfg.get('publicBaseUrl') ??
@@ -1496,9 +1203,7 @@ export const dataKmsKeyArnOutput = dataKmsKeyArn ?? ''
 export const dnsProviderOutput = dnsProvider
 export const edgeTlsModeOutput = edgeTlsMode
 export const hostedZoneNameOutput = hostedZoneName
-export const hostedZoneNameServers = hostedZone
-  ? hostedZone.nameServers
-  : []
+export const hostedZoneNameServers: string[] = []
 export const manualDnsRecordsOutput = manualDnsRecords
 export const uiBucketName = uiBucket.bucket
 export const uiCloudFrontDistributionId = uiDistribution.id
@@ -1857,15 +1562,23 @@ function domainFromEmail (value: string): string {
   return trimmed.slice(at + 1)
 }
 
-function cloudflareRecordName (recordName: string, zoneName: string): string {
-  if (recordName === zoneName) {
-    return '@'
+async function issuedAcmCertificateArn (
+  domain: string,
+  provider: aws.Provider
+): Promise<string | undefined> {
+  try {
+    const certificate = await aws.acm.getCertificate(
+      {
+        domain,
+        mostRecent: true,
+        statuses: ['ISSUED']
+      },
+      { provider }
+    )
+    return certificate.arn
+  } catch {
+    return undefined
   }
-  const suffix = `.${zoneName}`
-  if (!recordName.endsWith(suffix)) {
-    throw new Error(`${recordName} is not in Cloudflare zone ${zoneName}`)
-  }
-  return recordName.slice(0, -suffix.length)
 }
 
 function numberEnv (key: string, fallback: number): number {

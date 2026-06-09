@@ -80,7 +80,8 @@ Required deploy names:
 Recommended or conditional:
 
 - `NANOTRACE_AWS_ACCOUNT_ID`
-- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` when using Cloudflare DNS.
+- DNS is manual. No DNS provider credentials are required by deploy.
+- UI custom-domain TLS is a two-pass flow: first deploy outputs an ACM validation CNAME; after the user creates it and ACM issues the certificate, rerun deploy so CloudFront gets the custom domain alias.
 - `NANOTRACE_EMAIL_FROM` only when overriding the default `login@mail.<domain>`.
 - `NANOTRACE_GOOGLE_OAUTH_CLIENT_ID`, `NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET`, and optionally `NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI` when enabling Google login.
 - `NANOTRACE_KAFKA_TABLEFLOW_TOPIC` only when overriding `events.tableflow.batches.v1`.
@@ -93,7 +94,7 @@ Checkpoint 3: external service setup.
   - Kafka: WarpStream.
   - Iceberg: WarpStream Tableflow managed table over the Tableflow Kafka topic.
   - ClickHouse: ClickHouse Cloud.
-  - DNS: Cloudflare or Route53.
+  - DNS: manual.
   - Postgres: PlanetScale Postgres over PrivateLink.
   - Email: SES for magic-link login.
 - In WarpStream Kafka, confirm topics exist:
@@ -298,7 +299,6 @@ Checkpoint 2: secrets and config.
   - ClickHouse URL/user/password.
   - Kafka brokers and credentials.
   - WarpStream Tableflow cluster/configuration credentials if managed through CI.
-  - DNS provider credentials.
   - Nanotrace domain, email sender, OAuth, and session settings.
 
 Ask the user to bring back only the secret names configured, not secret values.
