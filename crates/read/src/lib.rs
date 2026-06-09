@@ -2115,7 +2115,10 @@ impl ReadStore {
             return self
                 .run_events_query_sql(
                     [
-                        "WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                        format!(
+                            "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
+                            "d.bucket_time"
+                        ),
                         "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
                         "FROM event_density_1s AS d".to_string(),
                         where_keyword(time_clause),
@@ -2177,7 +2180,10 @@ impl ReadStore {
                 return self
                     .run_events_query_sql(
                         [
-                            "WITH intDiv(toUnixTimestamp64Milli(d.bucket_time), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                            format!(
+                                "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
+                                "d.bucket_time"
+                            ),
                             "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
                             base,
                             "GROUP BY bucket ORDER BY bucket ASC".to_string(),
@@ -2218,7 +2224,10 @@ impl ReadStore {
         );
         self.run_events_query_sql(
             [
-                "WITH intDiv(toUnixTimestamp64Milli(e.timestamp), {bucket_ms:UInt64}) * {bucket_ms:UInt64} AS bucket".to_string(),
+                format!(
+                    "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
+                    "e.timestamp"
+                ),
                 "SELECT bucket, count() AS count".to_string(),
                 format!(", countIf({}) AS errorCount", error_expression("e")),
                 "FROM events AS e".to_string(),
