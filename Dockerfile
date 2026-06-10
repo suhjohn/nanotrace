@@ -25,6 +25,7 @@ COPY apps/alerts/src apps/alerts/src
 COPY apps/query/src apps/query/src
 COPY apps/server/src apps/server/src
 COPY apps/sidecar/src apps/sidecar/src
+COPY crates/auth/build.rs crates/auth/build.rs
 COPY crates/auth/src crates/auth/src
 COPY crates/auth/migrations crates/auth/migrations
 COPY crates/ingest/src crates/ingest/src
