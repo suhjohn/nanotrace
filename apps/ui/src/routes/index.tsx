@@ -4754,7 +4754,7 @@ async function fetchEvents({
   sortDirection: EventSortDirection
   timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  const response = await postEventsQuery<FlamegraphEventRow>({
+  const response = await postEventsQuery<EventRow>({
     apiBaseUrl,
     request: {
       filter: eventFilter,
@@ -4767,7 +4767,7 @@ async function fetchEvents({
       view: 'events'
     }
   })
-  const events = (response.data ?? []).map(rowToFlamegraphEvent)
+  const events = (response.data ?? []).map(rowToTraceEvent)
   const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
 
   return {
