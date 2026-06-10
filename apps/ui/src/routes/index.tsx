@@ -2566,6 +2566,18 @@ function QueryPlanBadge({
   ].filter(Boolean).join('\n')
   const rawFallback = isRawFallbackPlan(plan.planKind)
   const hasRecommendation = plan.recommendations.length > 0
+  const hasStatus = Boolean(
+    createFieldError ||
+    createMeasureError ||
+    createReportError ||
+    createSearchError ||
+    reportMaterializationTitle ||
+    reportMaterializationStatus
+  )
+
+  if (!hasRecommendation && !hasStatus) {
+    return null
+  }
 
   return (
     <span className="ml-auto inline-flex min-w-0 max-w-[520px] items-center gap-1">
