@@ -1,6 +1,5 @@
 mod config;
 mod definitions;
-mod deletions;
 mod http;
 mod materializations;
 mod metrics;
@@ -15,7 +14,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    config::Config, definitions::DefinitionStore, deletions::DeletionStore, http::AppState,
+    config::Config, definitions::DefinitionStore, http::AppState,
     materializations::MaterializationStore, metrics::ServerMetrics, read::ReadStore,
 };
 
@@ -46,7 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_sdk_default_definitions(definition_store.as_ref(), auth.as_deref()).await;
     }
     let materialization_store = Arc::new(MaterializationStore::new(cfg.clone()));
-    let deletion_store = Arc::new(DeletionStore::new(cfg.clone()));
     let metrics = Arc::new(ServerMetrics::new());
 
     let app = http::router(AppState {
@@ -54,7 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         definitions: definition_store.clone(),
         materializations: materialization_store.clone(),
-        deletions: deletion_store,
         read: read_store.clone(),
         raw_ingest,
         ses,

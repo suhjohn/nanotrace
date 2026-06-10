@@ -561,7 +561,6 @@ impl MaterializeTargets {
 #[derive(Debug, Serialize)]
 struct FieldIndexRow {
     tenant_id: String,
-    project_id: String,
     mode: String,
     field_name: String,
     value: String,
@@ -586,7 +585,6 @@ struct FieldIndexRow {
 #[derive(Debug, Serialize)]
 struct EventMeasureRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     measure_name: String,
@@ -605,7 +603,6 @@ struct EventMeasureRow {
 #[derive(Debug, Serialize)]
 struct MeasureCubePointRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     measure_name: String,
@@ -625,7 +622,6 @@ struct MeasureCubePointRow {
 #[derive(Debug, Serialize)]
 struct CounterRollupRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     metric_name: String,
@@ -640,7 +636,6 @@ struct CounterRollupRow {
 #[derive(Debug, Serialize)]
 struct GaugeRollupRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     metric_name: String,
@@ -658,7 +653,6 @@ struct GaugeRollupRow {
 #[derive(Debug, Serialize)]
 struct HistogramRollupRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     metric_name: String,
@@ -675,7 +669,6 @@ struct HistogramRollupRow {
 #[derive(Debug, Clone, Serialize)]
 struct EntityStateUpdateRow {
     tenant_id: String,
-    project_id: String,
     definition_id: String,
     definition_version: u64,
     entity_type: String,
@@ -692,7 +685,6 @@ struct EntityStateUpdateRow {
 #[derive(Debug, Serialize)]
 struct ReportResultRow {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -703,7 +695,6 @@ struct ReportResultRow {
 #[derive(Debug, Serialize)]
 struct SequenceReportResultRow {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -717,8 +708,6 @@ struct SequenceReportResultRow {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CohortMembershipRow {
     tenant_id: String,
-    #[serde(default)]
-    project_id: String,
     cohort_id: String,
     cohort_version: u64,
     entity_type: String,
@@ -4989,7 +4978,6 @@ fn push_field_index_row(
     }
     rows.push(FieldIndexRow {
         tenant_id: context.tenant_id.clone(),
-        project_id: context.project_id.clone(),
         mode: field.mode.to_string(),
         field_name: field.field_name.to_string(),
         value,
@@ -5037,7 +5025,6 @@ fn event_measure_rows(
         if dimensions.is_empty() {
             rows.push(EventMeasureRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 measure_name: measure_name.clone(),
@@ -5057,7 +5044,6 @@ fn event_measure_rows(
         for (dimension_name, dimension_value) in dimensions {
             rows.push(EventMeasureRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 measure_name: measure_name.clone(),
@@ -5116,7 +5102,6 @@ fn measure_cube_point_rows(
             }
             rows.push(MeasureCubePointRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 measure_name: measure_name.clone(),
@@ -5170,7 +5155,6 @@ fn metric_rollup_rows(
         match metric_kind.as_str() {
             "gauge" => rows.gauges.push(GaugeRollupRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 metric_name,
@@ -5186,7 +5170,6 @@ fn metric_rollup_rows(
             }),
             "histogram" | "timing" => rows.histograms.push(HistogramRollupRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 metric_name,
@@ -5201,7 +5184,6 @@ fn metric_rollup_rows(
             }),
             _ => rows.counters.push(CounterRollupRow {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 definition_id: rule.definition_id.clone(),
                 definition_version: rule.definition_version,
                 metric_name,
@@ -5280,7 +5262,6 @@ fn entity_state_update_rows(
         }
         rows.push(EntityStateUpdateRow {
             tenant_id: context.tenant_id.clone(),
-            project_id: context.project_id.clone(),
             definition_id: rule.definition_id.clone(),
             definition_version: rule.definition_version,
             entity_type,
@@ -5300,7 +5281,6 @@ fn entity_state_update_rows(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReportAggregateKey {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -5335,7 +5315,6 @@ fn report_result_rows(
                 serde_json::to_string(&dimensions).unwrap_or_else(|_| "{}".to_string());
             let key = ReportAggregateKey {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 report_id,
                 report_version: rule.definition_version,
                 bucket_time: context.bucket_time.clone(),
@@ -5379,7 +5358,6 @@ fn report_result_rows(
             }
             ReportResultRow {
                 tenant_id: key.tenant_id,
-                project_id: key.project_id,
                 report_id: key.report_id,
                 report_version: key.report_version,
                 bucket_time: key.bucket_time,
@@ -5391,7 +5369,6 @@ fn report_result_rows(
     rows.sort_by(|left, right| {
         left.tenant_id
             .cmp(&right.tenant_id)
-            .then(left.project_id.cmp(&right.project_id))
             .then(left.report_id.cmp(&right.report_id))
             .then(left.bucket_time.cmp(&right.bucket_time))
             .then(
@@ -5406,7 +5383,6 @@ fn report_result_rows(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TraceAggregateKey {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -5445,7 +5421,6 @@ fn trace_report_result_rows(
             }
             let key = TraceAggregateKey {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 report_id,
                 report_version: rule.definition_version,
                 bucket_time: context.bucket_time.clone(),
@@ -5522,7 +5497,6 @@ fn trace_report_result_rows(
                 .unwrap_or_default();
             ReportResultRow {
                 tenant_id: key.tenant_id,
-                project_id: key.project_id,
                 report_id: key.report_id,
                 report_version: key.report_version,
                 bucket_time: key.bucket_time,
@@ -5540,7 +5514,6 @@ fn trace_report_result_rows(
     rows.sort_by(|left, right| {
         left.tenant_id
             .cmp(&right.tenant_id)
-            .then(left.project_id.cmp(&right.project_id))
             .then(left.report_id.cmp(&right.report_id))
             .then(left.bucket_time.cmp(&right.bucket_time))
             .then(
@@ -5555,7 +5528,6 @@ fn trace_report_result_rows(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SequenceEntityKey {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -5573,7 +5545,6 @@ struct SequenceEventMatch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SequenceAggregateKey {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -5609,7 +5580,6 @@ fn sequence_report_result_rows(
                 }
                 let key = SequenceEntityKey {
                     tenant_id: context.tenant_id.clone(),
-                    project_id: context.project_id.clone(),
                     report_id: report_id.clone(),
                     report_version: rule.definition_version,
                     bucket_time: context.bucket_time.clone(),
@@ -5661,7 +5631,6 @@ fn sequence_report_result_rows(
         }
         let aggregate_key = SequenceAggregateKey {
             tenant_id: key.tenant_id,
-            project_id: key.project_id,
             report_id: key.report_id,
             report_version: key.report_version,
             bucket_time: key.bucket_time,
@@ -5692,7 +5661,6 @@ fn sequence_report_result_rows(
             let conversion_count = counts.get(step_index + 1).copied().unwrap_or(entity_count);
             rows.push(SequenceReportResultRow {
                 tenant_id: key.tenant_id.clone(),
-                project_id: key.project_id.clone(),
                 report_id: key.report_id.clone(),
                 report_version: key.report_version,
                 bucket_time: key.bucket_time.clone(),
@@ -5710,7 +5678,6 @@ fn sequence_report_result_rows(
     rows.sort_by(|left, right| {
         left.tenant_id
             .cmp(&right.tenant_id)
-            .then(left.project_id.cmp(&right.project_id))
             .then(left.report_id.cmp(&right.report_id))
             .then(left.bucket_time.cmp(&right.bucket_time))
             .then(left.step_index.cmp(&right.step_index))
@@ -5721,7 +5688,6 @@ fn sequence_report_result_rows(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RetentionMembershipKey {
     tenant_id: String,
-    project_id: String,
     cohort_id: String,
     entity_type: String,
     entity_id: String,
@@ -5730,7 +5696,6 @@ struct RetentionMembershipKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RetentionAggregateKey {
     tenant_id: String,
-    project_id: String,
     report_id: String,
     report_version: u64,
     bucket_time: String,
@@ -5752,12 +5717,10 @@ fn retention_report_result_rows(
         return Vec::new();
     }
     let mut memberships = HashMap::new();
-    let mut cohort_sizes: HashMap<(String, String, String, String), BTreeSet<String>> =
-        HashMap::new();
+    let mut cohort_sizes: HashMap<(String, String, String), BTreeSet<String>> = HashMap::new();
     for membership in current_memberships {
         let key = RetentionMembershipKey {
             tenant_id: membership.tenant_id.clone(),
-            project_id: membership.project_id.clone(),
             cohort_id: membership.cohort_id.clone(),
             entity_type: membership.entity_type.clone(),
             entity_id: membership.entity_id.clone(),
@@ -5765,7 +5728,6 @@ fn retention_report_result_rows(
         cohort_sizes
             .entry((
                 membership.tenant_id.clone(),
-                membership.project_id.clone(),
                 membership.cohort_id.clone(),
                 membership.entity_type.clone(),
             ))
@@ -5800,7 +5762,6 @@ fn retention_report_result_rows(
             }
             let membership_key = RetentionMembershipKey {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 cohort_id: cohort_id.clone(),
                 entity_type: entity_type.clone(),
                 entity_id: entity_id.clone(),
@@ -5827,7 +5788,6 @@ fn retention_report_result_rows(
                 serde_json::to_string(&dimensions).unwrap_or_else(|_| "{}".to_string());
             let aggregate_key = RetentionAggregateKey {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 report_id,
                 report_version: rule.definition_version,
                 bucket_time: context.bucket_time.clone(),
@@ -5836,7 +5796,6 @@ fn retention_report_result_rows(
             let cohort_entities = cohort_sizes
                 .get(&(
                     context.tenant_id.clone(),
-                    context.project_id.clone(),
                     cohort_id.clone(),
                     entity_type.clone(),
                 ))
@@ -5865,7 +5824,6 @@ fn retention_report_result_rows(
             };
             ReportResultRow {
                 tenant_id: key.tenant_id,
-                project_id: key.project_id,
                 report_id: key.report_id,
                 report_version: key.report_version,
                 bucket_time: key.bucket_time,
@@ -5882,7 +5840,6 @@ fn retention_report_result_rows(
     rows.sort_by(|left, right| {
         left.tenant_id
             .cmp(&right.tenant_id)
-            .then(left.project_id.cmp(&right.project_id))
             .then(left.report_id.cmp(&right.report_id))
             .then(left.bucket_time.cmp(&right.bucket_time))
             .then(
@@ -5910,7 +5867,6 @@ async fn retention_memberships_for_rows(
     for membership in current_memberships {
         existing.insert((
             membership.tenant_id.clone(),
-            membership.project_id.clone(),
             membership.cohort_id.clone(),
             membership.entity_type.clone(),
             membership.entity_id.clone(),
@@ -5933,13 +5889,7 @@ async fn retention_memberships_for_rows(
             if cohort_id.is_empty() || entity_type.is_empty() || entity_id.is_empty() {
                 continue;
             }
-            let key = (
-                context.tenant_id.clone(),
-                context.project_id.clone(),
-                cohort_id,
-                entity_type,
-                entity_id,
-            );
+            let key = (context.tenant_id.clone(), cohort_id, entity_type, entity_id);
             if !existing.contains(&key) {
                 wanted.insert(key);
             }
@@ -5952,11 +5902,10 @@ async fn retention_memberships_for_rows(
 
     let clauses = wanted
         .into_iter()
-        .map(|(tenant_id, project_id, cohort_id, entity_type, entity_id)| {
+        .map(|(tenant_id, cohort_id, entity_type, entity_id)| {
             format!(
-                "(tenant_id = {} AND project_id = {} AND cohort_id = {} AND entity_type = {} AND entity_id = {})",
+                "(tenant_id = {} AND cohort_id = {} AND entity_type = {} AND entity_id = {})",
                 quote_sql_string(&tenant_id),
-                quote_sql_string(&project_id),
                 quote_sql_string(&cohort_id),
                 quote_sql_string(&entity_type),
                 quote_sql_string(&entity_id)
@@ -5965,7 +5914,7 @@ async fn retention_memberships_for_rows(
         .collect::<Vec<_>>()
         .join(" OR ");
     let query = format!(
-        "SELECT tenant_id, project_id, cohort_id, cohort_version, entity_type, entity_id, toString(first_seen) AS first_seen, toString(last_seen) AS last_seen FROM {} FINAL WHERE {} FORMAT JSON",
+        "SELECT tenant_id, cohort_id, cohort_version, entity_type, entity_id, toString(first_seen) AS first_seen, toString(last_seen) AS last_seen FROM {} FINAL WHERE {} FORMAT JSON",
         cfg.qualified_cohort_memberships_table(),
         clauses
     );
@@ -5990,7 +5939,6 @@ fn json_number(value: f64) -> Value {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CohortMembershipKey {
     tenant_id: String,
-    project_id: String,
     cohort_id: String,
     cohort_version: u64,
     entity_type: String,
@@ -6024,7 +5972,6 @@ fn cohort_membership_rows(
             }
             let key = CohortMembershipKey {
                 tenant_id: context.tenant_id.clone(),
-                project_id: context.project_id.clone(),
                 cohort_id,
                 cohort_version: rule.definition_version,
                 entity_type,
@@ -6051,7 +5998,6 @@ fn cohort_membership_rows(
         .into_iter()
         .map(|(key, membership)| CohortMembershipRow {
             tenant_id: key.tenant_id,
-            project_id: key.project_id,
             cohort_id: key.cohort_id,
             cohort_version: key.cohort_version,
             entity_type: key.entity_type,
@@ -6063,7 +6009,6 @@ fn cohort_membership_rows(
     rows.sort_by(|left, right| {
         left.tenant_id
             .cmp(&right.tenant_id)
-            .then(left.project_id.cmp(&right.project_id))
             .then(left.cohort_id.cmp(&right.cohort_id))
             .then(left.entity_type.cmp(&right.entity_type))
             .then(left.entity_id.cmp(&right.entity_id))
@@ -6073,7 +6018,6 @@ fn cohort_membership_rows(
 
 struct EventContext {
     tenant_id: String,
-    project_id: String,
     timestamp: String,
     bucket_time: String,
     event_id: String,
@@ -6096,7 +6040,6 @@ impl EventContext {
             .unwrap_or_else(|| signal_for_event_type(&event_type).to_string());
         Self {
             tenant_id: string_value(data.get("tenant_id")),
-            project_id: string_value(data.get("project_id")),
             timestamp: row.timestamp.clone(),
             bucket_time: minute_bucket(&row.timestamp).unwrap_or_else(|| row.timestamp.clone()),
             event_id: row.event_id.clone(),
@@ -6907,7 +6850,6 @@ mod tests {
         let reports = vec![
             ReportResultRow {
                 tenant_id: "tenant-a".to_string(),
-                project_id: "proj-a".to_string(),
                 report_id: "checkout".to_string(),
                 report_version: 7,
                 bucket_time: "2026-06-04T00:00:00.000Z".to_string(),
@@ -6916,7 +6858,6 @@ mod tests {
             },
             ReportResultRow {
                 tenant_id: "tenant-a".to_string(),
-                project_id: "proj-a".to_string(),
                 report_id: "checkout".to_string(),
                 report_version: 7,
                 bucket_time: "2026-06-04T00:01:00.000Z".to_string(),
@@ -6926,7 +6867,6 @@ mod tests {
         ];
         let sequences = vec![SequenceReportResultRow {
             tenant_id: "tenant-a".to_string(),
-            project_id: "proj-a".to_string(),
             report_id: "signup".to_string(),
             report_version: 3,
             bucket_time: "2026-06-04T00:00:00.000Z".to_string(),
@@ -6938,7 +6878,6 @@ mod tests {
         }];
         let cohorts = vec![CohortMembershipRow {
             tenant_id: "tenant-a".to_string(),
-            project_id: "proj-a".to_string(),
             cohort_id: "june_signups".to_string(),
             cohort_version: 2,
             entity_type: "user".to_string(),
@@ -7319,7 +7258,6 @@ mod tests {
             source_length: 128,
             data: json!({
                 "tenant_id": "org_1",
-                "project_id": "proj_1",
                 "event_type": "track",
                 "country": "US",
                 "revenue": 42.5,
@@ -7375,15 +7313,12 @@ mod tests {
         let states = entity_state_update_rows(&row, &definitions);
 
         assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].project_id, "proj_1");
         assert_eq!(fields[0].field_name, "country");
         assert_eq!(fields[0].value, "US");
         assert_eq!(measures.len(), 1);
-        assert_eq!(measures[0].project_id, "proj_1");
         assert_eq!(measures[0].value, 42.5);
         assert_eq!(measures[0].dimension_value, "USD");
         assert_eq!(states.len(), 1);
-        assert_eq!(states[0].project_id, "proj_1");
         assert_eq!(states[0].entity_id, "user_1");
         assert_eq!(states[0].value, "pro");
     }

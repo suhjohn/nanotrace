@@ -117,34 +117,6 @@ pub enum QueryApiRequest {
     Alerts(AlertQueryRequest),
 }
 
-impl QueryApiRequest {
-    pub fn project_scope_project_ids(&self) -> Option<Vec<String>> {
-        match self {
-            Self::Events(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Search(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Measure(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Funnel(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Cohort(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Report(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::State(request) => Some(request.project_scope.normalized_project_ids()),
-            Self::Alerts(_) => None,
-        }
-    }
-
-    pub fn set_project_scope_project_ids(&mut self, project_ids: Vec<String>) {
-        match self {
-            Self::Events(request) => request.project_scope.project_ids = project_ids,
-            Self::Search(request) => request.project_scope.project_ids = project_ids,
-            Self::Measure(request) => request.project_scope.project_ids = project_ids,
-            Self::Funnel(request) => request.project_scope.project_ids = project_ids,
-            Self::Cohort(request) => request.project_scope.project_ids = project_ids,
-            Self::Report(request) => request.project_scope.project_ids = project_ids,
-            Self::State(request) => request.project_scope.project_ids = project_ids,
-            Self::Alerts(_) => {}
-        }
-    }
-}
-
 impl<'de> Deserialize<'de> for QueryApiRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -196,8 +168,6 @@ impl<'de> Deserialize<'de> for QueryApiRequest {
 pub struct SearchQueryRequest {
     pub query: String,
     #[serde(default)]
-    pub project_scope: ProjectScope,
-    #[serde(default)]
     pub mode: SearchMode,
     #[serde(default)]
     pub require_all_terms: bool,
@@ -217,28 +187,6 @@ pub struct SearchQueryRequest {
     pub allow_stale_serving: bool,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectScope {
-    #[serde(default)]
-    pub project_ids: Vec<String>,
-}
-
-impl ProjectScope {
-    fn normalized_project_ids(&self) -> Vec<String> {
-        let mut project_ids = self
-            .project_ids
-            .iter()
-            .map(|project_id| project_id.trim())
-            .filter(|project_id| !project_id.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        project_ids.sort();
-        project_ids.dedup();
-        project_ids
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SearchMode {
@@ -254,8 +202,6 @@ pub enum SearchMode {
 #[serde(rename_all = "camelCase")]
 pub struct MeasureQueryRequest {
     pub measure_name: String,
-    #[serde(default)]
-    pub project_scope: ProjectScope,
     pub from: String,
     pub to: String,
     #[serde(default = "default_measure_bucket_seconds")]
@@ -276,8 +222,6 @@ pub struct MeasureQueryRequest {
 pub struct FunnelQueryRequest {
     pub report_id: String,
     #[serde(default)]
-    pub project_scope: ProjectScope,
-    #[serde(default)]
     pub report_version: u64,
     #[serde(default)]
     pub from: String,
@@ -295,8 +239,6 @@ pub struct FunnelQueryRequest {
 pub struct CohortQueryRequest {
     pub cohort_id: String,
     #[serde(default)]
-    pub project_scope: ProjectScope,
-    #[serde(default)]
     pub cohort_version: u64,
     #[serde(default)]
     pub entity_type: String,
@@ -311,8 +253,6 @@ pub struct CohortQueryRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReportQueryRequest {
     pub report_id: String,
-    #[serde(default)]
-    pub project_scope: ProjectScope,
     #[serde(default)]
     pub report_version: u64,
     #[serde(default)]
@@ -333,8 +273,6 @@ pub struct ReportQueryRequest {
 pub struct StateQueryRequest {
     pub entity_type: String,
     pub state_name: String,
-    #[serde(default)]
-    pub project_scope: ProjectScope,
     #[serde(default)]
     pub entity_id: String,
     #[serde(default)]
@@ -381,8 +319,6 @@ pub struct AlertQueryRequest {
 pub struct EventsQueryRequest {
     #[serde(default)]
     pub view: EventsQueryView,
-    #[serde(default)]
-    pub project_scope: ProjectScope,
     #[serde(default)]
     pub filter: EventFilter,
     #[serde(default)]
@@ -700,14 +636,6 @@ impl ReadStore {
                 Value::from(request.event_type.trim().to_string()),
             );
         }
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "search.project_id",
-            "search_project_ids",
-            &mut parameters,
-        ) {
-            where_clauses.push(project_clause);
-        }
         parameters.insert(
             "search_inner_limit".to_string(),
             Value::from(request.limit.saturating_add(request.offset).min(10_000)),
@@ -771,22 +699,7 @@ impl ReadStore {
             Value::Number(serde_json::Number::from(request.bucket_seconds)),
         );
 
-        let mut filter_clauses = vec![
-            "measure_name = {measure_name:String}".to_string(),
-            "definition_id = {definition_id:String}".to_string(),
-            "dimension_set_id = {dimension_set_id:String}".to_string(),
-            "bucket_seconds = {bucket_seconds:UInt32}".to_string(),
-            "bucket_time >= parseDateTime64BestEffort({from:String}, 3, 'UTC')".to_string(),
-            "bucket_time <= parseDateTime64BestEffort({to:String}, 3, 'UTC')".to_string(),
-        ];
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "project_scope",
-            &mut parameters,
-        ) {
-            filter_clauses.push(project_clause);
-        }
+        let mut filter_clauses = Vec::new();
         for (index, (field, value)) in request.filters.iter().enumerate() {
             let parameter = format!("filter_{index}");
             parameters.insert(parameter.clone(), Value::String(json_scalar_string(value)));
@@ -795,9 +708,13 @@ impl ReadStore {
                 quote_sql_string(field)
             ));
         }
+        let filters = if filter_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", filter_clauses.join(" AND "))
+        };
         let query = format!(
-            "SELECT bucket_time AS bucketTime, mapFromArrays(dimension_names, dimension_values) AS dimensions, sumMerge(count_state) AS count, sumMerge(sum_state) AS sum, minMerge(min_state) AS min, maxMerge(max_state) AS max, avgMerge(avg_state) AS avg, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 1) AS p50, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 2) AS p90, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 3) AS p95, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 4) AS p99, 'measure_cube_rollups' AS source FROM measure_cube_rollups WHERE {} GROUP BY bucket_time, dimension_names, dimension_values ORDER BY bucket_time ASC",
-            filter_clauses.join(" AND ")
+            "SELECT bucket_time AS bucketTime, mapFromArrays(dimension_names, dimension_values) AS dimensions, sumMerge(count_state) AS count, sumMerge(sum_state) AS sum, minMerge(min_state) AS min, maxMerge(max_state) AS max, avgMerge(avg_state) AS avg, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 1) AS p50, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 2) AS p90, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 3) AS p95, arrayElement(quantilesTDigestMerge(0.5, 0.9, 0.95, 0.99)(quantiles_state), 4) AS p99, 'measure_cube_rollups' AS source FROM measure_cube_rollups WHERE measure_name = {{measure_name:String}} AND definition_id = {{definition_id:String}} AND dimension_set_id = {{dimension_set_id:String}} AND bucket_seconds = {{bucket_seconds:UInt32}} AND bucket_time >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND bucket_time <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC'){filters} GROUP BY bucket_time, dimension_names, dimension_values ORDER BY bucket_time ASC"
         );
         let response = self
             .query_with_context(
@@ -854,14 +771,6 @@ impl ReadStore {
             "report_id = {report_id:String}".to_string(),
             "report_version = {report_version:UInt64}".to_string(),
         ];
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "project_scope",
-            &mut parameters,
-        ) {
-            clauses.push(project_clause);
-        }
         if !request.from.trim().is_empty() {
             parameters.insert(
                 "from".to_string(),
@@ -956,14 +865,6 @@ impl ReadStore {
             "cohort_id = {cohort_id:String}".to_string(),
             "cohort_version = {cohort_version:UInt64}".to_string(),
         ];
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "project_scope",
-            &mut parameters,
-        ) {
-            clauses.push(project_clause);
-        }
         if !request.entity_type.trim().is_empty() {
             parameters.insert(
                 "entity_type".to_string(),
@@ -1046,14 +947,6 @@ impl ReadStore {
             "report_id = {report_id:String}".to_string(),
             "report_version = {report_version:UInt64}".to_string(),
         ];
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "project_scope",
-            &mut parameters,
-        ) {
-            clauses.push(project_clause);
-        }
         if !request.from.trim().is_empty() {
             parameters.insert(
                 "from".to_string(),
@@ -1137,14 +1030,6 @@ impl ReadStore {
             "entity_type = {entity_type:String}".to_string(),
             "state_name = {state_name:String}".to_string(),
         ];
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "project_scope",
-            &mut parameters,
-        ) {
-            clauses.push(project_clause);
-        }
         if !request.entity_id.trim().is_empty() {
             parameters.insert("entity_id".to_string(), Value::String(request.entity_id));
             clauses.push("entity_id = {entity_id:String}".to_string());
@@ -1826,16 +1711,13 @@ impl ReadStore {
         tenant_id: &str,
     ) -> Result<Value, ReadError> {
         let group_by = facet_key(&request.group_by)?;
-        let has_filters =
-            !request.filter.facets.is_empty() || !request.filter.text.trim().is_empty();
-        let (primary_query, primary_parameters) =
-            if !has_filters && catalog.core_rollup_contains(&group_by) {
-                grouped_rollup_query(request, &group_by)
-            } else if !has_filters && let Some(index_access) = catalog.index_table(&group_by) {
-                grouped_index_query(request, &group_by, index_access)
-            } else {
-                raw_groups_query(request, &group_by, catalog)?
-            };
+        let (primary_query, primary_parameters) = if catalog.core_rollup_contains(&group_by) {
+            grouped_rollup_query(request, &group_by)
+        } else if let Some(index_access) = catalog.index_table(&group_by) {
+            grouped_index_query(request, &group_by, index_access)
+        } else {
+            raw_groups_query(request, &group_by)?
+        };
 
         let response = self
             .run_events_query_sql(
@@ -1850,7 +1732,7 @@ impl ReadStore {
             return Ok(response);
         }
 
-        let (query, parameters) = raw_groups_query(request, &group_by, catalog)?;
+        let (query, parameters) = raw_groups_query(request, &group_by)?;
         self.run_events_query_sql(query, parameters, request, catalog, tenant_id)
             .await
     }
@@ -1923,26 +1805,17 @@ impl ReadStore {
             && request.filter.facets.is_empty()
             && request.filter.text.trim().is_empty()
         {
-            let (time_clause, mut parameters) = time_where_clause(
+            let (time_clause, parameters) = time_where_clause(
                 &request.filter,
                 request.time_range.as_ref(),
                 "d.bucket_time",
-            );
-            let scope_clause = project_scope_clause(
-                &request.project_scope,
-                "d.project_id",
-                "__project_scope",
-                &mut parameters,
             );
             return self
                 .run_events_query_sql(
                     [
                         "SELECT sum(count) AS count".to_string(),
                         "FROM event_density_1s AS d".to_string(),
-                        where_keyword(join_clauses(vec![
-                            time_clause,
-                            scope_clause.unwrap_or_default(),
-                        ])),
+                        where_keyword(time_clause),
                     ]
                     .into_iter()
                     .filter(|part| !part.is_empty())
@@ -1968,12 +1841,6 @@ impl ReadStore {
                     request.time_range.as_ref(),
                     "d.bucket_time",
                 );
-                let scope_clause = project_scope_clause(
-                    &request.project_scope,
-                    "d.project_id",
-                    "__project_scope",
-                    &mut parameters,
-                );
                 parameters.insert("group_key".to_string(), Value::from(group_by));
                 parameters.insert(
                     "group_value".to_string(),
@@ -1989,7 +1856,6 @@ impl ReadStore {
                                 "d.value = {group_value:String}".to_string(),
                                 "d.bucket_seconds = 1".to_string(),
                                 time_clause,
-                                scope_clause.unwrap_or_default(),
                             ])),
                         ]
                         .into_iter()
@@ -2077,19 +1943,13 @@ impl ReadStore {
                 request.time_range.as_ref(),
                 "d.bucket_time",
             );
-            let scope_clause = project_scope_clause(
-                &request.project_scope,
-                "d.project_id",
-                "__project_scope",
-                &mut parameters,
-            );
             parameters.insert("buckets".to_string(), Value::from(request.buckets));
             let range = self
                 .run_events_query_sql(
                     [
                         "SELECT min(d.bucket_time) AS from, max(d.bucket_time) AS to, sum(d.count) AS count".to_string(),
                         "FROM event_density_1s AS d".to_string(),
-                        where_keyword(join_clauses(vec![time_clause.clone(), scope_clause.clone().unwrap_or_default()])),
+                        where_keyword(time_clause.clone()),
                     ]
                     .into_iter()
                     .filter(|part| !part.is_empty())
@@ -2111,7 +1971,7 @@ impl ReadStore {
                             "SELECT {bucket_expr} AS bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount"
                         ),
                         "FROM event_density_1s AS d".to_string(),
-                        where_keyword(join_clauses(vec![time_clause, scope_clause.unwrap_or_default()])),
+                        where_keyword(time_clause),
                         format!("GROUP BY {bucket_expr} ORDER BY bucket ASC"),
                     ]
                     .into_iter()
@@ -2138,12 +1998,6 @@ impl ReadStore {
                     request.time_range.as_ref(),
                     "d.bucket_time",
                 );
-                let scope_clause = project_scope_clause(
-                    &request.project_scope,
-                    "d.project_id",
-                    "__project_scope",
-                    &mut parameters,
-                );
                 parameters.insert("group_key".to_string(), Value::from(group_by));
                 parameters.insert(
                     "group_value".to_string(),
@@ -2156,7 +2010,6 @@ impl ReadStore {
                         "d.value = {group_value:String}".to_string(),
                         "d.bucket_seconds = 1".to_string(),
                         time_clause.clone(),
-                        scope_clause.clone().unwrap_or_default(),
                     ])),
                 ]
                 .into_iter()
@@ -2285,23 +2138,13 @@ impl ReadStore {
             "event_id".to_string(),
             Value::from(request.page.event_id.clone()),
         );
-        let project_clause = project_scope_clause(
-            &request.project_scope,
-            "e.project_id",
-            "__project_scope",
-            &mut parameters,
-        )
-        .unwrap_or_default();
         let catalog = EventFieldCatalog::default();
         self.run_events_query_sql(
             [
                 "SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.data AS data".to_string(),
                 ", e.event_type AS event_type, e.signal AS signal, e.trace_id AS trace_id, e.span_id AS span_id".to_string(),
                 "FROM events AS e".to_string(),
-                where_keyword(join_clauses(vec![
-                    "e.event_id = {event_id:String}".to_string(),
-                    project_clause,
-                ])),
+                "WHERE e.event_id = {event_id:String}".to_string(),
                 "ORDER BY e.timestamp ASC LIMIT 1".to_string(),
             ]
             .join(" "),
@@ -2314,28 +2157,17 @@ impl ReadStore {
     }
 
     pub async fn event_bytes(&self, event_id: &str, tenant_id: &str) -> Result<Bytes, ReadError> {
-        self.event_bytes_scoped(event_id, tenant_id, &[]).await
-    }
-
-    pub async fn event_bytes_scoped(
-        &self,
-        event_id: &str,
-        tenant_id: &str,
-        project_ids: &[String],
-    ) -> Result<Bytes, ReadError> {
         if event_id.trim().is_empty() {
             return Err(ReadError::InvalidQuery("event_id is required".to_string()));
         }
 
-        self.event_bytes_from_clickhouse(event_id, tenant_id, project_ids)
-            .await
+        self.event_bytes_from_clickhouse(event_id, tenant_id).await
     }
 
     async fn event_bytes_from_clickhouse(
         &self,
         event_id: &str,
         tenant_id: &str,
-        project_ids: &[String],
     ) -> Result<Bytes, ReadError> {
         let mut parameters = serde_json::Map::new();
         parameters.insert("event_id".to_string(), Value::String(event_id.to_string()));
@@ -2343,17 +2175,8 @@ impl ReadStore {
             "__nanotrace_tenant_id".to_string(),
             Value::String(tenant_id.to_string()),
         );
-        let project_clause = if project_ids.is_empty() {
-            String::new()
-        } else {
-            parameters.insert(
-                "__project_scope".to_string(),
-                Value::Array(project_ids.iter().cloned().map(Value::String).collect()),
-            );
-            "AND project_id IN {__project_scope:Array(String)}".to_string()
-        };
         let query = format!(
-            "SELECT event_id, timestamp, observed_timestamp, ingested_timestamp, source_file, source_offset, source_length, data FROM {} WHERE tenant_id = {{__nanotrace_tenant_id:String}} AND event_id = {{event_id:String}} {project_clause} ORDER BY timestamp ASC LIMIT 1",
+            "SELECT event_id, timestamp, observed_timestamp, ingested_timestamp, source_file, source_offset, source_length, data FROM {} WHERE tenant_id = {{__nanotrace_tenant_id:String}} AND event_id = {{event_id:String}} ORDER BY timestamp ASC LIMIT 1",
             self.table_name()
         );
         let text = self.clickhouse_query(&query, &parameters).await?;
@@ -2805,7 +2628,6 @@ const CORE_ROLLUP_FIELD_NAMES: &[&str] = &[
 ];
 
 const RAW_GROUPABLE_FIELD_NAMES: &[&str] = &[
-    "project_id",
     "signal",
     "event_type",
     "name",
@@ -2844,7 +2666,6 @@ const RAW_GROUPABLE_FIELD_NAMES: &[&str] = &[
 ];
 
 const LOOKUP_FIELD_NAMES: &[&str] = &[
-    "project_id",
     "trace_id",
     "span_id",
     "request_id",
@@ -2879,14 +2700,6 @@ impl EventPredicatePlan {
         );
         clauses.push(time_clause);
         builder.parameters.extend(time_parameters);
-        if let Some(project_clause) = project_scope_clause(
-            &request.project_scope,
-            &format!("{alias}.project_id"),
-            "__project_scope",
-            &mut builder.parameters,
-        ) {
-            clauses.push(project_clause);
-        }
 
         if !request.group_by.trim().is_empty() && !request.selected_group_value.is_empty() {
             let path = facet_key(&request.group_by)?;
@@ -3449,17 +3262,10 @@ fn grouped_rollup_query(
     parameters.insert("group_key".to_string(), Value::from(group_by.to_string()));
     parameters.insert("limit".to_string(), Value::from(request.limit + 1));
     parameters.insert("offset".to_string(), Value::from(request.offset));
-    let scope_clause = project_scope_clause(
-        &request.project_scope,
-        "project_id",
-        "__project_scope",
-        &mut parameters,
-    );
     let mut clauses = vec![
         "field_name = {group_key:String}".to_string(),
         "bucket_seconds = 60".to_string(),
         time_range_clause(request.time_range.as_ref(), "bucket_time"),
-        scope_clause.unwrap_or_default(),
     ];
     if !request.search.is_empty() {
         parameters.insert(
@@ -3512,14 +3318,6 @@ fn grouped_index_query(
         "value != ''".to_string(),
         time_range_clause(request.time_range.as_ref(), "timestamp"),
     ];
-    if let Some(project_clause) = project_scope_clause(
-        &request.project_scope,
-        "project_id",
-        "__project_scope",
-        &mut builder.parameters,
-    ) {
-        clauses.push(project_clause);
-    }
     if index_access.include_mode() {
         clauses.push("mode IN ('facet', 'lookup')".to_string());
         clauses.push(field_index_definition_clause(
@@ -3576,13 +3374,6 @@ fn latest_grouped_rollup_query(
         "value = {group_value:String}".to_string(),
         "bucket_seconds = 60".to_string(),
         time_range_clause(request.time_range.as_ref(), "bucket_time"),
-        project_scope_clause(
-            &request.project_scope,
-            "project_id",
-            "__project_scope",
-            &mut parameters,
-        )
-        .unwrap_or_default(),
     ];
     (
         [
@@ -3619,14 +3410,6 @@ fn latest_grouped_index_query(
         "value = {group_value:String}".to_string(),
         time_range_clause(request.time_range.as_ref(), "timestamp"),
     ];
-    if let Some(project_clause) = project_scope_clause(
-        &request.project_scope,
-        "project_id",
-        "__project_scope",
-        &mut builder.parameters,
-    ) {
-        clauses.push(project_clause);
-    }
     if index_access.include_mode() {
         clauses.push("mode IN ('facet', 'lookup')".to_string());
         clauses.push(field_index_definition_clause(
@@ -3652,23 +3435,22 @@ fn latest_grouped_index_query(
 fn raw_groups_query(
     request: &EventsQueryRequest,
     group_by: &str,
-    catalog: &EventFieldCatalog,
 ) -> Result<(String, Map<String, Value>), ReadError> {
-    let mut plan = EventPredicatePlan::new(request, catalog, "e")?;
+    let mut parameters = time_parameters(request.time_range.as_ref());
+    parameters.insert("limit".to_string(), Value::from(request.limit + 1));
+    parameters.insert("offset".to_string(), Value::from(request.offset));
     let value_expression = event_value_expression(group_by, "e")?;
-    plan.clauses.push(format!("{value_expression} != ''"));
+    let mut clauses = vec![
+        format!("{value_expression} != ''"),
+        time_range_clause(request.time_range.as_ref(), "e.timestamp"),
+    ];
     if !request.search.is_empty() {
-        plan.parameters.insert(
+        parameters.insert(
             "group_value".to_string(),
             Value::from(request.search.clone()),
         );
-        plan.clauses
-            .push(format!("{value_expression} = {{group_value:String}}"));
+        clauses.push(format!("{value_expression} = {{group_value:String}}"));
     }
-    plan.parameters
-        .insert("limit".to_string(), Value::from(request.limit + 1));
-    plan.parameters
-        .insert("offset".to_string(), Value::from(request.offset));
     Ok((
         [
             format!("SELECT {value_expression} AS value"),
@@ -3678,7 +3460,7 @@ fn raw_groups_query(
             ", count() AS count".to_string(),
             format!(", countIf({}) AS errorCount", error_expression("e")),
             "FROM events AS e".to_string(),
-            plan.where_clause(),
+            where_keyword(join_clauses(clauses)),
             "GROUP BY value".to_string(),
             group_order_by_clause(group_by, true, request.sort.group),
             "LIMIT {limit:UInt64} OFFSET {offset:UInt64}".to_string(),
@@ -3687,7 +3469,7 @@ fn raw_groups_query(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" "),
-        plan.parameters,
+        parameters,
     ))
 }
 
@@ -3782,23 +3564,6 @@ fn time_where_clause(
     (join_clauses(clauses), parameters)
 }
 
-fn project_scope_clause(
-    project_scope: &ProjectScope,
-    column: &str,
-    parameter_name: &str,
-    parameters: &mut Map<String, Value>,
-) -> Option<String> {
-    let project_ids = project_scope.normalized_project_ids();
-    if project_ids.is_empty() {
-        return None;
-    }
-    parameters.insert(
-        parameter_name.to_string(),
-        Value::Array(project_ids.into_iter().map(Value::String).collect()),
-    );
-    Some(format!("{column} IN {{{parameter_name}:Array(String)}}"))
-}
-
 fn time_range_clause(time_range: Option<&EventTimeRange>, column: &str) -> String {
     let Some(time_range) = time_range else {
         return String::new();
@@ -3864,7 +3629,7 @@ fn join_clauses(clauses: Vec<String>) -> String {
 }
 
 fn event_metadata_select(alias: &str) -> String {
-    format!("{}, {alias}.data AS data", flamegraph_select(alias))
+    flamegraph_select(alias)
 }
 
 fn flamegraph_select(alias: &str) -> String {
@@ -3894,14 +3659,8 @@ fn event_value_expression(path: &str, alias: &str) -> Result<String, ReadError> 
     ))
 }
 
-const PROMOTED_STRING_COLUMNS: &[&str] = &[
-    "tenant_id",
-    "project_id",
-    "trace_id",
-    "span_id",
-    "event_type",
-    "signal",
-];
+const PROMOTED_STRING_COLUMNS: &[&str] =
+    &["tenant_id", "trace_id", "span_id", "event_type", "signal"];
 
 fn promoted_string_column(path: &str, alias: &str) -> String {
     if !PROMOTED_STRING_COLUMNS.contains(&path) {
@@ -5158,8 +4917,7 @@ fn replace_parameters_for_parser(query: &str, replacement: &str) -> String {
             }
             '{' => {
                 if let Some(end) = parameter_end(&chars, index) {
-                    let raw = chars[index + 1..end].iter().collect::<String>();
-                    out.push_str(&parser_parameter_replacement(&raw, replacement));
+                    out.push_str(replacement);
                     index = end + 1;
                 } else {
                     out.push(chars[index]);
@@ -5173,17 +4931,6 @@ fn replace_parameters_for_parser(query: &str, replacement: &str) -> String {
         }
     }
     out
-}
-
-fn parser_parameter_replacement(raw: &str, scalar_replacement: &str) -> String {
-    let mut parts = raw.splitn(2, ':');
-    let _name = parts.next().unwrap_or_default().trim();
-    let kind = parts.next().unwrap_or_default().trim();
-    if kind.starts_with("Array(") {
-        "(0)".to_string()
-    } else {
-        scalar_replacement.to_string()
-    }
 }
 
 fn sanitize_sql_shape(query: &str) -> String {
@@ -6042,15 +5789,6 @@ fn parameter_value(value: &Value) -> Result<String, ReadError> {
         Value::Null => Err(ReadError::InvalidQuery(
             "query parameters must not be null".to_string(),
         )),
-        Value::Array(values) if values.iter().all(Value::is_string) => Ok(format!(
-            "[{}]",
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|value| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")))
-                .collect::<Vec<_>>()
-                .join(",")
-        )),
         Value::Array(_) | Value::Object(_) => Err(ReadError::InvalidQuery(
             "query parameters must be scalar values".to_string(),
         )),
@@ -6077,10 +5815,10 @@ mod tests {
         event_page_filter, event_query_planning_metadata, event_table_order,
         event_value_expression, group_options_query, grouped_index_query, grouped_rollup_query,
         is_raw_fallback_plan, latest_grouped_index_query, latest_grouped_rollup_query,
-        nanotrace_with_materialization, normalize_prewhere, parameter_value,
-        phrase_search_query_sql, query_plan_kind, query_recommendations, query_shape_class,
-        query_sources, query_usage_shape, raw_groups_query, scope_query_with_allowed_tables,
-        search_snippet_sql, validate_parameter_name, validate_query_sources,
+        nanotrace_with_materialization, normalize_prewhere, phrase_search_query_sql,
+        query_plan_kind, query_recommendations, query_shape_class, query_sources,
+        query_usage_shape, raw_groups_query, scope_query_with_allowed_tables, search_snippet_sql,
+        validate_parameter_name, validate_query_sources,
     };
     use serde_json::Value;
 
@@ -6138,57 +5876,6 @@ mod tests {
 
         assert_eq!(request.report_id, "checkout_summary");
         assert_eq!(request.report_version, 42);
-    }
-
-    #[test]
-    fn typed_query_requests_expose_project_scope_for_authorization() {
-        for query_type in ["measure", "funnel", "cohort", "report", "state"] {
-            let mut body = serde_json::json!({
-                "type": query_type,
-                "projectScope": { "projectIds": ["proj_b", "proj_a", "proj_a", ""] },
-                "allowStaleServing": true
-            });
-            match query_type {
-                "measure" => {
-                    body["measureName"] = Value::String("checkout.latency".to_string());
-                    body["from"] = Value::String("2026-06-04T00:00:00.000Z".to_string());
-                    body["to"] = Value::String("2026-06-05T00:00:00.000Z".to_string());
-                }
-                "funnel" | "report" => {
-                    body["reportId"] = Value::String("checkout".to_string());
-                }
-                "cohort" => {
-                    body["cohortId"] = Value::String("checkout_users".to_string());
-                }
-                "state" => {
-                    body["entityType"] = Value::String("account".to_string());
-                    body["stateName"] = Value::String("account.plan".to_string());
-                }
-                _ => unreachable!(),
-            }
-
-            let mut request: QueryApiRequest =
-                serde_json::from_value(body).expect("typed query request");
-            assert_eq!(
-                request.project_scope_project_ids(),
-                Some(vec!["proj_a".to_string(), "proj_b".to_string()]),
-                "{query_type} should expose normalized project scope"
-            );
-            request.set_project_scope_project_ids(vec!["proj_allowed".to_string()]);
-            assert_eq!(
-                request.project_scope_project_ids(),
-                Some(vec!["proj_allowed".to_string()]),
-                "{query_type} should accept injected project scope"
-            );
-        }
-    }
-
-    #[test]
-    fn array_query_parameters_render_clickhouse_array_literals() {
-        assert_eq!(
-            parameter_value(&serde_json::json!(["proj_a", "proj'b"])).expect("array parameter"),
-            "['proj_a','proj\\'b']"
-        );
     }
 
     #[test]
@@ -6427,18 +6114,6 @@ mod tests {
         assert!(
             validate_query_sources("SELECT * FROM observatory.events, system.tables", &allowed)
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn query_parser_accepts_array_typed_parameters_in_in_clauses() {
-        let allowed = vec!["events".to_string()];
-        assert!(
-            validate_query_sources(
-                "SELECT count() FROM events WHERE project_id IN {project_scope:Array(String)}",
-                &allowed
-            )
-            .is_ok()
         );
     }
 
@@ -6902,8 +6577,7 @@ mod tests {
 
         assert!(RAW_GROUPABLE_FIELD_NAMES.contains(&"http.route"));
         assert!(!CORE_ROLLUP_FIELD_NAMES.contains(&"http.route"));
-        let catalog = EventFieldCatalog::default();
-        let (query, parameters) = raw_groups_query(&request, "http.route", &catalog).unwrap();
+        let (query, parameters) = raw_groups_query(&request, "http.route").unwrap();
 
         assert!(query.contains("FROM events AS e"));
         assert!(query.contains("getSubcolumn(e.data, 'http.route')"));
@@ -6911,32 +6585,6 @@ mod tests {
             parameters.get("limit").and_then(|value| value.as_u64()),
             Some(51)
         );
-    }
-
-    #[test]
-    fn filtered_groups_use_event_predicate_plan() {
-        let request = EventsQueryRequest {
-            group_by: "project_id".to_string(),
-            filter: EventFilter {
-                facets: vec![EventFacetFilter {
-                    path: "_project.run_id".to_string(),
-                    operator: EventFacetOperator::Eq,
-                    value: "project-run".to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let catalog = EventFieldCatalog::default();
-        let (query, parameters) = raw_groups_query(&request, "project_id", &catalog).unwrap();
-
-        assert!(query.contains("FROM events AS e"));
-        assert!(query.contains("e.project_id"));
-        assert!(query.contains("AS value"));
-        assert!(query.contains("FROM event_kv_index AS kv"));
-        assert!(parameters.values().any(|value| value == "_project.run_id"));
-        assert!(parameters.values().any(|value| value == "project-run"));
     }
 
     #[test]

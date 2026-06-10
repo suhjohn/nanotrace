@@ -24,8 +24,6 @@ Integration scenarios covered by this file:
     cube/raw drilldown as appropriate.
 19. Browser-session active organization switching scopes query, definitions,
     and API keys.
-20. Project defaults, project-scoped API keys, query projectScope, and deletion
-    jobs isolate rows by project.
 */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -45,13 +43,6 @@ const tenantA = `org_it_a_${suffix}`;
 const tenantB = `org_it_b_${suffix}`;
 const keyA = `ntak_it_a_${suffix}`;
 const keyB = `ntak_it_b_${suffix}`;
-const keyAProject = `ntak_it_proj_${suffix}`;
-const projectADefault = defaultProjectId(tenantA);
-const projectACustom = `proj_it_custom_${suffix}`;
-const projectRunId = `it_project_${suffix}`;
-const projectDefaultEventId = `evt_project_default_${suffix}`;
-const projectCustomEventId = `evt_project_custom_${suffix}`;
-const projectForbiddenEventId = `evt_project_forbidden_${suffix}`;
 const sessionToken = `nts_it_${suffix}`;
 const sessionSubject = `email:shared_${suffix}@example.com`;
 const sessionEmail = `shared_${suffix}@example.com`;
@@ -101,7 +92,6 @@ async function main() {
   await assertRawKvQueryParity();
   await assertBackfilledDefinitionWatermark();
   await assertTableflowMaterializerReplayIsIdempotent();
-  await assertProjectScopingAndDeletion();
   await assertSyntheticAnalyticsOracle();
 
   console.log("integrationResult=ok");
@@ -115,26 +105,16 @@ VALUES
   (${q(tenantB)}, ${q(`it-b-${suffix}`)}, 'Integration Tenant B')
 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now();
 
-INSERT INTO nanotrace_projects (id, organization_id, slug, name)
-VALUES (${q(projectACustom)}, ${q(tenantA)}, ${q(`custom-${suffix}`)}, 'Integration Custom Project')
-ON CONFLICT (id) DO UPDATE
-SET name = EXCLUDED.name,
-    archived_at = NULL,
-    updated_at = now();
-
 INSERT INTO nanotrace_api_keys
-  (organization_id, key_hash, prefix, name, role, scopes, project_ids, default_project_id, created_by, revoked_at)
+  (organization_id, key_hash, prefix, name, role, scopes, created_by, revoked_at)
 VALUES
-  (${q(tenantA)}, ${q(tokenHash(keyA))}, ${q(keyA.slice(0, 16))}, 'integration-a', 'admin', ARRAY['ingest:write','query:read','definitions:write','api_keys:write','data:delete','facets:write']::text[], '{}'::text[], ${q(projectADefault)}, 'integration', NULL),
-  (${q(tenantB)}, ${q(tokenHash(keyB))}, ${q(keyB.slice(0, 16))}, 'integration-b', 'admin', ARRAY['ingest:write','query:read','definitions:write','api_keys:write','data:delete','facets:write']::text[], '{}'::text[], ${q(defaultProjectId(tenantB))}, 'integration', NULL),
-  (${q(tenantA)}, ${q(tokenHash(keyAProject))}, ${q(keyAProject.slice(0, 16))}, 'integration-a-project', 'admin', ARRAY['ingest:write','query:read','data:delete']::text[], ARRAY[${q(projectACustom)}]::text[], ${q(projectACustom)}, 'integration', NULL)
+  (${q(tenantA)}, ${q(tokenHash(keyA))}, ${q(keyA.slice(0, 16))}, 'integration-a', 'admin', '{}'::text[], 'integration', NULL),
+  (${q(tenantB)}, ${q(tokenHash(keyB))}, ${q(keyB.slice(0, 16))}, 'integration-b', 'admin', '{}'::text[], 'integration', NULL)
 ON CONFLICT (key_hash) DO UPDATE
 SET organization_id = EXCLUDED.organization_id,
     name = EXCLUDED.name,
     role = EXCLUDED.role,
     scopes = EXCLUDED.scopes,
-    project_ids = EXCLUDED.project_ids,
-    default_project_id = EXCLUDED.default_project_id,
     revoked_at = NULL;
 
 INSERT INTO nanotrace_auth_users (subject, email, name, role, updated_at)
@@ -303,17 +283,13 @@ function replayTenantAEvents() {
   ];
 }
 
-async function postEvents(apiKey, events, projectId = "") {
-  const headers = {
-    authorization: `Bearer ${apiKey}`,
-    "content-type": "application/json",
-  };
-  if (projectId) {
-    headers["nanotrace-project-id"] = projectId;
-  }
+async function postEvents(apiKey, events) {
   const response = await fetch(`${baseUrl}/v1/events`, {
     method: "POST",
-    headers,
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify(events),
   });
   const body = await response.text();
@@ -822,208 +798,6 @@ FORMAT JSON
   }
 }
 
-async function assertProjectScopingAndDeletion() {
-  const projects = await fetchJson(`${baseUrl}/v1/projects`, {
-    headers: { authorization: `Bearer ${keyA}` },
-  });
-  const projectIds = new Set((projects.projects || []).map((project) => project.id));
-  assert(projectIds.has(projectADefault), `tenant A default project ${projectADefault} was not listed`);
-  assert(projectIds.has(projectACustom), `tenant A custom project ${projectACustom} was not listed`);
-
-  await postEvents(keyA, [
-    {
-      event_id: projectDefaultEventId,
-      timestamp: "2026-06-04T22:10:00.000Z",
-      data: {
-        event_type: "track",
-        name: "Default Project Probe",
-        project_bucket: "default",
-        _project: { run_id: projectRunId },
-      },
-    },
-  ]);
-  await postEvents(keyAProject, [
-    {
-      event_id: projectCustomEventId,
-      timestamp: "2026-06-04T22:10:01.000Z",
-      data: {
-        event_type: "track",
-        name: "Custom Project Probe",
-        project_bucket: "custom",
-        _project: { run_id: projectRunId },
-      },
-    },
-  ]);
-
-  const forbidden = await fetch(`${baseUrl}/v1/events`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${keyAProject}`,
-      "content-type": "application/json",
-      "nanotrace-project-id": projectADefault,
-    },
-    body: JSON.stringify([
-      {
-        event_id: projectForbiddenEventId,
-        timestamp: "2026-06-04T22:10:02.000Z",
-        data: {
-          event_type: "track",
-          name: "Forbidden Project Probe",
-          _project: { run_id: projectRunId },
-        },
-      },
-    ]),
-  });
-  assert(forbidden.status === 403, `restricted project key should not ingest default project, got ${forbidden.status}`);
-
-  await waitForProjectRows(2);
-  const stamped = await clickhouseJson(`
-SELECT event_id, tenant_id, project_id, toString(getSubcolumn(data, 'project_id')) AS data_project_id
-FROM ${ident(clickhouseDatabase)}.${ident(clickhouseTable)}
-WHERE getSubcolumn(data, '_project.run_id') = ${s(projectRunId)}
-ORDER BY event_id
-FORMAT JSON
-`);
-  assert(stamped.length === 2, `expected 2 project-scoped rows, got ${stamped.length}`);
-  const byEvent = new Map(stamped.map((row) => [row.event_id, row]));
-  assert(byEvent.get(projectDefaultEventId)?.project_id === projectADefault, "default ingest should stamp the default project id");
-  assert(byEvent.get(projectDefaultEventId)?.data_project_id === projectADefault, "default ingest should stamp data.project_id");
-  assert(byEvent.get(projectCustomEventId)?.project_id === projectACustom, "restricted project key should stamp custom project id");
-  assert(byEvent.get(projectCustomEventId)?.data_project_id === projectACustom, "restricted project key should stamp custom data.project_id");
-
-  const allProjects = await postEventsQuery(keyA, {
-    view: "summary",
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-    allow_stale_serving: true,
-  });
-  assert(Number((allProjects.data || [])[0]?.count ?? 0) === 2, "unrestricted key should query across projects by default");
-
-  const customOnly = await postEventsQuery(keyA, {
-    view: "summary",
-    projectScope: { projectIds: [projectACustom] },
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-    allow_stale_serving: true,
-  });
-  assert(Number((customOnly.data || [])[0]?.count ?? 0) === 1, "projectScope should narrow unrestricted query to custom project");
-
-  const restrictedDefault = await postEventsQuery(keyAProject, {
-    view: "summary",
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-    allow_stale_serving: true,
-  });
-  assert(Number((restrictedDefault.data || [])[0]?.count ?? 0) === 1, "restricted project key should default to its project scope");
-
-  const groupedByProject = await postEventsQuery(keyA, {
-    view: "groups",
-    groupBy: "project_id",
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-    limit: 10,
-    allow_stale_serving: true,
-  });
-  const groupedCounts = new Map(
-    (groupedByProject.data || []).map((row) => [row.value, Number(row.count || 0)]),
-  );
-  assert(groupedCounts.get(projectADefault) === 1, `groupBy project_id should include default project once, got ${JSON.stringify(groupedByProject.data || [])}`);
-  assert(groupedCounts.get(projectACustom) === 1, `groupBy project_id should include custom project once, got ${JSON.stringify(groupedByProject.data || [])}`);
-
-  const outOfScopeQuery = await fetch(`${baseUrl}/v1/query`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${keyAProject}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      type: "events",
-      view: "summary",
-      projectScope: { projectIds: [projectADefault] },
-      filter: {
-        facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-      },
-    }),
-  });
-  assert(outOfScopeQuery.status === 403, `restricted project key should reject out-of-scope query, got ${outOfScopeQuery.status}`);
-
-  const deletion = await createDeletion(keyA, {
-    projectScope: { projectIds: [projectACustom] },
-    from: "2026-06-04T22:09:59.000Z",
-    to: "2026-06-04T22:10:03.000Z",
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-  });
-  const completed = await waitForDeletion(deletion.deletion.deletion_id);
-  assert(completed.status === "completed", `deletion should complete, got ${completed.status}: ${completed.error}`);
-  assert(Number(completed.rows_matched || 0) === 1, `deletion should match one custom project row, got ${completed.rows_matched}`);
-
-  await waitUntil(async () => {
-    const rows = await clickhouseJson(`
-SELECT event_id, project_id
-FROM ${ident(clickhouseDatabase)}.${ident(clickhouseTable)}
-WHERE getSubcolumn(data, '_project.run_id') = ${s(projectRunId)}
-ORDER BY event_id
-FORMAT JSON
-`);
-    return rows.length === 1 && rows[0].event_id === projectDefaultEventId && rows[0].project_id === projectADefault
-      ? true
-      : null;
-  }, "custom project deletion visibility");
-
-  const deletedDetail = await fetch(`${baseUrl}/v1/events/${encodeURIComponent(projectCustomEventId)}`, {
-    headers: { authorization: `Bearer ${keyA}` },
-  });
-  assert(deletedDetail.status === 404, `deleted event detail should return 404, got ${deletedDetail.status}`);
-
-  const remainingDetail = await fetchJson(`${baseUrl}/v1/events/${encodeURIComponent(projectDefaultEventId)}`, {
-    headers: { authorization: `Bearer ${keyA}` },
-  });
-  assert(remainingDetail.event_id === projectDefaultEventId, "remaining default project event detail should still be readable");
-
-  const searchAfterDelete = await postSearchQuery(keyA, {
-    query: "Project Probe",
-    projectScope: { projectIds: [projectACustom] },
-    from: "2026-06-04T22:09:59.000Z",
-    to: "2026-06-04T22:10:03.000Z",
-    limit: 10,
-  });
-  assert((searchAfterDelete.data || []).length === 0, `custom project search should exclude deleted row, got ${JSON.stringify(searchAfterDelete.data || [])}`);
-
-  const densityAfterDelete = await postEventsQuery(keyA, {
-    view: "density",
-    projectScope: { projectIds: [projectACustom] },
-    timeRange: {
-      createdAfter: "2026-06-04T22:09:59.000Z",
-      createdBefore: "2026-06-04T22:10:03.000Z",
-    },
-    buckets: 4,
-    allow_stale_serving: true,
-  });
-  const densityCount = (densityAfterDelete.data || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
-  assert(densityCount === 0, `custom project density should exclude deleted row, got ${JSON.stringify(densityAfterDelete.data || [])}`);
-
-  const groupsAfterDelete = await postEventsQuery(keyA, {
-    view: "groups",
-    groupBy: "project_id",
-    filter: {
-      facets: [{ path: "_project.run_id", operator: "eq", value: projectRunId }],
-    },
-    limit: 10,
-    allow_stale_serving: true,
-  });
-  const afterDeleteCounts = new Map(
-    (groupsAfterDelete.data || []).map((row) => [row.value, Number(row.count || 0)]),
-  );
-  assert(afterDeleteCounts.get(projectADefault) === 1, `default project group should remain after deletion, got ${JSON.stringify(groupsAfterDelete.data || [])}`);
-  assert(!afterDeleteCounts.has(projectACustom), `custom project group should be gone after deletion, got ${JSON.stringify(groupsAfterDelete.data || [])}`);
-}
-
 async function assertSyntheticAnalyticsOracle() {
   const synthetic = buildSyntheticAnalyticsOracle(syntheticPointCount, syntheticSessionsPerBatch);
   console.log(
@@ -1408,7 +1182,7 @@ function runTableflowMaterializerOnce() {
       "server",
       "/usr/local/bin/nanotrace-lakehouse-rebuild",
     ],
-    { timeout: 900_000 },
+    { timeout: 300_000 },
   );
 }
 
@@ -1744,17 +1518,6 @@ async function postEventsQueryWithCookie(cookie, body) {
   });
 }
 
-async function postSearchQuery(apiKey, body) {
-  return fetchJson(`${baseUrl}/v1/query`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ type: "search", ...body }),
-  });
-}
-
 async function postMeasureQuery(apiKey, body) {
   return fetchJson(`${baseUrl}/v1/query`, {
     method: "POST",
@@ -1821,33 +1584,6 @@ async function createDefinition(apiKey, body) {
   });
 }
 
-async function createDeletion(apiKey, body) {
-  return fetchJson(`${baseUrl}/v1/deletions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-}
-
-async function waitForDeletion(deletionId) {
-  return waitUntil(async () => {
-    const response = await fetchJson(`${baseUrl}/v1/deletions/${encodeURIComponent(deletionId)}`, {
-      headers: { authorization: `Bearer ${keyA}` },
-    });
-    const deletion = response.deletion;
-    if (deletion?.status === "completed") {
-      return deletion;
-    }
-    if (deletion?.status === "failed") {
-      throw new Error(`deletion failed: ${deletion.error}`);
-    }
-    return null;
-  }, `deletion ${deletionId}`, 120_000, 1_000);
-}
-
 async function fetchJson(url, init = {}) {
   const response = await fetch(url, init);
   const text = await response.text();
@@ -1889,18 +1625,6 @@ FORMAT JSON
 `);
     return Number(rows[0]?.count || 0) >= expected ? true : null;
   }, `${expected} ClickHouse rows`);
-}
-
-async function waitForProjectRows(expected) {
-  await waitUntil(async () => {
-    const rows = await clickhouseJson(`
-SELECT count() AS count
-FROM ${ident(clickhouseDatabase)}.${ident(clickhouseTable)}
-WHERE getSubcolumn(data, '_project.run_id') = ${s(projectRunId)}
-FORMAT JSON
-`);
-    return Number(rows[0]?.count || 0) >= expected ? true : null;
-  }, `${expected} project ClickHouse rows`);
 }
 
 async function waitForClickHouseEventRows(eventId, expected) {
@@ -1999,10 +1723,6 @@ function hasDefinition(definitions, kind, name) {
 
 function tokenHash(token) {
   return createHash("sha256").update(token).digest("hex");
-}
-
-function defaultProjectId(organizationId) {
-  return `proj_${createHash("md5").update(`${organizationId}:default`).digest("hex").slice(0, 24)}`;
 }
 
 function sessionCookie(token = sessionToken) {

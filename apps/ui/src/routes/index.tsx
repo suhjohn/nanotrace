@@ -2,7 +2,7 @@ import { Link, createFileRoute, useNavigate } from '@tanstack/react-router'
 import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { InfiniteData } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, ChevronDown, Columns3, FolderKanban, KeyRound, LogOut, PanelLeftOpen, Plus, Trash2, UserCircle, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Calendar as CalendarIcon, Check, ChevronDown, Columns3, KeyRound, LogOut, PanelLeftOpen, UserCircle, X } from 'lucide-react'
 import { format } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -348,16 +348,6 @@ type CreatedApiKey = {
   api_key: ApiKeyRecord
 }
 
-type ProjectRecord = {
-  id: string
-  organization_id: string
-  slug: string
-  name: string
-  created_at: string
-  updated_at: string
-  archived_at?: string | null
-}
-
 export type RouteSelection = {
   field: string
   value: string
@@ -648,8 +638,6 @@ export function ObservatoryHome({
   const [freshEventIds, setFreshEventIds] = useState<string[]>([])
   const [selectedCanvasSpanId, setSelectedCanvasSpanId] = useState('')
   const [filter, setFilter] = useState('')
-  const [projectSelectOpen, setProjectSelectOpen] = useState(false)
-  const [projectNameDraft, setProjectNameDraft] = useState('')
   const [groupSelectOpen, setGroupSelectOpen] = useState(false)
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
@@ -675,41 +663,9 @@ export function ObservatoryHome({
   const previousGroupKeyRef = useRef('')
   const workspaceRef = useRef<HTMLElement | null>(null)
   const arrowKeyScopeRef = useRef<'events' | 'local'>('events')
-  const [selectedProjectId, setSelectedProjectId] = useCookieState<string>({
-    cookieName: 'observatory-ui-project-id',
-    initialValue: '',
-    parse: String
-  })
-  const selectedProjectScope = useMemo(
-    () => selectedProjectId ? { projectIds: [selectedProjectId] } : undefined,
-    [selectedProjectId]
-  )
-  const selectedProjectScopeKey = selectedProjectId || 'all'
-  const projectsQuery = useQuery({
-    queryKey: ['projects', observatoryUrl],
-    queryFn: () => fetchProjects({ apiBaseUrl: observatoryUrl }),
-    retry: false
-  })
-  const projects = projectsQuery.data?.projects ?? []
-  const selectedProject = projects.find(project => project.id === selectedProjectId) ?? null
-  const createProjectMutation = useMutation({
-    mutationFn: (name: string) => createProject({ apiBaseUrl: observatoryUrl, name }),
-    onSuccess: async project => {
-      setProjectNameDraft('')
-      selectProject(project.id)
-      await queryClient.invalidateQueries({ queryKey: ['projects', observatoryUrl] })
-    }
-  })
-  const archiveProjectMutation = useMutation({
-    mutationFn: (projectId: string) => archiveProject({ apiBaseUrl: observatoryUrl, projectId }),
-    onSuccess: async () => {
-      selectProject('')
-      await queryClient.invalidateQueries({ queryKey: ['projects', observatoryUrl] })
-    }
-  })
   const groupOptionsQuery = useQuery({
-    queryKey: ['logs', observatoryUrl, 'group-options', selectedProjectScopeKey],
-    queryFn: () => fetchGroupOptions({ apiBaseUrl: observatoryUrl, limit: 120, projectScope: selectedProjectScope })
+    queryKey: ['logs', observatoryUrl, 'group-options'],
+    queryFn: () => fetchGroupOptions({ apiBaseUrl: observatoryUrl, limit: 120 })
   })
   const groupOptions = groupOptionsQuery.data?.fields ?? emptyGroupOptions
   const activeFacetPaths = useMemo(() => {
@@ -782,8 +738,7 @@ export function ObservatoryHome({
       groupListTimeRange.createdAfter ?? '',
       groupListTimeRange.createdBefore ?? '',
       groupSortKey,
-      groupSearch,
-      selectedProjectScopeKey
+      groupSearch
     ],
     queryFn: ({ pageParam }) =>
       fetchGroups({
@@ -791,7 +746,6 @@ export function ObservatoryHome({
         groupBy,
         limit: groupPageSize,
         offset: pageParam,
-        projectScope: selectedProjectScope,
         search: groupSearch,
         sortKey: groupSortKey,
         timeRange: groupListTimeRange
@@ -823,28 +777,26 @@ export function ObservatoryHome({
   const needsLatest = Boolean(groupBy && selectedGroupValue && !selectedGroupSummary?.endedAt)
   const latestQuery = useQuery({
     enabled: needsLatest,
-    queryKey: ['logs', observatoryUrl, 'latest', groupBy, selectedGroupValue, selectedProjectScopeKey],
-    queryFn: () => fetchLatest({ apiBaseUrl: observatoryUrl, groupBy, projectScope: selectedProjectScope, selectedGroupValue }),
+    queryKey: ['logs', observatoryUrl, 'latest', groupBy, selectedGroupValue],
+    queryFn: () => fetchLatest({ apiBaseUrl: observatoryUrl, groupBy, selectedGroupValue }),
     retry: false
   })
   const latestCreatedAt = selectedGroupSummary?.endedAt || latestQuery.data?.lastCreatedAt
   const eventDataKey = [
     eventScopeKey,
     serializeEventFilter(eventFilterParams),
-    selectedTimeRangeCacheKey,
-    selectedProjectScopeKey
+    selectedTimeRangeCacheKey
   ].join('\u0000')
   const eventAnchorTimestamp = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.timestamp : ''
   const eventAnchorEventId = eventAnchorOverride?.key === eventDataKey ? eventAnchorOverride.eventId : ''
   const summaryQuery = useQuery({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, selectedProjectScopeKey],
+    queryKey: ['logs', observatoryUrl, 'summary', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
       fetchSummary({
         apiBaseUrl: observatoryUrl,
         eventFilter: eventFilterParams,
         groupBy,
-        projectScope: selectedProjectScope,
         selectedGroupValue,
         timeRange: selectedTimeRange
       }),
@@ -855,7 +807,7 @@ export function ObservatoryHome({
   const graphModeBeforeFlamegraph = flamegraphDisabledBySummary ? 'histogram' : selectedGraphMode
   const eventsQuery = useInfiniteQuery<LogEventsPage, Error, InfiniteData<LogEventsPage>, (string | ParsedEventFilter)[], EventPageParam>({
     enabled: Boolean(hasEventQuery),
-    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventAnchorEventId, effectiveEventSortDirection, selectedProjectScopeKey],
+    queryKey: ['logs', observatoryUrl, 'events', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, eventAnchorTimestamp, eventAnchorEventId, effectiveEventSortDirection],
     initialPageParam: (eventAnchorTimestamp ? { around: eventAnchorTimestamp, eventId: eventAnchorEventId } : {}) as EventPageParam,
     queryFn: ({ pageParam }) =>
       fetchEvents({
@@ -864,7 +816,6 @@ export function ObservatoryHome({
         groupBy,
         limit: 100,
         pageParam,
-        projectScope: selectedProjectScope,
         selectedGroupValue,
         sortDirection: effectiveEventSortDirection,
         timeRange: selectedTimeRange
@@ -889,14 +840,13 @@ export function ObservatoryHome({
   })
   const flamegraphQuery = useQuery({
     enabled: Boolean(viewingGroupedEvents && hasEventQuery && summaryQuery.data && graphModeBeforeFlamegraph === 'flamegraph'),
-    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, selectedProjectScopeKey],
+    queryKey: ['logs', observatoryUrl, 'flamegraph', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
       fetchFlamegraph({
         apiBaseUrl: observatoryUrl,
         eventFilter: eventFilterParams,
         groupBy,
         maxSpans: 20_000,
-        projectScope: selectedProjectScope,
         selectedGroupValue,
         timeRange: selectedTimeRange
       }),
@@ -907,14 +857,13 @@ export function ObservatoryHome({
   const graphMode = flamegraphDisabled ? 'histogram' : selectedGraphMode
   const densityQuery = useQuery({
     enabled: Boolean(hasEventQuery && summaryQuery.data && graphMode === 'histogram'),
-    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey, selectedProjectScopeKey],
+    queryKey: ['logs', observatoryUrl, 'density', groupBy, selectedGroupValue, eventFilterParams, selectedTimeRangeCacheKey],
     queryFn: () =>
       fetchDensity({
         apiBaseUrl: observatoryUrl,
         buckets: 700,
         eventFilter: eventFilterParams,
         groupBy,
-        projectScope: selectedProjectScope,
         selectedGroupValue,
         timeRange: selectedTimeRange
       }),
@@ -1087,10 +1036,6 @@ export function ObservatoryHome({
         }
       : null
   const flamegraph = flamegraphQuery.data ?? emptyFlamegraph
-  const projectError =
-    errorMessage(projectsQuery.error) ||
-    errorMessage(createProjectMutation.error) ||
-    errorMessage(archiveProjectMutation.error)
   const listError = errorMessage(groupOptionsQuery.error) || errorMessage(groupsQuery.error)
   const traceError =
     (!hasEventQuery && needsLatest ? errorMessage(latestQuery.error) : '') ||
@@ -1167,32 +1112,6 @@ export function ObservatoryHome({
         groupBy: undefined
       })
     } as never)
-  }
-
-  function selectProject(projectId: string) {
-    resetEventScope('all-events', { force: true })
-    setFilter('')
-    setEventSearch('')
-    setSelectedProjectId(projectId)
-    setProjectSelectOpen(false)
-  }
-
-  function submitCreateProject() {
-    const name = projectNameDraft.trim()
-    if (!name || createProjectMutation.isPending) {
-      return
-    }
-    createProjectMutation.mutate(name)
-  }
-
-  function deleteSelectedProject() {
-    if (!selectedProjectId || archiveProjectMutation.isPending) {
-      return
-    }
-    if (!window.confirm(`Delete ${selectedProject?.name ?? 'this project'}?`)) {
-      return
-    }
-    archiveProjectMutation.mutate(selectedProjectId)
   }
 
   function selectGroupBySearch(nextGroupBy: string) {
@@ -1334,12 +1253,6 @@ export function ObservatoryHome({
   }, [eventScopeKey])
 
   useEffect(() => {
-    if (selectedProjectId && projects.length > 0 && !projects.some(project => project.id === selectedProjectId)) {
-      selectProject('')
-    }
-  }, [projects, selectedProjectId])
-
-  useEffect(() => {
     if (eventFilterSearchText === undefined) {
       return
     }
@@ -1387,12 +1300,11 @@ export function ObservatoryHome({
           : '/events',
         eventTableFilterKey,
         selectedTimeRangeCacheKey,
-        selectedProjectScopeKey,
         effectiveEventSortDirection,
         eventAnchorTimestamp,
         eventAnchorEventId
       ].join('\u0000'),
-    [effectiveEventSortDirection, eventAnchorEventId, eventAnchorTimestamp, eventTableFilterKey, groupBy, selectedGroupValue, selectedProjectScopeKey, selectedTimeRangeCacheKey, viewingGroupedEvents]
+    [effectiveEventSortDirection, eventAnchorEventId, eventAnchorTimestamp, eventTableFilterKey, groupBy, selectedGroupValue, selectedTimeRangeCacheKey, viewingGroupedEvents]
   )
   const selectedEventColumnsForTrace = useMemo(() => {
     if (!eventDetail) return selectedEventColumns
@@ -1406,8 +1318,8 @@ export function ObservatoryHome({
     null
   const eventPayloadQuery = useQuery({
     enabled: Boolean(selectedEventId),
-    queryKey: ['logs', observatoryUrl, 'event', selectedEventId, selectedProjectScopeKey],
-    queryFn: () => fetchEvent({ apiBaseUrl: observatoryUrl, eventId: selectedEventId, projectScope: selectedProjectScope }),
+    queryKey: ['logs', observatoryUrl, 'event', selectedEventId],
+    queryFn: () => fetchEvent({ apiBaseUrl: observatoryUrl, eventId: selectedEventId }),
     retry: false
   })
   const inspectedEvent = eventPayloadQuery.data?.event ?? (eventPayloadQuery.isFetching ? null : selectedEvent)
@@ -1593,21 +1505,6 @@ export function ObservatoryHome({
             </button>
           </div>
         ) : null}
-        <ProjectSelector
-          creating={createProjectMutation.isPending}
-          deleting={archiveProjectMutation.isPending}
-          nameDraft={projectNameDraft}
-          open={projectSelectOpen}
-          projects={projects}
-          selectedProject={selectedProject}
-          selectedProjectId={selectedProjectId}
-          loading={projectsQuery.isPending}
-          onCreate={submitCreateProject}
-          onDeleteSelected={deleteSelectedProject}
-          onNameDraftChange={setProjectNameDraft}
-          onOpenChange={setProjectSelectOpen}
-          onSelect={selectProject}
-        />
         <form
           className="flex min-w-0 flex-1 items-center gap-1.5"
           onSubmit={event => {
@@ -1704,11 +1601,6 @@ export function ObservatoryHome({
       {listError ? (
         <div className="border-b border-neutral-800 bg-neutral-950 px-3 py-2 text-white">
           Trace list failed: {listError}
-        </div>
-      ) : null}
-      {projectError ? (
-        <div className="border-b border-neutral-800 bg-neutral-950 px-3 py-2 text-white">
-          Projects failed: {projectError}
         </div>
       ) : null}
       {traceError ? (
@@ -2043,161 +1935,6 @@ function ResizeHandle({ onPointerDown }: { onPointerDown: () => void }) {
     >
       <div className="absolute inset-y-0 -left-[3px] w-[6px] group-hover:bg-white" />
     </div>
-  )
-}
-
-function ProjectSelector({
-  creating,
-  deleting,
-  loading,
-  nameDraft,
-  onCreate,
-  onDeleteSelected,
-  onNameDraftChange,
-  onOpenChange,
-  onSelect,
-  open,
-  projects,
-  selectedProject,
-  selectedProjectId
-}: {
-  creating: boolean
-  deleting: boolean
-  loading: boolean
-  nameDraft: string
-  onCreate: () => void
-  onDeleteSelected: () => void
-  onNameDraftChange: (value: string) => void
-  onOpenChange: (open: boolean) => void
-  onSelect: (projectId: string) => void
-  open: boolean
-  projects: ProjectRecord[]
-  selectedProject: ProjectRecord | null
-  selectedProjectId: string
-}) {
-  const label = selectedProject ? selectedProject.name : 'All projects'
-  const canDelete = Boolean(selectedProjectId && selectedProject)
-
-  return (
-    <div className="flex shrink-0 items-center gap-1.5">
-      <span className="text-[10px] uppercase tracking-[0.08em] text-neutral-500">Project</span>
-      <Popover open={open} onOpenChange={onOpenChange}>
-        <PopoverTrigger asChild>
-          <button
-            aria-expanded={open}
-            aria-label="Project"
-            className="flex h-7 w-[180px] items-center justify-between gap-2 border border-neutral-800 bg-black px-2 text-left text-[12px] text-neutral-200 outline-none hover:bg-white/[0.04] focus:border-neutral-600"
-            role="combobox"
-            type="button"
-          >
-            <span className="flex min-w-0 items-center gap-1.5">
-              <FolderKanban size={13} strokeWidth={1.8} className="shrink-0 text-neutral-500" />
-              <span className="min-w-0 truncate">{loading ? 'Loading projects' : label}</span>
-            </span>
-            <ChevronDown size={13} strokeWidth={1.8} className="shrink-0 text-neutral-500" />
-          </button>
-        </PopoverTrigger>
-        <PopoverContent align="start" className="w-[260px] p-1">
-          <div className="grid gap-1">
-            <div className="max-h-[260px] overflow-y-auto" role="listbox">
-              <ProjectSelectItem
-                selected={!selectedProjectId}
-                subtitle="Cross-project"
-                title="All projects"
-                onSelect={() => onSelect('')}
-              />
-              {projects.map(project => (
-                <ProjectSelectItem
-                  key={project.id}
-                  selected={project.id === selectedProjectId}
-                  subtitle={project.slug}
-                  title={project.name}
-                  onSelect={() => onSelect(project.id)}
-                />
-              ))}
-              {loading ? (
-                <div className="px-2 py-2 text-[12px] text-neutral-600">Loading projects...</div>
-              ) : null}
-              {!loading && projects.length === 0 ? (
-                <div className="px-2 py-2 text-[12px] text-neutral-600">No active projects.</div>
-              ) : null}
-            </div>
-            <form
-              className="flex items-center gap-1 border-t border-neutral-800 pt-1"
-              onSubmit={event => {
-                event.preventDefault()
-                onCreate()
-              }}
-            >
-              <input
-                aria-label="Project name"
-                className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
-                value={nameDraft}
-                onChange={event => onNameDraftChange(event.target.value)}
-                placeholder="new project name"
-              />
-              <button
-                aria-label="Create project"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-300 hover:bg-white/[0.04] hover:text-white disabled:cursor-not-allowed disabled:text-neutral-700"
-                disabled={creating || !nameDraft.trim()}
-                title="Create project"
-                type="submit"
-              >
-                <Plus size={13} strokeWidth={1.8} />
-              </button>
-            </form>
-            <div className="flex items-center justify-between gap-2 border-t border-neutral-800 pt-1">
-              <span className="min-w-0 truncate px-1 text-[11px] text-neutral-600">
-                {selectedProject ? selectedProject.slug : 'All active projects'}
-              </span>
-              <button
-                aria-label="Delete selected project"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center border border-neutral-800 bg-black text-neutral-400 hover:border-red-900/70 hover:bg-red-950/30 hover:text-red-200 disabled:cursor-not-allowed disabled:text-neutral-800"
-                disabled={!canDelete || deleting}
-                title="Delete selected project"
-                type="button"
-                onClick={onDeleteSelected}
-              >
-                <Trash2 size={13} strokeWidth={1.8} />
-              </button>
-            </div>
-          </div>
-        </PopoverContent>
-      </Popover>
-    </div>
-  )
-}
-
-function ProjectSelectItem({
-  onSelect,
-  selected,
-  subtitle,
-  title
-}: {
-  onSelect: () => void
-  selected: boolean
-  subtitle: string
-  title: string
-}) {
-  return (
-    <button
-      aria-selected={selected}
-      className={cn(
-        'relative grid w-full gap-0.5 px-2 py-1.5 pr-7 text-left outline-none hover:bg-white/[0.07]',
-        selected ? 'text-white' : 'text-neutral-300'
-      )}
-      role="option"
-      type="button"
-      onClick={onSelect}
-    >
-      <span className="min-w-0 truncate text-[12px]">{title}</span>
-      <span className="min-w-0 truncate text-[11px] text-neutral-600">{subtitle}</span>
-      {selected ? (
-        <span className="absolute right-2 top-2 inline-flex items-center justify-center">
-          <Check size={12} strokeWidth={1.8} />
-        </span>
-      ) : null}
-    </button>
   )
 }
 
@@ -4726,7 +4463,6 @@ type EventsQueryRequest = {
     group?: GroupSortKey
   }
   page?: EventPageParam & { eventId?: string }
-  projectScope?: ProjectScope
   search?: string
   selectedGroupValue?: string
   sort?: {
@@ -4735,10 +4471,6 @@ type EventsQueryRequest = {
   }
   timeRange?: ResolvedTimeRange
   view: 'density' | 'event' | 'events' | 'flamegraph' | 'group_options' | 'groups' | 'latest' | 'summary'
-}
-
-type ProjectScope = {
-  projectIds: string[]
 }
 
 type TimeDomain = {
@@ -4801,12 +4533,10 @@ const groupableFields = [
 
 async function fetchGroupOptions({
   apiBaseUrl,
-  limit,
-  projectScope
+  limit
 }: {
   apiBaseUrl: string
   limit: number
-  projectScope?: ProjectScope
 }): Promise<{ fields: GroupOption[] }> {
   const response = await postEventsQuery<{
     aggregateEnabled?: boolean
@@ -4819,7 +4549,7 @@ async function fetchGroupOptions({
     valueType: string
   }>({
     apiBaseUrl,
-    request: { limit, projectScope, view: 'group_options' }
+    request: { limit, view: 'group_options' }
   })
   const dynamicFields = (response.data ?? []).map(field => ({
     cardinality: Number(field.cardinality) || 0,
@@ -4850,7 +4580,6 @@ async function fetchGroups({
   groupBy,
   limit,
   offset,
-  projectScope,
   search,
   sortKey,
   timeRange
@@ -4859,7 +4588,6 @@ async function fetchGroups({
   groupBy: string
   limit: number
   offset: number
-  projectScope?: ProjectScope
   search: string
   sortKey: GroupSortKey
   timeRange: ResolvedTimeRange
@@ -4878,7 +4606,6 @@ async function fetchGroups({
       limit,
       offset,
       orderBy: { group: sortKey },
-      projectScope,
       search,
       timeRange,
       view: 'groups'
@@ -4964,19 +4691,16 @@ function groupOrderByClause({
 async function fetchLatest({
   apiBaseUrl,
   groupBy,
-  projectScope,
   selectedGroupValue
 }: {
   apiBaseUrl: string
   groupBy: string
-  projectScope?: ProjectScope
   selectedGroupValue: string
 }): Promise<LogLatest> {
   const response = await postEventsQuery<{ lastCreatedAt: string }>({
     apiBaseUrl,
     request: {
       groupBy,
-      projectScope,
       selectedGroupValue,
       view: 'latest'
     }
@@ -4988,14 +4712,12 @@ async function fetchSummary({
   apiBaseUrl,
   eventFilter,
   groupBy,
-  projectScope,
   selectedGroupValue,
   timeRange
 }: {
   apiBaseUrl: string
   eventFilter: ParsedEventFilter
   groupBy: string
-  projectScope?: ProjectScope
   selectedGroupValue: string
   timeRange: ResolvedTimeRange
 }): Promise<LogSummary> {
@@ -5004,7 +4726,6 @@ async function fetchSummary({
     request: {
       filter: eventFilter,
       groupBy,
-      projectScope,
       selectedGroupValue,
       timeRange,
       view: 'summary'
@@ -5020,7 +4741,6 @@ async function fetchEvents({
   groupBy,
   limit,
   pageParam,
-  projectScope,
   selectedGroupValue,
   sortDirection,
   timeRange
@@ -5030,12 +4750,11 @@ async function fetchEvents({
   groupBy: string
   limit: number
   pageParam: EventPageParam
-  projectScope?: ProjectScope
   selectedGroupValue: string
   sortDirection: EventSortDirection
   timeRange?: ResolvedTimeRange
 }): Promise<LogEventsPage> {
-  const response = await postEventsQuery<EventRow>({
+  const response = await postEventsQuery<FlamegraphEventRow>({
     apiBaseUrl,
     request: {
       filter: eventFilter,
@@ -5043,13 +4762,12 @@ async function fetchEvents({
       limit,
       orderBy: { direction: sortDirection },
       page: pageParam,
-      projectScope,
       selectedGroupValue,
       timeRange,
       view: 'events'
     }
   })
-  const events = (response.data ?? []).map(rowToTraceEvent)
+  const events = (response.data ?? []).map(rowToFlamegraphEvent)
   const loadedTowardTop = sortDirection === 'desc' ? Boolean(pageParam.after) : Boolean(pageParam.before)
 
   return {
@@ -5075,7 +4793,6 @@ async function fetchFlamegraph({
   eventFilter,
   groupBy,
   maxSpans,
-  projectScope,
   selectedGroupValue,
   timeRange
 }: {
@@ -5083,7 +4800,6 @@ async function fetchFlamegraph({
   eventFilter: ParsedEventFilter
   groupBy: string
   maxSpans: number
-  projectScope?: ProjectScope
   selectedGroupValue: string
   timeRange: ResolvedTimeRange
 }): Promise<LogFlamegraph> {
@@ -5093,7 +4809,6 @@ async function fetchFlamegraph({
       filter: eventFilter,
       groupBy,
       limit: maxSpans,
-      projectScope,
       selectedGroupValue,
       timeRange,
       view: 'flamegraph'
@@ -5114,7 +4829,6 @@ async function fetchDensity({
   buckets,
   eventFilter,
   groupBy,
-  projectScope,
   selectedGroupValue,
   timeRange
 }: {
@@ -5122,7 +4836,6 @@ async function fetchDensity({
   buckets: number
   eventFilter: ParsedEventFilter
   groupBy: string
-  projectScope?: ProjectScope
   selectedGroupValue: string
   timeRange: ResolvedTimeRange
 }): Promise<LogDensity> {
@@ -5132,7 +4845,6 @@ async function fetchDensity({
       buckets,
       filter: eventFilter,
       groupBy,
-      projectScope,
       selectedGroupValue,
       timeRange,
       view: 'density'
@@ -5162,34 +4874,29 @@ async function fetchDensity({
 
 async function fetchEvent({
   apiBaseUrl,
-  eventId,
-  projectScope
+  eventId
 }: {
   apiBaseUrl: string
   eventId: string
-  projectScope?: ProjectScope
 }): Promise<LogEventPayload> {
-  if (!projectScope) {
-    try {
-      const response = await fetch(eventUrl(apiBaseUrl, eventId), {
-        credentials: 'include',
-        headers: queryHeaders(),
-        method: 'GET'
-      })
-      if (response.ok) {
-        const row = await response.json() as EventRow
-        return { event: rowToTraceEvent(row) }
-      }
-    } catch {
-      // Fall back to the read-only query endpoint when direct event reconstruction fails.
+  try {
+    const response = await fetch(eventUrl(apiBaseUrl, eventId), {
+      credentials: 'include',
+      headers: queryHeaders(),
+      method: 'GET'
+    })
+    if (response.ok) {
+      const row = await response.json() as EventRow
+      return { event: rowToTraceEvent(row) }
     }
+  } catch {
+    // Fall back to the read-only query endpoint when direct event reconstruction fails.
   }
 
   const response = await postEventsQuery<EventRow>({
     apiBaseUrl,
     request: {
       page: { eventId },
-      projectScope,
       view: 'event'
     }
   })
@@ -5507,62 +5214,6 @@ async function requestLoginLink({
   return (await response.json()) as { ok: boolean }
 }
 
-async function fetchProjects({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ projects: ProjectRecord[] }> {
-  const response = await fetch(projectsUrl(apiBaseUrl), {
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'GET'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  return (await response.json()) as { projects: ProjectRecord[] }
-}
-
-async function createProject({
-  apiBaseUrl,
-  name
-}: {
-  apiBaseUrl: string
-  name: string
-}): Promise<ProjectRecord> {
-  const response = await fetch(projectsUrl(apiBaseUrl), {
-    body: JSON.stringify({ name: name.trim() }),
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'POST'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  const body = (await response.json()) as { project?: ProjectRecord }
-  if (!body.project) throw new HTTPError({ message: 'project response missing project', status: 502 })
-  return body.project
-}
-
-async function archiveProject({
-  apiBaseUrl,
-  projectId
-}: {
-  apiBaseUrl: string
-  projectId: string
-}): Promise<ProjectRecord> {
-  const response = await fetch(`${projectsUrl(apiBaseUrl)}/${encodeURIComponent(projectId)}`, {
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'DELETE'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({ message: text || response.statusText, status: response.status })
-  }
-  const body = (await response.json()) as { project?: ProjectRecord }
-  if (!body.project) throw new HTTPError({ message: 'project response missing project', status: 502 })
-  return body.project
-}
-
 async function fetchApiKeys({ apiBaseUrl }: { apiBaseUrl: string }): Promise<{ api_keys: ApiKeyRecord[] }> {
   const response = await fetch(apiKeysUrl(apiBaseUrl), {
     credentials: 'include',
@@ -5714,11 +5365,6 @@ function authUrl(apiBaseUrl: string, path: string) {
 function apiKeysUrl(apiBaseUrl: string) {
   const base = apiBaseUrl.trim().replace(/\/+$/, '')
   return base ? `${base}/v1/api-keys` : '/v1/api-keys'
-}
-
-function projectsUrl(apiBaseUrl: string) {
-  const base = apiBaseUrl.trim().replace(/\/+$/, '')
-  return base ? `${base}/v1/projects` : '/v1/projects'
 }
 
 function resolveTimeRange({

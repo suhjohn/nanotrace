@@ -6,10 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use nanotrace_ingest::{
-    DEFAULT_ICEBERG_TOPIC, DEFAULT_INGEST_TOPIC, DEFAULT_INVALID_TOPIC, DEFAULT_NORMALIZED_TOPIC,
-    DEFAULT_TABLEFLOW_TOPIC, HEADER_ORGANIZATION_ID, HEADER_PROJECT_ID, HEADER_RECEIVED_AT,
-    HEADER_TENANT_ID, ManagedDefinitionSpec, consumer, count_ndjson_rows, header_value,
-    normalize_json_batch, producer, subscribe,
+    DEFAULT_INGEST_TOPIC, DEFAULT_INVALID_TOPIC, DEFAULT_NORMALIZED_TOPIC, DEFAULT_TABLEFLOW_TOPIC,
+    HEADER_ORGANIZATION_ID, HEADER_RECEIVED_AT, HEADER_TENANT_ID, ManagedDefinitionSpec, consumer,
+    count_ndjson_rows, header_value, normalize_json_batch, producer, subscribe,
 };
 use rdkafka::{
     Message,
@@ -27,7 +26,6 @@ struct Config {
     ingest_topic: String,
     normalized_topic: String,
     tableflow_topic: String,
-    iceberg_topic: String,
     invalid_topic: String,
     group_id: String,
     client_id: String,
@@ -66,7 +64,6 @@ async fn main() -> Result<()> {
         ingest_topic = cfg.ingest_topic,
         normalized_topic = cfg.normalized_topic,
         tableflow_topic = cfg.tableflow_topic,
-        iceberg_topic = cfg.iceberg_topic,
         invalid_topic = cfg.invalid_topic,
         clickhouse_enabled = cfg.clickhouse_url.is_some(),
         "nanotrace normalizer starting"
@@ -119,9 +116,6 @@ async fn process_message(
     let organization_id = header_value(message, HEADER_ORGANIZATION_ID)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| tenant_id.clone());
-    let project_id = header_value(message, HEADER_PROJECT_ID)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing {HEADER_PROJECT_ID} header"))?;
     let received_at = header_value(message, HEADER_RECEIVED_AT)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(chrono_like_now);
@@ -143,14 +137,12 @@ async fn process_message(
         payload,
         &tenant_id,
         &organization_id,
-        &project_id,
         &source_file,
         &received_at,
         cfg.max_event_bytes,
     );
 
     let mut tableflow_publish_ms = 0_u64;
-    let mut iceberg_publish_ms = 0_u64;
     let mut invalid_insert_ms = 0_u64;
     let mut clickhouse_inserted = false;
 
@@ -173,22 +165,6 @@ async fn process_message(
         .await
         .context("produce Tableflow batch")?;
         tableflow_publish_ms = elapsed_ms(publish_started.elapsed());
-
-        let publish_started = Instant::now();
-        let iceberg_payloads = iceberg_row_payloads(
-            &batch.normalized,
-            message,
-            &tenant_id,
-            &organization_id,
-            &received_at,
-        )
-        .context("build Iceberg row payloads")?;
-        for payload in iceberg_payloads {
-            produce_bytes(producer, &cfg.iceberg_topic, &tenant_id, &payload)
-                .await
-                .context("produce Iceberg row")?;
-        }
-        iceberg_publish_ms = elapsed_ms(publish_started.elapsed());
     }
     if !batch.invalid.is_empty() {
         let invalid_dedupe_token = format!("{token_prefix}:invalid");
@@ -241,9 +217,7 @@ async fn process_message(
         normalized_bytes = batch.normalized.len(),
         invalid_bytes = batch.invalid.len(),
         tableflow_topic = cfg.tableflow_topic,
-        iceberg_topic = cfg.iceberg_topic,
         tableflow_publish_ms,
-        iceberg_publish_ms,
         invalid_insert_ms,
         elapsed_ms = started_at.elapsed().as_millis(),
         "normalized ingest message"
@@ -375,7 +349,6 @@ impl Config {
             ingest_topic: env_or("NANOTRACE_KAFKA_INGEST_TOPIC", DEFAULT_INGEST_TOPIC),
             normalized_topic: env_or("NANOTRACE_KAFKA_NORMALIZED_TOPIC", DEFAULT_NORMALIZED_TOPIC),
             tableflow_topic: env_or("NANOTRACE_KAFKA_TABLEFLOW_TOPIC", DEFAULT_TABLEFLOW_TOPIC),
-            iceberg_topic: env_or("NANOTRACE_KAFKA_ICEBERG_TOPIC", DEFAULT_ICEBERG_TOPIC),
             invalid_topic: env_or("NANOTRACE_KAFKA_INVALID_TOPIC", DEFAULT_INVALID_TOPIC),
             group_id: env_or("NANOTRACE_NORMALIZER_GROUP_ID", "nanotrace-normalizer"),
             client_id: env_or("NANOTRACE_NORMALIZER_CLIENT_ID", "nanotrace-normalizer"),
@@ -496,70 +469,6 @@ fn tableflow_batch_payload(
     let mut output = serde_json::to_vec(&row).context("serialize Tableflow batch row")?;
     output.push(b'\n');
     Ok(output)
-}
-
-fn iceberg_row_payloads(
-    normalized_ndjson: &[u8],
-    message: &rdkafka::message::BorrowedMessage<'_>,
-    tenant_id: &str,
-    organization_id: &str,
-    received_at: &str,
-) -> Result<Vec<Vec<u8>>> {
-    let mut payloads = Vec::new();
-    let batch_id = format!(
-        "{}:{}:{}",
-        message.topic(),
-        message.partition(),
-        message.offset()
-    );
-    for (event_index, line) in normalized_ndjson
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        let event = serde_json::from_slice::<serde_json::Value>(line)
-            .context("parse normalized event row for Iceberg")?;
-        let data_json =
-            serde_json::to_string(event.get("data").unwrap_or(&serde_json::Value::Null))
-                .context("serialize Iceberg event data")?;
-        let timestamp = json_string(&event, "timestamp");
-        let row = serde_json::json!({
-            "schema_version": 1,
-            "batch_id": &batch_id,
-            "tenant_id": tenant_id,
-            "organization_id": organization_id,
-            "received_at": received_at,
-            "ingest_source_topic": message.topic(),
-            "ingest_source_partition": message.partition(),
-            "ingest_source_offset": message.offset(),
-            "event_index": event_index,
-            "event_id": json_string(&event, "event_id"),
-            "timestamp": timestamp,
-            "observed_timestamp": non_empty_or(json_string(&event, "observed_timestamp"), &timestamp),
-            "ingested_timestamp": non_empty_or(json_string(&event, "ingested_timestamp"), received_at),
-            "data_json": data_json,
-        });
-        let mut output = serde_json::to_vec(&row).context("serialize Iceberg row")?;
-        output.push(b'\n');
-        payloads.push(output);
-    }
-    Ok(payloads)
-}
-
-fn json_string(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn non_empty_or(value: String, fallback: &str) -> String {
-    if value.is_empty() {
-        fallback.to_string()
-    } else {
-        value
-    }
 }
 
 async fn shutdown_signal() {

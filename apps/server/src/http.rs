@@ -9,7 +9,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::{MatchedPath, Path, Query, State},
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
+        HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, LOCATION, SET_COOKIE},
     },
     middleware::{self, Next},
@@ -18,7 +18,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use nanotrace_auth::{AuthError, AuthIdentity, AuthRole, AuthStore};
-use nanotrace_ingest::HEADER_PROJECT_ID;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tower_http::{
@@ -32,10 +31,6 @@ use crate::{
     definitions::{
         BackfillRequest, CreateDefinitionRequest, DefinitionGetResponse, DefinitionListResponse,
         DefinitionStore, DefinitionStoreError,
-    },
-    deletions::{
-        CreateDeletionRequest, DeletionJobListResponse, DeletionJobResponse, DeletionStore,
-        DeletionStoreError,
     },
     materializations::{
         BackfillJobListResponse, BackfillJobResponse, CreateBackfillRequest, MaterializationStore,
@@ -53,7 +48,6 @@ pub struct AppState {
     pub auth: Option<Arc<AuthStore>>,
     pub definitions: Arc<DefinitionStore>,
     pub materializations: Arc<MaterializationStore>,
-    pub deletions: Arc<DeletionStore>,
     pub read: Arc<ReadStore>,
     pub raw_ingest: Arc<nanotrace_ingest::RawBatchProducer>,
     pub ses: aws_sdk_sesv2::Client,
@@ -84,8 +78,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/backfills", get(list_backfill_jobs))
         .route("/v1/backfills/{job_id}", get(get_backfill_job))
-        .route("/v1/deletions", get(list_deletions).post(create_deletion))
-        .route("/v1/deletions/{deletion_id}", get(get_deletion))
         .route("/v1/query/recommendations", get(list_query_recommendations))
         .route("/v1/query", post(post_query))
         .route("/auth/login", get(auth_login_form).post(auth_login))
@@ -107,11 +99,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/organizations/{organization_id}/switch",
             post(switch_organization),
-        )
-        .route("/v1/projects", get(list_projects).post(create_project))
-        .route(
-            "/v1/projects/{project_id}",
-            patch(update_project).delete(archive_project),
         )
         .route(
             "/v1/organizations/{organization_id}/leave",
@@ -189,11 +176,7 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(allowed_origins))
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-            .allow_headers([
-                AUTHORIZATION,
-                CONTENT_TYPE,
-                HeaderName::from_static(HEADER_PROJECT_ID),
-            ])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
             .allow_credentials(true),
     )
 }
@@ -233,12 +216,6 @@ pub(crate) async fn post_events(
     let headers = parts.headers;
     let identity = authorize_service(&state, &headers).await?;
     require_scope(&identity, "ingest:write")?;
-    let requested_project_id = headers
-        .get(HeaderName::from_static(HEADER_PROJECT_ID))
-        .and_then(|value| value.to_str().ok());
-    let project_id = auth_store(&state)?
-        .resolve_ingest_project(&identity, requested_project_id)
-        .await?;
     let body = to_bytes(body, state.cfg.max_request_bytes)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
@@ -252,7 +229,6 @@ pub(crate) async fn post_events(
         .produce_raw_batch(
             &identity.tenant_id,
             &identity.organization_id,
-            &project_id,
             content_type,
             &body,
         )
@@ -285,9 +261,8 @@ pub(crate) async fn post_query(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let mut request = serde_json::from_value::<QueryApiRequest>(request)
+    let request = serde_json::from_value::<QueryApiRequest>(request)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    apply_authorized_project_scope(&identity, &mut request)?;
     let query_type = query_type_name(&request);
     let started_at = Instant::now();
     match state.read.api_query(request, &identity.tenant_id).await {
@@ -504,68 +479,6 @@ pub(crate) async fn get_backfill_job(
 }
 
 #[utoipa::path(
-    post,
-    path = "/v1/deletions",
-    request_body = CreateDeletionRequest,
-    responses((status = 200, description = "Created deletion job.", body = DeletionJobResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Deletions"
-)]
-pub(crate) async fn create_deletion(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateDeletionRequest>,
-) -> Result<Json<DeletionJobResponse>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "data:delete").await?;
-    require_explicit_scope(&identity, "data:delete")?;
-    authorize_deletion_project_scope(&identity, &request.project_scope)?;
-    let response = state
-        .deletions
-        .create_deletion(&identity.tenant_id, &identity.subject, request)
-        .await?;
-    Ok(Json(response))
-}
-
-#[utoipa::path(
-    get,
-    path = "/v1/deletions",
-    responses((status = 200, description = "Deletion jobs.", body = DeletionJobListResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Deletions"
-)]
-pub(crate) async fn list_deletions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<DeletionJobListResponse>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "data:delete").await?;
-    require_explicit_scope(&identity, "data:delete")?;
-    let deletions = state.deletions.list_deletions(&identity.tenant_id).await?;
-    Ok(Json(DeletionJobListResponse { deletions }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/v1/deletions/{deletion_id}",
-    params(("deletion_id" = String, Path, description = "Deletion job id.")),
-    responses((status = 200, description = "Deletion job.", body = DeletionJobResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Deletions"
-)]
-pub(crate) async fn get_deletion(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(deletion_id): Path<String>,
-) -> Result<Json<DeletionJobResponse>, ApiError> {
-    let identity = authorize_admin_scope(&state, &headers, "data:delete").await?;
-    require_explicit_scope(&identity, "data:delete")?;
-    let deletion = state
-        .deletions
-        .get_deletion(&identity.tenant_id, &deletion_id)
-        .await?;
-    Ok(Json(DeletionJobResponse { deletion }))
-}
-
-#[utoipa::path(
     get,
     path = "/v1/events/{event_id}",
     params(("event_id" = String, Path, description = "Event id.")),
@@ -581,7 +494,7 @@ pub(crate) async fn get_event(
     let identity = authorize_scope(&state, &headers, "query:read").await?;
     let bytes = state
         .read
-        .event_bytes_scoped(&event_id, &identity.tenant_id, &identity.project_ids)
+        .event_bytes(&event_id, &identity.tenant_id)
         .await?;
     Ok(([("content-type", "application/json")], Body::from(bytes)).into_response())
 }
@@ -669,9 +582,6 @@ pub(crate) struct CreateApiKeyRequest {
     role: Option<String>,
     #[serde(default)]
     scopes: Vec<String>,
-    #[serde(default)]
-    project_ids: Vec<String>,
-    default_project_id: Option<String>,
     expires_at: Option<DateTime<Utc>>,
 }
 
@@ -683,18 +593,6 @@ pub(crate) struct CreateOrganizationRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct UpdateOrganizationRequest {
-    name: Option<String>,
-    slug: Option<String>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub(crate) struct CreateProjectRequest {
-    name: String,
-    slug: Option<String>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub(crate) struct UpdateProjectRequest {
     name: Option<String>,
     slug: Option<String>,
 }
@@ -748,18 +646,6 @@ pub(crate) struct OrganizationListApiResponse {
 pub(crate) struct OrganizationResponse {
     #[schema(value_type = serde_json::Value)]
     organization: nanotrace_auth::OrganizationRecord,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ProjectsResponse {
-    #[schema(value_type = Vec<serde_json::Value>)]
-    projects: Vec<nanotrace_auth::ProjectRecord>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ProjectResponse {
-    #[schema(value_type = serde_json::Value)]
-    project: nanotrace_auth::ProjectRecord,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1428,125 +1314,6 @@ pub(crate) async fn switch_organization(
 }
 
 #[utoipa::path(
-    get,
-    path = "/v1/projects",
-    responses((status = 200, description = "Project list.", body = ProjectsResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Projects"
-)]
-pub(crate) async fn list_projects(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<ProjectsResponse>, ApiError> {
-    let identity = authorize_scope(&state, &headers, "query:read").await?;
-    let projects = auth_store(&state)?
-        .list_projects(&identity.organization_id, false)
-        .await?;
-    Ok(Json(ProjectsResponse { projects }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/projects",
-    request_body = CreateProjectRequest,
-    responses((status = 200, description = "Created project.", body = ProjectResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Projects"
-)]
-pub(crate) async fn create_project(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateProjectRequest>,
-) -> Result<Json<ProjectResponse>, ApiError> {
-    let identity = authorize_admin(&state, &headers).await?;
-    let project = auth_store(&state)?
-        .create_project(
-            &identity.organization_id,
-            request.name,
-            request.slug.as_deref(),
-        )
-        .await?;
-    audit_account_event(
-        &state,
-        "project.created",
-        &identity,
-        Some(&identity.organization_id),
-        None,
-        None,
-        serde_json::json!({ "project_id": &project.id, "slug": &project.slug }),
-    )
-    .await?;
-    Ok(Json(ProjectResponse { project }))
-}
-
-#[utoipa::path(
-    patch,
-    path = "/v1/projects/{project_id}",
-    params(("project_id" = String, Path, description = "Project id.")),
-    request_body = UpdateProjectRequest,
-    responses((status = 200, description = "Updated project.", body = ProjectResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Projects"
-)]
-pub(crate) async fn update_project(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(project_id): Path<String>,
-    Json(request): Json<UpdateProjectRequest>,
-) -> Result<Json<ProjectResponse>, ApiError> {
-    let identity = authorize_admin(&state, &headers).await?;
-    let project = auth_store(&state)?
-        .update_project(
-            &identity.organization_id,
-            &project_id,
-            request.name,
-            request.slug.as_deref(),
-        )
-        .await?;
-    audit_account_event(
-        &state,
-        "project.updated",
-        &identity,
-        Some(&identity.organization_id),
-        None,
-        None,
-        serde_json::json!({ "project_id": &project.id, "slug": &project.slug }),
-    )
-    .await?;
-    Ok(Json(ProjectResponse { project }))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/v1/projects/{project_id}",
-    params(("project_id" = String, Path, description = "Project id.")),
-    responses((status = 200, description = "Archived project.", body = ProjectResponse)),
-    security(("bearerAuth" = [])),
-    tag = "Projects"
-)]
-pub(crate) async fn archive_project(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(project_id): Path<String>,
-) -> Result<Json<ProjectResponse>, ApiError> {
-    let identity = authorize_admin(&state, &headers).await?;
-    let project = auth_store(&state)?
-        .archive_project(&identity.organization_id, &project_id)
-        .await?;
-    audit_account_event(
-        &state,
-        "project.archived",
-        &identity,
-        Some(&identity.organization_id),
-        None,
-        None,
-        serde_json::json!({ "project_id": &project.id, "slug": &project.slug }),
-    )
-    .await?;
-    Ok(Json(ProjectResponse { project }))
-}
-
-#[utoipa::path(
     post,
     path = "/v1/organizations/{organization_id}/leave",
     params(("organization_id" = String, Path, description = "Organization id.")),
@@ -1904,8 +1671,6 @@ pub(crate) async fn create_api_key(
             &request.name,
             role,
             &request.scopes,
-            &request.project_ids,
-            request.default_project_id.as_deref(),
             &identity.subject,
             request.expires_at,
         )
@@ -2073,71 +1838,6 @@ fn require_scope(identity: &AuthIdentity, scope: &str) -> Result<(), ApiError> {
     }
 }
 
-fn require_explicit_scope(identity: &AuthIdentity, scope: &str) -> Result<(), ApiError> {
-    if identity.scopes.iter().any(|candidate| candidate == scope) {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden)
-    }
-}
-
-fn apply_authorized_project_scope(
-    identity: &AuthIdentity,
-    request: &mut QueryApiRequest,
-) -> Result<(), ApiError> {
-    let Some(requested_project_ids) = request.project_scope_project_ids() else {
-        if identity.project_ids.is_empty() {
-            return Ok(());
-        }
-        return Err(ApiError::Forbidden);
-    };
-    if identity.project_ids.is_empty() {
-        return Ok(());
-    }
-    if requested_project_ids.is_empty() {
-        request.set_project_scope_project_ids(identity.project_ids.clone());
-        return Ok(());
-    }
-    if requested_project_ids.iter().all(|project_id| {
-        identity
-            .project_ids
-            .iter()
-            .any(|allowed| allowed == project_id)
-    }) {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden)
-    }
-}
-
-fn authorize_deletion_project_scope(
-    identity: &AuthIdentity,
-    project_scope: &crate::read::ProjectScope,
-) -> Result<(), ApiError> {
-    if identity.project_ids.is_empty() {
-        return Ok(());
-    }
-    let requested_project_ids = project_scope
-        .project_ids
-        .iter()
-        .map(|project_id| project_id.trim())
-        .filter(|project_id| !project_id.is_empty())
-        .collect::<Vec<_>>();
-    if requested_project_ids.is_empty() {
-        return Err(ApiError::Forbidden);
-    }
-    if requested_project_ids.iter().all(|project_id| {
-        identity
-            .project_ids
-            .iter()
-            .any(|allowed| allowed == project_id)
-    }) {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden)
-    }
-}
-
 fn parse_requested_role(value: Option<&str>) -> Result<AuthRole, ApiError> {
     match value
         .unwrap_or("service")
@@ -2203,7 +1903,6 @@ pub enum ApiError {
     Unavailable(String),
     Email(String),
     Kafka(nanotrace_ingest::IngestError),
-    Deletion(crate::deletions::DeletionStoreError),
     Definition(crate::definitions::DefinitionStoreError),
     Materialization(crate::materializations::MaterializationStoreError),
     Read(crate::read::ReadError),
@@ -2243,25 +1942,6 @@ impl IntoResponse for ApiError {
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             Self::Email(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             Self::Kafka(err) => (StatusCode::BAD_GATEWAY, err.to_string()),
-            Self::Deletion(DeletionStoreError::InvalidRequest(message)) => {
-                (StatusCode::BAD_REQUEST, message)
-            }
-            Self::Deletion(DeletionStoreError::NotFound) => {
-                (StatusCode::NOT_FOUND, "not_found".to_string())
-            }
-            Self::Deletion(DeletionStoreError::ClickHouseNotConfigured) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ClickHouse is not configured".to_string(),
-            ),
-            Self::Deletion(DeletionStoreError::ClickHouseResponse { status, body }) => {
-                let status = if status.is_client_error() {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                (status, body)
-            }
-            Self::Deletion(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Self::Definition(
                 err @ (DefinitionStoreError::InvalidName
                 | DefinitionStoreError::InvalidKind
@@ -2336,12 +2016,6 @@ impl IntoResponse for ApiError {
 impl From<crate::read::ReadError> for ApiError {
     fn from(value: crate::read::ReadError) -> Self {
         Self::Read(value)
-    }
-}
-
-impl From<crate::deletions::DeletionStoreError> for ApiError {
-    fn from(value: crate::deletions::DeletionStoreError) -> Self {
-        Self::Deletion(value)
     }
 }
 

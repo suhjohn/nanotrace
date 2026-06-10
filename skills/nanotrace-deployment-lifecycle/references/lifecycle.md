@@ -85,7 +85,6 @@ Recommended or conditional:
 - `NANOTRACE_EMAIL_FROM` only when overriding the default `login@mail.<domain>`.
 - `NANOTRACE_GOOGLE_OAUTH_CLIENT_ID`, `NANOTRACE_GOOGLE_OAUTH_CLIENT_SECRET`, and optionally `NANOTRACE_GOOGLE_OAUTH_REDIRECT_URI` when enabling Google login.
 - `NANOTRACE_KAFKA_TABLEFLOW_TOPIC` only when overriding `events.tableflow.batches.v1`.
-- `NANOTRACE_KAFKA_ICEBERG_TOPIC` only when overriding `events.iceberg.rows.v1`.
 
 Ask the user to bring back only missing variable names, placeholder warnings, and selected DNS provider.
 
@@ -103,7 +102,6 @@ Checkpoint 3: external service setup.
   - `events.normalized.v1`
   - `events.invalid.v1`
   - `events.tableflow.batches.v1`
-  - `events.iceberg.rows.v1`
 - If WarpStream ACLs are disabled, no ACL rules are needed. If enabling ACLs, configure topic and consumer-group ACLs before enabling; otherwise non-superuser clients will be blocked.
 - Create a WarpStream Tableflow cluster, but expect to finish the Tableflow destination bucket after Nanotrace deploy outputs the S3 bucket.
 
@@ -172,7 +170,7 @@ In the Tableflow Configuration editor, define the source cluster, source topic, 
 Current canonical source topic:
 
 ```yaml
-source_topic: events.iceberg.rows.v1
+source_topic: events.tableflow.batches.v1
 ```
 
 Minimal YAML shape:
@@ -183,58 +181,41 @@ source_clusters:
     bootstrap_brokers:
       - hostname: <warpstream-bootstrap-host>
         port: 9092
+    credentials:
+      use_tls: true
+      sasl_mechanism: scram-512
+      sasl_username_env: KAFKA_SASL_USERNAME
+      sasl_password_env: KAFKA_SASL_PASSWORD
 
 tables:
   - source_cluster_name: nanotrace_prod
-    source_topic: events.iceberg.rows.v1
+    source_topic: events.tableflow.batches.v1
     source_format: json
     schema_mode: inline
-    input_schema: |
-      {
-        "type": "object",
-        "required": [
-          "schema_version",
-          "batch_id",
-          "tenant_id",
-          "organization_id",
-          "received_at",
-          "ingest_source_topic",
-          "ingest_source_partition",
-          "ingest_source_offset",
-          "event_index",
-          "event_id",
-          "timestamp",
-          "data_json"
-        ],
-        "properties": {
-          "schema_version": { "type": "integer" },
-          "batch_id": { "type": "string" },
-          "tenant_id": { "type": "string" },
-          "organization_id": { "type": "string" },
-          "received_at": { "type": "string" },
-          "ingest_source_topic": { "type": "string" },
-          "ingest_source_partition": { "type": "integer" },
-          "ingest_source_offset": { "type": "integer" },
-          "event_index": { "type": "integer" },
-          "event_id": { "type": "string" },
-          "timestamp": { "type": "string" },
-          "observed_timestamp": { "type": "string" },
-          "ingested_timestamp": { "type": "string" },
-          "data_json": { "type": "string" }
-        }
-      }
     partitioning_scheme: hour
     dlq_mode: stop
     compression: zstd
+    schema:
+      fields:
+        - { name: schema_version, id: 1, type: int }
+        - { name: batch_id, id: 2, type: string }
+        - { name: tenant_id, id: 3, type: string }
+        - { name: organization_id, id: 4, type: string }
+        - { name: received_at, id: 5, type: string }
+        - { name: source_topic, id: 6, type: string }
+        - { name: source_partition, id: 7, type: int }
+        - { name: source_offset, id: 8, type: long }
+        - { name: source_file, id: 9, type: string }
+        - { name: event_count, id: 10, type: int }
 
 destination_bucket_url: s3://<bucketName>?region=<AWS_REGION>
 ```
 
 Important operational notes:
 
-- If Tableflow connects through Nanotrace's internal WarpStream Kafka NLB, no SASL credentials are required in the source cluster config.
+- The source cluster credentials env names are identifiers. WarpStream Tableflow agents read them with the `TABLEFLOW_` prefix, so the agent environment must include `TABLEFLOW_KAFKA_SASL_USERNAME` and `TABLEFLOW_KAFKA_SASL_PASSWORD`.
 - Tableflow agents need S3 access to `s3://<bucketName>/warpstream/_tableflow/*` and relevant bucket list/read/write permissions.
-- Nanotrace emits one JSON object per Kafka record to `events.iceberg.rows.v1`; `data_json` contains the original normalized event payload as a JSON string.
+- Current Nanotrace emits batch-oriented JSON. This initial Tableflow table is a batch metadata table unless the producer is changed to emit one event per Kafka record or the Tableflow transform/schema is expanded to flatten nested events.
 
 Ask the user to bring back the Tableflow preview/save result, agent health, and any schema or permissions error.
 
@@ -244,9 +225,7 @@ Completion criteria:
 - UI URL is reachable.
 - Login email/DNS path is understood or verified.
 - `POST /v1/events` returns `202` with a valid key.
-- Normalizer publishes batch records to `events.tableflow.batches.v1` for the
-  ClickHouse materializer and per-event records to `events.iceberg.rows.v1` for
-  WarpStream Tableflow.
+- Normalizer publishes to `events.tableflow.batches.v1`.
 - Tableflow agents are healthy and writing Iceberg files under the configured bucket prefix.
 - E2E event reaches ClickHouse and query paths work.
 

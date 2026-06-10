@@ -116,9 +116,8 @@ async fn post_query(
 ) -> Result<Response, ApiError> {
     let identity = authorize(&state, &headers).await?;
     require_scope(&identity, "query:read")?;
-    let mut request = serde_json::from_value::<QueryApiRequest>(request)
+    let request = serde_json::from_value::<QueryApiRequest>(request)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    apply_authorized_project_scope(&identity, &mut request)?;
     Ok(Json(state.read.api_query(request, &identity.tenant_id).await?).into_response())
 }
 
@@ -131,42 +130,13 @@ async fn get_event(
     require_scope(&identity, "query:read")?;
     let bytes = state
         .read
-        .event_bytes_scoped(&event_id, &identity.tenant_id, &identity.project_ids)
+        .event_bytes(&event_id, &identity.tenant_id)
         .await?;
     Ok(([("content-type", "application/json")], bytes).into_response())
 }
 
 fn require_scope(identity: &AuthIdentity, scope: &str) -> Result<(), ApiError> {
     if nanotrace_auth::has_scope(identity, scope) {
-        Ok(())
-    } else {
-        Err(ApiError::Auth(AuthError::Forbidden))
-    }
-}
-
-fn apply_authorized_project_scope(
-    identity: &AuthIdentity,
-    request: &mut QueryApiRequest,
-) -> Result<(), ApiError> {
-    let Some(requested_project_ids) = request.project_scope_project_ids() else {
-        if identity.project_ids.is_empty() {
-            return Ok(());
-        }
-        return Err(ApiError::Auth(AuthError::Forbidden));
-    };
-    if identity.project_ids.is_empty() {
-        return Ok(());
-    }
-    if requested_project_ids.is_empty() {
-        request.set_project_scope_project_ids(identity.project_ids.clone());
-        return Ok(());
-    }
-    if requested_project_ids.iter().all(|project_id| {
-        identity
-            .project_ids
-            .iter()
-            .any(|allowed| allowed == project_id)
-    }) {
         Ok(())
     } else {
         Err(ApiError::Auth(AuthError::Forbidden))

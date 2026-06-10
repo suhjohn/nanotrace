@@ -452,8 +452,8 @@ impl DefinitionStore {
             .field_stats(&definition.tenant_id, &value_expr, &where_value, from, to)
             .await?;
         let query = format!(
-            "INSERT INTO {} (tenant_id, project_id, mode, field_name, value, value_type, timestamp, bucket_time, event_id, event_type, signal, is_error, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms, definition_id, definition_version)
-SELECT tenant_id, project_id, {{mode:String}}, {{field_name:String}}, {value_expr}, {{value_type:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), event_id, event_type, signal, toUInt8({}), trace_id, span_id, ifNull(toString(data.parent_span_id), ''), ifNull(toString(data.name), ''), parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')), parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')), toFloat64OrNull(ifNull(toString(data.duration_ms), '')), {{definition_id:String}}, {{definition_version:UInt64}}
+            "INSERT INTO {} (tenant_id, mode, field_name, value, value_type, timestamp, bucket_time, event_id, event_type, signal, is_error, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms, definition_id, definition_version)
+SELECT tenant_id, {{mode:String}}, {{field_name:String}}, {value_expr}, {{value_type:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), event_id, event_type, signal, toUInt8({}), trace_id, span_id, ifNull(toString(data.parent_span_id), ''), ifNull(toString(data.name), ''), parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')), parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')), toFloat64OrNull(ifNull(toString(data.duration_ms), '')), {{definition_id:String}}, {{definition_version:UInt64}}
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
             self.table("field_index"),
@@ -508,8 +508,8 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
             .field_stats(&definition.tenant_id, &value_expr, &where_value, from, to)
             .await?;
         let query = format!(
-            "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{entity_type:String}}, {entity_expr}, {{state_name:String}}, {value_expr}, {{value_type:String}}, timestamp, event_id, event_type, signal
+            "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{entity_type:String}}, {entity_expr}, {{state_name:String}}, {value_expr}, {{value_type:String}}, timestamp, event_id, event_type, signal
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
             self.table("entity_state_updates"),
@@ -530,11 +530,11 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
         )
         .await?;
         let current_query = format!(
-            "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{entity_type:String}}, {entity_expr}, {{state_name:String}}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
+            "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{entity_type:String}}, {entity_expr}, {{state_name:String}}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}
-GROUP BY tenant_id, project_id, {entity_expr}",
+GROUP BY tenant_id, {entity_expr}",
             self.table("entity_state_current"),
             self.events_table()
         );
@@ -590,8 +590,8 @@ GROUP BY tenant_id, project_id, {entity_expr}",
             .field_stats(&definition.tenant_id, &value_expr, &where_value, from, to)
             .await?;
         let query = format!(
-            "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_name, dimension_value)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{measure_name:String}}, {value_expr}, {{unit:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), 300, event_id, event_type, signal, {{dimension_name:String}}, {dimension_expr}
+            "INSERT INTO {} (tenant_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_name, dimension_value)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {{measure_name:String}}, {value_expr}, {{unit:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), 300, event_id, event_type, signal, {{dimension_name:String}}, {dimension_expr}
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
             self.table("event_measures"),
@@ -652,8 +652,8 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
                 .await?;
             stats.add(output_stats);
             let query = format!(
-                "INSERT INTO {} (tenant_id, project_id, mode, field_name, value, value_type, timestamp, bucket_time, event_id, event_type, signal, is_error, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms, definition_id, definition_version)
-SELECT tenant_id, project_id, {{mode:String}}, {{field_name:String}}, {value_expr}, {{value_type:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), event_id, event_type, signal, toUInt8({}), trace_id, span_id, ifNull(toString(data.parent_span_id), ''), ifNull(toString(data.name), ''), parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')), parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')), toFloat64OrNull(ifNull(toString(data.duration_ms), '')), {{definition_id:String}}, {{definition_version:UInt64}}
+                "INSERT INTO {} (tenant_id, mode, field_name, value, value_type, timestamp, bucket_time, event_id, event_type, signal, is_error, trace_id, span_id, parent_span_id, name, start_time, end_time, duration_ms, definition_id, definition_version)
+SELECT tenant_id, {{mode:String}}, {{field_name:String}}, {value_expr}, {{value_type:String}}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), event_id, event_type, signal, toUInt8({}), trace_id, span_id, ifNull(toString(data.parent_span_id), ''), ifNull(toString(data.name), ''), parseDateTime64BestEffortOrNull(ifNull(toString(data.start_time), '')), parseDateTime64BestEffortOrNull(ifNull(toString(data.end_time), '')), toFloat64OrNull(ifNull(toString(data.duration_ms), '')), {{definition_id:String}}, {{definition_version:UInt64}}
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
                 self.table("field_index"),
@@ -858,8 +858,8 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
                 .await?;
             stats.add(output_stats);
             let query = format!(
-                "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_set_id, dimension_names, dimension_values)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {measure_name_expr}, {value_expr}, {unit_expr}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), {{bucket_seconds:UInt32}}, event_id, event_type, signal, {{dimension_set_id:String}}, {names_sql}, {values_sql}
+                "INSERT INTO {} (tenant_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_set_id, dimension_names, dimension_values)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {measure_name_expr}, {value_expr}, {unit_expr}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), {{bucket_seconds:UInt32}}, event_id, event_type, signal, {{dimension_set_id:String}}, {names_sql}, {values_sql}
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
                 self.table("measure_cube_points"),
@@ -897,8 +897,8 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
         bucket_seconds: u32,
     ) -> Result<(), DefinitionStoreError> {
         let query = format!(
-            "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_name, dimension_value)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {measure_name_expr}, {value_expr}, {unit_expr}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), {{bucket_seconds:UInt32}}, event_id, event_type, signal, {dimension_name_expr}, {dimension_value_expr}
+            "INSERT INTO {} (tenant_id, definition_id, definition_version, measure_name, value, unit, timestamp, bucket_time, bucket_seconds, event_id, event_type, signal, dimension_name, dimension_value)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {measure_name_expr}, {value_expr}, {unit_expr}, timestamp, toStartOfInterval(timestamp, INTERVAL 5 MINUTE), {{bucket_seconds:UInt32}}, event_id, event_type, signal, {dimension_name_expr}, {dimension_value_expr}
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
             self.table("event_measures"),
@@ -960,8 +960,8 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
                 .await?;
             stats.add(output_stats);
             let query = format!(
-                "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {entity_type_expr}, {entity_id_expr}, {state_name_expr}, {value_expr}, {{value_type:String}}, timestamp, event_id, event_type, signal
+                "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {entity_type_expr}, {entity_id_expr}, {state_name_expr}, {value_expr}, {{value_type:String}}, timestamp, event_id, event_type, signal
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}",
                 self.table("entity_state_updates"),
@@ -980,11 +980,11 @@ WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffor
             )
             .await?;
             let current_query = format!(
-                "INSERT INTO {} (tenant_id, project_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
-SELECT tenant_id, project_id, {{definition_id:String}}, {{definition_version:UInt64}}, {entity_type_expr}, {entity_id_expr}, {state_name_expr}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
+                "INSERT INTO {} (tenant_id, definition_id, definition_version, entity_type, entity_id, state_name, value, value_type, timestamp, event_id, event_type, signal)
+SELECT tenant_id, {{definition_id:String}}, {{definition_version:UInt64}}, {entity_type_expr}, {entity_id_expr}, {state_name_expr}, argMax({value_expr}, timestamp), {{value_type:String}}, max(timestamp), argMax(event_id, timestamp), argMax(event_type, timestamp), argMax(signal, timestamp)
 FROM {}
 WHERE tenant_id = {{tenant_id:String}} AND timestamp >= parseDateTime64BestEffort({{from:String}}, 3, 'UTC') AND timestamp <= parseDateTime64BestEffort({{to:String}}, 3, 'UTC') AND {where_value}
-GROUP BY tenant_id, project_id, {entity_type_expr}, {entity_id_expr}, {state_name_expr}",
+GROUP BY tenant_id, {entity_type_expr}, {entity_id_expr}, {state_name_expr}",
                 self.table("entity_state_current"),
                 self.events_table()
             );

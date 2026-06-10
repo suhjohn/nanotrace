@@ -87,10 +87,6 @@ const kafkaTableflowTopic =
   cfg.get('kafkaTableflowTopic') ??
   process.env.NANOTRACE_KAFKA_TABLEFLOW_TOPIC ??
   'events.tableflow.batches.v1'
-const kafkaIcebergTopic =
-  cfg.get('kafkaIcebergTopic') ??
-  process.env.NANOTRACE_KAFKA_ICEBERG_TOPIC ??
-  'events.iceberg.rows.v1'
 const kafkaInvalidTopic =
   cfg.get('kafkaInvalidTopic') ??
   process.env.NANOTRACE_KAFKA_INVALID_TOPIC ??
@@ -117,82 +113,6 @@ const kafkaSaslPassword =
   (process.env.NANOTRACE_KAFKA_SASL_PASSWORD
     ? pulumi.secret(process.env.NANOTRACE_KAFKA_SASL_PASSWORD)
     : pulumi.secret(''))
-const inferredWarpstreamAgentGroup = inferWarpstreamAgentGroup(kafkaBrokers)
-const warpstreamVirtualClusterId =
-  requireConfigOrEnv('warpstreamVirtualClusterId', 'NANOTRACE_WARPSTREAM_VIRTUAL_CLUSTER_ID')
-const warpstreamAgentKey =
-  cfg.getSecret('warpstreamAgentKey') ??
-  (process.env.NANOTRACE_WARPSTREAM_AGENT_KEY
-    ? pulumi.secret(process.env.NANOTRACE_WARPSTREAM_AGENT_KEY)
-    : undefined)
-const warpstreamTableflowVirtualClusterId =
-  requireConfigOrEnv(
-    'warpstreamTableflowVirtualClusterId',
-    'NANOTRACE_WARPSTREAM_TABLEFLOW_VIRTUAL_CLUSTER_ID'
-  )
-const warpstreamTableflowAgentKey =
-  cfg.getSecret('warpstreamTableflowAgentKey') ??
-  (process.env.NANOTRACE_WARPSTREAM_TABLEFLOW_AGENT_KEY
-    ? pulumi.secret(process.env.NANOTRACE_WARPSTREAM_TABLEFLOW_AGENT_KEY)
-    : undefined)
-const warpstreamRegion =
-  cfg.get('warpstreamRegion') ??
-  process.env.NANOTRACE_WARPSTREAM_REGION ??
-  'us-west-2'
-const warpstreamTableflowRegion =
-  cfg.get('warpstreamTableflowRegion') ??
-  process.env.NANOTRACE_WARPSTREAM_TABLEFLOW_REGION ??
-  warpstreamRegion
-const warpstreamAgentGroup =
-  cfg.get('warpstreamAgentGroup') ??
-  process.env.NANOTRACE_WARPSTREAM_AGENT_GROUP ??
-  inferredWarpstreamAgentGroup
-const warpstreamAgentImage =
-  cfg.get('warpstreamAgentImage') ??
-  process.env.NANOTRACE_WARPSTREAM_AGENT_IMAGE ??
-  'public.ecr.aws/warpstream-labs/warpstream_agent:latest-stable'
-const warpstreamAgentInstanceType =
-  cfg.get('warpstreamAgentInstanceType') ??
-  (cpuArchitecture === 'arm64' ? 't4g.small' : 't3.small')
-const warpstreamAgentMinSize = cfg.getNumber('warpstreamAgentMinSize') ?? 1
-const warpstreamAgentMaxSize = cfg.getNumber('warpstreamAgentMaxSize') ?? 4
-const warpstreamAgentDesiredCapacity =
-  cfg.getNumber('warpstreamAgentDesiredCapacity') ?? warpstreamAgentMinSize
-const warpstreamTableflowAgentInstanceType =
-  cfg.get('warpstreamTableflowAgentInstanceType') ??
-  warpstreamAgentInstanceType
-const warpstreamTableflowAgentMinSize =
-  cfg.getNumber('warpstreamTableflowAgentMinSize') ?? 1
-const warpstreamTableflowAgentMaxSize =
-  cfg.getNumber('warpstreamTableflowAgentMaxSize') ?? 4
-const warpstreamTableflowAgentDesiredCapacity =
-  cfg.getNumber('warpstreamTableflowAgentDesiredCapacity') ??
-  warpstreamTableflowAgentMinSize
-const warpstreamKafkaPort = cfg.getNumber('warpstreamKafkaPort') ?? 9092
-const appKafkaSecurityProtocol =
-  cfg.get('appKafkaSecurityProtocol') ??
-  process.env.NANOTRACE_APP_KAFKA_SECURITY_PROTOCOL ??
-  'PLAINTEXT'
-const appKafkaSaslMechanism =
-  cfg.get('appKafkaSaslMechanism') ??
-  process.env.NANOTRACE_APP_KAFKA_SASL_MECHANISM ??
-  ''
-const appKafkaSaslUsername =
-  cfg.getSecret('appKafkaSaslUsername') ??
-  (process.env.NANOTRACE_APP_KAFKA_SASL_USERNAME
-    ? pulumi.secret(process.env.NANOTRACE_APP_KAFKA_SASL_USERNAME)
-    : pulumi.secret(''))
-const appKafkaSaslPassword =
-  cfg.getSecret('appKafkaSaslPassword') ??
-  (process.env.NANOTRACE_APP_KAFKA_SASL_PASSWORD
-    ? pulumi.secret(process.env.NANOTRACE_APP_KAFKA_SASL_PASSWORD)
-    : pulumi.secret(''))
-if (!warpstreamAgentKey) {
-  throw new Error('nanotrace:warpstreamAgentKey or NANOTRACE_WARPSTREAM_AGENT_KEY is required')
-}
-if (!warpstreamTableflowAgentKey) {
-  throw new Error('nanotrace:warpstreamTableflowAgentKey or NANOTRACE_WARPSTREAM_TABLEFLOW_AGENT_KEY is required')
-}
 const normalizerGroupId =
   cfg.get('normalizerGroupId') ??
   process.env.NANOTRACE_NORMALIZER_GROUP_ID ??
@@ -463,49 +383,6 @@ new aws.s3.BucketVersioningV2(`${name}-events-versioning`, {
   versioningConfiguration: { status: 'Enabled' }
 })
 
-const warpstreamBucket = new aws.s3.BucketV2(`${name}-warpstream`, {
-  forceDestroy: cfg.getBoolean('forceDestroyWarpstreamBucket') ?? false,
-  tags: { ...tags, Service: 'warpstream-agent' }
-})
-
-new aws.s3.BucketServerSideEncryptionConfigurationV2(`${name}-warpstream-encryption`, {
-  bucket: warpstreamBucket.id,
-  rules: [
-    {
-      applyServerSideEncryptionByDefault: dataKmsKeyArn
-        ? {
-            kmsMasterKeyId: dataKmsKeyArn,
-            sseAlgorithm: 'aws:kms'
-          }
-        : {
-            sseAlgorithm: 'AES256'
-          },
-      bucketKeyEnabled: dataKmsKeyArn ? true : undefined
-    }
-  ]
-})
-
-new aws.s3.BucketPublicAccessBlock(`${name}-warpstream-public-access`, {
-  bucket: warpstreamBucket.id,
-  blockPublicAcls: true,
-  blockPublicPolicy: true,
-  ignorePublicAcls: true,
-  restrictPublicBuckets: true
-})
-
-new aws.s3.BucketLifecycleConfigurationV2(`${name}-warpstream-lifecycle`, {
-  bucket: warpstreamBucket.id,
-  rules: [
-    {
-      id: 'abort-incomplete-multipart-uploads',
-      status: 'Enabled',
-      abortIncompleteMultipartUpload: {
-        daysAfterInitiation: 7
-      }
-    }
-  ]
-})
-
 const repository = new aws.ecr.Repository(`${name}-server`, {
   forceDelete: cfg.getBoolean('forceDeleteRepository') ?? false,
   imageScanningConfiguration: { scanOnPush: true },
@@ -670,85 +547,6 @@ const instanceProfile = new aws.iam.InstanceProfile(
   }
 )
 
-const warpstreamAgentRole = new aws.iam.Role(`${name}-warpstream-agent-role`, {
-  assumeRolePolicy: JSON.stringify({
-    Version: '2012-10-17',
-    Statement: [
-      {
-        Effect: 'Allow',
-        Principal: { Service: 'ec2.amazonaws.com' },
-        Action: 'sts:AssumeRole'
-      }
-    ]
-  }),
-  tags: { ...tags, Service: 'warpstream-agent' }
-})
-
-new aws.iam.RolePolicy(`${name}-warpstream-agent-policy`, {
-  role: warpstreamAgentRole.id,
-  policy: pulumi
-    .all([warpstreamBucket.arn, dataKmsKeyArn ?? pulumi.output('')])
-    .apply(([bucketArn, kmsKeyArn]) =>
-      JSON.stringify({
-        Version: '2012-10-17',
-        Statement: [
-          ...(kmsKeyArn
-            ? [
-                {
-                  Sid: 'UseDataKmsKey',
-                  Effect: 'Allow',
-                  Action: [
-                    'kms:Decrypt',
-                    'kms:Encrypt',
-                    'kms:GenerateDataKey',
-                    'kms:DescribeKey'
-                  ],
-                  Resource: kmsKeyArn
-                }
-              ]
-            : []),
-          {
-            Sid: 'ListWarpStreamBucket',
-            Effect: 'Allow',
-            Action: 's3:ListBucket',
-            Resource: bucketArn
-          },
-          {
-            Sid: 'ReadWriteWarpStreamObjects',
-            Effect: 'Allow',
-            Action: [
-              's3:AbortMultipartUpload',
-              's3:DeleteObject',
-              's3:GetObject',
-              's3:ListMultipartUploadParts',
-              's3:PutObject'
-            ],
-            Resource: `${bucketArn}/warpstream/*`
-          },
-          {
-            Sid: 'WriteWarpStreamDebugObjects',
-            Effect: 'Allow',
-            Action: ['s3:PutObject', 's3:AbortMultipartUpload'],
-            Resource: `${bucketArn}/_debug/*`
-          }
-        ]
-      })
-    )
-})
-
-new aws.iam.RolePolicyAttachment(`${name}-warpstream-agent-ssm`, {
-  role: warpstreamAgentRole.name,
-  policyArn: 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
-})
-
-const warpstreamAgentInstanceProfile = new aws.iam.InstanceProfile(
-  `${name}-warpstream-agent-profile`,
-  {
-    role: warpstreamAgentRole.name,
-    tags: { ...tags, Service: 'warpstream-agent' }
-  }
-)
-
 const clickHouseSchema = new command.local.Command(
   `${name}-clickhouse-schema`,
   {
@@ -817,33 +615,6 @@ const instanceSg = new aws.ec2.SecurityGroup(`${name}-instance-sg`, {
     }
   ],
   tags: { ...tags, Name: `${name}-instance-sg` }
-})
-
-const warpstreamAgentSg = new aws.ec2.SecurityGroup(`${name}-warpstream-agent-sg`, {
-  vpcId: vpc.id,
-  ingress: [
-    {
-      protocol: 'tcp',
-      fromPort: warpstreamKafkaPort,
-      toPort: warpstreamKafkaPort,
-      securityGroups: [instanceSg.id]
-    },
-    {
-      protocol: 'tcp',
-      fromPort: warpstreamKafkaPort,
-      toPort: warpstreamKafkaPort,
-      cidrBlocks: ['10.42.0.0/16']
-    }
-  ],
-  egress: [
-    {
-      protocol: '-1',
-      fromPort: 0,
-      toPort: 0,
-      cidrBlocks: ['0.0.0.0/0']
-    }
-  ],
-  tags: { ...tags, Name: `${name}-warpstream-agent-sg`, Service: 'warpstream-agent' }
 })
 
 const planetScaleEndpointSg = new aws.ec2.SecurityGroup(`${name}-planetscale-endpoint-sg`, {
@@ -925,43 +696,6 @@ const queryTargetGroup = new aws.lb.TargetGroup(`${name}-query-tg`, {
   },
   tags: { ...tags, Service: 'query' }
 })
-
-const warpstreamKafkaLoadBalancer = new aws.lb.LoadBalancer(`${name}-warpstream-kafka-nlb`, {
-  name: `${name}-ws-kafka`,
-  internal: true,
-  loadBalancerType: 'network',
-  subnets: subnets.map(subnet => subnet.id),
-  tags: { ...tags, Service: 'warpstream-agent' }
-})
-
-const warpstreamKafkaTargetGroup = new aws.lb.TargetGroup(`${name}-warpstream-kafka-tg`, {
-  name: `${name}-ws-kafka`,
-  vpcId: vpc.id,
-  targetType: 'instance',
-  protocol: 'TCP',
-  port: warpstreamKafkaPort,
-  deregistrationDelay: cfg.getNumber('warpstreamKafkaDeregistrationDelaySecs') ?? 15,
-  healthCheck: {
-    enabled: true,
-    protocol: 'TCP',
-    port: String(warpstreamKafkaPort),
-    healthyThreshold: 2,
-    unhealthyThreshold: 2,
-    interval: 10
-  },
-  tags: { ...tags, Service: 'warpstream-agent' }
-})
-
-new aws.lb.Listener(`${name}-warpstream-kafka`, {
-  loadBalancerArn: warpstreamKafkaLoadBalancer.arn,
-  port: warpstreamKafkaPort,
-  protocol: 'TCP',
-  defaultActions: [{ type: 'forward', targetGroupArn: warpstreamKafkaTargetGroup.arn }]
-})
-
-const appKafkaBrokers = warpstreamKafkaLoadBalancer.dnsName.apply(
-  dnsName => `${dnsName}:${warpstreamKafkaPort}`
-)
 
 type ManualDnsRecord = {
   name: string | pulumi.Output<string>
@@ -1262,9 +996,8 @@ const userData = pulumi
     clickhousePassword,
     databaseUrl,
     publicBaseUrl,
-    appKafkaBrokers,
-    appKafkaSaslUsername,
-    appKafkaSaslPassword,
+    kafkaSaslUsername,
+    kafkaSaslPassword,
     googleOauthClientSecret
   ])
   .apply(
@@ -1276,9 +1009,8 @@ const userData = pulumi
       resolvedClickhousePassword,
       resolvedDatabaseUrl,
       resolvedPublicBaseUrl,
-      resolvedAppKafkaBrokers,
-      resolvedAppKafkaSaslUsername,
-      resolvedAppKafkaSaslPassword,
+      resolvedKafkaSaslUsername,
+      resolvedKafkaSaslPassword,
       resolvedGoogleOauthClientSecret
     ]) =>
       renderUserData({
@@ -1291,15 +1023,14 @@ const userData = pulumi
         clickhouseMaxBytesToRead,
         imageUri: resolvedImageUri,
         imageBuildId: resolvedImageBuildId,
-        kafkaBrokers: resolvedAppKafkaBrokers,
+        kafkaBrokers,
         kafkaIngestTopic,
         kafkaInvalidTopic,
-        kafkaIcebergTopic,
         kafkaTableflowTopic,
-        kafkaSaslMechanism: appKafkaSaslMechanism,
-        kafkaSaslPassword: resolvedAppKafkaSaslPassword,
-        kafkaSaslUsername: resolvedAppKafkaSaslUsername,
-        kafkaSecurityProtocol: appKafkaSecurityProtocol,
+        kafkaSaslMechanism,
+        kafkaSaslPassword: resolvedKafkaSaslPassword,
+        kafkaSaslUsername: resolvedKafkaSaslUsername,
+        kafkaSecurityProtocol,
         kafkaNormalizedTopic,
         kafkaServerClientId,
         normalizerGroupId,
@@ -1349,46 +1080,6 @@ const queryUserData = pulumi
       sessionSecure,
       sessionSameSite,
       magicLinkTtlSecs
-    })
-  )
-
-const warpstreamAgentUserData = pulumi
-  .all([warpstreamBucket.bucket, warpstreamAgentKey])
-  .apply(([bucketName, resolvedWarpstreamAgentKey]) =>
-    renderWarpstreamAgentUserData({
-      agentGroup: warpstreamAgentGroup,
-      agentImage: warpstreamAgentImage,
-      agentKey: resolvedWarpstreamAgentKey,
-      bucketName,
-      kafkaPort: warpstreamKafkaPort,
-      region,
-      warpstreamRegion,
-      virtualClusterId: warpstreamVirtualClusterId
-    })
-  )
-
-const warpstreamTableflowAgentUserData = pulumi
-  .all([
-    warpstreamBucket.bucket,
-    warpstreamTableflowAgentKey,
-    kafkaSaslUsername,
-    kafkaSaslPassword
-  ])
-  .apply(([
-    bucketName,
-    resolvedWarpstreamTableflowAgentKey,
-    resolvedKafkaSaslUsername,
-    resolvedKafkaSaslPassword
-  ]) =>
-    renderWarpstreamTableflowAgentUserData({
-      agentImage: warpstreamAgentImage,
-      agentKey: resolvedWarpstreamTableflowAgentKey,
-      bucketName,
-      kafkaSaslPassword: resolvedKafkaSaslPassword,
-      kafkaSaslUsername: resolvedKafkaSaslUsername,
-      region,
-      tableflowRegion: warpstreamTableflowRegion,
-      virtualClusterId: warpstreamTableflowVirtualClusterId
     })
   )
 
@@ -1464,84 +1155,6 @@ const queryLaunchTemplate = new aws.ec2.LaunchTemplate(
   }
 )
 
-const warpstreamAgentLaunchTemplate = new aws.ec2.LaunchTemplate(
-  `${name}-warpstream-agent-lt`,
-  {
-    imageId: ami.id,
-    instanceType: warpstreamAgentInstanceType,
-    iamInstanceProfile: { arn: warpstreamAgentInstanceProfile.arn },
-    metadataOptions: {
-      httpEndpoint: 'enabled',
-      httpTokens: 'required',
-      httpPutResponseHopLimit: 2
-    },
-    vpcSecurityGroupIds: [warpstreamAgentSg.id],
-    userData: warpstreamAgentUserData.apply(value => Buffer.from(value).toString('base64')),
-    blockDeviceMappings: [
-      {
-        deviceName: '/dev/xvda',
-        ebs: {
-          volumeSize: cfg.getNumber('warpstreamAgentRootVolumeSizeGb') ?? 16,
-          volumeType: 'gp3',
-          deleteOnTermination: 'true',
-          encrypted: 'true',
-          kmsKeyId: dataKmsKeyArn
-        }
-      }
-    ],
-    tagSpecifications: [
-      { resourceType: 'instance', tags: { ...tags, Name: `${name}-warpstream-agent`, Service: 'warpstream-agent' } },
-      { resourceType: 'volume', tags: { ...tags, Service: 'warpstream-agent' } }
-    ],
-    tags: { ...tags, Service: 'warpstream-agent' }
-  },
-  {
-    dependsOn: [
-      warpstreamAgentInstanceProfile,
-      warpstreamBucket
-    ]
-  }
-)
-
-const warpstreamTableflowAgentLaunchTemplate = new aws.ec2.LaunchTemplate(
-  `${name}-warpstream-tableflow-agent-lt`,
-  {
-    imageId: ami.id,
-    instanceType: warpstreamTableflowAgentInstanceType,
-    iamInstanceProfile: { arn: warpstreamAgentInstanceProfile.arn },
-    metadataOptions: {
-      httpEndpoint: 'enabled',
-      httpTokens: 'required',
-      httpPutResponseHopLimit: 2
-    },
-    vpcSecurityGroupIds: [warpstreamAgentSg.id],
-    userData: warpstreamTableflowAgentUserData.apply(value => Buffer.from(value).toString('base64')),
-    blockDeviceMappings: [
-      {
-        deviceName: '/dev/xvda',
-        ebs: {
-          volumeSize: cfg.getNumber('warpstreamTableflowAgentRootVolumeSizeGb') ?? 16,
-          volumeType: 'gp3',
-          deleteOnTermination: 'true',
-          encrypted: 'true',
-          kmsKeyId: dataKmsKeyArn
-        }
-      }
-    ],
-    tagSpecifications: [
-      { resourceType: 'instance', tags: { ...tags, Name: `${name}-warpstream-tableflow-agent`, Service: 'warpstream-tableflow-agent' } },
-      { resourceType: 'volume', tags: { ...tags, Service: 'warpstream-tableflow-agent' } }
-    ],
-    tags: { ...tags, Service: 'warpstream-tableflow-agent' }
-  },
-  {
-    dependsOn: [
-      warpstreamAgentInstanceProfile,
-      warpstreamBucket
-    ]
-  }
-)
-
 const asg = new aws.autoscaling.Group(`${name}-asg`, {
   vpcZoneIdentifiers: subnets.map(subnet => subnet.id),
   minSize,
@@ -1581,45 +1194,6 @@ const queryAsg = new aws.autoscaling.Group(`${name}-query-asg`, {
   ]
 })
 
-const warpstreamAgentAsg = new aws.autoscaling.Group(`${name}-warpstream-agent-asg`, {
-  vpcZoneIdentifiers: subnets.map(subnet => subnet.id),
-  minSize: warpstreamAgentMinSize,
-  maxSize: warpstreamAgentMaxSize,
-  desiredCapacity: warpstreamAgentDesiredCapacity,
-  healthCheckType: 'EC2',
-  healthCheckGracePeriod: 120,
-  targetGroupArns: [warpstreamKafkaTargetGroup.arn],
-  launchTemplate: {
-    id: warpstreamAgentLaunchTemplate.id,
-    version: '$Latest'
-  },
-  tags: [
-    { key: 'Project', value: tags.Project, propagateAtLaunch: true },
-    { key: 'Deployment', value: tags.Deployment, propagateAtLaunch: true },
-    { key: 'Name', value: `${name}-warpstream-agent`, propagateAtLaunch: true },
-    { key: 'Service', value: 'warpstream-agent', propagateAtLaunch: true }
-  ]
-})
-
-const warpstreamTableflowAgentAsg = new aws.autoscaling.Group(`${name}-warpstream-tableflow-agent-asg`, {
-  vpcZoneIdentifiers: subnets.map(subnet => subnet.id),
-  minSize: warpstreamTableflowAgentMinSize,
-  maxSize: warpstreamTableflowAgentMaxSize,
-  desiredCapacity: warpstreamTableflowAgentDesiredCapacity,
-  healthCheckType: 'EC2',
-  healthCheckGracePeriod: 120,
-  launchTemplate: {
-    id: warpstreamTableflowAgentLaunchTemplate.id,
-    version: '$Latest'
-  },
-  tags: [
-    { key: 'Project', value: tags.Project, propagateAtLaunch: true },
-    { key: 'Deployment', value: tags.Deployment, propagateAtLaunch: true },
-    { key: 'Name', value: `${name}-warpstream-tableflow-agent`, propagateAtLaunch: true },
-    { key: 'Service', value: 'warpstream-tableflow-agent', propagateAtLaunch: true }
-  ]
-})
-
 export const albDnsName = lb.dnsName
 export const domainNameOutput = domainName
 export const apiDomainNameOutput = apiDomainName
@@ -1639,22 +1213,13 @@ export const ingestUrl = apiBaseUrl
 export const queryTargetGroupArn = queryTargetGroup.arn
 export const ingestAutoScalingGroupName = asg.name
 export const queryAutoScalingGroupName = queryAsg.name
-export const warpstreamAgentAutoScalingGroupName = warpstreamAgentAsg.name
-export const warpstreamTableflowAgentAutoScalingGroupName = warpstreamTableflowAgentAsg.name
 export const bucketName = bucket.bucket
-export const warpstreamBucketName = warpstreamBucket.bucket
 export const objectPrefix = prefix
-export const kafkaBrokersOutput = appKafkaBrokers
-export const warpstreamKafkaBootstrapOutput = kafkaBrokers
-export const warpstreamKafkaLoadBalancerDnsName = warpstreamKafkaLoadBalancer.dnsName
-export const warpstreamAgentGroupOutput = warpstreamAgentGroup
-export const warpstreamVirtualClusterIdOutput = warpstreamVirtualClusterId
-export const warpstreamTableflowVirtualClusterIdOutput = warpstreamTableflowVirtualClusterId
+export const kafkaBrokersOutput = kafkaBrokers
 export const kafkaIngestTopicOutput = kafkaIngestTopic
 export const kafkaNormalizedTopicOutput = kafkaNormalizedTopic
 export const kafkaInvalidTopicOutput = kafkaInvalidTopic
 export const kafkaTableflowTopicOutput = kafkaTableflowTopic
-export const kafkaIcebergTopicOutput = kafkaIcebergTopic
 export const clickhouseUrlOutput = clickhouseUrl
 export const clickhouseUserOutput = clickhouseUser
 export const clickhouseDatabaseOutput = clickhouseDatabase
@@ -1689,7 +1254,6 @@ interface UserDataArgs {
   kafkaBrokers: string
   kafkaIngestTopic: string
   kafkaInvalidTopic: string
-  kafkaIcebergTopic: string
   kafkaNormalizedTopic: string
   kafkaTableflowTopic: string
   kafkaSaslMechanism: string
@@ -1740,28 +1304,6 @@ interface QueryUserDataArgs {
   sessionSecure: boolean
   sessionSameSite: string
   magicLinkTtlSecs: number
-}
-
-interface WarpstreamAgentUserDataArgs {
-  agentGroup: string
-  agentImage: string
-  agentKey: string
-  bucketName: string
-  kafkaPort: number
-  region: string
-  warpstreamRegion: string
-  virtualClusterId: string
-}
-
-interface WarpstreamTableflowAgentUserDataArgs {
-  agentImage: string
-  agentKey: string
-  bucketName: string
-  kafkaSaslPassword: string
-  kafkaSaslUsername: string
-  region: string
-  tableflowRegion: string
-  virtualClusterId: string
 }
 
 function renderUserData (args: UserDataArgs): string {
@@ -1850,7 +1392,6 @@ docker run -d --name nanotrace-normalizer --restart unless-stopped \\
   -e NANOTRACE_KAFKA_INGEST_TOPIC=${shellQuote(args.kafkaIngestTopic)} \\
   -e NANOTRACE_KAFKA_NORMALIZED_TOPIC=${shellQuote(args.kafkaNormalizedTopic)} \\
   -e NANOTRACE_KAFKA_TABLEFLOW_TOPIC=${shellQuote(args.kafkaTableflowTopic)} \\
-  -e NANOTRACE_KAFKA_ICEBERG_TOPIC=${shellQuote(args.kafkaIcebergTopic)} \\
   -e NANOTRACE_KAFKA_INVALID_TOPIC=${shellQuote(args.kafkaInvalidTopic)} \\
   -e NANOTRACE_NORMALIZER_GROUP_ID=${shellQuote(args.normalizerGroupId)} \\
   -e NANOTRACE_NORMALIZER_CLIENT_ID=${shellQuote(args.normalizerClientId)} \\
@@ -1953,132 +1494,8 @@ docker run -d --name nanotrace-query --restart unless-stopped \\
 `
 }
 
-function renderWarpstreamAgentUserData (args: WarpstreamAgentUserDataArgs): string {
-  const agentGroupArg = args.agentGroup.trim()
-    ? `  -agentGroup=${shellQuote(args.agentGroup.trim())} \\`
-    : ''
-  return `#!/bin/bash
-set -uo pipefail
-
-LOG=/var/log/warpstream-agent-bootstrap.log
-exec > >(tee -a "$LOG") 2>&1
-
-TOKEN="$(curl -sS --max-time 2 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || echo)"
-INSTANCE_ID="$(curl -sS --max-time 2 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo unknown)"
-S3_DEBUG_PREFIX="s3://${args.bucketName}/_debug/$INSTANCE_ID"
-
-upload_debug() {
-  local rc=$?
-  echo "=== warpstream agent bootstrap exit rc=$rc ==="
-  (docker ps -a 2>&1 || true) > /tmp/warpstream-docker-ps.txt
-  (docker logs warpstream-agent 2>&1 || true) > /tmp/warpstream-agent-logs.txt
-  (docker inspect warpstream-agent 2>&1 || true) > /tmp/warpstream-agent-inspect.txt
-  (journalctl -u docker --no-pager 2>&1 || true) > /tmp/warpstream-docker-journal.txt
-  (cat /var/log/cloud-init-output.log 2>&1 || true) > /tmp/warpstream-cloud-init-output.log
-  for f in "$LOG" /tmp/warpstream-docker-ps.txt /tmp/warpstream-agent-logs.txt /tmp/warpstream-agent-inspect.txt /tmp/warpstream-docker-journal.txt /tmp/warpstream-cloud-init-output.log; do
-    aws s3 cp "$f" "$S3_DEBUG_PREFIX/$(basename "$f")" --region ${shellQuote(args.region)} || true
-  done
-}
-trap upload_debug EXIT
-
-set -e
-dnf update -y
-dnf install -y docker awscli amazon-ssm-agent
-systemctl enable --now docker
-systemctl enable --now amazon-ssm-agent || true
-
-mkdir -p /etc/warpstream
-umask 077
-printf '%s' ${shellQuote(args.agentKey)} > /etc/warpstream/agent-key
-
-docker pull ${shellQuote(args.agentImage)}
-docker rm -f warpstream-agent >/dev/null 2>&1 || true
-docker run -d --name warpstream-agent --restart unless-stopped \\
-  --network host \\
-  --ulimit nofile=1048576:1048576 \\
-  -v /etc/warpstream:/etc/warpstream:ro \\
-  -e AWS_REGION=${shellQuote(args.region)} \\
-  -e WARPSTREAM_BUCKET_URL=${shellQuote(`s3://${args.bucketName}`)} \\
-  -e WARPSTREAM_DEFAULT_VIRTUAL_CLUSTER_ID=${shellQuote(args.virtualClusterId)} \\
-  -e WARPSTREAM_REGION=${shellQuote(args.warpstreamRegion)} \\
-  ${shellQuote(args.agentImage)} \\
-  agent \\
-  -agentKeyPath=/etc/warpstream/agent-key \\
-${agentGroupArg}
-  -bucketURL=${shellQuote(`s3://${args.bucketName}`)}
-`
-}
-
-function renderWarpstreamTableflowAgentUserData (args: WarpstreamTableflowAgentUserDataArgs): string {
-  return `#!/bin/bash
-set -uo pipefail
-
-LOG=/var/log/warpstream-tableflow-agent-bootstrap.log
-exec > >(tee -a "$LOG") 2>&1
-
-TOKEN="$(curl -sS --max-time 2 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || echo)"
-INSTANCE_ID="$(curl -sS --max-time 2 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo unknown)"
-S3_DEBUG_PREFIX="s3://${args.bucketName}/_debug-tableflow/$INSTANCE_ID"
-
-upload_debug() {
-  local rc=$?
-  echo "=== warpstream tableflow agent bootstrap exit rc=$rc ==="
-  (docker ps -a 2>&1 || true) > /tmp/warpstream-tableflow-docker-ps.txt
-  (docker logs warpstream-tableflow-agent 2>&1 || true) > /tmp/warpstream-tableflow-agent-logs.txt
-  (docker inspect warpstream-tableflow-agent 2>&1 || true) > /tmp/warpstream-tableflow-agent-inspect.txt
-  (journalctl -u docker --no-pager 2>&1 || true) > /tmp/warpstream-tableflow-docker-journal.txt
-  (cat /var/log/cloud-init-output.log 2>&1 || true) > /tmp/warpstream-tableflow-cloud-init-output.log
-  for f in "$LOG" /tmp/warpstream-tableflow-docker-ps.txt /tmp/warpstream-tableflow-agent-logs.txt /tmp/warpstream-tableflow-agent-inspect.txt /tmp/warpstream-tableflow-docker-journal.txt /tmp/warpstream-tableflow-cloud-init-output.log; do
-    aws s3 cp "$f" "$S3_DEBUG_PREFIX/$(basename "$f")" --region ${shellQuote(args.region)} || true
-  done
-}
-trap upload_debug EXIT
-
-set -e
-dnf update -y
-dnf install -y docker awscli amazon-ssm-agent
-systemctl enable --now docker
-systemctl enable --now amazon-ssm-agent || true
-
-mkdir -p /etc/warpstream
-umask 077
-printf '%s' ${shellQuote(args.agentKey)} > /etc/warpstream/tableflow-agent-key
-
-docker pull ${shellQuote(args.agentImage)}
-docker rm -f warpstream-tableflow-agent >/dev/null 2>&1 || true
-docker run -d --name warpstream-tableflow-agent --restart unless-stopped \\
-  --network host \\
-  --ulimit nofile=1048576:1048576 \\
-  -v /etc/warpstream:/etc/warpstream:ro \\
-  -e AWS_REGION=${shellQuote(args.region)} \\
-  -e WARPSTREAM_BUCKET_URL=${shellQuote(`s3://${args.bucketName}`)} \\
-  -e WARPSTREAM_DEFAULT_VIRTUAL_CLUSTER_ID=${shellQuote(args.virtualClusterId)} \\
-  -e WARPSTREAM_REGION=${shellQuote(args.tableflowRegion)} \\
-  -e KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
-  -e KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
-  -e TABLEFLOW_KAFKA_SASL_USERNAME=${shellQuote(args.kafkaSaslUsername)} \\
-  -e TABLEFLOW_KAFKA_SASL_PASSWORD=${shellQuote(args.kafkaSaslPassword)} \\
-  ${shellQuote(args.agentImage)} \\
-  agent \\
-  -agentKeyPath=/etc/warpstream/tableflow-agent-key \\
-  -bucketURL=${shellQuote(`s3://${args.bucketName}`)}
-`
-}
-
 function shellQuote (value: unknown): string {
   return `'${String(value).replaceAll("'", "'\\''")}'`
-}
-
-function inferWarpstreamAgentGroup (brokers: string): string {
-  for (const broker of brokers.split(',')) {
-    const host = broker.trim().replace(/^[a-z]+:\/\//i, '').split(':')[0]
-    const parts = host.split('.')
-    const groupPart = parts.find((part, index) => part.startsWith('group') && parts[index + 1] === 'kafka')
-    if (groupPart) {
-      return groupPart.slice('group'.length)
-    }
-  }
-  return ''
 }
 
 function requireEnv (key: string): string {
