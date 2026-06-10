@@ -13,7 +13,7 @@ use http::{
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use thiserror::Error;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -46,6 +46,8 @@ pub struct AuthIdentity {
     pub tenant_id: String,
     pub organization_id: String,
     pub organization_name: String,
+    pub project_ids: Vec<String>,
+    pub default_project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<OrganizationMembershipSummary>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +78,8 @@ pub struct ApiKeyRecord {
     pub prefix: String,
     pub role: AuthRole,
     pub scopes: Vec<String>,
+    pub project_ids: Vec<String>,
+    pub default_project_id: Option<String>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -105,6 +109,17 @@ pub struct OrganizationRecord {
     pub slug: String,
     pub name: String,
     pub plan: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub organization_id: String,
+    pub slug: String,
+    pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
@@ -196,6 +211,8 @@ struct CachedApiKey {
     scopes: Vec<String>,
     organization_id: String,
     organization_name: String,
+    project_ids: Vec<String>,
+    default_project_id: Option<String>,
 }
 
 impl AuthStore {
@@ -505,6 +522,8 @@ impl AuthStore {
                 .as_ref()
                 .map(|row| row.organization_name.clone())
                 .unwrap_or_default(),
+            project_ids: Vec::new(),
+            default_project_id: None,
             organizations: Some(memberships),
             pending_invitations: Some(pending_invitations),
             scopes: if organization.is_some() {
@@ -528,8 +547,10 @@ impl AuthStore {
             name: Some(row.name),
             role: parse_role(&row.role),
             tenant_id: row.organization_id.clone(),
-            organization_id: row.organization_id,
+            organization_id: row.organization_id.clone(),
             organization_name: row.organization_name,
+            project_ids: row.project_ids,
+            default_project_id: row.default_project_id,
             organizations: None,
             pending_invitations: None,
             scopes: normalize_scopes(&row.scopes, parse_role(&row.role)),
@@ -557,6 +578,8 @@ impl AuthStore {
         name: &str,
         role: AuthRole,
         scopes: &[String],
+        project_ids: &[String],
+        default_project_id: Option<&str>,
         created_by: &str,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<CreatedApiKey, AuthError> {
@@ -577,15 +600,18 @@ impl AuthStore {
         if organization_exists.is_none() {
             return Err(AuthError::NotFound);
         }
+        let (project_ids, default_project_id) = self
+            .normalize_api_key_projects(organization_id, project_ids, default_project_id)
+            .await?;
         let key = format!("ntak_{}", random_token());
         let prefix: String = key.chars().take(16).collect();
         let key_hash = token_hash(&key);
         let scopes = normalize_scopes(scopes, role);
         let row = sqlx::query_as::<_, ApiKeyRow>(
             "INSERT INTO nanotrace_api_keys
-                (organization_id, key_hash, prefix, name, role, scopes, created_by, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             RETURNING id, organization_id, name, prefix, role, scopes,
+                (organization_id, key_hash, prefix, name, role, scopes, project_ids, default_project_id, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING id, organization_id, name, prefix, role, scopes, project_ids, default_project_id,
                        created_by, created_at, last_used_at, expires_at, revoked_at",
         )
         .bind(organization_id)
@@ -594,6 +620,8 @@ impl AuthStore {
         .bind(name)
         .bind(role_name(role))
         .bind(scopes)
+        .bind(project_ids)
+        .bind(default_project_id)
         .bind(created_by)
         .bind(expires_at)
         .fetch_one(&self.pool)
@@ -610,7 +638,7 @@ impl AuthStore {
         organization_id: &str,
     ) -> Result<Vec<ApiKeyRecord>, AuthError> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, organization_id, name, prefix, role, scopes,
+            "SELECT id, organization_id, name, prefix, role, scopes, project_ids, default_project_id,
                     created_by, created_at, last_used_at, expires_at, revoked_at
              FROM nanotrace_api_keys
              WHERE organization_id = $1
@@ -620,6 +648,153 @@ impl AuthStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
+    }
+
+    pub async fn list_projects(
+        &self,
+        organization_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ProjectRecord>, AuthError> {
+        let rows = sqlx::query_as::<_, ProjectRecordRow>(
+            "SELECT id, organization_id, slug, name, created_at, updated_at, archived_at
+             FROM nanotrace_projects
+             WHERE organization_id = $1
+               AND ($2 OR archived_at IS NULL)
+             ORDER BY archived_at ASC NULLS FIRST, created_at ASC, slug ASC",
+        )
+        .bind(organization_id)
+        .bind(include_archived)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(ProjectRecordRow::into_record)
+            .collect())
+    }
+
+    pub async fn create_project(
+        &self,
+        organization_id: &str,
+        name: String,
+        requested_slug: Option<&str>,
+    ) -> Result<ProjectRecord, AuthError> {
+        let name = normalized_project_name(&name)?;
+        let slug_base = match requested_slug {
+            Some(slug) => normalized_slug(slug)?,
+            None => slug_from_name(&name),
+        };
+        let mut slug = slug_base.clone();
+        let mut suffix = 2_u32;
+        loop {
+            let id = format!("proj_{}", random_token());
+            let row = sqlx::query_as::<_, ProjectRecordRow>(
+                "INSERT INTO nanotrace_projects (id, organization_id, slug, name)
+                 SELECT $1, o.id, $2, $3
+                 FROM nanotrace_organizations AS o
+                 WHERE o.id = $4 AND o.archived_at IS NULL
+                 ON CONFLICT (organization_id, slug) DO NOTHING
+                 RETURNING id, organization_id, slug, name, created_at, updated_at, archived_at",
+            )
+            .bind(&id)
+            .bind(&slug)
+            .bind(&name)
+            .bind(organization_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(row) = row {
+                return Ok(row.into_record());
+            }
+            let organization_exists = sqlx::query_as::<_, (String,)>(
+                "SELECT id FROM nanotrace_organizations WHERE id = $1 AND archived_at IS NULL",
+            )
+            .bind(organization_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if organization_exists.is_none() {
+                return Err(AuthError::NotFound);
+            }
+            slug = format!("{slug_base}-{suffix}");
+            suffix += 1;
+            if suffix > 100 {
+                return Err(AuthError::InvalidInput(
+                    "could not generate a unique project slug".to_string(),
+                ));
+            }
+        }
+    }
+
+    pub async fn update_project(
+        &self,
+        organization_id: &str,
+        project_id: &str,
+        name: Option<String>,
+        requested_slug: Option<&str>,
+    ) -> Result<ProjectRecord, AuthError> {
+        let name = match name {
+            Some(name) => Some(normalized_project_name(&name)?),
+            None => None,
+        };
+        let slug = match requested_slug {
+            Some(slug) => Some(normalized_slug(slug)?),
+            None => None,
+        };
+        if name.is_none() && slug.is_none() {
+            return Err(AuthError::InvalidInput(
+                "project name or slug is required".to_string(),
+            ));
+        }
+        if let Some(slug) = slug.as_deref() {
+            let existing = sqlx::query_as::<_, (String,)>(
+                "SELECT id
+                 FROM nanotrace_projects
+                 WHERE organization_id = $1 AND slug = $2 AND id <> $3",
+            )
+            .bind(organization_id)
+            .bind(slug)
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if existing.is_some() {
+                return Err(AuthError::InvalidInput(
+                    "project slug is already in use".to_string(),
+                ));
+            }
+        }
+        let row = sqlx::query_as::<_, ProjectRecordRow>(
+            "UPDATE nanotrace_projects
+             SET name = COALESCE($3, name),
+                 slug = COALESCE($4, slug),
+                 updated_at = now()
+             WHERE organization_id = $1 AND id = $2 AND archived_at IS NULL
+             RETURNING id, organization_id, slug, name, created_at, updated_at, archived_at",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .bind(name)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(ProjectRecordRow::into_record)
+            .ok_or(AuthError::NotFound)
+    }
+
+    pub async fn archive_project(
+        &self,
+        organization_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectRecord, AuthError> {
+        let row = sqlx::query_as::<_, ProjectRecordRow>(
+            "UPDATE nanotrace_projects
+             SET archived_at = COALESCE(archived_at, now()), updated_at = now()
+             WHERE organization_id = $1 AND id = $2
+             RETURNING id, organization_id, slug, name, created_at, updated_at, archived_at",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(ProjectRecordRow::into_record)
+            .ok_or(AuthError::NotFound)
     }
 
     pub async fn list_organization_ids(&self) -> Result<Vec<String>, AuthError> {
@@ -643,7 +818,7 @@ impl AuthStore {
             "UPDATE nanotrace_api_keys
              SET revoked_at = COALESCE(revoked_at, now())
              WHERE id = $1 AND organization_id = $2
-             RETURNING id, organization_id, name, prefix, role, scopes,
+             RETURNING id, organization_id, name, prefix, role, scopes, project_ids, default_project_id,
                        created_by, created_at, last_used_at, expires_at, revoked_at",
         )
         .bind(id)
@@ -703,6 +878,8 @@ impl AuthStore {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(row) = inserted {
+                self.insert_default_project(&mut tx, &row.id, row.created_at)
+                    .await?;
                 sqlx::query(
                     "INSERT INTO nanotrace_organization_members
                         (organization_id, subject, role, updated_at)
@@ -771,6 +948,8 @@ impl AuthStore {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(row) = inserted {
+                self.insert_default_project(&mut tx, &row.id, row.created_at)
+                    .await?;
                 sqlx::query(
                     "INSERT INTO nanotrace_organization_members
                         (organization_id, subject, role, updated_at)
@@ -1337,6 +1516,141 @@ impl AuthStore {
         Ok(membership)
     }
 
+    pub async fn resolve_ingest_project(
+        &self,
+        identity: &AuthIdentity,
+        requested_project_id: Option<&str>,
+    ) -> Result<String, AuthError> {
+        if identity.organization_id.is_empty() {
+            return Err(AuthError::Forbidden);
+        }
+        let project_id = match requested_project_id
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
+            Some(project_id) => project_id.to_string(),
+            None => identity
+                .default_project_id
+                .clone()
+                .or(self.default_project_id(&identity.organization_id).await?)
+                .unwrap_or_default(),
+        };
+        if project_id.is_empty() {
+            return Err(AuthError::InvalidInput(
+                "project id is required".to_string(),
+            ));
+        }
+        if !identity.project_ids.is_empty()
+            && !identity
+                .project_ids
+                .iter()
+                .any(|authorized_project_id| authorized_project_id == &project_id)
+        {
+            return Err(AuthError::Forbidden);
+        }
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT id
+             FROM nanotrace_projects
+             WHERE organization_id = $1
+               AND id = $2
+               AND archived_at IS NULL",
+        )
+        .bind(&identity.organization_id)
+        .bind(&project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if row.is_none() {
+            return Err(AuthError::Forbidden);
+        }
+        Ok(project_id)
+    }
+
+    async fn normalize_api_key_projects(
+        &self,
+        organization_id: &str,
+        project_ids: &[String],
+        default_project_id: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), AuthError> {
+        let mut normalized_project_ids = project_ids
+            .iter()
+            .map(|project_id| project_id.trim())
+            .filter(|project_id| !project_id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        normalized_project_ids.sort();
+        normalized_project_ids.dedup();
+
+        let active_project_ids = self.active_project_ids(organization_id).await?;
+        if active_project_ids.is_empty() {
+            return Err(AuthError::InvalidInput(
+                "organization must have an active project".to_string(),
+            ));
+        }
+        for project_id in &normalized_project_ids {
+            if !active_project_ids.iter().any(|active| active == project_id) {
+                return Err(AuthError::InvalidInput(format!(
+                    "project {project_id} is not active in this organization"
+                )));
+            }
+        }
+
+        let default_project_id = match default_project_id
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
+            Some(project_id) => Some(project_id.to_string()),
+            None => self.default_project_id(organization_id).await?,
+        };
+        if let Some(default_project_id) = default_project_id.as_deref() {
+            if !active_project_ids
+                .iter()
+                .any(|active| active == default_project_id)
+            {
+                return Err(AuthError::InvalidInput(
+                    "default project must be active in this organization".to_string(),
+                ));
+            }
+            if !normalized_project_ids.is_empty()
+                && !normalized_project_ids
+                    .iter()
+                    .any(|project_id| project_id == default_project_id)
+            {
+                return Err(AuthError::InvalidInput(
+                    "default project must be included in project_ids".to_string(),
+                ));
+            }
+        }
+        Ok((normalized_project_ids, default_project_id))
+    }
+
+    async fn active_project_ids(&self, organization_id: &str) -> Result<Vec<String>, AuthError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT id
+             FROM nanotrace_projects
+             WHERE organization_id = $1 AND archived_at IS NULL
+             ORDER BY created_at ASC, slug ASC",
+        )
+        .bind(organization_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn default_project_id(&self, organization_id: &str) -> Result<Option<String>, AuthError> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT id
+             FROM nanotrace_projects
+             WHERE organization_id = $1
+               AND archived_at IS NULL
+             ORDER BY (slug = 'default') DESC, created_at ASC, slug ASC
+             LIMIT 1",
+        )
+        .bind(organization_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     async fn run_migrations(&self) -> Result<(), AuthError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
@@ -1417,7 +1731,8 @@ impl AuthStore {
 
     async fn refresh_api_key_cache(&self) -> Result<(), AuthError> {
         let rows = sqlx::query_as::<_, CachedApiKeyRow>(
-            "SELECT k.key_hash, k.name, k.role, k.scopes, k.organization_id, o.name AS organization_name
+            "SELECT k.key_hash, k.name, k.role, k.scopes, k.project_ids, k.default_project_id,
+                    k.organization_id, o.name AS organization_name
              FROM nanotrace_api_keys AS k
              INNER JOIN nanotrace_organizations AS o ON k.organization_id = o.id
              WHERE k.revoked_at IS NULL
@@ -1437,6 +1752,8 @@ impl AuthStore {
                         scopes: row.scopes,
                         organization_id: row.organization_id,
                         organization_name: row.organization_name,
+                        project_ids: row.project_ids,
+                        default_project_id: row.default_project_id,
                     },
                 )
             })
@@ -1482,6 +1799,26 @@ impl AuthStore {
         .bind(name)
         .bind(role)
         .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_default_project(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        organization_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        let project_id = format!("proj_{}", random_token());
+        sqlx::query(
+            "INSERT INTO nanotrace_projects (id, organization_id, slug, name, created_at, updated_at)
+             VALUES ($1, $2, 'default', 'Default', $3, now())
+             ON CONFLICT (organization_id, slug) DO NOTHING",
+        )
+        .bind(project_id)
+        .bind(organization_id)
+        .bind(created_at)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
@@ -1786,6 +2123,8 @@ struct ApiKeyRow {
     prefix: String,
     role: String,
     scopes: Vec<String>,
+    project_ids: Vec<String>,
+    default_project_id: Option<String>,
     created_by: String,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
@@ -1802,6 +2141,8 @@ impl ApiKeyRow {
             prefix: self.prefix,
             role: parse_role(&self.role),
             scopes: self.scopes,
+            project_ids: self.project_ids,
+            default_project_id: self.default_project_id,
             created_by: self.created_by,
             created_at: self.created_at,
             last_used_at: self.last_used_at,
@@ -1817,8 +2158,35 @@ struct CachedApiKeyRow {
     name: String,
     role: String,
     scopes: Vec<String>,
+    project_ids: Vec<String>,
+    default_project_id: Option<String>,
     organization_id: String,
     organization_name: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ProjectRecordRow {
+    id: String,
+    organization_id: String,
+    slug: String,
+    name: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    archived_at: Option<DateTime<Utc>>,
+}
+
+impl ProjectRecordRow {
+    fn into_record(self) -> ProjectRecord {
+        ProjectRecord {
+            id: self.id,
+            organization_id: self.organization_id,
+            slug: self.slug,
+            name: self.name,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            archived_at: self.archived_at,
+        }
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2036,6 +2404,16 @@ fn normalized_organization_name(name: &str) -> Result<String, AuthError> {
     Ok(name.to_string())
 }
 
+fn normalized_project_name(name: &str) -> Result<String, AuthError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 120 {
+        return Err(AuthError::InvalidInput(
+            "project name is required".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
 fn normalized_slug(slug: &str) -> Result<String, AuthError> {
     let slug = slug_from_name(slug);
     if slug.is_empty() || slug.len() > 80 {
@@ -2148,6 +2526,7 @@ fn default_scopes(role: AuthRole) -> Vec<String> {
             "query:read".to_string(),
             "definitions:write".to_string(),
             "api_keys:write".to_string(),
+            "data:delete".to_string(),
             "facets:write".to_string(),
         ],
         AuthRole::Service => vec!["ingest:write".to_string(), "query:read".to_string()],
@@ -2678,7 +3057,16 @@ mod tests {
             assert!(updated.slug.starts_with("updated-archive-"));
 
             let created_key = store
-                .create_api_key(&org.id, "archive-key", AuthRole::Admin, &[], &subject, None)
+                .create_api_key(
+                    &org.id,
+                    "archive-key",
+                    AuthRole::Admin,
+                    &[],
+                    &[],
+                    None,
+                    &subject,
+                    None,
+                )
                 .await
                 .expect("api key");
             let token = store
@@ -2710,6 +3098,8 @@ mod tests {
                     "after-archive",
                     AuthRole::Admin,
                     &[],
+                    &[],
+                    None,
                     &subject,
                     None,
                 )

@@ -67,6 +67,7 @@ CREATE TABLE
             parent_span_id Nullable (String),
             request_id Nullable (String),
             organization_id Nullable (String),
+            project_id Nullable (String),
             thread_id Nullable (String),
             conversation_id Nullable (String),
             start_time Nullable (DateTime64 (3, 'UTC')),
@@ -92,6 +93,7 @@ CREATE TABLE
         ),
 
         tenant_id LowCardinality (String) DEFAULT ifNull (data.tenant_id, ''),
+        project_id LowCardinality (String) DEFAULT ifNull (data.project_id, ''),
         event_type String MATERIALIZED ifNull (data.event_type, '') CODEC (ZSTD (1)),
         trace_id String MATERIALIZED ifNull (data.trace_id, '') CODEC (ZSTD (1)),
         span_id String MATERIALIZED ifNull (data.span_id, '') CODEC (ZSTD (1)),
@@ -112,7 +114,10 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, timestamp, event_type, event_id);
+    (tenant_id, timestamp, project_id, event_type, event_id);
+
+ALTER TABLE observatory.events
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT ifNull (data.project_id, '') AFTER tenant_id;
 
 CREATE TABLE
     IF NOT EXISTS observatory.invalid_events (
@@ -179,6 +184,7 @@ ORDER BY
 CREATE TABLE
     IF NOT EXISTS observatory.event_text_index (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         event_id String CODEC (ZSTD (1)),
         event_type String CODEC (ZSTD (1)),
@@ -194,11 +200,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, timestamp, event_id);
+    (tenant_id, timestamp, project_id, event_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_density_1s (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         count UInt64 CODEC (Delta, ZSTD (1)),
         error_count UInt64 CODEC (Delta, ZSTD (1))
@@ -206,12 +213,18 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, bucket_time);
+    (tenant_id, bucket_time, project_id);
+
+ALTER TABLE observatory.event_density_1s
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+DROP VIEW IF EXISTS observatory.mv_event_density_1s;
 
 CREATE MATERIALIZED VIEW
     IF NOT EXISTS observatory.mv_event_density_1s TO observatory.event_density_1s AS
 SELECT
     tenant_id,
+    project_id,
     toStartOfInterval (timestamp, INTERVAL 1 SECOND) AS bucket_time,
     count () AS count,
     sum (toUInt64 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error'))) AS error_count
@@ -219,11 +232,13 @@ FROM
     observatory.events
 GROUP BY
     tenant_id,
+    project_id,
     bucket_time;
 
 CREATE TABLE
     IF NOT EXISTS observatory.field_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         field_name LowCardinality (String),
         value String CODEC (ZSTD (1)),
         value_hash UInt64 MATERIALIZED cityHash64 (value),
@@ -241,7 +256,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, field_name, bucket_seconds, bucket_time, value_hash, value);
+    (tenant_id, project_id, field_name, bucket_seconds, bucket_time, value_hash, value);
+
+ALTER TABLE observatory.field_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+DROP VIEW IF EXISTS observatory.mv_field_rollups;
 
 CREATE MATERIALIZED VIEW
     IF NOT EXISTS observatory.mv_field_rollups TO observatory.field_rollups AS
@@ -264,6 +284,7 @@ WITH
     ) AS dimensions
 SELECT
     tenant_id,
+    project_id,
     tupleElement (rollup, 1) AS field_name,
     tupleElement (rollup, 2) AS value,
     tupleElement (rollup, 3) AS bucket_time,
@@ -301,6 +322,7 @@ ARRAY JOIN
     ) AS rollup
 GROUP BY
     tenant_id,
+    project_id,
     field_name,
     value,
     bucket_time,
@@ -309,6 +331,7 @@ GROUP BY
 CREATE TABLE
     IF NOT EXISTS observatory.field_values (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         field_name LowCardinality (String),
         value String CODEC (ZSTD (1)),
         value_hash UInt64 MATERIALIZED cityHash64 (value),
@@ -325,7 +348,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, field_name, value_hash, value, timestamp, event_id);
+    (tenant_id, project_id, field_name, value_hash, value, timestamp, event_id);
+
+ALTER TABLE observatory.field_values
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+DROP VIEW IF EXISTS observatory.mv_field_values;
 
 CREATE MATERIALIZED VIEW
     IF NOT EXISTS observatory.mv_field_values TO observatory.field_values AS
@@ -342,6 +370,7 @@ WITH
     toUInt8 (ifNull (data.is_error, 0) != 0 OR endsWith (lower (event_type), '_error')) AS error_value
 SELECT
     tenant_id,
+    project_id,
     tupleElement (lookup, 1) AS field_name,
     tupleElement (lookup, 2) AS value,
     timestamp,
@@ -394,6 +423,7 @@ ORDER BY
 CREATE TABLE
     IF NOT EXISTS observatory.field_index (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         mode LowCardinality (String),
         field_name LowCardinality (String),
         value String CODEC (ZSTD (1)),
@@ -418,11 +448,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, mode, field_name, value_hash, value, timestamp, event_id, definition_id);
+    (tenant_id, project_id, mode, field_name, value_hash, value, timestamp, event_id, definition_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.event_kv_index (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
         event_id String CODEC (ZSTD (1)),
         event_type String DEFAULT '' CODEC (ZSTD (1)),
@@ -447,6 +478,7 @@ PARTITION BY
 ORDER BY
     (
         tenant_id,
+        project_id,
         path_hash,
         path,
         value_type,
@@ -461,6 +493,7 @@ ORDER BY
 CREATE TABLE
     IF NOT EXISTS observatory.event_measures (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         measure_name LowCardinality (String),
@@ -478,11 +511,15 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, definition_id, measure_name, dimension_name, dimension_value, timestamp, event_id, definition_version);
+    (tenant_id, project_id, definition_id, measure_name, dimension_name, dimension_value, timestamp, event_id, definition_version);
+
+ALTER TABLE observatory.event_measures
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
 
 CREATE TABLE
     IF NOT EXISTS observatory.measure_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
@@ -501,12 +538,18 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, definition_id, measure_name, bucket_seconds, bucket_time, dimension_name, dimension_value);
+    (tenant_id, project_id, definition_id, measure_name, bucket_seconds, bucket_time, dimension_name, dimension_value);
+
+ALTER TABLE observatory.measure_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+DROP VIEW IF EXISTS observatory.mv_measure_rollups;
 
 CREATE MATERIALIZED VIEW
     IF NOT EXISTS observatory.mv_measure_rollups TO observatory.measure_rollups AS
 SELECT
     tenant_id,
+    project_id,
     definition_id,
     anyLast (definition_version) AS definition_version,
     bucket_time,
@@ -525,6 +568,7 @@ FROM
     observatory.event_measures
 GROUP BY
     tenant_id,
+    project_id,
     definition_id,
     bucket_time,
     bucket_seconds,
@@ -536,6 +580,7 @@ GROUP BY
 CREATE TABLE
     IF NOT EXISTS observatory.measure_cube_points (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         measure_name LowCardinality (String),
@@ -561,6 +606,7 @@ PARTITION BY
 ORDER BY
     (
         tenant_id,
+        project_id,
         definition_id,
         measure_name,
         dimension_set_id,
@@ -570,9 +616,13 @@ ORDER BY
         definition_version
     );
 
+ALTER TABLE observatory.measure_cube_points
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
 CREATE TABLE
     IF NOT EXISTS observatory.measure_cube_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
@@ -599,6 +649,7 @@ PARTITION BY
 ORDER BY
     (
         tenant_id,
+        project_id,
         definition_id,
         measure_name,
         bucket_seconds,
@@ -607,10 +658,16 @@ ORDER BY
         dimensions_hash
     );
 
+ALTER TABLE observatory.measure_cube_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+DROP VIEW IF EXISTS observatory.mv_measure_cube_rollups;
+
 CREATE MATERIALIZED VIEW
     IF NOT EXISTS observatory.mv_measure_cube_rollups TO observatory.measure_cube_rollups AS
 SELECT
     tenant_id,
+    project_id,
     definition_id,
     anyLast (definition_version) AS definition_version,
     bucket_time,
@@ -630,6 +687,7 @@ FROM
     observatory.measure_cube_points
 GROUP BY
     tenant_id,
+    project_id,
     definition_id,
     bucket_time,
     bucket_seconds,
@@ -642,6 +700,7 @@ GROUP BY
 CREATE TABLE
     IF NOT EXISTS observatory.counter_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         metric_name LowCardinality (String),
@@ -656,11 +715,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+    (tenant_id, project_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
 
 CREATE TABLE
     IF NOT EXISTS observatory.gauge_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         metric_name LowCardinality (String),
@@ -678,11 +738,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+    (tenant_id, project_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
 
 CREATE TABLE
     IF NOT EXISTS observatory.histogram_rollups (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         metric_name LowCardinality (String),
@@ -699,11 +760,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
+    (tenant_id, project_id, definition_id, metric_name, bucket_seconds, bucket_time, dimensions_hash);
 
 CREATE TABLE
     IF NOT EXISTS observatory.entity_state_updates (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         entity_type LowCardinality (String),
@@ -720,11 +782,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMMDD (timestamp)
 ORDER BY
-    (tenant_id, entity_type, entity_hash, state_name, timestamp, event_id, definition_id);
+    (tenant_id, project_id, entity_type, entity_hash, state_name, timestamp, event_id, definition_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.entity_state_current (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         definition_id String DEFAULT '' CODEC (ZSTD (1)),
         definition_version UInt64 DEFAULT 0,
         entity_type LowCardinality (String),
@@ -742,11 +805,12 @@ CREATE TABLE
 PARTITION BY
     cityHash64 (entity_type) % 16
 ORDER BY
-    (tenant_id, entity_type, entity_hash, state_name);
+    (tenant_id, project_id, entity_type, entity_hash, state_name);
 
 CREATE TABLE
     IF NOT EXISTS observatory.cohort_memberships (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         cohort_id String CODEC (ZSTD (1)),
         cohort_version UInt64 DEFAULT 0,
         entity_type LowCardinality (String),
@@ -759,11 +823,12 @@ CREATE TABLE
 PARTITION BY
     cityHash64 (cohort_id) % 16
 ORDER BY
-    (tenant_id, cohort_id, cohort_version, entity_type, entity_hash);
+    (tenant_id, project_id, cohort_id, cohort_version, entity_type, entity_hash);
 
 CREATE TABLE
     IF NOT EXISTS observatory.report_results (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         report_id String CODEC (ZSTD (1)),
         report_version UInt64 DEFAULT 0,
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
@@ -775,11 +840,12 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, report_id, report_version, bucket_time, dimensions_hash);
+    (tenant_id, project_id, report_id, report_version, bucket_time, dimensions_hash);
 
 CREATE TABLE
     IF NOT EXISTS observatory.sequence_report_results (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        project_id LowCardinality (String) DEFAULT '' CODEC (ZSTD (1)),
         report_id String CODEC (ZSTD (1)),
         report_version UInt64 DEFAULT 0,
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
@@ -794,7 +860,7 @@ CREATE TABLE
 PARTITION BY
     toYYYYMM (bucket_time)
 ORDER BY
-    (tenant_id, report_id, report_version, bucket_time, segment_hash, step_index);
+    (tenant_id, project_id, report_id, report_version, bucket_time, segment_hash, step_index);
 
 CREATE TABLE
     IF NOT EXISTS observatory.definition_stats (
@@ -929,7 +995,7 @@ CREATE TABLE
         completed_at Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1))
     ) ENGINE = ReplacingMergeTree (updated_at)
 ORDER BY
-    (tenant_id, target_type, target_id, target_version, status);
+    (tenant_id, target_type, target_id, target_version);
 
 CREATE TABLE
     IF NOT EXISTS observatory.materialization_watermarks (
@@ -947,6 +1013,31 @@ CREATE TABLE
     ) ENGINE = ReplacingMergeTree (updated_at)
 ORDER BY
     (tenant_id, target_type, target_id, target_version);
+
+CREATE TABLE
+    IF NOT EXISTS observatory.deletion_jobs (
+        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
+        deletion_id String CODEC (ZSTD (1)),
+        status LowCardinality (String) DEFAULT 'pending',
+        requested_by String CODEC (ZSTD (1)),
+        project_ids Array (String),
+        source_start DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        source_end DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
+        filter JSON (max_dynamic_paths = 1024, max_dynamic_types = 8),
+        rows_matched UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
+        rows_deleted UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
+        derived_tables_deleted Array (String),
+        materializations_marked_stale UInt64 DEFAULT 0 CODEC (Delta, ZSTD (1)),
+        error String DEFAULT '' CODEC (ZSTD (3)),
+        created_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
+        updated_at DateTime64 (3, 'UTC') DEFAULT now64 (3),
+        completed_at Nullable (DateTime64 (3, 'UTC')) CODEC (Delta (8), ZSTD (1)),
+        attributes JSON (max_dynamic_paths = 256, max_dynamic_types = 8)
+    ) ENGINE = ReplacingMergeTree (updated_at)
+PARTITION BY
+    toYYYYMM (source_start)
+ORDER BY
+    (tenant_id, deletion_id);
 
 CREATE TABLE
     IF NOT EXISTS observatory.pipeline_metrics (
@@ -999,6 +1090,63 @@ ORDER BY
 
 ALTER TABLE observatory.report_results
     ADD COLUMN IF NOT EXISTS dimensions_hash UInt64 MATERIALIZED cityHash64 (toJSONString (dimensions)) AFTER dimensions;
+
+ALTER TABLE observatory.events
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT ifNull (data.project_id, '') AFTER tenant_id;
+
+ALTER TABLE observatory.event_text_index
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.event_density_1s
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.field_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.event_kv_index
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.field_values
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.field_index
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.event_measures
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.measure_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.measure_cube_points
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.measure_cube_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.counter_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.gauge_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.histogram_rollups
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.entity_state_updates
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.entity_state_current
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.cohort_memberships
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.report_results
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
+
+ALTER TABLE observatory.sequence_report_results
+    ADD COLUMN IF NOT EXISTS project_id LowCardinality (String) DEFAULT '' AFTER tenant_id;
 
 ALTER TABLE observatory.events
     ADD INDEX IF NOT EXISTS idx_source_file source_file TYPE bloom_filter (0.01) GRANULARITY 4;

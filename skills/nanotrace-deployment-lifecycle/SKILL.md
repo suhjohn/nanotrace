@@ -72,7 +72,7 @@ Use this as the recommended target unless repo code or user constraints say othe
 
 - AWS Pulumi stack for VPC, ALB, EC2 Auto Scaling Groups, ECR, S3, CloudFront, IAM, manual DNS record outputs, and SES email identity.
 - WarpStream Kafka for ingest topics.
-- WarpStream Tableflow for managed Iceberg writes from `events.tableflow.batches.v1`; Nanotrace app containers do not write Iceberg or require writable Iceberg REST catalog envs.
+- WarpStream Tableflow for managed Iceberg writes from `events.iceberg.rows.v1`; Nanotrace app containers do not write Iceberg or require writable Iceberg REST catalog envs.
 - External ClickHouse Cloud; the stack applies schema but does not provision the service.
 - PlanetScale Postgres over PrivateLink; `DATABASE_URL` is required and `PLANETSCALE_PRIVATELINK_SERVICE_NAME` is required for deploy.
 - Separate Pulumi stacks for `staging` and `prod`.

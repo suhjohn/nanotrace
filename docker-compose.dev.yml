@@ -25,6 +25,7 @@ x-app-env: &app-env
   NANOTRACE_KAFKA_INGEST_TOPIC: events.ingest.v1
   NANOTRACE_KAFKA_NORMALIZED_TOPIC: events.normalized.v1
   NANOTRACE_KAFKA_TABLEFLOW_TOPIC: events.tableflow.batches.v1
+  NANOTRACE_KAFKA_ICEBERG_TOPIC: events.iceberg.rows.v1
   NANOTRACE_KAFKA_INVALID_TOPIC: events.invalid.v1
   RUST_LOG: info
 

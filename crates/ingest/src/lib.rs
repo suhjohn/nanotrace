@@ -19,10 +19,12 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_INGEST_TOPIC: &str = "events.ingest.v1";
 pub const DEFAULT_NORMALIZED_TOPIC: &str = "events.normalized.v1";
 pub const DEFAULT_TABLEFLOW_TOPIC: &str = "events.tableflow.batches.v1";
+pub const DEFAULT_ICEBERG_TOPIC: &str = "events.iceberg.rows.v1";
 pub const DEFAULT_INVALID_TOPIC: &str = "events.invalid.v1";
 
 pub const HEADER_TENANT_ID: &str = "nanotrace-tenant-id";
 pub const HEADER_ORGANIZATION_ID: &str = "nanotrace-organization-id";
+pub const HEADER_PROJECT_ID: &str = "nanotrace-project-id";
 pub const HEADER_RECEIVED_AT: &str = "nanotrace-received-at";
 pub const HEADER_CONTENT_TYPE: &str = "content-type";
 pub const HEADER_SCHEMA_VERSION: &str = "nanotrace-schema-version";
@@ -82,6 +84,7 @@ impl RawBatchProducer {
         &self,
         tenant_id: &str,
         organization_id: &str,
+        project_id: &str,
         content_type: &str,
         body: &[u8],
     ) -> Result<ProducedBatch, IngestError> {
@@ -95,6 +98,10 @@ impl RawBatchProducer {
             .insert(Header {
                 key: HEADER_ORGANIZATION_ID,
                 value: Some(organization_id),
+            })
+            .insert(Header {
+                key: HEADER_PROJECT_ID,
+                value: Some(project_id),
             })
             .insert(Header {
                 key: HEADER_RECEIVED_AT,
@@ -242,6 +249,7 @@ pub struct ManagedDefinitionSpec {
 #[derive(Debug, Clone, Serialize)]
 pub struct EventKvIndexRow {
     pub tenant_id: String,
+    pub project_id: String,
     pub timestamp: String,
     pub event_id: String,
     pub event_type: String,
@@ -259,6 +267,7 @@ pub struct EventKvIndexRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct EventTextIndexRow {
     pub tenant_id: String,
+    pub project_id: String,
     pub timestamp: String,
     pub event_id: String,
     pub event_type: String,
@@ -281,6 +290,7 @@ pub fn normalize_json_batch(
     body: &[u8],
     tenant_id: &str,
     organization_id: &str,
+    project_id: &str,
     source_file: &str,
     received_at: &str,
     max_event_bytes: usize,
@@ -315,6 +325,7 @@ pub fn normalize_json_batch(
             value,
             tenant_id,
             organization_id,
+            project_id,
             source_file,
             source_offset,
             max_event_bytes,
@@ -363,6 +374,7 @@ fn normalize_event(
     value: Value,
     tenant_id: &str,
     organization_id: &str,
+    project_id: &str,
     source_file: &str,
     source_offset: u64,
     max_event_bytes: usize,
@@ -398,12 +410,20 @@ fn normalize_event(
         "organization_id".to_string(),
         Value::String(organization_id.to_string()),
     );
+    data.insert(
+        "project_id".to_string(),
+        Value::String(project_id.to_string()),
+    );
     let managed_definitions = managed_definition_specs(&data);
 
     let mut row = Map::new();
     row.insert(
         "tenant_id".to_string(),
         Value::String(tenant_id.to_string()),
+    );
+    row.insert(
+        "project_id".to_string(),
+        Value::String(project_id.to_string()),
     );
     row.insert("event_id".to_string(), Value::String(event_id.to_string()));
     row.insert(
@@ -565,6 +585,9 @@ pub fn event_kv_index_rows_with_limits(
     let tenant_id = string_value(event_object, "tenant_id")
         .or_else(|| string_value(data, "tenant_id"))
         .unwrap_or_default();
+    let project_id = string_value(event_object, "project_id")
+        .or_else(|| string_value(data, "project_id"))
+        .unwrap_or_default();
     let event_id = string_value(event_object, "event_id").unwrap_or_default();
     let timestamp = string_value(event_object, "timestamp").unwrap_or_default();
     if tenant_id.is_empty() || event_id.is_empty() || timestamp.is_empty() {
@@ -576,6 +599,7 @@ pub fn event_kv_index_rows_with_limits(
     let source_file = string_value(event_object, "source_file").unwrap_or_default();
     let context = KvIndexContext {
         tenant_id,
+        project_id,
         timestamp,
         event_id,
         event_type,
@@ -636,6 +660,9 @@ pub fn event_text_index_rows_with_limits(
     let tenant_id = string_value(event_object, "tenant_id")
         .or_else(|| string_value(data, "tenant_id"))
         .unwrap_or_default();
+    let project_id = string_value(event_object, "project_id")
+        .or_else(|| string_value(data, "project_id"))
+        .unwrap_or_default();
     let event_id = string_value(event_object, "event_id").unwrap_or_default();
     let timestamp = string_value(event_object, "timestamp").unwrap_or_default();
     if tenant_id.is_empty() || event_id.is_empty() || timestamp.is_empty() {
@@ -658,6 +685,7 @@ pub fn event_text_index_rows_with_limits(
 
     vec![EventTextIndexRow {
         tenant_id,
+        project_id,
         timestamp,
         event_id,
         event_type,
@@ -735,6 +763,7 @@ fn push_search_fragment(output: &mut String, fragment: &str, max_text_bytes: usi
 
 struct KvIndexContext {
     tenant_id: String,
+    project_id: String,
     timestamp: String,
     event_id: String,
     event_type: String,
@@ -887,6 +916,7 @@ fn push_kv_index_row(
     }
     rows.push(EventKvIndexRow {
         tenant_id: context.tenant_id.clone(),
+        project_id: context.project_id.clone(),
         timestamp: context.timestamp.clone(),
         event_id: context.event_id.clone(),
         event_type: context.event_type.clone(),
@@ -1048,6 +1078,7 @@ fn is_dimension_field(path: &str) -> bool {
         path,
         "tenant_id"
             | "organization_id"
+            | "project_id"
             | "event_type"
             | "signal"
             | "metric_value"
@@ -1134,6 +1165,7 @@ mod tests {
             body,
             "tenant-a",
             "org-a",
+            "proj-a",
             "kafka://events.ingest.v1/0/12",
             "2026-06-04T00:00:02Z",
             usize::MAX,
@@ -1153,8 +1185,10 @@ mod tests {
             }
             let row: Value = serde_json::from_slice(line).expect("row is JSON");
             assert_eq!(row["tenant_id"], "tenant-a");
+            assert_eq!(row["project_id"], "proj-a");
             assert_eq!(row["data"]["tenant_id"], "tenant-a");
             assert_eq!(row["data"]["organization_id"], "org-a");
+            assert_eq!(row["data"]["project_id"], "proj-a");
             assert!(row["source_length"].as_u64().unwrap() > 0);
         }
     }
@@ -1165,6 +1199,7 @@ mod tests {
             br#"{"event_id":"","timestamp":"2026-06-04T00:00:00Z","data":{}}"#,
             "tenant-a",
             "org-a",
+            "proj-a",
             "kafka://events.ingest.v1/0/13",
             "2026-06-04T00:00:02Z",
             usize::MAX,
@@ -1224,6 +1259,7 @@ mod tests {
             body,
             "tenant-a",
             "org-a",
+            "proj-a",
             "kafka://events.ingest.v1/0/14",
             "2026-06-04T00:00:02Z",
             usize::MAX,
@@ -1287,6 +1323,7 @@ mod tests {
             br#"{"event_id":"evt-1","timestamp":"2026-06-04T00:00:00Z","data":{"event_type":"track","plan":"pro","latency_ms":125}}"#,
             "tenant-a",
             "org-a",
+            "proj-a",
             "kafka://events.ingest.v1/0/14",
             "2026-06-04T00:00:02Z",
             usize::MAX,

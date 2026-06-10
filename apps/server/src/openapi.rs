@@ -25,6 +25,9 @@ use utoipa::{
         crate::http::list_backfill_jobs,
         crate::http::create_definition_backfill,
         crate::http::get_backfill_job,
+        crate::http::create_deletion,
+        crate::http::list_deletions,
+        crate::http::get_deletion,
         crate::http::auth_providers,
         crate::http::auth_login,
         crate::http::auth_logout,
@@ -34,6 +37,10 @@ use utoipa::{
         crate::http::update_organization,
         crate::http::archive_organization,
         crate::http::switch_organization,
+        crate::http::list_projects,
+        crate::http::create_project,
+        crate::http::update_project,
+        crate::http::archive_project,
         crate::http::leave_organization,
         crate::http::list_organization_members,
         crate::http::update_organization_member,
@@ -84,11 +91,19 @@ use utoipa::{
         crate::materializations::MaterializationChunkRecord,
         crate::materializations::BackfillJobResponse,
         crate::materializations::BackfillJobListResponse,
+        crate::deletions::CreateDeletionRequest,
+        crate::deletions::DeletionJobRecord,
+        crate::deletions::DeletionJobResponse,
+        crate::deletions::DeletionJobListResponse,
         crate::http::AuthProvidersResponse,
         crate::http::LoginRequest,
         crate::http::LoginResponse,
         crate::http::CreateOrganizationRequest,
         crate::http::UpdateOrganizationRequest,
+        crate::http::CreateProjectRequest,
+        crate::http::UpdateProjectRequest,
+        crate::http::ProjectsResponse,
+        crate::http::ProjectResponse,
         crate::http::OrganizationListApiResponse,
         crate::http::OrganizationResponse,
         crate::http::OrganizationMemberResponse,
@@ -110,8 +125,10 @@ use utoipa::{
         (name = "Query", description = "Structured read query endpoint"),
         (name = "Definitions", description = "Definition management and backfills"),
         (name = "Backfills", description = "Historical processing jobs for definition outputs"),
+        (name = "Deletions", description = "Hard-delete jobs for project-scoped event data"),
         (name = "Auth", description = "Browser session authentication"),
         (name = "Organizations", description = "Organization lifecycle and membership management"),
+        (name = "Projects", description = "Organization project management"),
         (name = "API Keys", description = "API key management")
     )
 )]
@@ -170,6 +187,8 @@ mod tests {
         assert!(!paths.contains_key("/v1/definitions/sdk-defaults"));
         assert!(paths.contains_key("/v1/backfills"));
         assert!(paths.contains_key("/v1/backfills/{job_id}"));
+        assert!(paths.contains_key("/v1/deletions"));
+        assert!(paths.contains_key("/v1/deletions/{deletion_id}"));
         assert!(!paths.contains_key("/v1/materializations"));
         assert!(!paths.contains_key("/v1/materializations/{job_id}"));
         assert!(!paths.contains_key("/v1/reports"));
@@ -179,6 +198,8 @@ mod tests {
         assert!(paths.contains_key("/v1/organizations"));
         assert!(paths.contains_key("/v1/organizations/{organization_id}"));
         assert!(paths.contains_key("/v1/organizations/{organization_id}/switch"));
+        assert!(paths.contains_key("/v1/projects"));
+        assert!(paths.contains_key("/v1/projects/{project_id}"));
         assert!(paths.contains_key("/v1/organizations/{organization_id}/leave"));
         assert!(paths.contains_key(
             "/v1/organizations/{organization_id}/invitations/{invitation_id}/resend"
