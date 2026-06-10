@@ -840,7 +840,7 @@ const boundaryCases = [
   "to": "...",
   "limit": 20
 }`,
-    how: 'KV filtering is exact and structured. Ranked token search has different indexing, retention, ranking, and cost semantics and is served from event_search_terms. Regex scans remain offline lakehouse query/export work; advanced analyzers, fuzzy search, and semantic search remain separate.'
+    how: 'KV filtering is exact and structured. Text contains search is served from event_text_index. Regex scans remain offline lakehouse query/export work; advanced analyzers, fuzzy search, and semantic search remain separate.'
   },
   {
     tag: 'joins',

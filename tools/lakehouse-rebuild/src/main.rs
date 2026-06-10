@@ -15,8 +15,7 @@ use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use datafusion::{datasource::file_format::options::ParquetReadOptions, prelude::SessionContext};
 use nanotrace_ingest::{
-    DEFAULT_TABLEFLOW_TOPIC, consumer, event_kv_index_rows, event_search_term_rows,
-    event_text_index_rows, subscribe,
+    DEFAULT_TABLEFLOW_TOPIC, consumer, event_kv_index_rows, event_text_index_rows, subscribe,
 };
 use nanotrace_lakehouse::{
     LakehouseCommit, LakehouseCompactionOptions, LakehouseCompactionResult, LakehouseConfig,
@@ -48,7 +47,6 @@ struct Config {
     clickhouse_database: String,
     clickhouse_events_table: String,
     clickhouse_event_text_index_table: String,
-    clickhouse_event_search_terms_table: String,
     clickhouse_event_kv_index_table: String,
     clickhouse_field_index_table: String,
     clickhouse_event_measures_table: String,
@@ -452,7 +450,6 @@ enum NumberExpr {
 struct MaterializedCounts {
     events: usize,
     event_text_index: usize,
-    event_search_terms: usize,
     event_kv_index: usize,
     field_index: usize,
     event_measures: usize,
@@ -483,7 +480,6 @@ struct MaterializedOutputVersion {
 struct MaterializeTargets {
     events: bool,
     event_text_index: bool,
-    event_search_terms: bool,
     event_kv_index: bool,
     field_index: bool,
     event_measures: bool,
@@ -510,7 +506,6 @@ impl MaterializeTargets {
         Self {
             events: false,
             event_text_index: false,
-            event_search_terms: false,
             event_kv_index: false,
             field_index: false,
             event_measures: false,
@@ -530,7 +525,6 @@ impl MaterializeTargets {
         Self {
             events: true,
             event_text_index: true,
-            event_search_terms: true,
             event_kv_index: true,
             field_index: true,
             event_measures: true,
@@ -549,7 +543,6 @@ impl MaterializeTargets {
     fn any(self) -> bool {
         self.events
             || self.event_text_index
-            || self.event_search_terms
             || self.event_kv_index
             || self.field_index
             || self.event_measures
@@ -1047,7 +1040,6 @@ async fn main() -> Result<()> {
     if cfg.rebuild_derived && !cfg.allow_non_empty {
         for table in [
             cfg.qualified_event_text_index_table(),
-            cfg.qualified_event_search_terms_table(),
             cfg.qualified_event_kv_index_table(),
             cfg.qualified_field_index_table(),
             cfg.qualified_event_measures_table(),
@@ -1101,8 +1093,6 @@ impl Config {
         let clickhouse_events_table = env_or("CLICKHOUSE_TABLE", "events");
         let clickhouse_event_text_index_table =
             env_or("CLICKHOUSE_EVENT_TEXT_INDEX_TABLE", "event_text_index");
-        let clickhouse_event_search_terms_table =
-            env_or("CLICKHOUSE_EVENT_SEARCH_TERMS_TABLE", "event_search_terms");
         let clickhouse_event_kv_index_table =
             env_or("CLICKHOUSE_EVENT_KV_INDEX_TABLE", "event_kv_index");
         let clickhouse_field_index_table = env_or("CLICKHOUSE_FIELD_INDEX_TABLE", "field_index");
@@ -1144,10 +1134,6 @@ impl Config {
         validate_identifier(
             "CLICKHOUSE_EVENT_TEXT_INDEX_TABLE",
             &clickhouse_event_text_index_table,
-        )?;
-        validate_identifier(
-            "CLICKHOUSE_EVENT_SEARCH_TERMS_TABLE",
-            &clickhouse_event_search_terms_table,
         )?;
         validate_identifier(
             "CLICKHOUSE_EVENT_KV_INDEX_TABLE",
@@ -1229,7 +1215,6 @@ impl Config {
             clickhouse_database,
             clickhouse_events_table,
             clickhouse_event_text_index_table,
-            clickhouse_event_search_terms_table,
             clickhouse_event_kv_index_table,
             clickhouse_field_index_table,
             clickhouse_event_measures_table,
@@ -1338,13 +1323,6 @@ impl Config {
         format!(
             "{}.{}",
             self.clickhouse_database, self.clickhouse_event_text_index_table
-        )
-    }
-
-    fn qualified_event_search_terms_table(&self) -> String {
-        format!(
-            "{}.{}",
-            self.clickhouse_database, self.clickhouse_event_search_terms_table
         )
     }
 
@@ -1553,7 +1531,6 @@ async fn rebuild_commit(
             )
             .await?;
             materialized.event_text_index += counts.event_text_index;
-            materialized.event_search_terms += counts.event_search_terms;
             materialized.event_kv_index += counts.event_kv_index;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
@@ -1628,7 +1605,6 @@ async fn run_incremental_materialize(
             materialized.event_kv_index += counts.event_kv_index;
             materialized.events += counts.events;
             materialized.event_text_index += counts.event_text_index;
-            materialized.event_search_terms += counts.event_search_terms;
             materialized.field_index += counts.field_index;
             materialized.event_measures += counts.event_measures;
             materialized.measure_cube_points += counts.measure_cube_points;
@@ -1656,12 +1632,6 @@ async fn run_incremental_materialize(
         if targets.event_text_index {
             watermarks.insert(
                 cfg.clickhouse_event_text_index_table.clone(),
-                commit.sequence_number,
-            );
-        }
-        if targets.event_search_terms {
-            watermarks.insert(
-                cfg.clickhouse_event_search_terms_table.clone(),
                 commit.sequence_number,
             );
         }
@@ -1732,13 +1702,12 @@ async fn run_incremental_materialize(
             );
         }
         println!(
-            "materialized snapshot={} sequence={} scanned_rows={} event_rows={} event_text_index_rows={} event_search_term_rows={} event_kv_index_rows={} field_index_rows={} event_measure_rows={} measure_cube_point_rows={} counter_rollup_rows={} gauge_rollup_rows={} histogram_rollup_rows={} entity_state_update_rows={} entity_state_current_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
+            "materialized snapshot={} sequence={} scanned_rows={} event_rows={} event_text_index_rows={} event_kv_index_rows={} field_index_rows={} event_measure_rows={} measure_cube_point_rows={} counter_rollup_rows={} gauge_rollup_rows={} histogram_rollup_rows={} entity_state_update_rows={} entity_state_current_rows={} report_result_rows={} sequence_report_result_rows={} cohort_membership_rows={}",
             commit.snapshot_id,
             commit.sequence_number,
             commit_scanned_rows,
             materialized.events,
             materialized.event_text_index,
-            materialized.event_search_terms,
             materialized.event_kv_index,
             materialized.field_index,
             materialized.event_measures,
@@ -3001,11 +2970,6 @@ fn materialize_targets_for_commit(
             .copied()
             .unwrap_or(0)
             < sequence_number,
-        event_search_terms: watermarks
-            .get(&cfg.clickhouse_event_search_terms_table)
-            .copied()
-            .unwrap_or(0)
-            < sequence_number,
         event_kv_index: watermarks
             .get(&cfg.clickhouse_event_kv_index_table)
             .copied()
@@ -3230,7 +3194,6 @@ async fn materialize_rows(
     options: MaterializeOptions<'_>,
 ) -> Result<MaterializedCounts> {
     let mut event_text_index = Vec::new();
-    let mut event_search_terms = Vec::new();
     let mut event_kv_index = Vec::new();
     let mut field_index = Vec::new();
     let mut event_measures = Vec::new();
@@ -3248,11 +3211,6 @@ async fn materialize_rows(
         if options.targets.event_text_index {
             let value = serde_json::to_value(row).context("serialize event row for text index")?;
             event_text_index.extend(event_text_index_rows(&value));
-        }
-        if options.targets.event_search_terms {
-            let value =
-                serde_json::to_value(row).context("serialize event row for search terms")?;
-            event_search_terms.extend(event_search_term_rows(&value));
         }
         if options.targets.event_kv_index {
             let value = serde_json::to_value(row).context("serialize event row for KV index")?;
@@ -3312,7 +3270,6 @@ async fn materialize_rows(
             0
         },
         event_text_index: event_text_index.len(),
-        event_search_terms: event_search_terms.len(),
         event_kv_index: event_kv_index.len(),
         field_index: field_index.len(),
         event_measures: event_measures.len(),
@@ -3359,18 +3316,6 @@ async fn materialize_rows(
         )
         .await
         .context("insert materialized event text index rows")?;
-    }
-    if !event_search_terms.is_empty() {
-        let body = rows_to_ndjson(&event_search_terms)?;
-        insert_clickhouse(
-            client,
-            cfg,
-            &cfg.qualified_event_search_terms_table(),
-            &body,
-            &format!("{token_prefix}:event_search_terms"),
-        )
-        .await
-        .context("insert materialized event search term rows")?;
     }
     if !event_kv_index.is_empty() {
         let body = rows_to_ndjson(&event_kv_index)?;
@@ -3717,7 +3662,6 @@ async fn insert_commit_metadata(
             "rebuilt_rows": rebuilt_rows,
             "materialized_enabled": materialized_enabled,
             "event_text_index_rows": materialized.event_text_index,
-            "event_search_term_rows": materialized.event_search_terms,
             "event_kv_index_rows": materialized.event_kv_index,
             "field_index_rows": materialized.field_index,
             "event_measure_rows": materialized.event_measures,
@@ -4023,12 +3967,6 @@ fn materialized_watermarks<'a>(
             "event_text_index_rows",
             materialized.event_text_index,
             targets.event_text_index,
-        ),
-        (
-            cfg.clickhouse_event_search_terms_table.as_str(),
-            "event_search_term_rows",
-            materialized.event_search_terms,
-            targets.event_search_terms,
         ),
         (
             cfg.clickhouse_event_kv_index_table.as_str(),
@@ -6346,7 +6284,6 @@ async fn derived_watermark_sequences(
     let serving_tables = [
         cfg.clickhouse_events_table.as_str(),
         cfg.clickhouse_event_text_index_table.as_str(),
-        cfg.clickhouse_event_search_terms_table.as_str(),
         cfg.clickhouse_event_kv_index_table.as_str(),
         cfg.clickhouse_field_index_table.as_str(),
         cfg.clickhouse_event_measures_table.as_str(),
@@ -6878,13 +6815,14 @@ mod tests {
     use super::{
         CohortMembershipRow, CommitSource, Config, DataFileLocation, DefinitionRecord,
         EventInsertRow, ExtractionDefinitions, LakehouseCommitRecord, ReportResultRow,
-        SequenceReportResultRow, cohort_membership_rows, combined_materialized_output_versions,
-        commit_record_to_commit, data_file_location, entity_state_update_rows, event_measure_rows,
-        field_index_rows, format_timestamp_us, materialization_chunk_id, materialization_job_id,
-        materialization_target_table, materialize_targets_for_commit, materialized_output_versions,
-        metric_rollup_rows, ndjson_chunks, queued_rows_written, report_result_rows,
-        retention_report_result_rows, sdk_metric_managed_definition_record,
-        sequence_report_result_rows, trace_report_result_rows,
+        SequenceReportResultRow, TableflowMaterializerMode, cohort_membership_rows,
+        combined_materialized_output_versions, commit_record_to_commit, data_file_location,
+        entity_state_update_rows, event_measure_rows, field_index_rows, format_timestamp_us,
+        materialization_chunk_id, materialization_job_id, materialization_target_table,
+        materialize_targets_for_commit, materialized_output_versions, metric_rollup_rows,
+        ndjson_chunks, queued_rows_written, report_result_rows, retention_report_result_rows,
+        sdk_metric_managed_definition_record, sequence_report_result_rows,
+        trace_report_result_rows,
     };
 
     #[test]
@@ -7934,7 +7872,6 @@ mod tests {
 
         assert!(targets.events);
         assert!(targets.event_text_index);
-        assert!(targets.event_search_terms);
         assert!(targets.event_kv_index);
         assert!(targets.field_index);
         assert!(!targets.event_measures);
@@ -7977,6 +7914,10 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            kafka_brokers: "localhost:9092".to_string(),
+            tableflow_topic: "events.tableflow.batches.v1".to_string(),
+            tableflow_materializer_group_id: "test-materializer".to_string(),
+            tableflow_materializer_client_id: "test-materializer".to_string(),
             warehouse_dir: PathBuf::from("/tmp/lakehouse"),
             namespace: "nanotrace".to_string(),
             source_table: "events".to_string(),
@@ -7986,7 +7927,6 @@ mod tests {
             clickhouse_database: "observatory".to_string(),
             clickhouse_events_table: "events".to_string(),
             clickhouse_event_text_index_table: "event_text_index".to_string(),
-            clickhouse_event_search_terms_table: "event_search_terms".to_string(),
             clickhouse_event_kv_index_table: "event_kv_index".to_string(),
             clickhouse_field_index_table: "field_index".to_string(),
             clickhouse_event_measures_table: "event_measures".to_string(),

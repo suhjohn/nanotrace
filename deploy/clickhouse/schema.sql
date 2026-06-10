@@ -197,28 +197,6 @@ ORDER BY
     (tenant_id, timestamp, event_id);
 
 CREATE TABLE
-    IF NOT EXISTS observatory.event_search_terms (
-        tenant_id LowCardinality (String) CODEC (ZSTD (1)),
-        timestamp DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),
-        event_id String CODEC (ZSTD (1)),
-        event_type String CODEC (ZSTD (1)),
-        signal LowCardinality (String) CODEC (ZSTD (1)),
-        term String CODEC (ZSTD (1)),
-        term_hash UInt64 MATERIALIZED cityHash64 (term),
-        path String CODEC (ZSTD (1)),
-        path_hash UInt64 MATERIALIZED cityHash64 (path),
-        weight UInt16 DEFAULT 1 CODEC (T64, ZSTD (1)),
-        source_file String DEFAULT '' CODEC (ZSTD (1)),
-
-        INDEX idx_event_id event_id TYPE bloom_filter (0.01) GRANULARITY 4,
-        INDEX idx_term term TYPE bloom_filter (0.01) GRANULARITY 4
-    ) ENGINE = ReplacingMergeTree
-PARTITION BY
-    toYYYYMMDD (timestamp)
-ORDER BY
-    (tenant_id, term_hash, term, timestamp, event_id, path_hash, path);
-
-CREATE TABLE
     IF NOT EXISTS observatory.event_density_1s (
         tenant_id LowCardinality (String) CODEC (ZSTD (1)),
         bucket_time DateTime64 (3, 'UTC') CODEC (Delta (8), ZSTD (1)),

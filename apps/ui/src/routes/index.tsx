@@ -642,11 +642,6 @@ export function ObservatoryHome({
   const [eventFilterDraft, setEventFilterDraft] = useState('')
   const [eventFilterGroupKey, setEventFilterGroupKey] = useState('')
   const [eventFilterParams, setEventFilterParams] = useState<ParsedEventFilter>({ text: '' })
-  const [eventSearchDraft, setEventSearchDraft] = useState('')
-  const [eventSearchQuery, setEventSearchQuery] = useState('')
-  const [eventSearchMode, setEventSearchMode] = useState<EventSearchMode>('token')
-  const [eventSearchRequireAllTerms, setEventSearchRequireAllTerms] = useState(false)
-  const [eventSearchIncludeSnippets, setEventSearchIncludeSnippets] = useState(false)
   const [eventAnchorOverride, setEventAnchorOverride] = useState<{ eventId: string; key: string; timestamp: string } | null>(null)
   const [inspectorQuery, setInspectorQuery] = useState('')
 
@@ -875,44 +870,14 @@ export function ObservatoryHome({
     refetchInterval: liveRefetchInterval,
     retry: false
   })
-  const activeEventSearchQuery = eventSearchQuery.trim()
-  const eventSearchActive = activeEventSearchQuery.length >= 2
-  const eventSearchResultsQuery = useQuery({
-    enabled: eventSearchActive,
-    queryKey: [
-      'logs',
-      observatoryUrl,
-      'search',
-      activeEventSearchQuery,
-      eventSearchMode,
-      eventSearchRequireAllTerms,
-      eventSearchIncludeSnippets,
-      selectedTimeRangeCacheKey
-    ],
-    queryFn: () =>
-      fetchEventSearch({
-        apiBaseUrl: observatoryUrl,
-        includeSnippets: eventSearchIncludeSnippets,
-        mode: eventSearchMode,
-        query: activeEventSearchQuery,
-        requireAllTerms: eventSearchRequireAllTerms,
-        timeRange: selectedTimeRange
-      }),
-    retry: false
-  })
   const eventPages = eventsQuery.data?.pages ?? []
   const allEvents = useMemo(
     () => eventPages.flatMap(page => page.events),
     [eventPages]
   )
-  const searchEvents = eventSearchResultsQuery.data?.events ?? []
-  const displayedEvents = eventSearchActive ? searchEvents : allEvents
-  const displayedFields = eventSearchActive
-    ? eventSearchResultsQuery.data?.fields ?? []
-    : mergeLogFields(eventPages.flatMap(page => page.fields))
-  const displayedQueryPlan = eventSearchActive
-    ? eventSearchResultsQuery.data?.queryPlan
-    : eventPages.find(page => page.queryPlan)?.queryPlan
+  const displayedEvents = allEvents
+  const displayedFields = mergeLogFields(eventPages.flatMap(page => page.fields))
+  const displayedQueryPlan = eventPages.find(page => page.queryPlan)?.queryPlan
   const eventQueryPlan = useMemo(
     () => displayedQueryPlan,
     [displayedQueryPlan]
@@ -974,11 +939,11 @@ export function ObservatoryHome({
       createSearchDefinitionFromRecommendation({
         apiBaseUrl: observatoryUrl,
         eventFilter: eventFilterParams,
-        includeSnippets: eventSearchIncludeSnippets,
-        query: activeEventSearchQuery,
+        includeSnippets: true,
+        query: '',
         recommendation,
-        requireAllTerms: eventSearchRequireAllTerms,
-        searchMode: eventSearchMode
+        requireAllTerms: false,
+        searchMode: 'phrase'
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['definitions', observatoryUrl] })
@@ -1062,12 +1027,10 @@ export function ObservatoryHome({
       }
     : null
   const eventDetail =
-    eventSearchActive || eventPages.length > 0
+    eventPages.length > 0
       ? {
           fields: displayedFields,
-          group: eventSearchActive
-            ? pageGroupSummary({ events: displayedEvents, groupBy: 'search', selectedGroupValue: activeEventSearchQuery })
-            : eventPages[0]?.group ?? pageGroupSummary({ events: allEvents, groupBy: '', selectedGroupValue: 'events' }),
+          group: eventPages[0]?.group ?? pageGroupSummary({ events: allEvents, groupBy: '', selectedGroupValue: 'events' }),
           events: displayedEvents,
           relatedEvents: []
         }
@@ -1078,7 +1041,6 @@ export function ObservatoryHome({
     (!hasEventQuery && needsLatest ? errorMessage(latestQuery.error) : '') ||
     errorMessage(summaryQuery.error) ||
     errorMessage(eventsQuery.error) ||
-    errorMessage(eventSearchResultsQuery.error) ||
     (graphMode === 'histogram' ? errorMessage(densityQuery.error) : errorMessage(flamegraphQuery.error))
   const loadingList = groupOptionsQuery.isPending || (Boolean(groupBy) && groupsQuery.isPending)
   const emptyObservatory = !loadingList && !listError && groupOptions.length === 0
@@ -1091,7 +1053,7 @@ export function ObservatoryHome({
       ? densityQuery.isPending
       : flamegraphQuery.isPending
   const loadingDetail = hasEventQuery && (waitingForLatest || waitingForSummary || loadingGraph)
-  const loadingTableDetail = eventSearchActive ? eventSearchResultsQuery.isPending : hasEventQuery && eventsQuery.isPending
+  const loadingTableDetail = hasEventQuery && eventsQuery.isPending
   const loadingAnchoredEvents = Boolean(
     eventAnchorOverride?.key === eventDataKey &&
     eventsQuery.isFetching &&
@@ -1163,7 +1125,17 @@ export function ObservatoryHome({
   }
 
   function setFilterSearch(value: string) {
-    updateSearch({ filter: value || undefined })
+    if (value) {
+      updateSearch({ filter: value })
+      return
+    }
+
+    void navigate({
+      search: (current: ObservatorySearch) => {
+        const { filter: _filter, ...next } = current
+        return next
+      }
+    } as never)
   }
 
   function setTimeRangeSearch(key: TimeRangeKey, start?: string, end?: string) {
@@ -1241,6 +1213,10 @@ export function ObservatoryHome({
   }
 
   function applyEventFilter() {
+    if (eventFilterDraft.trim() === '') {
+      clearEventFilter()
+      return
+    }
     filterTouchedRef.current = true
     syncTimeRangeControlsFromFilter(draftEventFilterParams)
     commitEventFilter(stripTimeBounds(draftEventFilterParams))
@@ -1249,17 +1225,6 @@ export function ObservatoryHome({
   function clearEventFilter() {
     filterTouchedRef.current = true
     commitEventFilter({ text: '' })
-  }
-
-  function applyEventSearch() {
-    setEventSearchQuery(eventSearchDraft.trim())
-    setEventAnchorOverride(null)
-  }
-
-  function clearEventSearch() {
-    setEventSearchDraft('')
-    setEventSearchQuery('')
-    setEventAnchorOverride(null)
   }
 
   function applyHistogramTimeRange({ createdAfter, createdBefore }: { createdAfter: string; createdBefore: string }) {
@@ -1548,10 +1513,11 @@ export function ObservatoryHome({
           }}
         >
           <input
+            aria-label="Search or filter events"
             className="h-7 min-w-0 flex-1 border border-neutral-800 bg-black px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
             value={eventFilterDraft}
             onChange={event => setEventFilterDraft(event.target.value)}
-            placeholder="filter events, e.g. name=llm service=api"
+            placeholder='search or filter events, e.g. error service=api "timeout"'
           />
           <button
             aria-label="Apply filter"
@@ -1735,77 +1701,6 @@ export function ObservatoryHome({
             </div>
           </div>
 
-          <form
-            className="flex min-w-0 flex-wrap items-center gap-2 border-b border-neutral-800 bg-black px-2 py-1.5"
-            onSubmit={event => {
-              event.preventDefault()
-              applyEventSearch()
-            }}
-          >
-            <input
-              aria-label="Ranked event search"
-              className="h-7 min-w-[220px] flex-1 border border-neutral-800 bg-neutral-950 px-2 text-[12px] text-white outline-none placeholder:text-neutral-600 focus:border-neutral-600"
-              placeholder="ranked event search..."
-              value={eventSearchDraft}
-              onChange={event => setEventSearchDraft(event.target.value)}
-            />
-            <div className="inline-flex h-7 shrink-0 border border-neutral-800 bg-neutral-950">
-              {eventSearchModeOptions.map(option => (
-                <button
-                  key={option.value}
-                  className={cn(
-                    'border-l border-neutral-800 px-2 text-[11px] text-neutral-500 first:border-l-0 hover:text-white',
-                    eventSearchMode === option.value && 'bg-neutral-800 text-white'
-                  )}
-                  title={option.title}
-                  type="button"
-                  onClick={() => setEventSearchMode(option.value)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-            <label className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-neutral-800 bg-neutral-950 px-2 text-[11px] text-neutral-400">
-              <input
-                checked={eventSearchRequireAllTerms}
-                className="h-3 w-3 accent-neutral-200"
-                type="checkbox"
-                onChange={event => setEventSearchRequireAllTerms(event.target.checked)}
-              />
-              All terms
-            </label>
-            <label className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-neutral-800 bg-neutral-950 px-2 text-[11px] text-neutral-400">
-              <input
-                checked={eventSearchIncludeSnippets}
-                className="h-3 w-3 accent-neutral-200"
-                type="checkbox"
-                onChange={event => setEventSearchIncludeSnippets(event.target.checked)}
-              />
-              Snippets
-            </label>
-            <button
-              className="h-7 shrink-0 border border-neutral-700 bg-neutral-100 px-2 text-[12px] text-black hover:bg-white disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600"
-              disabled={eventSearchDraft.trim().length < 2}
-              type="submit"
-            >
-              Search
-            </button>
-            {eventSearchActive ? (
-              <button
-                className="h-7 shrink-0 border border-neutral-800 bg-neutral-950 px-2 text-[12px] text-neutral-400 hover:text-white"
-                type="button"
-                onClick={clearEventSearch}
-              >
-                Clear
-              </button>
-            ) : null}
-            {eventSearchActive ? (
-              <span className="min-w-0 truncate text-[11px] text-neutral-600">
-                {eventSearchResultsQuery.isFetching ? 'searching' : `${searchEvents.length} results`}
-              </span>
-            ) : null}
-          </form>
-
           {hasEventQuery ? (
           <>
           <div className="overflow-hidden border-b border-neutral-800 bg-black" style={{ height: flamegraphHeight, minHeight: flamegraphHeight }}>
@@ -1923,32 +1818,26 @@ export function ObservatoryHome({
               anchorIndex={eventPages[0]?.anchorIndex ?? 0}
               events={displayedEvents}
               emptyLabel={
-                eventSearchActive
-                  ? 'No search results.'
-                  : hasAppliedEventFilter(eventFilterParams) ? 'No events matched filter.' : 'No events.'
+                hasAppliedEventFilter(eventFilterParams) ? 'No events matched search/filter.' : 'No events.'
               }
               fields={eventDetail.fields}
               freshEventIds={freshEventIds}
-              hasMore={eventSearchActive ? false : eventsQuery.hasNextPage}
-              hasPrevious={eventSearchActive ? false : eventsQuery.hasPreviousPage}
+              hasMore={eventsQuery.hasNextPage}
+              hasPrevious={eventsQuery.hasPreviousPage}
               highlightedEventIds={highlightedEventIds}
               loading={loadingTableDetail}
               loadingAnchor={loadingAnchoredEvents}
-              loadingMore={eventSearchActive ? false : eventsQuery.isFetchingNextPage}
-              loadingPrevious={eventSearchActive ? false : eventsQuery.isFetchingPreviousPage}
-              scrollStateKey={
-                eventSearchActive
-                  ? `observatory-ui-search-scroll\u0000${activeEventSearchQuery}\u0000${eventSearchMode}\u0000${eventSearchRequireAllTerms}\u0000${eventSearchIncludeSnippets}\u0000${selectedTimeRangeCacheKey}`
-                  : eventTableScrollKey
-              }
+              loadingMore={eventsQuery.isFetchingNextPage}
+              loadingPrevious={eventsQuery.isFetchingPreviousPage}
+              scrollStateKey={eventTableScrollKey}
               selectedColumns={selectedEventColumnsForTrace}
               selectedEventAlign={eventAnchorOverride?.key === eventDataKey ? 'center' : 'auto'}
               selectedEventId={selectedEventId}
               sortDirection={effectiveEventSortDirection}
               onLoadMore={() => {
-                if (!eventSearchActive) void eventsQuery.fetchNextPage()
+                void eventsQuery.fetchNextPage()
               }}
-              onLoadPrevious={() => eventSearchActive ? Promise.resolve() : eventsQuery.fetchPreviousPage().then(() => undefined)}
+              onLoadPrevious={() => eventsQuery.fetchPreviousPage().then(() => undefined)}
               onInspect={selectEvent}
               onSetColumns={setSelectedEventColumns}
               onToggleSortDirection={() => setEffectiveEventSortDirection(current => current === 'desc' ? 'asc' : 'desc')}
@@ -4572,18 +4461,6 @@ type EventsQueryRequest = {
   view: 'density' | 'event' | 'events' | 'flamegraph' | 'group_options' | 'groups' | 'latest' | 'summary'
 }
 
-type SearchQueryRequest = {
-  eventType?: string
-  from?: string
-  includeSnippets?: boolean
-  limit?: number
-  mode: EventSearchMode
-  offset?: number
-  query: string
-  requireAllTerms?: boolean
-  to?: string
-}
-
 type TimeDomain = {
   from: string
   to: string
@@ -4605,20 +4482,6 @@ type EventRow = {
   timestamp: string
   trace_id?: string
 }
-
-type SearchEventRow = EventRow & {
-  matched_paths?: string[]
-  matched_terms?: string[]
-  score?: number
-  snippet?: string
-}
-
-const eventSearchModeOptions: Array<{ label: string; title: string; value: EventSearchMode }> = [
-  { label: 'Token', title: 'Rank exact indexed terms', value: 'token' },
-  { label: 'Prefix', title: 'Rank indexed terms that start with the query tokens', value: 'prefix' },
-  { label: 'Fuzzy', title: 'Rank indexed terms within a bounded edit distance', value: 'fuzzy' },
-  { label: 'Phrase', title: 'Search the bounded event text document', value: 'phrase' }
-]
 
 type FlamegraphEventRow = {
   duration_ms?: number
@@ -4909,43 +4772,6 @@ async function fetchEvents({
   }
 }
 
-async function fetchEventSearch({
-  apiBaseUrl,
-  includeSnippets,
-  mode,
-  query,
-  requireAllTerms,
-  timeRange
-}: {
-  apiBaseUrl: string
-  includeSnippets: boolean
-  mode: EventSearchMode
-  query: string
-  requireAllTerms: boolean
-  timeRange: ResolvedTimeRange
-}): Promise<LogEventsPage> {
-  const domain = queryTimeDomain({ eventFilter: { text: '' }, timeRange })
-  const response = await postSearchQuery<SearchEventRow>({
-    apiBaseUrl,
-    request: {
-      includeSnippets,
-      limit: 100,
-      mode,
-      query,
-      requireAllTerms,
-      ...(domain?.from ? { from: domain.from } : {}),
-      ...(domain?.to ? { to: domain.to } : {})
-    }
-  })
-  const events = (response.data ?? []).map(rowToSearchTraceEvent)
-  return {
-    events,
-    fields: orderLogFields(inferLogFields(events)),
-    group: pageGroupSummary({ events, groupBy: 'search', selectedGroupValue: query }),
-    queryPlan: queryPlanMetadata(response)
-  }
-}
-
 function eventCursor(event: TraceEvent | undefined): EventCursor | undefined {
   return event ? { createdAt: event.createdAt, eventId: event.id } : undefined
 }
@@ -5076,29 +4902,6 @@ async function postEventsQuery<T>({
 }): Promise<ClickHouseResponse<T>> {
   const response = await fetch(eventsQueryUrl(apiBaseUrl), {
     body: JSON.stringify({ type: 'events', ...request }),
-    credentials: 'include',
-    headers: queryHeaders(),
-    method: 'POST'
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new HTTPError({
-      message: text || response.statusText,
-      status: response.status
-    })
-  }
-  return (await response.json()) as ClickHouseResponse<T>
-}
-
-async function postSearchQuery<T>({
-  apiBaseUrl,
-  request
-}: {
-  apiBaseUrl: string
-  request: SearchQueryRequest
-}): Promise<ClickHouseResponse<T>> {
-  const response = await fetch(eventsQueryUrl(apiBaseUrl), {
-    body: JSON.stringify({ type: 'search', ...request }),
     credentials: 'include',
     headers: queryHeaders(),
     method: 'POST'
@@ -5658,23 +5461,6 @@ function rowToTraceEvent(row: EventRow): TraceEvent {
     id: String(row.event_id),
     createdAt: normalizeTimestamp(row.timestamp),
     data
-  }
-}
-
-function rowToSearchTraceEvent(row: SearchEventRow): TraceEvent {
-  const event = rowToTraceEvent(row)
-  const snippet = typeof row.snippet === 'string' ? row.snippet.trim() : ''
-  return {
-    ...event,
-    data: {
-      ...event.data,
-      _search: {
-        matchedPaths: Array.isArray(row.matched_paths) ? row.matched_paths : [],
-        matchedTerms: Array.isArray(row.matched_terms) ? row.matched_terms : [],
-        score: Number(row.score) || 0,
-        ...(snippet ? { snippet } : {})
-      }
-    }
   }
 }
 

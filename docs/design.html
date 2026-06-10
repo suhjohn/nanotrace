@@ -199,12 +199,12 @@
     </div>
     <pre>WarpStream Kafka -> nanotrace-normalizer -> Iceberg REST catalog + S3 warehouse
                                       \-> invalid_events + lakehouse_commits
-Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_index + event_search_terms + event_kv_index + derived serving tables</pre>
+Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_index + event_kv_index + derived serving tables</pre>
     <table>
       <thead><tr><th>Concern</th><th>Current contract</th></tr></thead>
       <tbody>
         <tr><td>Accepted write</td><td><code>POST /v1/events</code> returns <code>202</code> after Kafka accepts the raw request body. It is not a visibility guarantee.</td></tr>
-        <tr><td>Visibility</td><td>Rows become queryable after the normalizer commits valid events to Iceberg and the materializer catches up ClickHouse <code>events</code>, <code>event_text_index</code>, <code>event_search_terms</code>, and <code>event_kv_index</code>.</td></tr>
+        <tr><td>Visibility</td><td>Rows become queryable after the normalizer commits valid events to Iceberg and the materializer catches up ClickHouse <code>events</code>, <code>event_text_index</code>, and <code>event_kv_index</code>.</td></tr>
         <tr><td>Replay</td><td>Kafka processing is at-least-once; deterministic source batch ids and materializer insert tokens keep replay idempotent for tested paths.</td></tr>
         <tr><td>Tenant isolation</td><td>The authenticated API key determines tenant identity; client-supplied <code>tenant_id</code> is overwritten. Structured product queries are tenant-scoped; cross-tenant analysis belongs in operator-controlled lakehouse query/export tooling, not a server API route.</td></tr>
         <tr><td>High cardinality</td><td>High-cardinality strings are filterable, not automatically promoted. Grouping/rollup requires an explicit definition and guardrails.</td></tr>
@@ -222,7 +222,7 @@ Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_inde
   -> invalid_events + lakehouse_commits
   -> Kafka offset commit
   -> lakehouse materializer / rebuild
-  -> ClickHouse events, event_text_index, event_search_terms, event_kv_index, field_index, event_measures, measure_rollups, reports, sequences, cohorts</pre>
+  -> ClickHouse events, event_text_index, event_kv_index, field_index, event_measures, measure_rollups, reports, sequences, cohorts</pre>
     <table>
       <thead><tr><th>Component</th><th>Responsibility</th><th>Does not do</th></tr></thead>
       <tbody>
@@ -260,7 +260,7 @@ Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_inde
         <tr><td>Track/product</td><td><code>event_type=track</code>, <code>name</code>, entity ids, arbitrary KVs</td><td>Stored raw and indexed for filters. No automatic rollup.</td></tr>
         <tr><td>Trace/span</td><td><code>span_start</code>, <code>span_end</code>, <code>trace_id</code>, <code>span_id</code>, <code>duration_ms</code></td><td>Signal becomes <code>trace</code>. Span fields are not auto-promoted as measures.</td></tr>
         <tr><td>Metric</td><td><code>event_type=metric</code>, <code>metric_name</code>, <code>metric_type</code>, <code>metric_value</code></td><td>SDK-managed metric definition can materialize metric rollups.</td></tr>
-        <tr><td>Log</td><td><code>event_type=log</code>, severity, message, service</td><td>Stored raw; exact bounded KVs are indexed and ranked interactive search uses <code>event_search_terms</code>.</td></tr>
+        <tr><td>Log</td><td><code>event_type=log</code>, severity, message, service</td><td>Stored raw; exact bounded KVs are indexed and text search uses <code>event_text_index</code>.</td></tr>
       </tbody>
     </table>
     <div class="rule warn">
@@ -277,7 +277,6 @@ Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_inde
         <tr><td><code>events</code></td><td>Materializer/rebuild</td><td>Raw serving row with stable envelope columns and preserved JSON payload.</td><td><code>serving_watermarks</code> vs latest lakehouse commit.</td></tr>
         <tr><td><code>invalid_events</code></td><td>Normalizer</td><td>Rejected raw payloads and validation reasons.</td><td>Written before Kafka offset progress for invalid rows.</td></tr>
         <tr><td><code>event_text_index</code></td><td>Materializer/rebuild</td><td>Bounded per-event search documents for event text filters.</td><td><code>serving_watermarks</code>.</td></tr>
-        <tr><td><code>event_search_terms</code></td><td>Materializer/rebuild</td><td>Token-level inverted index for ranked interactive search.</td><td><code>serving_watermarks</code>.</td></tr>
         <tr><td><code>event_kv_index</code></td><td>Materializer/rebuild</td><td>Universal exact/range filter substrate for bounded scalar arbitrary KVs.</td><td><code>serving_watermarks</code>.</td></tr>
         <tr><td><code>field_rollups</code></td><td>ClickHouse MV</td><td>Always-on summaries for core dimensions: signal, event_type, name, service, environment, is_error.</td><td>Follows <code>events</code>.</td></tr>
         <tr><td><code>field_values</code></td><td>ClickHouse MV</td><td>Always-on lookup for common identifiers such as trace_id, span_id, request_id, user_id, account_id.</td><td>Follows <code>events</code>.</td></tr>
@@ -306,14 +305,14 @@ Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_inde
       <tbody>
         <tr><td>Latest events, event detail, bounded trace/span lookup</td><td><code>events</code>, <code>field_values</code></td><td>Tenant and time predicates are mandatory for broad reads.</td></tr>
         <tr><td>Bounded event text search</td><td><code>event_text_index</code></td><td>Event-level text filters use a capped search document, not arbitrary full-text search.</td></tr>
-        <tr><td>Ranked interactive search</td><td><code>event_search_terms</code></td><td><code>/v1/query</code> with <code>type=search</code> ranks events by matched weighted exact, prefix, or bounded fuzzy terms and joins back to <code>events</code>.</td></tr>
+        <tr><td>Saved text search</td><td><code>event_text_index</code></td><td><code>/v1/query</code> with <code>type=search</code> searches bounded per-event text documents and joins back to <code>events</code>.</td></tr>
         <tr><td>Arbitrary scalar equality, IN, exists, numeric ranges</td><td><code>event_kv_index</code></td><td>Correct default for unpromoted paths such as <code>request_id</code>, <code>plan</code>, <code>llm.model</code>.</td></tr>
         <tr><td>Repeated grouping/faceting</td><td><code>field_rollups</code> for core fields; <code>field_index</code> for explicit definitions</td><td>High-cardinality group-by needs fanout checks.</td></tr>
         <tr><td>Percentiles/sums/averages</td><td><code>measure_rollups</code> or <code>event_measures</code></td><td>Requires explicit measure or SDK metric semantics.</td></tr>
         <tr><td>Latest/as-of entity state</td><td><code>entity_state_current</code>, <code>entity_state_updates</code></td><td>Latest reads use the compact snapshot; as-of reads use update history.</td></tr>
         <tr><td>Funnel conversion</td><td><code>sequence_report_results</code></td><td>Requires a sequence definition with entity id and steps.</td></tr>
         <tr><td>Reusable population</td><td><code>cohort_memberships</code></td><td>Use cohorts for retention denominators, experiments, eligibility, and repeated drilldowns.</td></tr>
-        <tr><td>Large text search, regex over arbitrary JSON</td><td>Not <code>event_kv_index</code></td><td>Use <code>event_search_terms</code> for ranked exact, prefix, or bounded fuzzy term search and <code>NANOTRACE_LAKEHOUSE_QUERY_REGEX</code> for offline regex scans; advanced analyzers and semantic search remain separate.</td></tr>
+        <tr><td>Large text search, regex over arbitrary JSON</td><td>Not <code>event_kv_index</code></td><td>Use <code>event_text_index</code> for bounded contains search and <code>NANOTRACE_LAKEHOUSE_QUERY_REGEX</code> for offline regex scans; advanced analyzers, fuzzy search, and semantic search remain separate.</td></tr>
       </tbody>
     </table>
     <p><code>POST /v1/query</code> is the structured product query API. The request body carries a <code>type</code> such as <code>events</code>, <code>search</code>, <code>measure</code>, <code>funnel</code>, <code>cohort</code>, <code>report</code>, <code>state</code>, or <code>alerts</code>. Event queries plan arbitrary scalar filters through <code>event_kv_index</code> and use promoted indexes only with freshness proof.</p>
@@ -414,7 +413,7 @@ Iceberg commits -> nanotrace-materializer -> ClickHouse events + event_text_inde
         <tr><td class="ok">Current</td><td>The schema UI can create reviewed field, measure, state, saved search, custom report, sequence, cohort, and alert definitions from JSON templates, then backfill field/measure/state definitions, queue report/sequence/cohort backfill jobs for the selected source window, or hand hot event-match alerts to <code>nanotrace-alerts</code>.</td></tr>
         <tr><td class="ok">Current</td><td><code>nanotrace-alerts</code> supports hot event-match alerts plus webhook outbox delivery through <code>alert_events</code> and <code>alert_notifications</code>.</td></tr>
         <tr><td class="no">Not current</td><td>No processor-management API/runtime is part of the default architecture.</td></tr>
-        <tr><td class="ok">Current</td><td>The event explorer exposes ranked exact-token, prefix, bounded fuzzy, and phrase search controls; exact/prefix/fuzzy search is served by <code>event_search_terms</code>, while exact KV filtering remains separate from search ranking.</td></tr>
+        <tr><td class="ok">Current</td><td>The event explorer exposes a single search/filter control; text contains search is served by <code>event_text_index</code>, while exact KV filtering remains separate.</td></tr>
         <tr><td class="no">Not current</td><td>Dashboard-specific APIs are removed for now. Reusable views should use structured <code>/v1/query</code> helpers for <code>events</code>, <code>measure</code>, <code>state</code>, <code>report</code>, <code>funnel</code>, <code>cohort</code>, and alert reads.</td></tr>
         <tr><td class="ok">Current</td><td>The event explorer can approve planner recommendations into field, saved search, numeric measure, and basic summary report definitions; grouped report approval also queues the backfill job for the viewed source window and shows matching job status.</td></tr>
         <tr><td class="ok">Current</td><td><code>GET /v1/query/recommendations</code> exposes recent query-usage recommendation records, and the schema UI can prefill field, measure, and grouped report drafts from that feed while showing live approval, backfill, and report-job status.</td></tr>

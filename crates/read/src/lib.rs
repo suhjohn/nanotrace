@@ -190,10 +190,10 @@ pub struct SearchQueryRequest {
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SearchMode {
-    #[default]
     Token,
     Prefix,
     Fuzzy,
+    #[default]
     Phrase,
 }
 
@@ -595,156 +595,7 @@ impl ReadStore {
         tenant_id: &str,
     ) -> Result<Value, ReadError> {
         request.limit = request.limit.clamp(1, 200);
-        match request.mode {
-            SearchMode::Token => self.token_search_query(request, tenant_id).await,
-            SearchMode::Prefix => self.prefix_search_query(request, tenant_id).await,
-            SearchMode::Fuzzy => self.fuzzy_search_query(request, tenant_id).await,
-            SearchMode::Phrase => self.phrase_search_query(request, tenant_id).await,
-        }
-    }
-
-    async fn token_search_query(
-        &self,
-        request: SearchQueryRequest,
-        tenant_id: &str,
-    ) -> Result<Value, ReadError> {
-        let terms = search_query_terms(&request.query);
-        if terms.is_empty() {
-            return Err(ReadError::InvalidQuery(
-                "search query must contain at least one token".to_string(),
-            ));
-        }
-        let terms_sql = terms
-            .iter()
-            .map(|term| quote_sql_string(term))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut where_clauses = vec![format!("term IN ({terms_sql})")];
-        let mut parameters = search_base_parameters(&request);
-        add_search_time_and_type_filters(&request, &mut where_clauses, &mut parameters);
-        add_search_inner_limit(&request, &mut parameters);
-        parameters.insert(
-            "search_snippet_needle".to_string(),
-            Value::from(terms.first().cloned().unwrap_or_default()),
-        );
-        let having_clause =
-            token_search_require_all_terms_having(&request, terms.len(), &mut parameters);
-        let where_clause = where_clauses.join(" AND ");
-        let include_snippets = request.include_snippets;
-        let snippet_expr = if include_snippets {
-            search_snippet_sql("doc.text", "search_snippet_needle")
-        } else {
-            "''".to_string()
-        };
-        let query = token_search_query_sql(
-            &where_clause,
-            having_clause,
-            &snippet_expr,
-            include_snippets,
-        );
-        self.query_with_context_and_metadata(
-            QueryRequest {
-                query,
-                parameters,
-                allow_stale_serving: request.allow_stale_serving,
-            },
-            tenant_id,
-            QueryContext::SEARCH,
-            token_search_planning_metadata(&request, &terms),
-        )
-        .await
-    }
-
-    async fn prefix_search_query(
-        &self,
-        request: SearchQueryRequest,
-        tenant_id: &str,
-    ) -> Result<Value, ReadError> {
-        let terms = search_query_terms(&request.query);
-        if terms.is_empty() {
-            return Err(ReadError::InvalidQuery(
-                "prefix search query must contain at least one token".to_string(),
-            ));
-        }
-        let mut where_clauses = vec![prefix_search_where_clause(&terms)];
-        let mut parameters = search_base_parameters(&request);
-        add_search_time_and_type_filters(&request, &mut where_clauses, &mut parameters);
-        add_search_inner_limit(&request, &mut parameters);
-        parameters.insert(
-            "search_snippet_needle".to_string(),
-            Value::from(terms.first().cloned().unwrap_or_default()),
-        );
-        let having_clause = search_require_all_terms_having(&request, terms.len(), &mut parameters);
-        let snippet_expr = if request.include_snippets {
-            search_snippet_sql("doc.text", "search_snippet_needle")
-        } else {
-            "''".to_string()
-        };
-        let query = indexed_search_query_sql(
-            &where_clauses.join(" AND "),
-            &prefix_search_match_expr(&terms),
-            "toUInt64(weight)",
-            having_clause,
-            &snippet_expr,
-            request.include_snippets,
-        );
-        self.query_with_context_and_metadata(
-            QueryRequest {
-                query,
-                parameters,
-                allow_stale_serving: request.allow_stale_serving,
-            },
-            tenant_id,
-            QueryContext::SEARCH,
-            indexed_search_planning_metadata(&request, &terms, "prefix"),
-        )
-        .await
-    }
-
-    async fn fuzzy_search_query(
-        &self,
-        request: SearchQueryRequest,
-        tenant_id: &str,
-    ) -> Result<Value, ReadError> {
-        let terms = search_query_terms(&request.query);
-        if terms.is_empty() {
-            return Err(ReadError::InvalidQuery(
-                "fuzzy search query must contain at least one token".to_string(),
-            ));
-        }
-        let mut where_clauses = vec![fuzzy_search_where_clause(&terms)];
-        let mut parameters = search_base_parameters(&request);
-        add_search_time_and_type_filters(&request, &mut where_clauses, &mut parameters);
-        add_search_inner_limit(&request, &mut parameters);
-        parameters.insert(
-            "search_snippet_needle".to_string(),
-            Value::from(terms.first().cloned().unwrap_or_default()),
-        );
-        let having_clause = search_require_all_terms_having(&request, terms.len(), &mut parameters);
-        let snippet_expr = if request.include_snippets {
-            search_snippet_sql("doc.text", "search_snippet_needle")
-        } else {
-            "''".to_string()
-        };
-        let query = indexed_search_query_sql(
-            &where_clauses.join(" AND "),
-            &fuzzy_search_match_expr(&terms),
-            &fuzzy_search_score_expr(&terms),
-            having_clause,
-            &snippet_expr,
-            request.include_snippets,
-        );
-        self.query_with_context_and_metadata(
-            QueryRequest {
-                query,
-                parameters,
-                allow_stale_serving: request.allow_stale_serving,
-            },
-            tenant_id,
-            QueryContext::SEARCH,
-            indexed_search_planning_metadata(&request, &terms, "fuzzy"),
-        )
-        .await
+        self.phrase_search_query(request, tenant_id).await
     }
 
     async fn phrase_search_query(
@@ -2112,17 +1963,16 @@ impl ReadStore {
                 .await?;
             let bucket_ms = density_bucket_ms(&range, request.buckets, 1_000);
             parameters.insert("bucket_ms".to_string(), Value::from(bucket_ms));
+            let bucket_expr = "intDiv((toUnixTimestamp(d.bucket_time) * 1000), {bucket_ms:UInt64}) * {bucket_ms:UInt64}";
             return self
                 .run_events_query_sql(
                     [
                         format!(
-                            "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
-                            "d.bucket_time"
+                            "SELECT {bucket_expr} AS bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount"
                         ),
-                        "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
                         "FROM event_density_1s AS d".to_string(),
                         where_keyword(time_clause),
-                        "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+                        format!("GROUP BY {bucket_expr} ORDER BY bucket ASC"),
                     ]
                     .into_iter()
                     .filter(|part| !part.is_empty())
@@ -2177,16 +2027,15 @@ impl ReadStore {
                     .await?;
                 let bucket_ms = density_bucket_ms(&range, request.buckets, 1);
                 parameters.insert("bucket_ms".to_string(), Value::from(bucket_ms));
+                let bucket_expr = "intDiv((toUnixTimestamp(d.bucket_time) * 1000), {bucket_ms:UInt64}) * {bucket_ms:UInt64}";
                 return self
                     .run_events_query_sql(
                         [
                             format!(
-                                "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
-                                "d.bucket_time"
+                                "SELECT {bucket_expr} AS bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount"
                             ),
-                            "SELECT bucket, sum(d.count) AS count, sum(d.error_count) AS errorCount".to_string(),
                             base,
-                            "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+                            format!("GROUP BY {bucket_expr} ORDER BY bucket ASC"),
                         ]
                         .join(" "),
                         parameters,
@@ -2222,17 +2071,18 @@ impl ReadStore {
             "bucket_ms".to_string(),
             Value::from(density_bucket_ms(&range, request.buckets, 1)),
         );
+        let bucket_expr = "intDiv((toUnixTimestamp(e.timestamp) * 1000), {bucket_ms:UInt64}) * {bucket_ms:UInt64}";
         self.run_events_query_sql(
             [
-                format!(
-                    "WITH intDiv((toUnixTimestamp({}) * 1000), {{bucket_ms:UInt64}}) * {{bucket_ms:UInt64}} AS bucket",
-                    "e.timestamp"
-                ),
-                "SELECT bucket, count() AS count".to_string(),
+                format!("SELECT {bucket_expr} AS bucket, count() AS count"),
                 format!(", countIf({}) AS errorCount", error_expression("e")),
                 "FROM events AS e".to_string(),
-                EventPredicatePlan { parameters: parameters.clone(), ..plan }.where_clause(),
-                "GROUP BY bucket ORDER BY bucket ASC".to_string(),
+                EventPredicatePlan {
+                    parameters: parameters.clone(),
+                    ..plan
+                }
+                .where_clause(),
+                format!("GROUP BY {bucket_expr} ORDER BY bucket ASC"),
             ]
             .into_iter()
             .filter(|part| !part.is_empty())
@@ -2552,7 +2402,6 @@ impl ReadStore {
         }
         [
             "event_text_index",
-            "event_search_terms",
             "event_kv_index",
             "field_index",
             "event_measures",
@@ -2609,7 +2458,6 @@ impl ReadStore {
     fn allowed_table_names(&self) -> Vec<String> {
         const ANALYTICS_TABLES: &[&str] = &[
             "event_text_index",
-            "event_search_terms",
             "event_kv_index",
             "field_index",
             "field_values",
@@ -4030,217 +3878,10 @@ fn search_snippet_sql(text_expr: &str, needle_param: &str) -> String {
     )
 }
 
-fn search_base_parameters(request: &SearchQueryRequest) -> Map<String, Value> {
-    let mut parameters = Map::new();
-    parameters.insert("limit".to_string(), Value::from(request.limit));
-    parameters.insert("offset".to_string(), Value::from(request.offset));
-    parameters
-}
-
-fn add_search_inner_limit(request: &SearchQueryRequest, parameters: &mut Map<String, Value>) {
-    parameters.insert(
-        "search_inner_limit".to_string(),
-        Value::from(request.limit.saturating_add(request.offset).min(10_000)),
-    );
-}
-
-fn add_search_time_and_type_filters(
-    request: &SearchQueryRequest,
-    where_clauses: &mut Vec<String>,
-    parameters: &mut Map<String, Value>,
-) {
-    if !request.from.trim().is_empty() {
-        where_clauses.push("timestamp >= {search_from:DateTime64(3, 'UTC')}".to_string());
-        parameters.insert(
-            "search_from".to_string(),
-            Value::from(clickhouse_datetime64(&request.from)),
-        );
-    }
-    if !request.to.trim().is_empty() {
-        where_clauses.push("timestamp <= {search_to:DateTime64(3, 'UTC')}".to_string());
-        parameters.insert(
-            "search_to".to_string(),
-            Value::from(clickhouse_datetime64(&request.to)),
-        );
-    }
-    if !request.event_type.trim().is_empty() {
-        where_clauses.push("event_type = {search_event_type:String}".to_string());
-        parameters.insert(
-            "search_event_type".to_string(),
-            Value::from(request.event_type.trim().to_string()),
-        );
-    }
-}
-
-fn token_search_require_all_terms_having(
-    request: &SearchQueryRequest,
-    term_count: usize,
-    parameters: &mut Map<String, Value>,
-) -> &'static str {
-    if request.require_all_terms {
-        parameters.insert(
-            "search_min_matched_terms".to_string(),
-            Value::from(u64::try_from(term_count).unwrap_or(u64::MAX)),
-        );
-        " HAVING uniqExact(term) >= {search_min_matched_terms:UInt64}"
-    } else {
-        ""
-    }
-}
-
-fn search_require_all_terms_having(
-    request: &SearchQueryRequest,
-    term_count: usize,
-    parameters: &mut Map<String, Value>,
-) -> &'static str {
-    if request.require_all_terms {
-        parameters.insert(
-            "search_min_matched_terms".to_string(),
-            Value::from(u64::try_from(term_count).unwrap_or(u64::MAX)),
-        );
-        " HAVING uniqExact(query_term) >= {search_min_matched_terms:UInt64}"
-    } else {
-        ""
-    }
-}
-
-fn token_search_query_sql(
-    where_clause: &str,
-    having_clause: &str,
-    snippet_expr: &str,
-    include_snippets: bool,
-) -> String {
-    let doc_join = if include_snippets {
-        " LEFT ANY JOIN event_text_index AS doc ON doc.event_id = search.event_id"
-    } else {
-        ""
-    };
-    format!(
-        "SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.trace_id AS trace_id, e.span_id AS span_id, e.signal AS signal, search.score AS score, search.matched_terms AS matched_terms, search.matched_paths AS matched_paths, {snippet_expr} AS snippet, e.data AS data FROM (SELECT event_id, sum(toUInt64(weight)) AS score, groupUniqArray(term) AS matched_terms, groupUniqArray(path) AS matched_paths FROM event_search_terms WHERE {where_clause} GROUP BY event_id{having_clause} ORDER BY score DESC, event_id ASC LIMIT {{search_inner_limit:UInt64}}) AS search INNER JOIN events AS e ON e.event_id = search.event_id{doc_join} ORDER BY score DESC, timestamp DESC, event_id ASC LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}"
-    )
-}
-
-fn indexed_search_query_sql(
-    where_clause: &str,
-    query_term_expr: &str,
-    score_expr: &str,
-    having_clause: &str,
-    snippet_expr: &str,
-    include_snippets: bool,
-) -> String {
-    let doc_join = if include_snippets {
-        " LEFT ANY JOIN event_text_index AS doc ON doc.event_id = search.event_id"
-    } else {
-        ""
-    };
-    format!(
-        "SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.trace_id AS trace_id, e.span_id AS span_id, e.signal AS signal, search.score AS score, search.matched_terms AS matched_terms, search.matched_paths AS matched_paths, {snippet_expr} AS snippet, e.data AS data FROM (SELECT event_id, sum(match_score) AS score, groupUniqArray(term) AS matched_terms, groupUniqArray(path) AS matched_paths FROM (SELECT event_id, term, path, {query_term_expr} AS query_term, {score_expr} AS match_score FROM event_search_terms WHERE {where_clause}) WHERE query_term != '' GROUP BY event_id{having_clause} ORDER BY score DESC, event_id ASC LIMIT {{search_inner_limit:UInt64}}) AS search INNER JOIN events AS e ON e.event_id = search.event_id{doc_join} ORDER BY score DESC, timestamp DESC, event_id ASC LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}"
-    )
-}
-
 fn phrase_search_query_sql(where_clause: &str, snippet_expr: &str) -> String {
     format!(
         "SELECT e.event_id AS event_id, e.timestamp AS timestamp, e.event_type AS event_type, e.trace_id AS trace_id, e.span_id AS span_id, e.signal AS signal, search.score AS score, [{{search_phrase:String}}] AS matched_terms, [] AS matched_paths, {snippet_expr} AS snippet, e.data AS data FROM (SELECT event_id, timestamp, event_type, text, 1000000 AS score FROM event_text_index AS search WHERE {where_clause} ORDER BY timestamp DESC, event_id ASC LIMIT {{search_inner_limit:UInt64}}) AS search INNER JOIN events AS e ON e.event_id = search.event_id ORDER BY score DESC, timestamp DESC, event_id ASC LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}"
     )
-}
-
-fn prefix_search_where_clause(terms: &[String]) -> String {
-    parenthesized_sql(
-        terms
-            .iter()
-            .map(|term| format!("startsWith(term, {})", quote_sql_string(term)))
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
-}
-
-fn prefix_search_match_expr(terms: &[String]) -> String {
-    search_match_expr(terms, |term| {
-        format!("startsWith(term, {})", quote_sql_string(term))
-    })
-}
-
-fn fuzzy_search_where_clause(terms: &[String]) -> String {
-    parenthesized_sql(
-        terms
-            .iter()
-            .map(|term| {
-                let distance = fuzzy_term_distance(term);
-                let len = term.len();
-                let min_len = len.saturating_sub(distance);
-                let max_len = len.saturating_add(distance);
-                format!(
-                    "(length(term) BETWEEN {min_len} AND {max_len} AND editDistance(term, {}) <= {distance})",
-                    quote_sql_string(term)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
-}
-
-fn fuzzy_search_match_expr(terms: &[String]) -> String {
-    search_match_expr(terms, |term| {
-        let distance = fuzzy_term_distance(term);
-        format!(
-            "editDistance(term, {}) <= {distance}",
-            quote_sql_string(term)
-        )
-    })
-}
-
-fn fuzzy_search_score_expr(terms: &[String]) -> String {
-    let mut args = Vec::new();
-    for term in terms {
-        let distance = fuzzy_term_distance(term);
-        let quoted = quote_sql_string(term);
-        args.push(format!("editDistance(term, {quoted}) <= {distance}"));
-        args.push(format!(
-            "toUInt64(greatest(toInt64(weight) * 100 - toInt64(editDistance(term, {quoted})) * 40, 1))"
-        ));
-    }
-    args.push("toUInt64(weight)".to_string());
-    format!("multiIf({})", args.join(", "))
-}
-
-fn search_match_expr(terms: &[String], predicate: impl Fn(&str) -> String) -> String {
-    let mut args = Vec::new();
-    for term in terms {
-        args.push(predicate(term));
-        args.push(quote_sql_string(term));
-    }
-    args.push("''".to_string());
-    format!("multiIf({})", args.join(", "))
-}
-
-fn fuzzy_term_distance(term: &str) -> usize {
-    if term.len() <= 4 { 1 } else { 2 }
-}
-
-fn parenthesized_sql(value: String) -> String {
-    format!("({value})")
-}
-
-fn search_query_terms(query: &str) -> Vec<String> {
-    let mut terms = BTreeSet::new();
-    let mut token = String::new();
-    for ch in query.chars() {
-        if ch.is_ascii_alphanumeric() {
-            token.push(ch.to_ascii_lowercase());
-            if token.len() >= 64 {
-                terms.insert(token.clone());
-                token.clear();
-            }
-        } else if token.len() >= 2 {
-            terms.insert(std::mem::take(&mut token));
-        } else {
-            token.clear();
-        }
-    }
-    if token.len() >= 2 {
-        terms.insert(token);
-    }
-    terms.into_iter().take(16).collect()
 }
 
 #[allow(dead_code)]
@@ -4845,43 +4486,6 @@ fn event_query_planning_metadata(
     }
 }
 
-fn token_search_planning_metadata(
-    request: &SearchQueryRequest,
-    terms: &[String],
-) -> QueryPlanningMetadata {
-    indexed_search_planning_metadata(request, terms, "token")
-}
-
-fn indexed_search_planning_metadata(
-    request: &SearchQueryRequest,
-    terms: &[String],
-    mode: &'static str,
-) -> QueryPlanningMetadata {
-    let (time_range_start, time_range_end) =
-        explicit_time_range_metadata(&request.from, &request.to);
-    QueryPlanningMetadata {
-        filter_paths: if request.event_type.trim().is_empty() {
-            Vec::new()
-        } else {
-            vec!["event_type".to_string()]
-        },
-        time_range_start,
-        time_range_end,
-        text_search: Some(serde_json::json!({
-            "mode": mode,
-            "termCount": terms.len(),
-            "requireAllTerms": request.require_all_terms,
-            "includeSnippets": request.include_snippets,
-            "source": if request.include_snippets {
-                "event_search_terms+event_text_index"
-            } else {
-                "event_search_terms"
-            },
-        })),
-        ..Default::default()
-    }
-}
-
 fn phrase_search_planning_metadata(request: &SearchQueryRequest) -> QueryPlanningMetadata {
     let (time_range_start, time_range_end) =
         explicit_time_range_metadata(&request.from, &request.to);
@@ -4996,12 +4600,7 @@ fn query_shape_class(
         _ if matches!(plan_kind, "cohort_membership") => "cohort_retention",
         _ if matches!(
             plan_kind,
-            "search_terms"
-                | "search_terms_join"
-                | "search_terms_text_join"
-                | "text_index"
-                | "text_index_join"
-                | "raw_text_scan"
+            "text_index" | "text_index_join" | "raw_text_scan"
         ) =>
         {
             "search"
@@ -5027,7 +4626,7 @@ fn query_recommendations(
             serde_json::json!({
                 "kind": "route",
                 "targetType": "search",
-                "targetTable": "event_search_terms",
+                "targetTable": "event_text_index",
                 "reason": "query scans raw event JSON with text matching",
                 "action": "use_search_query_or_event_text_filter",
             }),
@@ -5047,7 +4646,7 @@ fn query_recommendations(
                     "field"
                 };
                 let target_table = if operator == "contains" {
-                    "event_search_terms"
+                    "event_text_index"
                 } else {
                     "field_index"
                 };
@@ -5175,12 +4774,6 @@ fn query_plan_kind(query: &str, sources: &[String]) -> &'static str {
     }
 
     if source_names.len() > 1 {
-        if source_names.contains(&"events") && source_names.contains(&"event_search_terms") {
-            if source_names.contains(&"event_text_index") {
-                return "search_terms_text_join";
-            }
-            return "search_terms_join";
-        }
         if source_names.contains(&"events") && source_names.contains(&"event_text_index") {
             return "text_index_join";
         }
@@ -5203,7 +4796,6 @@ fn query_plan_kind(query: &str, sources: &[String]) -> &'static str {
         "events" if query_uses_raw_text_scan(query) => "raw_text_scan",
         "events" => "raw_events",
         "event_text_index" => "text_index",
-        "event_search_terms" => "search_terms",
         "event_kv_index" => "kv_index",
         "field_index" => "promoted_index",
         "field_values" => "lookup_index",
@@ -6221,15 +5813,12 @@ mod tests {
         QueryExplanation, RAW_GROUPABLE_FIELD_NAMES, ReadError, ReportQueryRequest, SearchMode,
         attach_query_explanation, checked_select_query, event_filter_explanations,
         event_page_filter, event_query_planning_metadata, event_table_order,
-        event_value_expression, fuzzy_search_match_expr, fuzzy_search_score_expr,
-        fuzzy_search_where_clause, group_options_query, grouped_index_query, grouped_rollup_query,
-        indexed_search_query_sql, is_raw_fallback_plan, latest_grouped_index_query,
-        latest_grouped_rollup_query, nanotrace_with_materialization, normalize_prewhere,
-        phrase_search_query_sql, prefix_search_match_expr, prefix_search_where_clause,
+        event_value_expression, group_options_query, grouped_index_query, grouped_rollup_query,
+        is_raw_fallback_plan, latest_grouped_index_query, latest_grouped_rollup_query,
+        nanotrace_with_materialization, normalize_prewhere, phrase_search_query_sql,
         query_plan_kind, query_recommendations, query_shape_class, query_sources,
-        query_usage_shape, raw_groups_query, scope_query_with_allowed_tables, search_query_terms,
-        search_snippet_sql, token_search_query_sql, validate_parameter_name,
-        validate_query_sources,
+        query_usage_shape, raw_groups_query, scope_query_with_allowed_tables, search_snippet_sql,
+        validate_parameter_name, validate_query_sources,
     };
     use serde_json::Value;
 
@@ -6305,7 +5894,7 @@ mod tests {
         assert_eq!(request.query, "checkout timeout");
         assert_eq!(request.from, "2026-06-04T00:00:00Z");
         assert_eq!(request.limit, 25);
-        assert!(matches!(request.mode, SearchMode::Token));
+        assert!(matches!(request.mode, SearchMode::Phrase));
         assert!(!request.require_all_terms);
         assert!(!request.include_snippets);
     }
@@ -6352,7 +5941,7 @@ mod tests {
     }
 
     #[test]
-    fn query_api_request_accepts_prefix_and_fuzzy_search_modes() {
+    fn query_api_request_still_accepts_legacy_search_modes() {
         let request: QueryApiRequest = serde_json::from_value(serde_json::json!({
             "type": "search",
             "query": "chekout timeot",
@@ -6381,41 +5970,6 @@ mod tests {
     }
 
     #[test]
-    fn search_query_terms_tokenize_and_deduplicate() {
-        assert_eq!(
-            search_query_terms("Checkout timeout checkout gpt-5.5"),
-            vec!["checkout", "gpt", "timeout"]
-        );
-        assert!(search_query_terms("x !").is_empty());
-    }
-
-    #[test]
-    fn search_sql_supports_required_terms_and_snippets() {
-        let snippet = search_snippet_sql("doc.text", "search_snippet_needle");
-        let sql = token_search_query_sql(
-            "term IN ('checkout', 'timeout')",
-            " HAVING uniqExact(term) >= {search_min_matched_terms:UInt64}",
-            &snippet,
-            true,
-        );
-
-        assert!(sql.contains("FROM event_search_terms"));
-        assert!(sql.contains("LEFT ANY JOIN event_text_index AS doc"));
-        assert!(sql.contains("HAVING uniqExact(term) >= {search_min_matched_terms:UInt64}"));
-        assert!(sql.contains("positionCaseInsensitive(doc.text, {search_snippet_needle:String})"));
-        assert!(sql.contains(" AS snippet"));
-    }
-
-    #[test]
-    fn default_token_search_sql_avoids_text_document_join() {
-        let sql = token_search_query_sql("term IN ('checkout')", "", "''", false);
-
-        assert!(sql.contains("FROM event_search_terms"));
-        assert!(!sql.contains("event_text_index AS doc"));
-        assert!(sql.contains("'' AS snippet"));
-    }
-
-    #[test]
     fn phrase_search_sql_uses_text_index_and_snippet() {
         let snippet = search_snippet_sql("search.text", "search_phrase");
         let sql = phrase_search_query_sql(
@@ -6427,47 +5981,6 @@ mod tests {
         assert!(sql.contains("positionCaseInsensitive(search.text, {search_phrase:String}) > 0"));
         assert!(sql.contains("[{search_phrase:String}] AS matched_terms"));
         assert!(sql.contains(" AS snippet"));
-    }
-
-    #[test]
-    fn prefix_search_sql_uses_term_prefixes_and_query_term_having() {
-        let terms = vec!["check".to_string(), "time".to_string()];
-        let sql = indexed_search_query_sql(
-            &prefix_search_where_clause(&terms),
-            &prefix_search_match_expr(&terms),
-            "toUInt64(weight)",
-            " HAVING uniqExact(query_term) >= {search_min_matched_terms:UInt64}",
-            "''",
-            false,
-        );
-
-        assert!(sql.contains("FROM event_search_terms"));
-        assert!(sql.contains("startsWith(term, 'check')"));
-        assert!(sql.contains("startsWith(term, 'time')"));
-        assert!(sql.contains("multiIf(startsWith(term, 'check'), 'check'"));
-        assert!(sql.contains("HAVING uniqExact(query_term) >= {search_min_matched_terms:UInt64}"));
-        assert!(!sql.contains("event_text_index AS doc"));
-    }
-
-    #[test]
-    fn fuzzy_search_sql_uses_bounded_edit_distance_and_snippet_join() {
-        let terms = vec!["chekout".to_string(), "timeot".to_string()];
-        let snippet = search_snippet_sql("doc.text", "search_snippet_needle");
-        let sql = indexed_search_query_sql(
-            &fuzzy_search_where_clause(&terms),
-            &fuzzy_search_match_expr(&terms),
-            &fuzzy_search_score_expr(&terms),
-            "",
-            &snippet,
-            true,
-        );
-
-        assert!(sql.contains("FROM event_search_terms"));
-        assert!(sql.contains("editDistance(term, 'chekout') <= 2"));
-        assert!(sql.contains("length(term) BETWEEN 5 AND 9"));
-        assert!(sql.contains("LEFT ANY JOIN event_text_index AS doc"));
-        assert!(sql.contains("positionCaseInsensitive(doc.text, {search_snippet_needle:String})"));
-        assert!(sql.contains("sum(match_score) AS score"));
     }
 
     #[test]
@@ -6703,24 +6216,6 @@ mod tests {
                 &["events".to_string(), "event_text_index".to_string()]
             ),
             "text_index_join"
-        );
-        assert_eq!(
-            query_plan_kind(
-                "SELECT * FROM events JOIN event_search_terms USING event_id",
-                &["events".to_string(), "event_search_terms".to_string()]
-            ),
-            "search_terms_join"
-        );
-        assert_eq!(
-            query_plan_kind(
-                "SELECT * FROM events JOIN event_search_terms USING event_id JOIN event_text_index USING event_id",
-                &[
-                    "events".to_string(),
-                    "event_search_terms".to_string(),
-                    "event_text_index".to_string()
-                ]
-            ),
-            "search_terms_text_join"
         );
         assert_eq!(
             query_plan_kind(

@@ -325,7 +325,6 @@ flowchart TB
 
   Events["events"]
   Text["event_text_index"]
-  Terms["event_search_terms"]
   KV["event_kv_index"]
   Fields["field_index"]
   Measures["event_measures\nmeasure_cube_points"]
@@ -401,8 +400,6 @@ materialize_rows:
   for each event row:
     if target event_text_index:
       append bounded text document rows
-    if target event_search_terms:
-      append token rows with path and weight
     if target event_kv_index:
       flatten scalar JSON paths, including array-object scope metadata
     if target field_index:
@@ -453,8 +450,8 @@ flowchart LR
 
 | Type | Main request struct | Serving substrate |
 | --- | --- | --- |
-| `events` | `EventsQueryRequest` | `events`, `event_density_1s`, `field_rollups`, `field_values`, `event_kv_index`, `event_text_index`, `event_search_terms`, `field_index` where safe. |
-| `search` | `SearchQueryRequest` | `event_search_terms` for token/prefix/fuzzy modes, `event_text_index` for phrase/snippets. |
+| `events` | `EventsQueryRequest` | `events`, `event_density_1s`, `field_rollups`, `field_values`, `event_kv_index`, `event_text_index`, `field_index` where safe. |
+| `search` | `SearchQueryRequest` | `event_text_index` for bounded text contains search and snippets. |
 | `measure` | `MeasureQueryRequest` | `measure_cube_rollups`. |
 | `funnel` | `FunnelQueryRequest` | `sequence_report_results`. |
 | `cohort` | `CohortQueryRequest` | `cohort_memberships`. |
@@ -484,12 +481,8 @@ Event filter operators:
 - `lte`
 - `in`
 
-Search modes:
-
-- `token`
-- `prefix`
-- `fuzzy`
-- `phrase`
+Search uses bounded text contains semantics over `event_text_index`; legacy mode
+values are accepted for compatibility but do not select a token index.
 
 Pseudocode:
 
@@ -918,7 +911,7 @@ tables:
 | --- | --- |
 | Raw and invalid events | `events`, `invalid_events` |
 | Alerting | `alert_events`, `alert_notifications` |
-| Search indexes | `event_text_index`, `event_search_terms` |
+| Search indexes | `event_text_index` |
 | Always-on rollups/indexes | `event_density_1s`, `field_rollups`, `field_values` |
 | Promotion definitions and indexes | `definitions`, `field_index`, `event_kv_index` |
 | Measures and metric rollups | `event_measures`, `measure_rollups`, `measure_cube_points`, `measure_cube_rollups`, `counter_rollups`, `gauge_rollups`, `histogram_rollups` |

@@ -105,7 +105,7 @@ component's section states the contract.
   are written by `nanotrace-lakehouse-rebuild` in rebuild, incremental, loop, or
   queued-executor modes.
 - Raw serving rows and generic indexes are materialized from lakehouse commits:
-  `events`, `event_text_index`, `event_search_terms`, and `event_kv_index`.
+  `events`, `event_text_index`, and `event_kv_index`.
 - Full rebuild raw-event insertion is controlled by `NANOTRACE_REBUILD_RAW`.
   Derived materialization through `MaterializeTargets::all()` must not imply a
   second raw `events` insert.
@@ -134,10 +134,9 @@ component's section states the contract.
 - Event browsing and unsupported predicates fall back to `events`, but repeated
   broad scans should become promoted fields, measures, reports, sequences,
   cohorts, or offline lakehouse work.
-- Event text filters use `event_text_index`; ranked exact-token, prefix, and
-  bounded fuzzy search use `event_search_terms`; arbitrary scalar equality,
-  existence, set, and numeric range predicates use `event_kv_index` when
-  possible.
+- Event text filters and saved search use `event_text_index`; arbitrary scalar
+  equality, existence, set, and numeric range predicates use `event_kv_index`
+  when possible.
 - If a promoted index is absent or stale, scalar filters must fall back to
   `event_kv_index` when possible. Raw `events.data` scans are reserved for
   unsupported predicates or explicitly bounded diagnostic paths.

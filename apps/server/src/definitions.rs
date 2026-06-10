@@ -2330,7 +2330,6 @@ fn normalize_capabilities(kind: &str, mode: &str, capabilities: Value) -> Value 
         }),
         ("search", _) => serde_json::json!({
             "saved_search": true,
-            "event_search_terms": true,
             "event_text_index": true
         }),
         ("report", _) => serde_json::json!({

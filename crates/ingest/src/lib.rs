@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     time::Duration,
 };
@@ -28,8 +28,7 @@ pub const HEADER_CONTENT_TYPE: &str = "content-type";
 pub const HEADER_SCHEMA_VERSION: &str = "nanotrace-schema-version";
 pub const DEFAULT_MAX_EVENT_KV_INDEX_ROWS: usize = 2048;
 pub const DEFAULT_MAX_EVENT_KV_STRING_BYTES: usize = 1024;
-pub const DEFAULT_MAX_EVENT_SEARCH_TEXT_BYTES: usize = 32 * 1024;
-pub const DEFAULT_MAX_EVENT_SEARCH_TERM_ROWS: usize = 512;
+pub const DEFAULT_MAX_EVENT_SEARCH_TEXT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub struct RawBatchProducer {
@@ -267,19 +266,6 @@ pub struct EventTextIndexRow {
     pub trace_id: String,
     pub span_id: String,
     pub text: String,
-    pub source_file: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EventSearchTermRow {
-    pub tenant_id: String,
-    pub timestamp: String,
-    pub event_id: String,
-    pub event_type: String,
-    pub signal: String,
-    pub term: String,
-    pub path: String,
-    pub weight: u16,
     pub source_file: String,
 }
 
@@ -637,66 +623,6 @@ pub fn event_text_index_rows(event: &Value) -> Vec<EventTextIndexRow> {
     event_text_index_rows_with_limits(event, DEFAULT_MAX_EVENT_SEARCH_TEXT_BYTES)
 }
 
-pub fn event_search_term_rows(event: &Value) -> Vec<EventSearchTermRow> {
-    event_search_term_rows_with_limits(event, DEFAULT_MAX_EVENT_SEARCH_TERM_ROWS)
-}
-
-pub fn event_search_term_rows_with_limits(
-    event: &Value,
-    max_rows_per_event: usize,
-) -> Vec<EventSearchTermRow> {
-    let Some(event_object) = event.as_object() else {
-        return Vec::new();
-    };
-    let Some(data) = event_object.get("data").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    let tenant_id = string_value(event_object, "tenant_id")
-        .or_else(|| string_value(data, "tenant_id"))
-        .unwrap_or_default();
-    let event_id = string_value(event_object, "event_id").unwrap_or_default();
-    let timestamp = string_value(event_object, "timestamp").unwrap_or_default();
-    if tenant_id.is_empty() || event_id.is_empty() || timestamp.is_empty() {
-        return Vec::new();
-    }
-
-    let event_type = string_value(data, "event_type").unwrap_or_default();
-    let signal = derived_signal(data, &event_type);
-    let source_file = string_value(event_object, "source_file").unwrap_or_default();
-    let mut terms = BTreeMap::<(String, String), u16>::new();
-    collect_search_terms("event_id", &Value::String(event_id.clone()), 4, &mut terms);
-    collect_search_terms(
-        "event_type",
-        &Value::String(event_type.clone()),
-        4,
-        &mut terms,
-    );
-    collect_search_terms("signal", &Value::String(signal.clone()), 3, &mut terms);
-    if let Some(trace_id) = string_value(data, "trace_id") {
-        collect_search_terms("trace_id", &Value::String(trace_id), 3, &mut terms);
-    }
-    if let Some(span_id) = string_value(data, "span_id") {
-        collect_search_terms("span_id", &Value::String(span_id), 3, &mut terms);
-    }
-    collect_search_terms("", &Value::Object(data.clone()), 1, &mut terms);
-
-    terms
-        .into_iter()
-        .take(max_rows_per_event)
-        .map(|((term, path), weight)| EventSearchTermRow {
-            tenant_id: tenant_id.clone(),
-            timestamp: timestamp.clone(),
-            event_id: event_id.clone(),
-            event_type: event_type.clone(),
-            signal: signal.clone(),
-            term,
-            path,
-            weight,
-            source_file: source_file.clone(),
-        })
-        .collect()
-}
-
 pub fn event_text_index_rows_with_limits(
     event: &Value,
     max_text_bytes: usize,
@@ -741,82 +667,6 @@ pub fn event_text_index_rows_with_limits(
         text,
         source_file: string_value(event_object, "source_file").unwrap_or_default(),
     }]
-}
-
-fn collect_search_terms(
-    path: &str,
-    value: &Value,
-    base_weight: u16,
-    terms: &mut BTreeMap<(String, String), u16>,
-) {
-    match value {
-        Value::Null => push_search_tokens(path, "null", base_weight, terms),
-        Value::Bool(value) => push_search_tokens(path, &value.to_string(), base_weight, terms),
-        Value::Number(value) => push_search_tokens(path, &value.to_string(), base_weight, terms),
-        Value::String(value) => {
-            push_search_tokens(path, value, path_search_weight(path, base_weight), terms)
-        }
-        Value::Object(object) => {
-            for (key, value) in object {
-                let child_path = if path.is_empty() {
-                    key.to_string()
-                } else {
-                    format!("{path}.{key}")
-                };
-                collect_search_terms(&child_path, value, base_weight, terms);
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_search_terms(path, value, base_weight, terms);
-            }
-        }
-    }
-}
-
-fn path_search_weight(path: &str, base_weight: u16) -> u16 {
-    match path {
-        "event_id" | "event_type" => base_weight.max(4),
-        "message" | "name" | "error.message" | "exception.message" => base_weight.max(3),
-        "trace_id" | "span_id" | "request_id" | "service" => base_weight.max(2),
-        _ => base_weight,
-    }
-}
-
-fn push_search_tokens(
-    path: &str,
-    value: &str,
-    weight: u16,
-    terms: &mut BTreeMap<(String, String), u16>,
-) {
-    let mut token = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            token.push(ch.to_ascii_lowercase());
-            if token.len() >= 64 {
-                push_search_token(path, &token, weight, terms);
-                token.clear();
-            }
-        } else {
-            push_search_token(path, &token, weight, terms);
-            token.clear();
-        }
-    }
-    push_search_token(path, &token, weight, terms);
-}
-
-fn push_search_token(
-    path: &str,
-    token: &str,
-    weight: u16,
-    terms: &mut BTreeMap<(String, String), u16>,
-) {
-    if token.len() < 2 {
-        return;
-    }
-    let key = (token.to_string(), path.to_string());
-    let entry = terms.entry(key).or_insert(0);
-    *entry = entry.saturating_add(weight).min(255);
 }
 
 fn collect_search_text(path: &str, value: &Value, output: &mut String, max_text_bytes: usize) {
@@ -1479,48 +1329,5 @@ mod tests {
         assert!(rows[0].text.contains("message:checkout timeout"));
         assert!(rows[0].text.contains("tags:payments"));
         assert!(rows[0].text.len() <= 512);
-    }
-
-    #[test]
-    fn search_terms_tokenize_and_weight_log_text() {
-        let event = serde_json::json!({
-            "tenant_id": "tenant-a",
-            "event_id": "evt-1",
-            "timestamp": "2026-06-04T00:00:00Z",
-            "source_file": "kafka://events/0/1",
-            "data": {
-                "event_type": "log",
-                "trace_id": "trace-1",
-                "service": "api",
-                "message": "Checkout timeout talking to Redis",
-                "llm": { "model": "gpt-5.5" }
-            }
-        });
-
-        let rows = event_search_term_rows_with_limits(&event, 128);
-
-        assert!(
-            rows.iter()
-                .any(|row| row.term == "checkout" && row.path == "message")
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.term == "redis" && row.path == "message")
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.term == "gpt" && row.path == "llm.model")
-        );
-        let message_weight = rows
-            .iter()
-            .find(|row| row.term == "checkout" && row.path == "message")
-            .expect("message token")
-            .weight;
-        let model_weight = rows
-            .iter()
-            .find(|row| row.term == "gpt" && row.path == "llm.model")
-            .expect("model token")
-            .weight;
-        assert!(message_weight > model_weight);
     }
 }
