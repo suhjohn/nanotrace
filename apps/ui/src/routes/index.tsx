@@ -478,6 +478,15 @@ function parseStringArray(value: string) {
   return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [...defaultEventColumns]
 }
 
+function parseProjectIdCookie(value: string) {
+  try {
+    const parsed = JSON.parse(value)
+    return typeof parsed === 'string' ? parsed : value
+  } catch {
+    return value
+  }
+}
+
 function parseTimeRangeKey(value: string): TimeRangeKey {
   return value === 'custom' || timeRangeOptions.some(option => option.key === value) ? value as TimeRangeKey : '24h'
 }
@@ -678,7 +687,8 @@ export function ObservatoryHome({
   const [selectedProjectId, setSelectedProjectId] = useCookieState<string>({
     cookieName: 'observatory-ui-project-id',
     initialValue: '',
-    parse: String
+    parse: parseProjectIdCookie,
+    serialize: String
   })
   const selectedProjectScope = useMemo(
     () => selectedProjectId ? { projectIds: [selectedProjectId] } : undefined,
