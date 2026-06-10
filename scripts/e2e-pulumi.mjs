@@ -233,6 +233,7 @@ WHERE event_id = {event_id:String}
     view: "summary",
     filter: {
       facets: [
+        { path: "_pulumi_e2e.run_id", operator: "eq", value: runId },
         { path: "llm.model", operator: "eq", value: "gpt-4.1" },
         { path: "llm.usage.prompt_tokens", operator: "gte", value: "1000" },
         { path: "items[].sku", operator: "eq", value: "sku_1" },
@@ -250,6 +251,7 @@ WHERE event_id = {event_id:String}
     view: "summary",
     filter: {
       facets: [
+        { path: "_pulumi_e2e.run_id", operator: "eq", value: runId },
         { path: "items[].sku", operator: "eq", value: "sku_1" },
         { path: "items[].price", operator: "eq", value: "20" },
       ],

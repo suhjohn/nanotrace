@@ -3629,7 +3629,9 @@ fn join_clauses(clauses: Vec<String>) -> String {
 }
 
 fn event_metadata_select(alias: &str) -> String {
-    flamegraph_select(alias)
+    format!(
+        "SELECT {alias}.event_id AS event_id, {alias}.timestamp AS timestamp, {alias}.data AS data, {alias}.event_type AS event_type, {alias}.signal AS signal, {alias}.trace_id AS trace_id, {alias}.span_id AS span_id"
+    )
 }
 
 fn flamegraph_select(alias: &str) -> String {
